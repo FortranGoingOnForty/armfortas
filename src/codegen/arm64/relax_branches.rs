@@ -37,6 +37,13 @@ use super::mir::{
     ArmCond, ArmOpcode, MBlockId, MachineBlock, MachineFunction, MachineInst, MachineOperand,
 };
 
+#[cfg(test)]
+std::thread_local! {
+    static INST_EMIT_BYTE_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 /// Maximum signed offset (in bytes) reachable by a `B.cond` and by
 /// `cbz/cbnz`. The 19-bit signed immediate is scaled by 4, giving
 /// ±(2^20) bytes. Subtract a safety margin so we never sit right on
@@ -112,15 +119,13 @@ fn relax_once(mf: &mut MachineFunction) -> bool {
 /// Single relaxation pass. Returns `true` when at least one branch was
 /// expanded (caller should iterate); `false` at the fixed point.
 fn relax_once_with_limits(mf: &mut MachineFunction, limits: BranchLimits) -> bool {
-    // Compute byte offsets for every block label using the actual
-    // emit-time instruction count. Several MIR opcodes lower to
-    // multiple ARM64 instructions (AdrpLdr / AdrpAdd / AdrpGotLdr, prologue +
-    // stack-probe sequences, large-immediate movz/movk chains, etc.),
-    // so a flat 4-bytes-per-MachineInst estimate would systematically
-    // under-shoot the real offsets in functions like stdlib_slaruv
-    // and miss far branches that need relaxation.
-    let block_offsets = compute_block_offsets(mf);
-    let mut overflows = collect_overflows(mf, &block_offsets, limits);
+    // Compute exact block and branch offsets in one render pass. Several MIR
+    // opcodes lower to multiple ARM64 instructions (AdrpLdr / AdrpAdd /
+    // AdrpGotLdr, prologue + stack-probe sequences, large-immediate movz/movk
+    // chains, etc.), so a flat 4-bytes-per-MachineInst estimate would
+    // systematically under-shoot real offsets. The earlier implementation
+    // rendered every instruction again while collecting branch sites.
+    let mut overflows = scan_branch_layout(mf, limits).into_overflows();
 
     if overflows.is_empty() {
         return false;
@@ -143,37 +148,33 @@ fn relax_once_with_limits(mf: &mut MachineFunction, limits: BranchLimits) -> boo
     true
 }
 
-fn collect_overflows(
-    mf: &MachineFunction,
-    block_offsets: &std::collections::HashMap<MBlockId, i64>,
-    limits: BranchLimits,
-) -> Vec<OverflowSite> {
-    // Collect overflow sites before mutating anything. We also record
-    // the per-instruction prefix offset within each block so we can
-    // skip past wide-emit insts that precede a branch.
-    let mut overflows: Vec<OverflowSite> = Vec::new();
-    for block in &mf.blocks {
-        let block_offset = block_offsets[&block.id];
-        let mut running = 0i64;
-        for (inst_idx, inst) in block.insts.iter().enumerate() {
-            if let Some((target, limit, kind)) = relaxable_branch(inst, limits) {
-                if let Some(&target_offset) = block_offsets.get(&target) {
-                    let branch_offset = block_offset + running;
-                    let delta = target_offset - branch_offset;
-                    if delta.abs() > limit {
-                        overflows.push(OverflowSite {
-                            block_id: block.id,
-                            inst_idx,
-                            target,
-                            kind,
-                        });
-                    }
-                }
-            }
-            running += inst_emit_bytes(inst, mf) as i64;
-        }
+struct BranchLayout {
+    block_offsets: std::collections::HashMap<MBlockId, i64>,
+    sites: Vec<BranchSite>,
+}
+
+impl BranchLayout {
+    fn into_overflows(self) -> Vec<OverflowSite> {
+        let Self {
+            block_offsets,
+            sites,
+        } = self;
+        sites
+            .into_iter()
+            .filter_map(|site| {
+                let source_offset = block_offsets[&site.overflow.block_id];
+                let target_offset = *block_offsets.get(&site.overflow.target)?;
+                let delta = target_offset - (source_offset + site.local_offset);
+                (delta.abs() > site.limit).then_some(site.overflow)
+            })
+            .collect()
     }
-    overflows
+}
+
+struct BranchSite {
+    overflow: OverflowSite,
+    local_offset: i64,
+    limit: i64,
 }
 
 #[derive(Clone)]
@@ -264,22 +265,55 @@ fn relaxable_branch(
     }
 }
 
-/// Compute byte offsets for every block label, summing the actual
-/// emit-time instruction byte count for every MachineInst in linear
-/// order. Each emitted ARM64 instruction is 4 bytes; we count the
-/// `\n` separators in the emitted text to figure out how many real
-/// instructions an opcode produces (most are 1, but pseudo-ops and
-/// large-immediate forms emit 2+).
-fn compute_block_offsets(mf: &MachineFunction) -> std::collections::HashMap<MBlockId, i64> {
+/// Compute every block label and relaxable branch position while summing the
+/// actual emit-time instruction byte count in linear order. Each emitted ARM64
+/// instruction is 4 bytes; [`inst_emit_bytes`] counts the rendered lines so the
+/// emitter remains the single source of truth for pseudo-op expansion sizes.
+fn scan_branch_layout(mf: &MachineFunction, limits: BranchLimits) -> BranchLayout {
     let mut offsets = std::collections::HashMap::with_capacity(mf.blocks.len());
+    let mut sites = Vec::new();
     let mut running: i64 = 0;
     for block in &mf.blocks {
         offsets.insert(block.id, running);
-        for inst in &block.insts {
-            running += inst_emit_bytes(inst, mf) as i64;
+        let mut local_offset = 0i64;
+        for (inst_idx, inst) in block.insts.iter().enumerate() {
+            if let Some((target, limit, kind)) = relaxable_branch(inst, limits) {
+                sites.push(BranchSite {
+                    overflow: OverflowSite {
+                        block_id: block.id,
+                        inst_idx,
+                        target,
+                        kind,
+                    },
+                    local_offset,
+                    limit,
+                });
+            }
+            let bytes = inst_emit_bytes(inst, mf) as i64;
+            local_offset += bytes;
+            running += bytes;
         }
     }
-    offsets
+    BranchLayout {
+        block_offsets: offsets,
+        sites,
+    }
+}
+
+#[cfg(test)]
+fn compute_block_offsets(mf: &MachineFunction) -> std::collections::HashMap<MBlockId, i64> {
+    scan_branch_layout(mf, PRODUCTION_BRANCH_LIMITS).block_offsets
+}
+
+#[cfg(test)]
+fn collect_overflows(
+    mf: &MachineFunction,
+    block_offsets: &std::collections::HashMap<MBlockId, i64>,
+    limits: BranchLimits,
+) -> Vec<OverflowSite> {
+    let mut layout = scan_branch_layout(mf, limits);
+    layout.block_offsets.clone_from(block_offsets);
+    layout.into_overflows()
 }
 
 /// Number of bytes a single MachineInst emits at assembly time.
@@ -288,9 +322,21 @@ fn compute_block_offsets(mf: &MachineFunction) -> std::collections::HashMap<MBlo
 /// matches the real instruction count without re-deriving each
 /// opcode's expansion rules here.
 fn inst_emit_bytes(inst: &MachineInst, mf: &MachineFunction) -> u32 {
+    #[cfg(test)]
+    INST_EMIT_BYTE_COUNT.with(|count| count.set(count.get() + 1));
     let text = emit_inst_text(inst, mf);
     let lines = text.matches('\n').count() as u32 + 1;
     4 * lines
+}
+
+#[cfg(test)]
+fn reset_inst_emit_byte_count() {
+    INST_EMIT_BYTE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn inst_emit_byte_count() -> usize {
+    INST_EMIT_BYTE_COUNT.with(std::cell::Cell::get)
 }
 
 fn block_position(mf: &MachineFunction, id: MBlockId) -> usize {
@@ -454,6 +500,34 @@ mod tests {
         assert_eq!(mf.blocks.len(), block_count_before);
         assert_eq!(mf.blocks[0].insts.len(), 1);
         assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::BCond);
+    }
+
+    #[test]
+    fn stable_relaxation_renders_each_machine_instruction_once() {
+        let mut mf = MachineFunction::new("single_layout_scan".into());
+        let target = mf.new_block("target");
+        mf.blocks[0].insts.extend([
+            MachineInst {
+                opcode: ArmOpcode::Nop,
+                operands: vec![],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::B,
+                operands: vec![MachineOperand::BlockRef(target)],
+                def: None,
+            },
+        ]);
+        mf.block_mut(target).insts.push(MachineInst {
+            opcode: ArmOpcode::Nop,
+            operands: vec![],
+            def: None,
+        });
+        let instruction_count = mf.blocks.iter().map(|block| block.insts.len()).sum();
+
+        reset_inst_emit_byte_count();
+        assert!(!relax_once(&mut mf));
+        assert_eq!(inst_emit_byte_count(), instruction_count);
     }
 
     /// Out-of-range branch expands to a trampoline. We force
