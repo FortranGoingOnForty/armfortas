@@ -18,6 +18,13 @@ use crate::ir::types::IrType;
 use crate::target::TargetLayout;
 use std::collections::HashMap;
 
+#[cfg(test)]
+std::thread_local! {
+    static ORACLE_CONSTRUCTION_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 /// Result of an alias query between two pointer values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AliasResult {
@@ -99,6 +106,9 @@ pub struct AliasOracle<'a> {
 
 impl<'a> AliasOracle<'a> {
     pub fn new(func: &'a Function, layout: TargetLayout) -> Self {
+        #[cfg(test)]
+        ORACLE_CONSTRUCTION_COUNT.with(|count| count.set(count.get() + 1));
+
         let insts = func
             .blocks
             .iter()
@@ -443,6 +453,16 @@ impl<'a> AliasOracle<'a> {
     fn find_inst(&self, vid: ValueId) -> Option<&'a Inst> {
         self.insts.get(&vid).copied()
     }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_oracle_construction_count() {
+    ORACLE_CONSTRUCTION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn oracle_construction_count() -> usize {
+    ORACLE_CONSTRUCTION_COUNT.with(std::cell::Cell::get)
 }
 
 /// Query whether two pointer values may alias.
