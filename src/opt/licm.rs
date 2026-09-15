@@ -205,12 +205,13 @@ fn licm_function(func: &mut Function, layout: crate::target::TargetLayout) -> bo
         loop {
             let mut hoists: Vec<Hoist> = Vec::new();
             // Loads may require many alias queries against stores in the
-            // loop. Reuse one whole-function oracle for this discovery
-            // sweep; the convenience `alias::query` would rebuild all of
-            // its value maps for every load/store pair. Drop the oracle
-            // before moving any instructions so its indexes remain valid.
+            // loop. Lazily create and then reuse one whole-function oracle
+            // for this discovery sweep; most loops have no eligible load,
+            // and eagerly indexing a large function once per loop dominated
+            // compile time. Drop the oracle before moving any instructions
+            // so its indexes remain valid.
             {
-                let mut alias_oracle = AliasOracle::new(func, layout);
+                let mut alias_oracle = None;
                 for (bi, block) in func.blocks.iter().enumerate() {
                     if !lp.body.contains(&block.id) {
                         continue;
@@ -230,7 +231,9 @@ fn licm_function(func: &mut Function, layout: crate::target::TargetLayout) -> bo
                         }
                         let hoistable = match &inst.kind {
                             InstKind::Load(ptr) => {
-                                load_is_loop_invariant(func, lp, inst.id, *ptr, &mut alias_oracle)
+                                let alias_oracle = alias_oracle
+                                    .get_or_insert_with(|| AliasOracle::new(func, layout));
+                                load_is_loop_invariant(func, lp, inst.id, *ptr, alias_oracle)
                                     && load_is_safe_to_move_to_preheader(func, lp, block.id, *ptr)
                             }
                             _ => is_non_memory_hoist_candidate(&inst.kind),
@@ -478,6 +481,15 @@ mod tests {
 
         m.add_function(f);
         (m, header, latch, exit)
+    }
+
+    #[test]
+    fn pure_loop_does_not_build_alias_oracle() {
+        let (mut module, ..) = build_loop_module();
+        super::super::alias::reset_oracle_construction_count();
+
+        assert!(Licm.run(&mut module));
+        assert_eq!(super::super::alias::oracle_construction_count(), 0);
     }
 
     #[test]

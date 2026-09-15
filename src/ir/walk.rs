@@ -547,6 +547,59 @@ pub fn compute_dominators(func: &Function) -> HashMap<BlockId, HashSet<BlockId>>
         .collect()
 }
 
+/// Preorder intervals for constant-time dominance queries on the dominator
+/// tree. A block dominates exactly the blocks whose intervals nest inside its
+/// own. Unreachable blocks are absent.
+struct DominatorTreeIntervals {
+    intervals: HashMap<BlockId, (usize, usize)>,
+}
+
+impl DominatorTreeIntervals {
+    fn new(func: &Function) -> Self {
+        if func.try_block(func.entry).is_none() {
+            return Self {
+                intervals: HashMap::new(),
+            };
+        }
+
+        let idoms = compute_immediate_dominators(func);
+        let children = dominator_tree_children(&idoms);
+        let mut intervals: HashMap<BlockId, (usize, usize)> =
+            HashMap::with_capacity(idoms.len() + 1);
+        let mut clock = 0usize;
+        let mut stack = vec![(func.entry, false)];
+
+        while let Some((block, exiting)) = stack.pop() {
+            if exiting {
+                intervals.get_mut(&block).expect("entered dominator node").1 = clock;
+                clock += 1;
+                continue;
+            }
+
+            intervals.insert(block, (clock, clock));
+            clock += 1;
+            stack.push((block, true));
+            if let Some(kids) = children.get(&block) {
+                for &child in kids.iter().rev() {
+                    stack.push((child, false));
+                }
+            }
+        }
+
+        Self { intervals }
+    }
+
+    fn dominates(&self, dominator: BlockId, block: BlockId) -> bool {
+        let Some(&(dom_enter, dom_exit)) = self.intervals.get(&dominator) else {
+            return false;
+        };
+        let Some(&(block_enter, block_exit)) = self.intervals.get(&block) else {
+            return false;
+        };
+        dom_enter <= block_enter && block_exit <= dom_exit
+    }
+}
+
 /// A natural loop: header + the set of blocks in the loop body.
 #[derive(Debug, Clone)]
 pub struct NaturalLoop {
@@ -569,7 +622,10 @@ pub struct NaturalLoop {
 /// passes can merge them if needed. (LICM only cares about the body
 /// set, so identical-header loops are still safe.)
 pub fn find_natural_loops(func: &Function) -> Vec<NaturalLoop> {
-    let doms = compute_dominator_info(func);
+    // Loop discovery needs only dominance queries for CFG edges. Derive
+    // constant-time ancestor checks from direct immediate dominators instead
+    // of constructing every block's full dominator bitset.
+    let dominators = DominatorTreeIntervals::new(func);
     let preds = predecessors(func);
 
     // Collect back edges: (latch → header) where header dominates latch.
@@ -577,7 +633,7 @@ pub fn find_natural_loops(func: &Function) -> Vec<NaturalLoop> {
     for block in &func.blocks {
         if let Some(term) = &block.terminator {
             for tgt in terminator_targets(term) {
-                if doms.dominates(tgt, block.id) {
+                if dominators.dominates(tgt, block.id) {
                     back_edges.push((block.id, tgt));
                 }
             }
@@ -1380,7 +1436,7 @@ mod walk_tests {
     }
 
     #[test]
-    fn direct_idoms_match_full_sets_across_generated_cfgs() {
+    fn direct_dominator_results_match_full_sets_across_generated_cfgs() {
         fn next_random(state: &mut u64) -> u64 {
             *state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
@@ -1421,11 +1477,24 @@ mod walk_tests {
                 });
             }
 
+            let direct_idoms = compute_immediate_dominators(&f);
             assert_eq!(
-                compute_immediate_dominators(&f),
+                direct_idoms,
                 compute_immediate_dominators_from_sets(&f),
                 "direct idoms diverged from full dominator sets for seed {seed}"
             );
+
+            let direct_queries = DominatorTreeIntervals::new(&f);
+            let full_sets = compute_dominator_info(&f);
+            for &dominator in &blocks {
+                for &block in &blocks {
+                    assert_eq!(
+                        direct_queries.dominates(dominator, block),
+                        full_sets.dominates(dominator, block),
+                        "direct dominance query diverged for seed {seed}: {dominator:?} -> {block:?}"
+                    );
+                }
+            }
         }
     }
 }
