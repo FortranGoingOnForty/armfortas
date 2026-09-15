@@ -85,7 +85,7 @@ pub fn emit_module(ir_module: &Module, opts: &Options) -> String {
         // Re-emit __TEXT section before each function in case the previous
         // function's constant pool switched to __DATA.
         asm_text.push_str(".section __TEXT,__text,regular,pure_instructions\n");
-        asm_text.push_str(&emit::emit_function(mf));
+        emit::emit_function_into(&mut asm_text, mf);
         asm_text.push('\n');
     }
 
