@@ -208,42 +208,84 @@ impl FrameAddress {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+const GP_REGISTER_COUNT: usize = 31;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FrameTaintState {
     /// GP register numbers whose current value may derive from this frame.
-    tainted_regs: HashSet<u8>,
+    tainted_regs: u32,
     /// Exact FP-relative slots that may contain a frame-derived pointer.
     tainted_slots: HashSet<i64>,
     /// Registers that may address this frame, with exact offsets when known.
-    frame_addr_regs: HashMap<u8, FrameAddress>,
+    frame_addr_regs: [Option<FrameAddress>; GP_REGISTER_COUNT],
     /// A frame-derived pointer was stored through an imprecise frame address.
     unknown_tainted_slot: bool,
 }
 
+impl Default for FrameTaintState {
+    fn default() -> Self {
+        Self {
+            tainted_regs: 0,
+            tainted_slots: HashSet::new(),
+            frame_addr_regs: [None; GP_REGISTER_COUNT],
+            unknown_tainted_slot: false,
+        }
+    }
+}
+
 impl FrameTaintState {
+    #[inline]
+    fn reg_is_tainted(&self, reg: u8) -> bool {
+        self.tainted_regs & (1u32 << reg) != 0
+    }
+
+    #[inline]
+    fn taint_reg(&mut self, reg: u8) {
+        self.tainted_regs |= 1u32 << reg;
+    }
+
+    #[inline]
+    fn frame_address(&self, reg: u8) -> Option<FrameAddress> {
+        self.frame_addr_regs[reg as usize]
+    }
+
+    #[inline]
+    fn set_frame_address(&mut self, reg: u8, address: FrameAddress) {
+        self.frame_addr_regs[reg as usize] = Some(address);
+    }
+
+    #[inline]
+    fn clear_frame_address(&mut self, reg: u8) {
+        self.frame_addr_regs[reg as usize] = None;
+    }
+
     fn merge_from(&mut self, other: &Self) -> bool {
         let mut changed = false;
 
-        let old_reg_count = self.tainted_regs.len();
-        self.tainted_regs.extend(&other.tainted_regs);
-        changed |= self.tainted_regs.len() != old_reg_count;
+        let merged_regs = self.tainted_regs | other.tainted_regs;
+        if self.tainted_regs != merged_regs {
+            self.tainted_regs = merged_regs;
+            changed = true;
+        }
 
         let old_slot_count = self.tainted_slots.len();
         self.tainted_slots.extend(&other.tainted_slots);
         changed |= self.tainted_slots.len() != old_slot_count;
 
-        for (&reg, &incoming) in &other.frame_addr_regs {
-            match self.frame_addr_regs.get_mut(&reg) {
-                Some(current) => {
-                    let merged = current.merge(incoming);
-                    if *current != merged {
-                        *current = merged;
+        for (current, incoming) in self.frame_addr_regs.iter_mut().zip(other.frame_addr_regs) {
+            if let Some(incoming) = incoming {
+                match current {
+                    Some(current) => {
+                        let merged = current.merge(incoming);
+                        if *current != merged {
+                            *current = merged;
+                            changed = true;
+                        }
+                    }
+                    None => {
+                        *current = Some(incoming);
                         changed = true;
                     }
-                }
-                None => {
-                    self.frame_addr_regs.insert(reg, incoming);
-                    changed = true;
                 }
             }
         }
@@ -257,7 +299,7 @@ impl FrameTaintState {
     }
 
     fn has_frame_derived_argument(&self) -> bool {
-        (0u8..8).any(|reg| self.tainted_regs.contains(&reg))
+        self.tainted_regs & 0xff != 0
     }
 }
 
@@ -366,38 +408,34 @@ fn has_frame_derived_arg(entry: &FrameTaintState, insts: &[MachineInst]) -> bool
 
 fn propagate_frame_taint(state: &mut FrameTaintState, insts: &[MachineInst]) {
     for inst in insts {
-        let source_frame_address = op_gp(inst, 1)
-            .and_then(|source| state.frame_addr_regs.get(&source))
-            .copied();
+        let source_frame_address = op_gp(inst, 1).and_then(|source| state.frame_address(source));
         let frame_access = match inst.opcode {
-            ArmOpcode::StrImm | ArmOpcode::LdrImm => {
-                effective_frame_slot_offset(inst, 1, 2, &state.frame_addr_regs)
-            }
+            ArmOpcode::StrImm | ArmOpcode::LdrImm => effective_frame_slot_offset(inst, 1, 2, state),
             _ => None,
         };
         if let Some(dst) = written_gp_reg(inst) {
-            state.frame_addr_regs.remove(&dst);
+            state.clear_frame_address(dst);
         }
         match inst.opcode {
             // sub xN, x29, #imm  →  xN holds a frame-relative address.
             ArmOpcode::SubImm if op_is_fp(inst, 1) => {
                 if let Some(n) = op_gp(inst, 0) {
-                    state.tainted_regs.insert(n);
+                    state.taint_reg(n);
                     let address = op_imm(inst, 2)
                         .and_then(i64::checked_neg)
                         .map(FrameAddress::Exact)
                         .unwrap_or(FrameAddress::Unknown);
-                    state.frame_addr_regs.insert(n, address);
+                    state.set_frame_address(n, address);
                 }
             }
             // add xN, x29, #imm  →  xN holds a frame-relative address.
             ArmOpcode::AddImm if op_is_fp(inst, 1) => {
                 if let Some(n) = op_gp(inst, 0) {
-                    state.tainted_regs.insert(n);
+                    state.taint_reg(n);
                     let address = op_imm(inst, 2)
                         .map(FrameAddress::Exact)
                         .unwrap_or(FrameAddress::Unknown);
-                    state.frame_addr_regs.insert(n, address);
+                    state.set_frame_address(n, address);
                 }
             }
             // add xN, xM, #imm where xM is a known frame address.
@@ -406,11 +444,11 @@ fn propagate_frame_taint(state: &mut FrameTaintState, insts: &[MachineInst]) {
                     (op_gp(inst, 0), op_gp(inst, 1), op_imm(inst, 2))
                 {
                     if let Some(base) = source_frame_address {
-                        state.tainted_regs.insert(dst);
-                        state.frame_addr_regs.insert(dst, base.add(imm));
-                    } else if state.tainted_regs.contains(&src) {
-                        state.tainted_regs.insert(dst);
-                        state.frame_addr_regs.insert(dst, FrameAddress::Unknown);
+                        state.taint_reg(dst);
+                        state.set_frame_address(dst, base.add(imm));
+                    } else if state.reg_is_tainted(src) {
+                        state.taint_reg(dst);
+                        state.set_frame_address(dst, FrameAddress::Unknown);
                     }
                 }
             }
@@ -420,60 +458,59 @@ fn propagate_frame_taint(state: &mut FrameTaintState, insts: &[MachineInst]) {
                     (op_gp(inst, 0), op_gp(inst, 1), op_imm(inst, 2))
                 {
                     if let Some(base) = source_frame_address {
-                        state.tainted_regs.insert(dst);
-                        state.frame_addr_regs.insert(dst, base.sub(imm));
-                    } else if state.tainted_regs.contains(&src) {
-                        state.tainted_regs.insert(dst);
-                        state.frame_addr_regs.insert(dst, FrameAddress::Unknown);
+                        state.taint_reg(dst);
+                        state.set_frame_address(dst, base.sub(imm));
+                    } else if state.reg_is_tainted(src) {
+                        state.taint_reg(dst);
+                        state.set_frame_address(dst, FrameAddress::Unknown);
                     }
                 }
             }
             // add xN, xM, xP  (GEP: propagate taint from either source)
             ArmOpcode::AddReg
-                if op_gp(inst, 1).is_some_and(|n| state.tainted_regs.contains(&n))
-                    || op_gp(inst, 2).is_some_and(|n| state.tainted_regs.contains(&n)) =>
+                if op_gp(inst, 1).is_some_and(|n| state.reg_is_tainted(n))
+                    || op_gp(inst, 2).is_some_and(|n| state.reg_is_tainted(n)) =>
             {
                 if let Some(n) = op_gp(inst, 0) {
-                    state.tainted_regs.insert(n);
-                    state.frame_addr_regs.insert(n, FrameAddress::Unknown);
+                    state.taint_reg(n);
+                    state.set_frame_address(n, FrameAddress::Unknown);
                 }
             }
             // mov xN, xM  (register copy — propagates taint to arg reg)
-            ArmOpcode::MovReg
-                if op_gp(inst, 1).is_some_and(|n| state.tainted_regs.contains(&n)) =>
-            {
+            ArmOpcode::MovReg if op_gp(inst, 1).is_some_and(|n| state.reg_is_tainted(n)) => {
                 if let Some(n) = op_gp(inst, 0) {
-                    state.tainted_regs.insert(n);
-                    state
-                        .frame_addr_regs
-                        .insert(n, source_frame_address.unwrap_or(FrameAddress::Unknown));
+                    state.taint_reg(n);
+                    state.set_frame_address(
+                        n,
+                        source_frame_address.unwrap_or(FrameAddress::Unknown),
+                    );
                 }
             }
             // mul xN, xM, xP  (index computation in GEP; conservative)
             ArmOpcode::Mul
-                if op_gp(inst, 1).is_some_and(|n| state.tainted_regs.contains(&n))
-                    || op_gp(inst, 2).is_some_and(|n| state.tainted_regs.contains(&n)) =>
+                if op_gp(inst, 1).is_some_and(|n| state.reg_is_tainted(n))
+                    || op_gp(inst, 2).is_some_and(|n| state.reg_is_tainted(n)) =>
             {
                 if let Some(n) = op_gp(inst, 0) {
-                    state.tainted_regs.insert(n);
-                    state.frame_addr_regs.insert(n, FrameAddress::Unknown);
+                    state.taint_reg(n);
+                    state.set_frame_address(n, FrameAddress::Unknown);
                 }
             }
             // csel xN, xM, xP, cond — either selectable value can reach the
             // destination at runtime, so taint from either source is enough
             // to make the result frame-derived.
             ArmOpcode::CselReg
-                if op_gp(inst, 1).is_some_and(|n| state.tainted_regs.contains(&n))
-                    || op_gp(inst, 2).is_some_and(|n| state.tainted_regs.contains(&n)) =>
+                if op_gp(inst, 1).is_some_and(|n| state.reg_is_tainted(n))
+                    || op_gp(inst, 2).is_some_and(|n| state.reg_is_tainted(n)) =>
             {
                 if let Some(n) = op_gp(inst, 0) {
-                    state.tainted_regs.insert(n);
-                    state.frame_addr_regs.insert(n, FrameAddress::Unknown);
+                    state.taint_reg(n);
+                    state.set_frame_address(n, FrameAddress::Unknown);
                 }
             }
             // str xN, [x29, #off] — if xN is tainted, the slot becomes tainted.
             ArmOpcode::StrImm
-                if op_gp(inst, 0).is_some_and(|n| state.tainted_regs.contains(&n))
+                if op_gp(inst, 0).is_some_and(|n| state.reg_is_tainted(n))
                     && frame_access.is_some() =>
             {
                 match frame_access {
@@ -501,8 +538,8 @@ fn propagate_frame_taint(state: &mut FrameTaintState, insts: &[MachineInst]) {
                             FrameAddress::Unknown => true,
                         };
                         if may_hold_frame_pointer {
-                            state.tainted_regs.insert(n);
-                            state.frame_addr_regs.insert(n, FrameAddress::Unknown);
+                            state.taint_reg(n);
+                            state.set_frame_address(n, FrameAddress::Unknown);
                         }
                     }
                 }
@@ -558,13 +595,13 @@ fn effective_frame_slot_offset(
     inst: &MachineInst,
     base_idx: usize,
     off_idx: usize,
-    frame_addr_regs: &HashMap<u8, FrameAddress>,
+    state: &FrameTaintState,
 ) -> Option<FrameAddress> {
     let off = op_imm(inst, off_idx).unwrap_or(0);
     match inst.operands.get(base_idx)? {
         MachineOperand::PhysReg(p) if *p == PhysReg::FP => Some(FrameAddress::Exact(off)),
         MachineOperand::PhysReg(PhysReg::Gp(n)) => {
-            frame_addr_regs.get(n).copied().map(|base| base.add(off))
+            state.frame_address(*n).map(|base| base.add(off))
         }
         _ => None,
     }
@@ -707,6 +744,36 @@ mod tests {
             mf.block_mut(id).insts = blk_insts;
         }
         mf
+    }
+
+    #[test]
+    fn fixed_gp_state_preserves_taint_merge_semantics() {
+        let mut state = FrameTaintState::default();
+        state.taint_reg(1);
+        state.taint_reg(30);
+        state.set_frame_address(1, FrameAddress::Exact(-8));
+        state.set_frame_address(4, FrameAddress::Exact(-32));
+        state.tainted_slots.insert(-48);
+
+        let mut incoming = FrameTaintState::default();
+        incoming.taint_reg(2);
+        incoming.set_frame_address(1, FrameAddress::Exact(-16));
+        incoming.set_frame_address(3, FrameAddress::Unknown);
+        incoming.tainted_slots.insert(-64);
+        incoming.unknown_tainted_slot = true;
+
+        assert!(state.merge_from(&incoming));
+        assert!(state.reg_is_tainted(1));
+        assert!(state.reg_is_tainted(2));
+        assert!(state.reg_is_tainted(30));
+        assert!(state.has_frame_derived_argument());
+        assert_eq!(state.frame_address(1), Some(FrameAddress::Unknown));
+        assert_eq!(state.frame_address(3), Some(FrameAddress::Unknown));
+        assert_eq!(state.frame_address(4), Some(FrameAddress::Exact(-32)));
+        assert!(state.tainted_slots.contains(&-48));
+        assert!(state.tainted_slots.contains(&-64));
+        assert!(state.unknown_tainted_slot);
+        assert!(!state.merge_from(&incoming));
     }
 
     #[test]
