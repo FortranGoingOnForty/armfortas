@@ -48,6 +48,11 @@ fn global_lsf_function(func: &mut Function, layout: crate::target::TargetLayout)
         let mut alias_oracle = alias::AliasOracle::new(func, layout);
 
         for block in &func.blocks {
+            // Reachability and revisitability depend only on the CFG and the
+            // load's block, not on the individual pointer being loaded. Keep
+            // them for every load in this block, then discard them before the
+            // next block so peak cache size stays O(blocks).
+            let mut graph_cache = LoadBlockGraphCache::default();
             for (inst_index, inst) in block.insts.iter().enumerate() {
                 if let InstKind::Load(ptr) = &inst.kind {
                     if let Some(forwarded_val) = find_reaching_store(
@@ -55,6 +60,7 @@ fn global_lsf_function(func: &mut Function, layout: crate::target::TargetLayout)
                         func,
                         &idoms,
                         &preds,
+                        &mut graph_cache,
                         block.id,
                         inst_index,
                         *ptr,
@@ -97,12 +103,19 @@ enum MemoryState {
     Clobbered,
 }
 
+#[derive(Default)]
+struct LoadBlockGraphCache {
+    reverse_reachable: Option<HashSet<BlockId>>,
+    revisitable_without: HashMap<BlockId, bool>,
+}
+
 /// Find the nearest store that safely reaches the given load.
 fn find_reaching_store(
     alias_oracle: &mut alias::AliasOracle<'_>,
     func: &Function,
     idoms: &HashMap<BlockId, BlockId>,
     preds: &HashMap<BlockId, Vec<BlockId>>,
+    graph_cache: &mut LoadBlockGraphCache,
     load_block: BlockId,
     load_inst_index: usize,
     load_ptr: ValueId,
@@ -120,7 +133,15 @@ fn find_reaching_store(
         } // entry
         current = idom;
 
-        if !paths_to_load_are_clean(alias_oracle, func, preds, current, load_block, load_ptr) {
+        if !paths_to_load_are_clean(
+            alias_oracle,
+            func,
+            preds,
+            graph_cache,
+            current,
+            load_block,
+            load_ptr,
+        ) {
             return None;
         }
 
@@ -237,15 +258,22 @@ fn paths_to_load_are_clean(
     alias_oracle: &mut alias::AliasOracle<'_>,
     func: &Function,
     preds: &HashMap<BlockId, Vec<BlockId>>,
+    graph_cache: &mut LoadBlockGraphCache,
     start_block: BlockId,
     load_block: BlockId,
     load_ptr: ValueId,
 ) -> bool {
-    if load_block_is_revisitable_without_store(func, start_block, load_block) {
+    let revisitable = *graph_cache
+        .revisitable_without
+        .entry(start_block)
+        .or_insert_with(|| load_block_is_revisitable_without_store(func, start_block, load_block));
+    if revisitable {
         return false;
     }
 
-    let can_reach_load = reverse_reachable_blocks(preds, load_block);
+    let can_reach_load = graph_cache
+        .reverse_reachable
+        .get_or_insert_with(|| reverse_reachable_blocks(preds, load_block));
     let mut queue = VecDeque::new();
     let mut visited = HashSet::new();
 
@@ -1148,6 +1176,120 @@ mod tests {
             matches!(load_inst.kind, InstKind::Load(ptr) if ptr == alloca),
             "aggregate load should remain untouched, got {:?}",
             load_inst.kind
+        );
+    }
+
+    #[test]
+    fn forwards_multiple_loads_with_shared_graph_facts() {
+        let ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)));
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new(
+            "f".into(),
+            vec![
+                Param {
+                    name: "first".into(),
+                    ty: ptr_ty.clone(),
+                    id: ValueId(0),
+                    fortran_noalias: true,
+                },
+                Param {
+                    name: "second".into(),
+                    ty: ptr_ty,
+                    id: ValueId(1),
+                    fortran_noalias: true,
+                },
+                Param {
+                    name: "condition".into(),
+                    ty: IrType::Bool,
+                    id: ValueId(2),
+                    fortran_noalias: false,
+                },
+            ],
+            IrType::Int(IntWidth::I32),
+        );
+        let span = crate::lexer::Span {
+            file_id: 0,
+            start: crate::lexer::Position { line: 0, col: 0 },
+            end: crate::lexer::Position { line: 0, col: 0 },
+        };
+        let side = f.create_block("side");
+        let merge = f.create_block("merge");
+
+        let seven = f.next_value_id();
+        let eleven = f.next_value_id();
+        let store_first = f.next_value_id();
+        let store_second = f.next_value_id();
+        f.block_mut(f.entry).insts.extend([
+            Inst {
+                id: seven,
+                ty: IrType::Int(IntWidth::I32),
+                span,
+                kind: InstKind::ConstInt(7, IntWidth::I32),
+            },
+            Inst {
+                id: eleven,
+                ty: IrType::Int(IntWidth::I32),
+                span,
+                kind: InstKind::ConstInt(11, IntWidth::I32),
+            },
+            Inst {
+                id: store_first,
+                ty: IrType::Void,
+                span,
+                kind: InstKind::Store(seven, ValueId(0)),
+            },
+            Inst {
+                id: store_second,
+                ty: IrType::Void,
+                span,
+                kind: InstKind::Store(eleven, ValueId(1)),
+            },
+        ]);
+        f.block_mut(f.entry).terminator = Some(Terminator::CondBranch {
+            cond: ValueId(2),
+            true_dest: side,
+            true_args: vec![],
+            false_dest: merge,
+            false_args: vec![],
+        });
+        f.block_mut(side).terminator = Some(Terminator::Branch(merge, vec![]));
+
+        let load_first = f.next_value_id();
+        let load_second = f.next_value_id();
+        let sum = f.next_value_id();
+        f.block_mut(merge).insts.extend([
+            Inst {
+                id: load_first,
+                ty: IrType::Int(IntWidth::I32),
+                span,
+                kind: InstKind::Load(ValueId(0)),
+            },
+            Inst {
+                id: load_second,
+                ty: IrType::Int(IntWidth::I32),
+                span,
+                kind: InstKind::Load(ValueId(1)),
+            },
+            Inst {
+                id: sum,
+                ty: IrType::Int(IntWidth::I32),
+                span,
+                kind: InstKind::IAdd(load_first, load_second),
+            },
+        ]);
+        f.block_mut(merge).terminator = Some(Terminator::Return(Some(sum)));
+        m.add_function(f);
+
+        assert!(GlobalLsf.run(&mut m));
+        let sum_inst = m.functions[0]
+            .block(merge)
+            .insts
+            .iter()
+            .find(|inst| inst.id == sum)
+            .expect("sum should remain");
+        assert!(
+            matches!(sum_inst.kind, InstKind::IAdd(lhs, rhs) if lhs == seven && rhs == eleven),
+            "both loads should forward through their shared clean CFG"
         );
     }
 }

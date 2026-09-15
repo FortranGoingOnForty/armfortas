@@ -687,27 +687,133 @@ pub fn prune_unreachable(func: &mut Function) -> bool {
 /// Unreachable blocks have an empty dominator set (per
 /// [`compute_dominators`]) and therefore no idom.
 ///
-/// **Performance**: this still uses the simple iterative data-flow
-/// algorithm, but `compute_dominator_info` stores each dominator set
-/// as a compact bitset. That keeps verifier/optimizer memory bounded
-/// for large lowered functions while preserving the old API surface.
-/// A future Lengauer–Tarjan implementation would improve asymptotic
-/// time, but the bitset representation fixes the current practical
-/// memory cliff.
+/// Uses the Cooper-Harvey-Kennedy iterative algorithm over reverse postorder.
+/// This computes immediate dominators directly instead of first constructing
+/// every block's full dominator set. The full bitset solver remains available
+/// through [`compute_dominators`] for callers that actually need those sets.
 pub fn compute_immediate_dominators(func: &Function) -> HashMap<BlockId, BlockId> {
+    let blocks: Vec<BlockId> = func.blocks.iter().map(|block| block.id).collect();
+    let index: HashMap<BlockId, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(position, block)| (*block, position))
+        .collect();
+    let Some(&entry) = index.get(&func.entry) else {
+        return HashMap::new();
+    };
+
+    let mut pred_indices = vec![Vec::new(); blocks.len()];
+    for (position, block) in func.blocks.iter().enumerate() {
+        if let Some(term) = &block.terminator {
+            for target in terminator_targets(term) {
+                if let Some(&target_position) = index.get(&target) {
+                    pred_indices[target_position].push(position);
+                }
+            }
+        }
+    }
+
+    let rpo = reachable_reverse_postorder(func, &index, entry);
+    let mut rpo_position = vec![usize::MAX; blocks.len()];
+    for (position, &block) in rpo.iter().enumerate() {
+        rpo_position[block] = position;
+    }
+
+    // The entry points to itself internally so every established idom chain
+    // terminates. It is omitted from the public result below.
+    let mut idom = vec![None; blocks.len()];
+    idom[entry] = Some(entry);
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &block in rpo.iter().skip(1) {
+            let mut processed_preds = pred_indices[block]
+                .iter()
+                .copied()
+                .filter(|pred| idom[*pred].is_some());
+            let Some(mut new_idom) = processed_preds.next() else {
+                continue;
+            };
+            for pred in processed_preds {
+                new_idom = intersect_idom_chains(pred, new_idom, &idom, &rpo_position);
+            }
+            if idom[block] != Some(new_idom) {
+                idom[block] = Some(new_idom);
+                changed = true;
+            }
+        }
+    }
+
+    rpo.iter()
+        .copied()
+        .filter(|&block| block != entry)
+        .filter_map(|block| idom[block].map(|parent| (blocks[block], blocks[parent])))
+        .collect()
+}
+
+fn reachable_reverse_postorder(
+    func: &Function,
+    index: &HashMap<BlockId, usize>,
+    entry: usize,
+) -> Vec<usize> {
+    let mut visited = vec![false; func.blocks.len()];
+    let mut postorder = Vec::with_capacity(func.blocks.len());
+    let mut stack = vec![(entry, false)];
+
+    while let Some((block, expanded)) = stack.pop() {
+        if expanded {
+            postorder.push(block);
+            continue;
+        }
+        if visited[block] {
+            continue;
+        }
+        visited[block] = true;
+        stack.push((block, true));
+
+        if let Some(term) = &func.blocks[block].terminator {
+            let targets = terminator_targets(term);
+            for target in targets.into_iter().rev() {
+                if let Some(&target_position) = index.get(&target) {
+                    if !visited[target_position] {
+                        stack.push((target_position, false));
+                    }
+                }
+            }
+        }
+    }
+
+    postorder.reverse();
+    postorder
+}
+
+fn intersect_idom_chains(
+    mut first: usize,
+    mut second: usize,
+    idom: &[Option<usize>],
+    rpo_position: &[usize],
+) -> usize {
+    while first != second {
+        while rpo_position[first] > rpo_position[second] {
+            first = idom[first].expect("processed dominator chain");
+        }
+        while rpo_position[second] > rpo_position[first] {
+            second = idom[second].expect("processed dominator chain");
+        }
+    }
+    first
+}
+
+#[cfg(test)]
+fn compute_immediate_dominators_from_sets(func: &Function) -> HashMap<BlockId, BlockId> {
     let doms = compute_dominator_info(func);
-    let mut idoms: HashMap<BlockId, BlockId> = HashMap::new();
+    let mut idoms = HashMap::new();
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         if block.id == func.entry || !doms.reachable[block_idx] {
             continue;
         }
-
-        // The immediate dominator is the dominator (other than
-        // self) that is dominated by every other dominator (other
-        // than self). Equivalently: the dominator that has the
-        // largest dominator set — all other dominators of `block`
-        // also dominate the idom.
         let candidates: Vec<usize> = doms
             .blocks
             .iter()
@@ -716,18 +822,13 @@ pub fn compute_immediate_dominators(func: &Function) -> HashMap<BlockId, BlockId
                 (idx != block_idx && bit_is_set(&doms.doms[block_idx], idx)).then_some(idx)
             })
             .collect();
-
-        let idom = candidates.iter().copied().find(|&cand_idx| {
-            // cand is idom iff no other candidate strictly
-            // dominates it (only cand itself and cand's own
-            // dominators do).
-            candidates.iter().all(|&other_idx| {
-                other_idx == cand_idx || bit_is_set(&doms.doms[cand_idx], other_idx)
-            })
+        let idom = candidates.iter().copied().find(|&candidate| {
+            candidates
+                .iter()
+                .all(|&other| other == candidate || bit_is_set(&doms.doms[candidate], other))
         });
-
-        if let Some(idom_idx) = idom {
-            idoms.insert(block.id, doms.blocks[idom_idx]);
+        if let Some(parent) = idom {
+            idoms.insert(block.id, doms.blocks[parent]);
         }
     }
 
@@ -1276,5 +1377,55 @@ mod walk_tests {
         let order = dominator_tree_preorder(&f);
         assert_eq!(order.len(), 4); // entry, a, b, exit
         assert_eq!(order[0], f.entry);
+    }
+
+    #[test]
+    fn direct_idoms_match_full_sets_across_generated_cfgs() {
+        fn next_random(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        for seed in 0..128u64 {
+            let block_count = 1 + (seed as usize % 31);
+            let mut f = Function::new(format!("generated_{seed}"), vec![], IrType::Void);
+            let mut blocks = vec![f.entry];
+            for _ in 1..block_count {
+                blocks.push(f.create_block("block"));
+            }
+            let cond = f.next_value_id();
+            f.block_mut(f.entry).insts.push(Inst {
+                id: cond,
+                kind: InstKind::ConstBool(true),
+                ty: IrType::Bool,
+                span: dummy_span(),
+            });
+
+            let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+            for &block in &blocks {
+                let choice = next_random(&mut state);
+                let first = blocks[next_random(&mut state) as usize % blocks.len()];
+                let second = blocks[next_random(&mut state) as usize % blocks.len()];
+                f.block_mut(block).terminator = Some(match choice % 5 {
+                    0 => Terminator::Return(None),
+                    1 | 2 => Terminator::Branch(first, vec![]),
+                    _ => Terminator::CondBranch {
+                        cond,
+                        true_dest: first,
+                        true_args: vec![],
+                        false_dest: second,
+                        false_args: vec![],
+                    },
+                });
+            }
+
+            assert_eq!(
+                compute_immediate_dominators(&f),
+                compute_immediate_dominators_from_sets(&f),
+                "direct idoms diverged from full dominator sets for seed {seed}"
+            );
+        }
     }
 }
