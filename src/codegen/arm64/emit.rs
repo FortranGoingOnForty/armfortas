@@ -3,7 +3,7 @@
 //! Produces output compatible with both afs-as and Apple's system assembler.
 
 use super::mir::*;
-use std::fmt::Write;
+use std::fmt::{self, Write};
 
 /// Emit a machine function as ARM64 assembly text.
 pub fn emit_function(mf: &MachineFunction) -> String {
@@ -33,7 +33,11 @@ pub fn emit_function_into(out: &mut String, mf: &MachineFunction) {
         }
 
         for inst in &block.insts {
-            writeln!(out, "    {}", emit_inst(inst, mf)).unwrap();
+            out.push_str("    ");
+            if !emit_common_inst_into(out, inst, mf) {
+                out.push_str(&emit_inst(inst, mf));
+            }
+            out.push('\n');
         }
     }
 
@@ -255,6 +259,303 @@ fn address_scratch(avoid: &[&str]) -> &'static str {
 /// directly rather than re-deriving each opcode's expansion rules.
 pub fn emit_inst_text(inst: &MachineInst, mf: &MachineFunction) -> String {
     emit_inst(inst, mf)
+}
+
+struct OperandText<'a>(&'a MachineOperand);
+
+impl fmt::Display for OperandText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            MachineOperand::VReg(id) => write!(f, "v{}", id.0),
+            MachineOperand::PhysReg(PhysReg::Sp) => f.write_str("sp"),
+            MachineOperand::PhysReg(PhysReg::Xzr) => f.write_str("xzr"),
+            MachineOperand::PhysReg(PhysReg::Wzr) => f.write_str("wzr"),
+            MachineOperand::PhysReg(PhysReg::Gp(n)) => write!(f, "x{n}"),
+            MachineOperand::PhysReg(PhysReg::Gp32(n)) => write!(f, "w{n}"),
+            MachineOperand::PhysReg(PhysReg::Fp(n)) => write!(f, "d{n}"),
+            MachineOperand::PhysReg(PhysReg::Fp32(n)) => write!(f, "s{n}"),
+            MachineOperand::Imm(v) => write!(f, "#{v}"),
+            MachineOperand::FrameSlot(off) => write!(f, "[fp, #{off}]"),
+            MachineOperand::Cond(c) => f.write_str(cond_str(*c)),
+            MachineOperand::BlockRef(id) => write!(f, "bb{}", id.0),
+            MachineOperand::Extern(name) => f.write_str(name),
+            MachineOperand::GlobalLabel(name) => {
+                if name.starts_with('_') {
+                    f.write_str(name)
+                } else {
+                    write!(f, "_{name}")
+                }
+            }
+            MachineOperand::ConstPool(idx) => write!(f, "cp{idx}"),
+            MachineOperand::Shift(s) => write!(f, "lsl #{s}"),
+        }
+    }
+}
+
+fn operand_text(op: &MachineOperand) -> OperandText<'_> {
+    OperandText(op)
+}
+
+fn gp_operand_width(op: &MachineOperand) -> Option<u8> {
+    match op {
+        MachineOperand::PhysReg(PhysReg::Gp(_) | PhysReg::Sp | PhysReg::Xzr) => Some(64),
+        MachineOperand::PhysReg(PhysReg::Gp32(_) | PhysReg::Wzr) => Some(32),
+        _ => None,
+    }
+}
+
+/// Write the common single-line scalar instructions without allocating an
+/// intermediate instruction String. Complex and uncommon forms fall back to
+/// the canonical emitter below.
+fn emit_common_inst_into(out: &mut String, inst: &MachineInst, mf: &MachineFunction) -> bool {
+    macro_rules! emitted {
+        ($($arg:tt)*) => {{
+            write!(out, $($arg)*).unwrap();
+            true
+        }};
+    }
+
+    let op = |index| operand_text(&inst.operands[index]);
+
+    match inst.opcode {
+        ArmOpcode::AddReg => emitted!("add {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::AddsReg => emitted!("adds {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::AdcReg => emitted!("adc {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::AddImm => {
+            let imm = match &inst.operands[2] {
+                MachineOperand::FrameSlot(off) if (0..=4095).contains(off) => *off as i64,
+                MachineOperand::Imm(v) if (0..=4095).contains(v) => *v,
+                _ => return false,
+            };
+            emitted!("add {}, {}, #{}", op(0), op(1), imm)
+        }
+        ArmOpcode::SubReg => emitted!("sub {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::SubsReg => emitted!("subs {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::SbcReg => emitted!("sbc {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::SubImm => {
+            let imm = match &inst.operands[2] {
+                MachineOperand::Imm(v) if (0..=4095).contains(v) => *v,
+                _ => return false,
+            };
+            emitted!("sub {}, {}, #{}", op(0), op(1), imm)
+        }
+        ArmOpcode::Mul => emitted!("mul {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::Sdiv => emitted!("sdiv {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::Madd => emitted!("madd {}, {}, {}, {}", op(0), op(1), op(2), op(3)),
+        ArmOpcode::Msub => emitted!("msub {}, {}, {}, {}", op(0), op(1), op(2), op(3)),
+        ArmOpcode::Neg => emitted!("neg {}, {}", op(0), op(1)),
+        ArmOpcode::AndReg => emitted!("and {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::OrrReg => emitted!("orr {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::EorReg => emitted!("eor {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::OrnReg => emitted!("orn {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::LslReg => emitted!("lsl {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::LsrReg => emitted!("lsr {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::AsrReg => emitted!("asr {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::Mvn => emitted!("mvn {}, {}", op(0), op(1)),
+        ArmOpcode::Clz => emitted!("clz {}, {}", op(0), op(1)),
+        ArmOpcode::Rbit => emitted!("rbit {}, {}", op(0), op(1)),
+        ArmOpcode::CmpReg => emitted!("cmp {}, {}", op(0), op(1)),
+        ArmOpcode::CmpImm => {
+            let imm = match &inst.operands[1] {
+                MachineOperand::Imm(v) => *v,
+                _ => 0,
+            };
+            emitted!("cmp {}, #{}", op(0), imm)
+        }
+        ArmOpcode::Cset | ArmOpcode::FCset => {
+            let cond = match &inst.operands[1] {
+                MachineOperand::Cond(c) => cond_str(*c),
+                _ => "eq",
+            };
+            emitted!("cset {}, {}", op(0), cond)
+        }
+        ArmOpcode::CselReg => {
+            let cond = match &inst.operands[3] {
+                MachineOperand::Cond(c) => cond_str(*c),
+                _ => "eq",
+            };
+            emitted!("csel {}, {}, {}, {}", op(0), op(1), op(2), cond)
+        }
+        ArmOpcode::FCmpReg => emitted!("fcmp {}, {}", op(0), op(1)),
+        ArmOpcode::FcselReg => {
+            let cond = match &inst.operands[3] {
+                MachineOperand::Cond(c) => cond_str(*c),
+                _ => "eq",
+            };
+            emitted!("fcsel {}, {}, {}, {}", op(0), op(1), op(2), cond)
+        }
+        ArmOpcode::FaddS | ArmOpcode::FaddD => emitted!("fadd {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::FsubS | ArmOpcode::FsubD => emitted!("fsub {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::FmulS | ArmOpcode::FmulD => emitted!("fmul {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::FdivS | ArmOpcode::FdivD => emitted!("fdiv {}, {}, {}", op(0), op(1), op(2)),
+        ArmOpcode::FnegS | ArmOpcode::FnegD => emitted!("fneg {}, {}", op(0), op(1)),
+        ArmOpcode::FabsS | ArmOpcode::FabsD => emitted!("fabs {}, {}", op(0), op(1)),
+        ArmOpcode::FsqrtS | ArmOpcode::FsqrtD => emitted!("fsqrt {}, {}", op(0), op(1)),
+        ArmOpcode::FmaddS | ArmOpcode::FmaddD => {
+            emitted!("fmadd {}, {}, {}, {}", op(0), op(1), op(2), op(3))
+        }
+        ArmOpcode::FmsubS | ArmOpcode::FmsubD => {
+            emitted!("fmsub {}, {}, {}, {}", op(0), op(1), op(2), op(3))
+        }
+        ArmOpcode::FnmsubS | ArmOpcode::FnmsubD => {
+            emitted!("fnmsub {}, {}, {}, {}", op(0), op(1), op(2), op(3))
+        }
+        ArmOpcode::ScvtfSW | ArmOpcode::ScvtfDW | ArmOpcode::ScvtfSX | ArmOpcode::ScvtfDX => {
+            emitted!("scvtf {}, {}", op(0), op(1))
+        }
+        ArmOpcode::FcvtzsWS | ArmOpcode::FcvtzsWD | ArmOpcode::FcvtzsXS | ArmOpcode::FcvtzsXD => {
+            emitted!("fcvtzs {}, {}", op(0), op(1))
+        }
+        ArmOpcode::Movz | ArmOpcode::Movk | ArmOpcode::Movn => {
+            let mnemonic = match inst.opcode {
+                ArmOpcode::Movz => "movz",
+                ArmOpcode::Movk => "movk",
+                ArmOpcode::Movn => "movn",
+                _ => unreachable!(),
+            };
+            let imm = match &inst.operands[1] {
+                MachineOperand::Imm(v) => *v,
+                _ => 0,
+            };
+            let shift = match &inst.operands[2] {
+                MachineOperand::Shift(s) => *s,
+                _ => 0,
+            };
+            if inst.opcode == ArmOpcode::Movz && shift == 0 {
+                emitted!("{} {}, #{}", mnemonic, op(0), imm)
+            } else {
+                emitted!("{} {}, #{}, lsl #{}", mnemonic, op(0), imm, shift)
+            }
+        }
+        ArmOpcode::MovReg => {
+            let dest_width = gp_operand_width(&inst.operands[0]);
+            let src_width = gp_operand_width(&inst.operands[1]);
+            if dest_width.is_none() || dest_width != src_width {
+                return false;
+            }
+            emitted!("mov {}, {}", op(0), op(1))
+        }
+        ArmOpcode::FmovReg => emitted!("fmov {}, {}", op(0), op(1)),
+        ArmOpcode::LdrImm | ArmOpcode::LdrFpImm | ArmOpcode::LdrsbImm | ArmOpcode::LdrshImm => {
+            let offset = match &inst.operands[2] {
+                MachineOperand::FrameSlot(off) => *off as i64,
+                MachineOperand::Imm(v) => *v,
+                _ => 0,
+            };
+            if !(-256..=255).contains(&offset) {
+                return false;
+            }
+            let mnemonic = match inst.opcode {
+                ArmOpcode::LdrsbImm => "ldrsb",
+                ArmOpcode::LdrshImm => "ldrsh",
+                _ => "ldr",
+            };
+            emitted!("{} {}, [{}, #{}]", mnemonic, op(0), op(1), offset)
+        }
+        ArmOpcode::StrImm | ArmOpcode::StrFpImm | ArmOpcode::StrbImm | ArmOpcode::StrhImm => {
+            let offset = match &inst.operands[2] {
+                MachineOperand::FrameSlot(off) => *off as i64,
+                MachineOperand::Imm(v) => *v,
+                _ => 0,
+            };
+            if !(-256..=255).contains(&offset) {
+                return false;
+            }
+            let mnemonic = match inst.opcode {
+                ArmOpcode::StrbImm => "strb",
+                ArmOpcode::StrhImm => "strh",
+                _ => "str",
+            };
+            emitted!("{} {}, [{}, #{}]", mnemonic, op(0), op(1), offset)
+        }
+        ArmOpcode::LdrReg | ArmOpcode::LdrFpReg | ArmOpcode::StrReg | ArmOpcode::StrFpReg => {
+            let shift = match &inst.operands[3] {
+                MachineOperand::Imm(v) => *v,
+                _ => 0,
+            };
+            let mnemonic = match inst.opcode {
+                ArmOpcode::LdrReg | ArmOpcode::LdrFpReg => "ldr",
+                ArmOpcode::StrReg | ArmOpcode::StrFpReg => "str",
+                _ => unreachable!(),
+            };
+            if shift == 0 {
+                emitted!("{} {}, [{}, {}]", mnemonic, op(0), op(1), op(2))
+            } else {
+                emitted!(
+                    "{} {}, [{}, {}, lsl #{}]",
+                    mnemonic,
+                    op(0),
+                    op(1),
+                    op(2),
+                    shift
+                )
+            }
+        }
+        ArmOpcode::B => match &inst.operands[0] {
+            MachineOperand::BlockRef(id) => emitted!("b {}", mf.block(*id).label.as_str()),
+            MachineOperand::Extern(name) if name.starts_with('_') => emitted!("b {}", name),
+            MachineOperand::Extern(name) => emitted!("b _{}", name),
+            _ => emitted!("b ???"),
+        },
+        ArmOpcode::BCond => {
+            let cond = match &inst.operands[0] {
+                MachineOperand::Cond(c) => cond_str(*c),
+                _ => "eq",
+            };
+            let target = match &inst.operands[1] {
+                MachineOperand::BlockRef(id) => mf.block(*id).label.as_str(),
+                _ => "???",
+            };
+            emitted!("b.{} {}", cond, target)
+        }
+        ArmOpcode::Cbz | ArmOpcode::Cbnz => {
+            let mnemonic = if inst.opcode == ArmOpcode::Cbz {
+                "cbz"
+            } else {
+                "cbnz"
+            };
+            let target = match &inst.operands[1] {
+                MachineOperand::BlockRef(id) => mf.block(*id).label.as_str(),
+                _ => "???",
+            };
+            emitted!("{} {}, {}", mnemonic, op(0), target)
+        }
+        ArmOpcode::Tbz | ArmOpcode::Tbnz => {
+            let mnemonic = if inst.opcode == ArmOpcode::Tbz {
+                "tbz"
+            } else {
+                "tbnz"
+            };
+            let bit = match &inst.operands[1] {
+                MachineOperand::Imm(v) => *v,
+                _ => 0,
+            };
+            let target = match &inst.operands[2] {
+                MachineOperand::BlockRef(id) => mf.block(*id).label.as_str(),
+                _ => "???",
+            };
+            emitted!("{} {}, #{}, {}", mnemonic, op(0), bit, target)
+        }
+        ArmOpcode::Bl => match &inst.operands[0] {
+            MachineOperand::Extern(name) if name.starts_with('_') => emitted!("bl {}", name),
+            MachineOperand::Extern(name) => emitted!("bl _{}", name),
+            _ => emitted!("bl ???"),
+        },
+        ArmOpcode::Blr => emitted!("blr {}", op(0)),
+        ArmOpcode::Sxtw => emitted!("sxtw {}, {}", op(0), op(1)),
+        ArmOpcode::Sxth => emitted!("sxth {}, {}", op(0), op(1)),
+        ArmOpcode::Sxtb => emitted!("sxtb {}, {}", op(0), op(1)),
+        ArmOpcode::Ret => emitted!("ret"),
+        ArmOpcode::Nop => emitted!("nop"),
+        ArmOpcode::Brk => {
+            let imm = match &inst.operands[0] {
+                MachineOperand::Imm(v) => *v,
+                _ => 1,
+            };
+            emitted!("brk #{}", imm)
+        }
+        _ => false,
+    }
 }
 
 /// Emit a single machine instruction as assembly text.
@@ -1391,30 +1692,7 @@ fn v_lane_bare(op: &MachineOperand, _lane_ty: &str, lane: u8) -> String {
 
 /// Format a machine operand as assembly text.
 fn op_str(op: &MachineOperand) -> String {
-    match op {
-        MachineOperand::VReg(id) => format!("v{}", id.0), // placeholder until regalloc
-        MachineOperand::PhysReg(PhysReg::Sp) => "sp".into(),
-        MachineOperand::PhysReg(PhysReg::Xzr) => "xzr".into(),
-        MachineOperand::PhysReg(PhysReg::Wzr) => "wzr".into(),
-        MachineOperand::PhysReg(PhysReg::Gp(n)) => format!("x{}", n),
-        MachineOperand::PhysReg(PhysReg::Gp32(n)) => format!("w{}", n),
-        MachineOperand::PhysReg(PhysReg::Fp(n)) => format!("d{}", n),
-        MachineOperand::PhysReg(PhysReg::Fp32(n)) => format!("s{}", n),
-        MachineOperand::Imm(v) => format!("#{}", v),
-        MachineOperand::FrameSlot(off) => format!("[fp, #{}]", off),
-        MachineOperand::Cond(c) => cond_str(*c).into(),
-        MachineOperand::BlockRef(id) => format!("bb{}", id.0),
-        MachineOperand::Extern(name) => name.clone(),
-        MachineOperand::GlobalLabel(name) => {
-            if name.starts_with('_') {
-                name.clone()
-            } else {
-                format!("_{}", name)
-            }
-        }
-        MachineOperand::ConstPool(idx) => format!("cp{}", idx),
-        MachineOperand::Shift(s) => format!("lsl #{}", s),
-    }
+    operand_text(op).to_string()
 }
 
 fn fp_reg_str(op: &MachineOperand, is_f64: bool) -> String {
@@ -1478,6 +1756,30 @@ mod tests {
         emit_function(&mf)
     }
 
+    fn machine_inst(opcode: ArmOpcode, operands: Vec<MachineOperand>) -> MachineInst {
+        MachineInst {
+            opcode,
+            operands,
+            def: None,
+        }
+    }
+
+    fn gp(n: u8) -> MachineOperand {
+        MachineOperand::PhysReg(PhysReg::Gp(n))
+    }
+
+    fn gp32(n: u8) -> MachineOperand {
+        MachineOperand::PhysReg(PhysReg::Gp32(n))
+    }
+
+    fn fp(n: u8) -> MachineOperand {
+        MachineOperand::PhysReg(PhysReg::Fp(n))
+    }
+
+    fn fp32(n: u8) -> MachineOperand {
+        MachineOperand::PhysReg(PhysReg::Fp32(n))
+    }
+
     #[test]
     fn emit_prologue_epilogue() {
         let asm = emit_simple(|b| b.ret_void());
@@ -1536,6 +1838,178 @@ mod tests {
         emit_function_into(&mut output, &mf);
 
         assert_eq!(output, format!("existing prefix\n{expected}"));
+    }
+
+    #[test]
+    fn operand_display_matches_canonical_text() {
+        let operands = [
+            (MachineOperand::VReg(VRegId(7)), "v7"),
+            (MachineOperand::PhysReg(PhysReg::Sp), "sp"),
+            (MachineOperand::PhysReg(PhysReg::Xzr), "xzr"),
+            (MachineOperand::PhysReg(PhysReg::Wzr), "wzr"),
+            (gp(3), "x3"),
+            (gp32(4), "w4"),
+            (fp(5), "d5"),
+            (fp32(6), "s6"),
+            (MachineOperand::Imm(-19), "#-19"),
+            (MachineOperand::FrameSlot(-32), "[fp, #-32]"),
+            (MachineOperand::Cond(ArmCond::Ge), "ge"),
+            (MachineOperand::BlockRef(MBlockId(8)), "bb8"),
+            (MachineOperand::Extern("_external".into()), "_external"),
+            (MachineOperand::GlobalLabel("global".into()), "_global"),
+            (MachineOperand::GlobalLabel("_prefixed".into()), "_prefixed"),
+            (MachineOperand::ConstPool(9), "cp9"),
+            (MachineOperand::Shift(16), "lsl #16"),
+        ];
+
+        for (operand, expected) in &operands {
+            assert_eq!(operand_text(operand).to_string(), *expected);
+            assert_eq!(op_str(operand), *expected);
+        }
+    }
+
+    #[test]
+    fn common_instruction_writer_matches_canonical_emitter() {
+        let mut mf = MachineFunction::new("test".into());
+        let target = mf.new_block("target");
+        let c = |condition| MachineOperand::Cond(condition);
+        let imm = MachineOperand::Imm;
+        let shift = MachineOperand::Shift;
+        let block = || MachineOperand::BlockRef(target);
+        let instructions = vec![
+            machine_inst(ArmOpcode::AddReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::AddsReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::AdcReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::AddImm, vec![gp(0), gp(1), imm(4095)]),
+            machine_inst(ArmOpcode::SubReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::SubsReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::SbcReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::SubImm, vec![gp(0), gp(1), imm(17)]),
+            machine_inst(ArmOpcode::Mul, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::Sdiv, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::Madd, vec![gp(0), gp(1), gp(2), gp(3)]),
+            machine_inst(ArmOpcode::Msub, vec![gp(0), gp(1), gp(2), gp(3)]),
+            machine_inst(ArmOpcode::Neg, vec![gp(0), gp(1)]),
+            machine_inst(ArmOpcode::AndReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::OrrReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::EorReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::OrnReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::LslReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::LsrReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::AsrReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::Mvn, vec![gp(0), gp(1)]),
+            machine_inst(ArmOpcode::Clz, vec![gp(0), gp(1)]),
+            machine_inst(ArmOpcode::Rbit, vec![gp(0), gp(1)]),
+            machine_inst(ArmOpcode::CmpReg, vec![gp(0), gp(1)]),
+            machine_inst(ArmOpcode::CmpImm, vec![gp(0), imm(11)]),
+            machine_inst(ArmOpcode::Cset, vec![gp32(0), c(ArmCond::Eq)]),
+            machine_inst(ArmOpcode::FCset, vec![gp32(0), c(ArmCond::Ne)]),
+            machine_inst(
+                ArmOpcode::CselReg,
+                vec![gp(0), gp(1), gp(2), c(ArmCond::Lt)],
+            ),
+            machine_inst(ArmOpcode::FCmpReg, vec![fp(0), fp(1)]),
+            machine_inst(
+                ArmOpcode::FcselReg,
+                vec![fp(0), fp(1), fp(2), c(ArmCond::Gt)],
+            ),
+            machine_inst(ArmOpcode::FaddS, vec![fp32(0), fp32(1), fp32(2)]),
+            machine_inst(ArmOpcode::FsubD, vec![fp(0), fp(1), fp(2)]),
+            machine_inst(ArmOpcode::FmulS, vec![fp32(0), fp32(1), fp32(2)]),
+            machine_inst(ArmOpcode::FdivD, vec![fp(0), fp(1), fp(2)]),
+            machine_inst(ArmOpcode::FnegS, vec![fp32(0), fp32(1)]),
+            machine_inst(ArmOpcode::FabsD, vec![fp(0), fp(1)]),
+            machine_inst(ArmOpcode::FsqrtS, vec![fp32(0), fp32(1)]),
+            machine_inst(ArmOpcode::FmaddD, vec![fp(0), fp(1), fp(2), fp(3)]),
+            machine_inst(ArmOpcode::FmsubS, vec![fp32(0), fp32(1), fp32(2), fp32(3)]),
+            machine_inst(ArmOpcode::FnmsubD, vec![fp(0), fp(1), fp(2), fp(3)]),
+            machine_inst(ArmOpcode::ScvtfDX, vec![fp(0), gp(1)]),
+            machine_inst(ArmOpcode::FcvtzsWS, vec![gp32(0), fp32(1)]),
+            machine_inst(ArmOpcode::Movz, vec![gp(0), imm(12), shift(0)]),
+            machine_inst(ArmOpcode::Movk, vec![gp(0), imm(13), shift(16)]),
+            machine_inst(ArmOpcode::Movn, vec![gp(0), imm(14), shift(32)]),
+            machine_inst(ArmOpcode::MovReg, vec![gp(0), gp(1)]),
+            machine_inst(ArmOpcode::MovReg, vec![gp32(0), gp32(1)]),
+            machine_inst(ArmOpcode::FmovReg, vec![fp(0), fp(1)]),
+            machine_inst(ArmOpcode::LdrImm, vec![gp(0), gp(1), imm(-256)]),
+            machine_inst(
+                ArmOpcode::LdrFpImm,
+                vec![fp(0), gp(1), MachineOperand::FrameSlot(255)],
+            ),
+            machine_inst(ArmOpcode::LdrsbImm, vec![gp32(0), gp(1), imm(3)]),
+            machine_inst(ArmOpcode::LdrshImm, vec![gp32(0), gp(1), imm(4)]),
+            machine_inst(ArmOpcode::StrImm, vec![gp(0), gp(1), imm(-5)]),
+            machine_inst(ArmOpcode::StrFpImm, vec![fp(0), gp(1), imm(6)]),
+            machine_inst(ArmOpcode::StrbImm, vec![gp32(0), gp(1), imm(7)]),
+            machine_inst(ArmOpcode::StrhImm, vec![gp32(0), gp(1), imm(8)]),
+            machine_inst(ArmOpcode::LdrReg, vec![gp(0), gp(1), gp(2), imm(3)]),
+            machine_inst(ArmOpcode::LdrFpReg, vec![fp(0), gp(1), gp(2), imm(0)]),
+            machine_inst(ArmOpcode::StrReg, vec![gp(0), gp(1), gp(2), imm(2)]),
+            machine_inst(ArmOpcode::StrFpReg, vec![fp(0), gp(1), gp(2), imm(0)]),
+            machine_inst(ArmOpcode::B, vec![block()]),
+            machine_inst(ArmOpcode::B, vec![MachineOperand::Extern("tail".into())]),
+            machine_inst(ArmOpcode::BCond, vec![c(ArmCond::Hi), block()]),
+            machine_inst(ArmOpcode::Cbz, vec![gp(0), block()]),
+            machine_inst(ArmOpcode::Cbnz, vec![gp(0), block()]),
+            machine_inst(ArmOpcode::Tbz, vec![gp(0), imm(7), block()]),
+            machine_inst(ArmOpcode::Tbnz, vec![gp(0), imm(8), block()]),
+            machine_inst(ArmOpcode::Bl, vec![MachineOperand::Extern("callee".into())]),
+            machine_inst(ArmOpcode::Blr, vec![gp(12)]),
+            machine_inst(ArmOpcode::Sxtw, vec![gp(0), gp32(1)]),
+            machine_inst(ArmOpcode::Sxth, vec![gp32(0), gp32(1)]),
+            machine_inst(ArmOpcode::Sxtb, vec![gp32(0), gp32(1)]),
+            machine_inst(ArmOpcode::Ret, vec![]),
+            machine_inst(ArmOpcode::Nop, vec![]),
+            machine_inst(ArmOpcode::Brk, vec![imm(9)]),
+        ];
+
+        for instruction in &instructions {
+            let expected = emit_inst(instruction, &mf);
+            let mut actual = String::new();
+            assert!(
+                emit_common_inst_into(&mut actual, instruction, &mf),
+                "common writer rejected {:?}",
+                instruction.opcode
+            );
+            assert_eq!(actual, expected, "{:?}", instruction.opcode);
+        }
+    }
+
+    #[test]
+    fn common_instruction_writer_falls_back_without_partial_output() {
+        let mf = MachineFunction::new("test".into());
+        let fallback_instructions = [
+            machine_inst(
+                ArmOpcode::AddImm,
+                vec![gp(0), gp(1), MachineOperand::Imm(-1)],
+            ),
+            machine_inst(
+                ArmOpcode::SubImm,
+                vec![gp(0), gp(1), MachineOperand::Imm(5000)],
+            ),
+            machine_inst(ArmOpcode::MovReg, vec![gp(0), gp32(1)]),
+            machine_inst(ArmOpcode::MovReg, vec![gp(0), fp(1)]),
+            machine_inst(
+                ArmOpcode::LdrImm,
+                vec![gp(0), gp(1), MachineOperand::Imm(256)],
+            ),
+            machine_inst(
+                ArmOpcode::StrImm,
+                vec![gp(0), gp(1), MachineOperand::Imm(-257)],
+            ),
+            machine_inst(ArmOpcode::FcvtSD, vec![fp32(0), fp(1)]),
+            machine_inst(ArmOpcode::AddV4S, vec![fp(0), fp(1), fp(2)]),
+        ];
+
+        for instruction in &fallback_instructions {
+            let mut output = String::new();
+            assert!(
+                !emit_common_inst_into(&mut output, instruction, &mf),
+                "common writer unexpectedly accepted {:?}",
+                instruction.opcode
+            );
+            assert!(output.is_empty(), "fallback left partial output: {output}");
+        }
     }
 
     #[test]
