@@ -8,7 +8,12 @@ use std::fmt::Write;
 /// Emit a machine function as ARM64 assembly text.
 pub fn emit_function(mf: &MachineFunction) -> String {
     let mut out = String::new();
+    emit_function_into(&mut out, mf);
+    out
+}
 
+/// Append a machine function's ARM64 assembly text to an existing buffer.
+pub fn emit_function_into(out: &mut String, mf: &MachineFunction) {
     // Function directive.
     if mf.internal_only {
         writeln!(out, ".private_extern _{}", mf.name).unwrap();
@@ -59,13 +64,11 @@ pub fn emit_function(mf: &MachineFunction) -> String {
                 ConstPoolEntry::Bytes(b) => {
                     writeln!(out, ".p2align 3").unwrap();
                     writeln!(out, "{}:", label).unwrap();
-                    emit_const_pool_bytes(&mut out, b);
+                    emit_const_pool_bytes(out, b);
                 }
             }
         }
     }
-
-    out
 }
 
 fn emit_const_pool_bytes(out: &mut String, bytes: &[u8]) {
@@ -1517,6 +1520,22 @@ mod tests {
         let asm = emit_simple(|b| b.ret_void());
         assert!(asm.contains(".globl _test"), "missing .globl: {}", asm);
         assert!(asm.contains("_test:"), "missing function label: {}", asm);
+    }
+
+    #[test]
+    fn emit_function_into_appends_the_wrapper_output() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            b.ret_void();
+        }
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
+        let expected = emit_function(&mf);
+        let mut output = String::from("existing prefix\n");
+
+        emit_function_into(&mut output, &mf);
+
+        assert_eq!(output, format!("existing prefix\n{expected}"));
     }
 
     #[test]
