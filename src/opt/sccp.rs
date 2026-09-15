@@ -46,6 +46,7 @@ use super::pass::Pass;
 use super::util::prune_unreachable;
 use crate::ir::inst::*;
 use crate::ir::types::{FloatWidth, IntWidth, IrType};
+use crate::ir::walk::{for_each_operand_mut, for_each_terminator_operand_mut};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -567,6 +568,43 @@ struct SccpResult {
     lattice: HashMap<ValueId, Lattice>,
 }
 
+/// Replace every use covered by `rewrites` in one function walk.
+///
+/// Generated rank-heavy code can expose thousands of constant block
+/// parameters in one SCCP application. Walking the whole function once per
+/// parameter makes materialization quadratic in practice; collect the
+/// independent renames and apply them together instead.
+fn substitute_uses_batch(func: &mut Function, rewrites: &HashMap<ValueId, ValueId>) {
+    let rewrite = |value: &mut ValueId| {
+        if let Some(&replacement) = rewrites.get(value) {
+            *value = replacement;
+        }
+    };
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            for_each_operand_mut(&mut inst.kind, rewrite);
+        }
+        if let Some(term) = &mut block.terminator {
+            for_each_terminator_operand_mut(term, rewrite);
+        }
+    }
+}
+
+fn remove_rewritten_args(
+    dest: BlockId,
+    args: &mut Vec<ValueId>,
+    removed_param_indices: &HashMap<BlockId, Vec<usize>>,
+) {
+    let Some(indices) = removed_param_indices.get(&dest) else {
+        return;
+    };
+    for &param_index in indices {
+        if param_index < args.len() {
+            args.remove(param_index);
+        }
+    }
+}
+
 /// Apply the SCCP analysis result to `func`. Returns whether anything
 /// was rewritten.
 fn apply(func: &mut Function, analysis: &SccpResult) -> bool {
@@ -601,9 +639,11 @@ fn apply(func: &mut Function, analysis: &SccpResult) -> bool {
     }
 
     if !const_param_rewrites.is_empty() {
-        // Sort by (block, descending param index) so predecessor
-        // arg removal is index-stable as we mutate.
+        // Sort globally by descending param index so removal is index-stable
+        // within every block as we mutate.
         const_param_rewrites.sort_by_key(|x| std::cmp::Reverse(x.1));
+        let mut use_rewrites = HashMap::with_capacity(const_param_rewrites.len());
+        let mut removed_param_indices: HashMap<BlockId, Vec<usize>> = HashMap::new();
         for (block_id, pi, param_id, cval, ty) in const_param_rewrites {
             // Allocate a new value for the constant.
             let new_id = func.next_value_id();
@@ -636,37 +676,43 @@ fn apply(func: &mut Function, analysis: &SccpResult) -> bool {
                 );
                 // Drop the param.
                 block.params.remove(pi);
+                use_rewrites.insert(param_id, new_id);
+                removed_param_indices.entry(block_id).or_default().push(pi);
+                changed = true;
             }
-            // Rewrite uses of param_id → new_id.
-            crate::ir::walk::substitute_uses(func, param_id, new_id);
-            // Drop the matching argument in every predecessor's
-            // branch.
-            for pred_block in &mut func.blocks {
-                let Some(term) = pred_block.terminator.as_mut() else {
-                    continue;
-                };
-                match term {
-                    Terminator::Branch(dest, args) if *dest == block_id && pi < args.len() => {
-                        args.remove(pi);
-                    }
-                    Terminator::CondBranch {
-                        true_dest,
-                        true_args,
-                        false_dest,
-                        false_args,
-                        ..
-                    } => {
-                        if *true_dest == block_id && pi < true_args.len() {
-                            true_args.remove(pi);
-                        }
-                        if *false_dest == block_id && pi < false_args.len() {
-                            false_args.remove(pi);
-                        }
-                    }
-                    _ => {}
+        }
+
+        substitute_uses_batch(func, &use_rewrites);
+
+        // Each block's indices were collected in descending order because the
+        // rewrite list was sorted that way. Sort again defensively so this
+        // helper stays correct if collection order changes later.
+        for indices in removed_param_indices.values_mut() {
+            indices.sort_unstable_by(|a, b| b.cmp(a));
+        }
+
+        // Drop all matching predecessor arguments in one CFG walk rather than
+        // rescanning every block for each rewritten parameter.
+        for pred_block in &mut func.blocks {
+            let Some(term) = pred_block.terminator.as_mut() else {
+                continue;
+            };
+            match term {
+                Terminator::Branch(dest, args) => {
+                    remove_rewritten_args(*dest, args, &removed_param_indices);
                 }
+                Terminator::CondBranch {
+                    true_dest,
+                    true_args,
+                    false_dest,
+                    false_args,
+                    ..
+                } => {
+                    remove_rewritten_args(*true_dest, true_args, &removed_param_indices);
+                    remove_rewritten_args(*false_dest, false_args, &removed_param_indices);
+                }
+                _ => {}
             }
-            changed = true;
         }
         func.rebuild_type_cache();
     }
@@ -1159,5 +1205,111 @@ mod tests {
             1,
             "distinct executable edges must keep the merge parameter"
         );
+    }
+
+    #[test]
+    fn rewrites_multiple_uniform_params_on_parallel_edges() {
+        // Both executable arms carry the same two constants to the same
+        // destination. SCCP should materialize both constants together,
+        // rewrite both uses, and remove both argument slots from both arms.
+        let params = vec![Param {
+            name: "condition".into(),
+            ty: IrType::Bool,
+            id: ValueId(0),
+            fortran_noalias: false,
+        }];
+        let mut module = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut func = Function::new("f".into(), params, IrType::Int(IntWidth::I32));
+        let merge_id = func.create_block("merge");
+        let seven = func.next_value_id();
+        let eleven = func.next_value_id();
+        let first_param = func.next_value_id();
+        let second_param = func.next_value_id();
+        let sum = func.next_value_id();
+
+        func.block_mut(func.entry).insts.extend([
+            Inst {
+                id: seven,
+                kind: InstKind::ConstInt(7, IntWidth::I32),
+                ty: IrType::Int(IntWidth::I32),
+                span: dummy_span(),
+            },
+            Inst {
+                id: eleven,
+                kind: InstKind::ConstInt(11, IntWidth::I32),
+                ty: IrType::Int(IntWidth::I32),
+                span: dummy_span(),
+            },
+        ]);
+        func.block_mut(func.entry).terminator = Some(Terminator::CondBranch {
+            cond: ValueId(0),
+            true_dest: merge_id,
+            true_args: vec![seven, eleven],
+            false_dest: merge_id,
+            false_args: vec![seven, eleven],
+        });
+        func.block_mut(merge_id).params.extend([
+            BlockParam {
+                id: first_param,
+                ty: IrType::Int(IntWidth::I32),
+            },
+            BlockParam {
+                id: second_param,
+                ty: IrType::Int(IntWidth::I32),
+            },
+        ]);
+        func.block_mut(merge_id).insts.push(Inst {
+            id: sum,
+            kind: InstKind::IAdd(first_param, second_param),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
+        });
+        func.block_mut(merge_id).terminator = Some(Terminator::Return(Some(sum)));
+        func.rebuild_type_cache();
+        module.add_function(func);
+
+        assert!(
+            verify_module(&module).is_empty(),
+            "test IR must start valid"
+        );
+        assert!(Sccp_.run(&mut module));
+        assert!(
+            verify_module(&module).is_empty(),
+            "batched SCCP rewriting must preserve valid IR"
+        );
+
+        let func = &module.functions[0];
+        match &func.block(func.entry).terminator {
+            Some(Terminator::CondBranch {
+                true_args,
+                false_args,
+                ..
+            }) => {
+                assert!(true_args.is_empty());
+                assert!(false_args.is_empty());
+            }
+            other => panic!("expected the unknown conditional branch, got {other:?}"),
+        }
+
+        let merge = func.block(merge_id);
+        assert!(merge.params.is_empty());
+        let constants: HashMap<ValueId, i128> = merge
+            .insts
+            .iter()
+            .filter_map(|inst| match inst.kind {
+                InstKind::ConstInt(value, IntWidth::I32) => Some((inst.id, value)),
+                _ => None,
+            })
+            .collect();
+        let add = merge
+            .insts
+            .iter()
+            .find(|inst| inst.id == sum)
+            .expect("sum instruction should remain");
+        let InstKind::IAdd(lhs, rhs) = &add.kind else {
+            panic!("expected sum instruction, got {:?}", add.kind);
+        };
+        assert_eq!(constants.get(lhs), Some(&7));
+        assert_eq!(constants.get(rhs), Some(&11));
     }
 }
