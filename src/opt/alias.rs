@@ -92,9 +92,9 @@ pub fn may_reach_through_call_arg(
 pub struct AliasOracle<'a> {
     func: &'a Function,
     layout: TargetLayout,
-    insts: HashMap<ValueId, &'a Inst>,
-    value_types: HashMap<ValueId, &'a IrType>,
-    params: HashMap<ValueId, bool>,
+    insts: Vec<Option<&'a Inst>>,
+    value_types: Vec<Option<&'a IrType>>,
+    params: Vec<Option<bool>>,
     base_cache: HashMap<ValueId, PtrBase>,
     offset_cache: HashMap<ValueId, Option<i64>>,
     aggregate_cache: HashMap<ValueId, bool>,
@@ -109,32 +109,45 @@ impl<'a> AliasOracle<'a> {
         #[cfg(test)]
         ORACLE_CONSTRUCTION_COUNT.with(|count| count.set(count.get() + 1));
 
-        let insts = func
-            .blocks
-            .iter()
-            .flat_map(|block| block.insts.iter())
-            .map(|inst| (inst.id, inst))
-            .collect();
-        let params = func
+        // ValueIds are allocated monotonically within a function. Optimizer
+        // deletion can leave holes, and tests may construct sparse IDs by
+        // hand, so derive the authoritative upper bound from the live IR
+        // rather than relying on Function's private allocation cursor.
+        let value_bound = func
             .params
             .iter()
-            .map(|param| (param.id, param.fortran_noalias))
-            .collect();
-        let value_types = func
-            .params
-            .iter()
-            .map(|param| (param.id, &param.ty))
+            .map(|param| param.id.0)
             .chain(
                 func.blocks
                     .iter()
-                    .flat_map(|block| block.params.iter().map(|param| (param.id, &param.ty))),
+                    .flat_map(|block| block.params.iter().map(|param| param.id.0)),
             )
             .chain(
                 func.blocks
                     .iter()
-                    .flat_map(|block| block.insts.iter().map(|inst| (inst.id, &inst.ty))),
+                    .flat_map(|block| block.insts.iter().map(|inst| inst.id.0)),
             )
-            .collect();
+            .max()
+            .map_or(0, |id| id as usize + 1);
+
+        let mut insts = vec![None; value_bound];
+        let mut value_types = vec![None; value_bound];
+        let mut params = vec![None; value_bound];
+        for param in &func.params {
+            let index = param.id.0 as usize;
+            params[index] = Some(param.fortran_noalias);
+            value_types[index] = Some(&param.ty);
+        }
+        for block in &func.blocks {
+            for param in &block.params {
+                value_types[param.id.0 as usize] = Some(&param.ty);
+            }
+            for inst in &block.insts {
+                let index = inst.id.0 as usize;
+                insts[index] = Some(inst);
+                value_types[index] = Some(&inst.ty);
+            }
+        }
         Self {
             func,
             layout,
@@ -287,7 +300,7 @@ impl<'a> AliasOracle<'a> {
     }
 
     pub(crate) fn value_type(&self, value: ValueId) -> Option<&'a IrType> {
-        self.value_types.get(&value).copied()
+        self.value_types.get(value.0 as usize).copied().flatten()
     }
 
     /// Arbitrary calls can read or write globals without receiving their
@@ -323,7 +336,7 @@ impl<'a> AliasOracle<'a> {
 
     fn compute_trace_base(&mut self, ptr: ValueId) -> PtrBase {
         // Check if this is a function parameter (pointer arg).
-        if self.params.contains_key(&ptr) {
+        if self.params.get(ptr.0 as usize).is_some_and(Option::is_some) {
             return PtrBase::Param(ptr);
         }
 
@@ -356,7 +369,7 @@ impl<'a> AliasOracle<'a> {
     }
 
     fn compute_trace_offset(&mut self, ptr: ValueId) -> Option<i64> {
-        if self.params.contains_key(&ptr) {
+        if self.params.get(ptr.0 as usize).is_some_and(Option::is_some) {
             return Some(0);
         }
         let (kind, ty) = self
@@ -389,7 +402,11 @@ impl<'a> AliasOracle<'a> {
     }
 
     fn param_is_fortran_noalias(&self, param_id: ValueId) -> bool {
-        self.params.get(&param_id).copied().unwrap_or(false)
+        self.params
+            .get(param_id.0 as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(false)
     }
 
     fn trace_param_wrapper(&mut self, addr: ValueId) -> Option<ValueId> {
@@ -435,7 +452,7 @@ impl<'a> AliasOracle<'a> {
                     if *ptr != slot {
                         continue;
                     }
-                    if !self.params.contains_key(val) {
+                    if !self.params.get(val.0 as usize).is_some_and(Option::is_some) {
                         break 'scan None;
                     }
                     if stored_param.replace(*val).is_some() {
@@ -451,7 +468,7 @@ impl<'a> AliasOracle<'a> {
     }
 
     fn find_inst(&self, vid: ValueId) -> Option<&'a Inst> {
-        self.insts.get(&vid).copied()
+        self.insts.get(vid.0 as usize).copied().flatten()
     }
 }
 
@@ -886,6 +903,44 @@ mod tests {
         assert_eq!(
             AliasOracle::new(&f, crate::target::TargetLayout::LP64).call_arg_pointer(integer),
             None
+        );
+    }
+
+    #[test]
+    fn dense_indexes_cover_sparse_authoritative_value_ids() {
+        let params = vec![
+            param(
+                "a",
+                17,
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+                true,
+            ),
+            param(
+                "b",
+                201,
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+                true,
+            ),
+        ];
+        let mut f = Function::new("test".into(), params, IrType::Void);
+        let first = ValueId(1000);
+        let second = ValueId(4096);
+        for id in [first, second] {
+            f.block_mut(f.entry).insts.push(Inst {
+                id,
+                ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+                span: span(),
+                kind: InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            });
+        }
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+
+        let mut oracle = AliasOracle::new(&f, crate::target::TargetLayout::LP64);
+        assert!(oracle.value_is_pointer(first));
+        assert_eq!(oracle.query(first, second), AliasResult::NoAlias);
+        assert_eq!(
+            oracle.query(ValueId(17), ValueId(201)),
+            AliasResult::NoAlias
         );
     }
 }
