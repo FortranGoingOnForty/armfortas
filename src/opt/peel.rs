@@ -24,6 +24,11 @@ use std::collections::HashSet;
 
 pub struct LoopPeel;
 
+#[cfg(test)]
+std::thread_local! {
+    static EXTERNAL_SSA_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Pass for LoopPeel {
     fn name(&self) -> &'static str {
         "loop-peel"
@@ -108,10 +113,10 @@ fn peel_in_function(func: &mut Function) -> bool {
         // Check if body has a FIRST-ITERATION conditional:
         // ICmp(Eq, iv, init_val) feeding a CondBranch.
         let loop_defs = loop_defined_values(func, lp);
-        if has_external_ssa_uses(func, lp, &loop_defs) {
+        if !has_first_iter_conditional(func, lp, iv, init_const, &loop_defs) {
             continue;
         }
-        if !has_first_iter_conditional(func, lp, iv, init_const, &loop_defs) {
+        if has_external_ssa_uses(func, lp, &loop_defs) {
             continue;
         }
 
@@ -196,6 +201,9 @@ fn has_external_ssa_uses(
     lp: &crate::ir::walk::NaturalLoop,
     loop_defs: &HashSet<ValueId>,
 ) -> bool {
+    #[cfg(test)]
+    EXTERNAL_SSA_SCAN_COUNT.with(|count| count.set(count.get() + 1));
+
     for block in &func.blocks {
         if lp.body.contains(&block.id) {
             continue;
@@ -364,8 +372,9 @@ mod tests {
     }
 
     #[test]
-    fn peel_no_op_without_eq_check() {
+    fn peel_rejects_loop_without_eq_before_external_ssa_scan() {
         // Loop with no `if (i == init)` → should not peel.
+        EXTERNAL_SSA_SCAN_COUNT.with(|count| count.set(0));
         let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Void);
 
@@ -461,6 +470,13 @@ mod tests {
         let pass = LoopPeel;
         let changed = pass.run(&mut m);
         assert!(!changed, "loop without i==init check should not be peeled");
+        EXTERNAL_SSA_SCAN_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "non-candidates must not trigger the whole-function external-use scan"
+            );
+        });
     }
 
     #[test]
