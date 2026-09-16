@@ -32,7 +32,7 @@
 //! from the original branch population. Exceeding that bound produces
 //! a release-build ICE rather than invalid machine code.
 
-use super::emit::emit_inst_text;
+use super::emit::emit_inst_into;
 use super::mir::{
     ArmCond, ArmOpcode, MBlockId, MachineBlock, MachineFunction, MachineInst, MachineOperand,
 };
@@ -272,6 +272,7 @@ fn relaxable_branch(
 fn scan_branch_layout(mf: &MachineFunction, limits: BranchLimits) -> BranchLayout {
     let mut offsets = std::collections::HashMap::with_capacity(mf.blocks.len());
     let mut sites = Vec::new();
+    let mut inst_text = String::new();
     let mut running: i64 = 0;
     for block in &mf.blocks {
         offsets.insert(block.id, running);
@@ -289,7 +290,7 @@ fn scan_branch_layout(mf: &MachineFunction, limits: BranchLimits) -> BranchLayou
                     limit,
                 });
             }
-            let bytes = inst_emit_bytes(inst, mf) as i64;
+            let bytes = inst_emit_bytes(inst, mf, &mut inst_text) as i64;
             local_offset += bytes;
             running += bytes;
         }
@@ -317,14 +318,15 @@ fn collect_overflows(
 }
 
 /// Number of bytes a single MachineInst emits at assembly time.
-/// Counted from the rendered text — `emit_inst_text` already produces
-/// exactly the lines `emit_function` would, so newline-count + 1
+/// Counted from the rendered text — `emit_inst_into` already produces exactly
+/// the lines `emit_function` would, so newline-count + 1
 /// matches the real instruction count without re-deriving each
 /// opcode's expansion rules here.
-fn inst_emit_bytes(inst: &MachineInst, mf: &MachineFunction) -> u32 {
+fn inst_emit_bytes(inst: &MachineInst, mf: &MachineFunction, text: &mut String) -> u32 {
     #[cfg(test)]
     INST_EMIT_BYTE_COUNT.with(|count| count.set(count.get() + 1));
-    let text = emit_inst_text(inst, mf);
+    text.clear();
+    emit_inst_into(text, inst, mf);
     let lines = text.matches('\n').count() as u32 + 1;
     4 * lines
 }
