@@ -11,7 +11,8 @@
 use super::liveness::LivenessResult;
 use super::mir::*;
 use crate::codegen::shared::{classify_call_crossing, CallCrossing};
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 /// GP registers available for allocation (excludes x18, x29, x30, x31/sp).
 /// Ordered: caller-saved first (prefer these to avoid save/restore overhead),
@@ -86,31 +87,33 @@ impl SpillSlotPlan {
     fn new(intervals: &[super::liveness::LiveInterval]) -> Self {
         let mut vreg_colors = HashMap::with_capacity(intervals.len());
         let mut colors: Vec<SpillColor> = Vec::new();
-        let mut active: Vec<(u32, usize)> = Vec::new();
-        let mut free: Vec<usize> = Vec::new();
+        let mut active: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
+        let mut free_8: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
+        let mut free_16: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
 
         for interval in intervals {
             // Values used and defined by the same instruction overlap at that
             // position. Only a strictly earlier interval may release a color.
-            let mut index = 0;
-            while index < active.len() {
-                if active[index].0 < interval.start {
-                    let (_, color) = active.swap_remove(index);
-                    free.push(color);
-                } else {
-                    index += 1;
+            while active
+                .peek()
+                .is_some_and(|Reverse((end, _))| *end < interval.start)
+            {
+                let Reverse((_, color)) = active.pop().expect("active color must exist");
+                match colors[color].size {
+                    8 => free_8.push(Reverse(color)),
+                    16 => free_16.push(Reverse(color)),
+                    size => unreachable!("unsupported spill color size {size}"),
                 }
             }
 
             let size = spill_slot_size(interval.class);
-            let reusable = free
-                .iter()
-                .enumerate()
-                .filter(|(_, color)| colors[**color].size >= size)
-                .min_by_key(|(_, color)| (colors[**color].size, **color))
-                .map(|(index, _)| index);
-            let color = if let Some(index) = reusable {
-                free.swap_remove(index)
+            let reusable = match size {
+                8 => free_8.pop().or_else(|| free_16.pop()),
+                16 => free_16.pop(),
+                size => unreachable!("unsupported spill slot size {size}"),
+            };
+            let color = if let Some(Reverse(color)) = reusable {
+                color
             } else {
                 let color = colors.len();
                 colors.push(SpillColor { size });
@@ -118,7 +121,7 @@ impl SpillSlotPlan {
             };
 
             vreg_colors.insert(interval.vreg, color);
-            active.push((interval.end, color));
+            active.push(Reverse((interval.end, color)));
         }
 
         let offsets = vec![None; colors.len()];
@@ -2074,6 +2077,60 @@ mod tests {
 
         assert_ne!(first, second);
         assert_eq!(mf.frame.locals.len(), 2);
+    }
+
+    #[test]
+    fn spill_slot_plan_uses_smallest_compatible_lowest_color() {
+        let intervals = vec![
+            LiveInterval {
+                vreg: VRegId(0),
+                class: RegClass::Gp64,
+                start: 0,
+                end: 0,
+                hint: None,
+            },
+            LiveInterval {
+                vreg: VRegId(1),
+                class: RegClass::Gp64,
+                start: 0,
+                end: 0,
+                hint: None,
+            },
+            LiveInterval {
+                vreg: VRegId(2),
+                class: RegClass::V128,
+                start: 0,
+                end: 0,
+                hint: None,
+            },
+            LiveInterval {
+                vreg: VRegId(3),
+                class: RegClass::Gp64,
+                start: 2,
+                end: 2,
+                hint: None,
+            },
+            LiveInterval {
+                vreg: VRegId(4),
+                class: RegClass::V128,
+                start: 2,
+                end: 2,
+                hint: None,
+            },
+        ];
+        let mut plan = SpillSlotPlan::new(&intervals);
+        let mut mf = MachineFunction::new("mixed_spill_colors".into());
+
+        let first_small = plan.offset_for(&mut mf, VRegId(0), RegClass::Gp64);
+        let second_small = plan.offset_for(&mut mf, VRegId(1), RegClass::Gp64);
+        let first_wide = plan.offset_for(&mut mf, VRegId(2), RegClass::V128);
+        let reused_small = plan.offset_for(&mut mf, VRegId(3), RegClass::Gp64);
+        let reused_wide = plan.offset_for(&mut mf, VRegId(4), RegClass::V128);
+
+        assert_eq!(reused_small, first_small);
+        assert_ne!(reused_small, second_small);
+        assert_eq!(reused_wide, first_wide);
+        assert_eq!(mf.frame.locals.len(), 3);
     }
 
     #[test]
