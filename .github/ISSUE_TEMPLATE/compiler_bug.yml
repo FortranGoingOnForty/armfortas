@@ -1,0 +1,106 @@
+name: Compiler bug
+description: Report wrong code, a crash, or incorrect Fortran acceptance or rejection
+title: "[compiler] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing ARMFORTAS. Small, self-contained reproducers are
+        the fastest route to a compiler fix. Please remove private data and
+        dependencies that are not needed to reproduce the behavior.
+
+  - type: input
+    id: version
+    attributes:
+      label: ARMFORTAS version
+      description: Paste the complete output of `armfortas --version`.
+      placeholder: armfortas 0.1.0 (arm64-macos)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Host platform
+      options:
+        - Apple Silicon macOS
+        - Linux x86_64 glibc
+        - Linux x86_64 musl
+        - FreeBSD x86_64
+        - Other source-build environment
+    validations:
+      required: true
+
+  - type: dropdown
+    id: behavior
+    attributes:
+      label: Failure class
+      options:
+        - Wrong runtime result
+        - Compiler crash or internal error
+        - Valid Fortran rejected
+        - Invalid Fortran accepted
+        - Linker or object-file failure
+        - Optimization-level difference
+        - Diagnostic problem
+        - Other compiler behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: source
+    attributes:
+      label: Minimal reproducer
+      description: Provide the smallest complete source file or source set that reproduces the issue.
+      render: Fortran
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command
+      description: Include every option, environment override, and separate-compilation step.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: State the expected output or diagnostic and how you established it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include complete stdout, stderr, exit status, and any crash report that is safe to share.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reference
+    attributes:
+      label: Reference compiler results
+      description: If available, include the gfortran or flang version, command, and result for the same source.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Note whether the issue changes with `-O0`, `-O2`, `-O3`, or `-Ofast`, and attach IR or assembly only when useful.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Submission checklist
+      options:
+        - label: I searched existing issues for this behavior.
+          required: true
+        - label: The reproducer does not depend solely on unsupported OpenMP behavior.
+          required: true
+        - label: I minimized the source and removed sensitive data.
+          required: true
