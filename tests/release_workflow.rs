@@ -6,6 +6,7 @@ fn release_workflow_validates_complete_sources_before_publishing() {
         "pull_request:",
         "tags:\n      - \"v*\"",
         "scripts/package-release-source.sh",
+        "package_id=${package_id##*#}\n            version=${package_id##*@}",
         "submodules: recursive",
         "actions/upload-artifact@v7",
         "actions/download-artifact@v7",

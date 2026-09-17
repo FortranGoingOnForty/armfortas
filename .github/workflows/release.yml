@@ -40,6 +40,7 @@ jobs:
             version="${GITHUB_REF_NAME#v}"
           else
             package_id=$(cargo pkgid -p armfortas)
+            package_id=${package_id##*#}
             version=${package_id##*@}
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
