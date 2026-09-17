@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".gitmodules"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "runtime/**"
+      - "afs-as"
+      - "afs-ld"
+      - "bencch"
+      - "scripts/package-release-source.sh"
+      - "scripts/validate-release-source.sh"
+      - "tests/release_packaging.rs"
+      - "tests/release_workflow.rs"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  source-bundle:
+    name: Complete source bundle
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            package_id=$(cargo pkgid -p armfortas)
+            package_id=${package_id##*#}
+            version=${package_id##*@}
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - run: scripts/package-release-source.sh "${{ steps.version.outputs.version }}" dist
+      - working-directory: dist
+        run: sha256sum -c "armfortas-${{ steps.version.outputs.version }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: armfortas-source-${{ steps.version.outputs.version }}
+          path: |
+            dist/armfortas-${{ steps.version.outputs.version }}.tar.gz
+            dist/armfortas-${{ steps.version.outputs.version }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  validate-source:
+    name: Source smoke (${{ matrix.platform }})
+    needs: source-bundle
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: macOS ARM64
+          - os: ubuntu-latest
+            platform: Linux x86_64 glibc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v7
+        with:
+          name: armfortas-source-${{ needs.source-bundle.outputs.version }}
+          path: dist
+      - run: scripts/validate-release-source.sh "dist/armfortas-${{ needs.source-bundle.outputs.version }}.tar.gz"
+
+  validate-arch:
+    name: Source smoke (Arch Linux x86_64)
+    needs: source-bundle
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm --needed ca-certificates git rust cargo gcc binutils
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: armfortas-source-${{ needs.source-bundle.outputs.version }}
+          path: dist
+      - run: scripts/validate-release-source.sh "dist/armfortas-${{ needs.source-bundle.outputs.version }}.tar.gz"
+
+  publish:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - source-bundle
+      - validate-source
+      - validate-arch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: armfortas-source-${{ needs.source-bundle.outputs.version }}
+          path: dist
+      - name: Create preview release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/armfortas-${{ needs.source-bundle.outputs.version }}.tar.gz" \
+            "dist/armfortas-${{ needs.source-bundle.outputs.version }}.tar.gz.sha256" \
+            --verify-tag \
+            --prerelease \
+            --generate-notes \
+            --title "ARMFORTAS ${{ needs.source-bundle.outputs.version }}"

@@ -27,6 +27,30 @@ Pipeline: Source → Preprocessor → Lexer → Parser → AST →
 
 `afs-as` assembles both architectures and emits both object formats in-process; no system `as` in the default path anywhere. The system linker (`ld`) is the last delegated component, and `afs-ld` is replacing it: set `AFS_LD=1` (or `AFS_LD_PATH`) to link ELF and Mach-O binaries with our own linker. Real programs — up to and including fpm building itself to a byte-identical fixed point — compile and run.
 
+## Install
+
+ARMFORTAS 0.1.x releases are compiler previews intended for real-project
+testing and actionable bug reports.
+
+Apple Silicon macOS:
+
+```bash
+brew install FortranGoingOnForty/tap/armfortas
+```
+
+Arch Linux x86_64:
+
+```bash
+git clone https://aur.archlinux.org/armfortas.git
+cd armfortas
+makepkg -si
+```
+
+The Homebrew package is ARM64-only and the AUR package is x86_64-only. Other
+supported targets can build from source. When using a GitHub release, download
+the attached `armfortas-VERSION.tar.gz` asset: GitHub's automatically generated
+"Source code" archives omit submodule contents and cannot build this workspace.
+
 ## Build
 
 ```bash
@@ -47,11 +71,37 @@ target/debug/armfortas --emit-ir hello.f90   # emit IR
 target/debug/armfortas --target x86_64-linux-gnu -c hello.f90   # cross-compile to object
 ```
 
-On Linux hosts the driver probes the GCC directories for the crt objects
-it needs to link (`crtbeginS.o` etc.). If your distro's GCC lives somewhere
-the probe doesn't know (it knows Debian and RedHat layouts), point
-`AFS_CRT_DIR` at the directory containing them, e.g.
-`AFS_CRT_DIR=/usr/lib/gcc/x86_64-pc-linux-gnu/16` on Arch.
+On Linux hosts the driver probes common Debian, Red Hat, and Arch GCC layouts
+for the crt objects it needs to link (`crtbeginS.o` etc.). On non-FHS systems
+such as NixOS, point `AFS_CRT_DIR` at the directory containing those objects
+and add the corresponding runtime library directory to `LIBRARY_PATH`.
+
+To install both compiler command names from a complete release archive:
+
+```bash
+cargo install --path . --locked
+armfortas --version
+afs --version
+```
+
+## Preview limitations
+
+- OpenMP is not implemented. ARMFORTAS does not silently treat OpenMP as a
+  supported parallel-execution mode.
+- `afs-as` is the default in-process assembler, but the system linker remains
+  the default. `AFS_LD=1` opts into the standalone `afs-ld` linker while its
+  parity campaign continues.
+- Linux AArch64 is not a supported target. The supported ARM64 target is
+  Apple Silicon macOS; supported ELF and FreeBSD targets are x86_64.
+- `.amod` module files are ARMFORTAS interfaces and are not compatible with
+  module files emitted by gfortran, flang, or other compilers.
+- Language and optimizer coverage is substantial but incomplete. A 0.1.x
+  release is an invitation to report minimized compiler edges, not a claim of
+  complete Fortran conformance.
+
+Please use the compiler-bug issue form for wrong code, crashes, rejected valid
+programs, or accepted invalid programs. Include `armfortas --version`, the full
+command line, host platform, and the smallest source that reproduces the issue.
 
 ## What Works
 
