@@ -228,6 +228,15 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+      # The checkout is bind-mounted into this container with the host
+      # runner's ownership. Trust only the repositories the release-package
+      # regression reads; keep Git's ownership checks everywhere else.
+      - name: Trust the container checkout
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/afs-as"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/afs-ld"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/bencch"
       - run: cargo build --workspace
       - run: cargo test -p armfortas --lib
       - shell: bash

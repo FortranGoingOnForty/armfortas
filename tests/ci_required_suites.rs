@@ -72,6 +72,25 @@ const AFS_LD_REQUIRED_CONTROLS: &[(&str, &str)] = &[
     ),
 ];
 
+const MUSL_REQUIRED_TRUSTED_CHECKOUTS: &[(&str, &str)] = &[
+    (
+        "workspace repository",
+        r#"git config --global --add safe.directory "$GITHUB_WORKSPACE""#,
+    ),
+    (
+        "afs-as submodule",
+        r#"git config --global --add safe.directory "$GITHUB_WORKSPACE/afs-as""#,
+    ),
+    (
+        "afs-ld submodule",
+        r#"git config --global --add safe.directory "$GITHUB_WORKSPACE/afs-ld""#,
+    ),
+    (
+        "bencch submodule",
+        r#"git config --global --add safe.directory "$GITHUB_WORKSPACE/bencch""#,
+    ),
+];
+
 fn workflow_run_commands(workflow: &str) -> Vec<(&str, &str)> {
     let mut current_job = None;
     let mut commands = Vec::new();
@@ -127,6 +146,15 @@ fn missing_afs_as_controls(workflow: &str) -> Vec<&'static str> {
 fn missing_afs_ld_controls(workflow: &str) -> Vec<&'static str> {
     let job = workflow_job(workflow, "test-afs-ld");
     AFS_LD_REQUIRED_CONTROLS
+        .iter()
+        .filter(|(_, required)| !job.contains(required))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+fn missing_musl_trusted_checkouts(workflow: &str) -> Vec<&'static str> {
+    let job = workflow_job(workflow, "build-linux-musl");
+    MUSL_REQUIRED_TRUSTED_CHECKOUTS
         .iter()
         .filter(|(_, required)| !job.contains(required))
         .map(|(name, _)| *name)
@@ -252,6 +280,42 @@ fn policy_check_rejects_each_missing_afs_ld_control() {
         let rendered = required.replace('\n', "\n    ");
         let incomplete = complete.replacen(&rendered, "", 1);
         assert_eq!(missing_afs_ld_controls(&incomplete), vec![*name]);
+    }
+}
+
+#[test]
+fn musl_ci_trusts_only_the_release_packaging_repositories() {
+    let missing = missing_musl_trusted_checkouts(WORKFLOW);
+    assert!(
+        missing.is_empty(),
+        "{} does not trust the container-mounted release inputs: {}",
+        Path::new(".github/workflows/ci.yml").display(),
+        missing.join(", ")
+    );
+
+    let musl_job = workflow_job(WORKFLOW, "build-linux-musl");
+    assert!(
+        !musl_job.contains("safe.directory '*'") && !musl_job.contains("safe.directory \"*\""),
+        "musl CI must not disable Git ownership checks globally"
+    );
+}
+
+#[test]
+fn policy_check_rejects_each_missing_musl_trusted_checkout() {
+    let complete = format!(
+        "jobs:\n  build-linux-musl:\n    {}\n",
+        MUSL_REQUIRED_TRUSTED_CHECKOUTS
+            .iter()
+            .map(|(_, required)| required)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n    ")
+    );
+    assert!(missing_musl_trusted_checkouts(&complete).is_empty());
+
+    for (name, required) in MUSL_REQUIRED_TRUSTED_CHECKOUTS {
+        let incomplete = complete.replacen(required, "", 1);
+        assert_eq!(missing_musl_trusted_checkouts(&incomplete), vec![*name]);
     }
 }
 
