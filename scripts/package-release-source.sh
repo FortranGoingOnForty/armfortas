@@ -113,16 +113,32 @@ find "$bundle_root" -type l -exec touch -h -t "$touch_stamp" {} +
 (
     cd "$staging_dir"
     find "$prefix" -print | LC_ALL=C sort > archive-files.txt
-    if tar --version 2>/dev/null | grep -q 'GNU tar'; then
-        COPYFILE_DISABLE=1 tar --no-xattrs --format=ustar \
+    tar_bin=${ARMFORTAS_TAR:-tar}
+    tar_version=$("$tar_bin" --version 2>/dev/null || true)
+    case "$tar_version" in
+    *"GNU tar"*)
+        COPYFILE_DISABLE=1 "$tar_bin" --no-xattrs --format=ustar \
             --owner=0 --group=0 --numeric-owner \
             --mtime="@$source_epoch" --no-recursion \
             -cf source.tar -T archive-files.txt
-    else
-        COPYFILE_DISABLE=1 tar --no-xattrs --format=ustar \
+        ;;
+    bsdtar*)
+        COPYFILE_DISABLE=1 "$tar_bin" --no-xattrs --format=ustar \
             --uid 0 --gid 0 --uname root --gname root \
             --no-recursion -cf source.tar -T archive-files.txt
-    fi
+        ;;
+    *[Bb]usy[Bb]ox*)
+        # BusyBox tar has no xattr, format, owner, or mtime switches. The
+        # staged tree already has normalized times; CI containers run as
+        # root, and BusyBox does not emit AppleDouble metadata.
+        COPYFILE_DISABLE=1 "$tar_bin" --no-recursion \
+            -cf source.tar -T archive-files.txt
+        ;;
+    *)
+        echo "unsupported tar implementation: ${tar_version:-unknown}" >&2
+        exit 1
+        ;;
+    esac
     gzip -n -9 -c source.tar > "$archive"
 )
 

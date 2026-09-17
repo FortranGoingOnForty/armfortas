@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -13,15 +14,19 @@ fn temp_dir() -> PathBuf {
     path
 }
 
-fn build_archive(output_dir: &Path) -> PathBuf {
+fn build_archive_with_tar(output_dir: &Path, tar_override: Option<(&Path, &Path)>) -> PathBuf {
     fs::create_dir_all(output_dir).expect("create archive output directory");
-    let output = Command::new("bash")
+    let mut command = Command::new("bash");
+    command
         .arg("scripts/package-release-source.sh")
         .arg(VERSION)
         .arg(output_dir)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("run release source packager");
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
+    if let Some((tar, real_tar)) = tar_override {
+        command.env("ARMFORTAS_TAR", tar);
+        command.env("ARMFORTAS_TEST_REAL_TAR", real_tar);
+    }
+    let output = command.output().expect("run release source packager");
     assert!(
         output.status.success(),
         "source packager failed\nstdout:\n{}\nstderr:\n{}",
@@ -29,6 +34,28 @@ fn build_archive(output_dir: &Path) -> PathBuf {
         String::from_utf8_lossy(&output.stderr)
     );
     output_dir.join(format!("armfortas-{VERSION}.tar.gz"))
+}
+
+fn build_archive(output_dir: &Path) -> PathBuf {
+    build_archive_with_tar(output_dir, None)
+}
+
+fn archive_entries(archive: &Path) -> Vec<String> {
+    let listing = Command::new("tar")
+        .args(["-tzf"])
+        .arg(archive)
+        .output()
+        .expect("list release archive");
+    assert!(
+        listing.status.success(),
+        "could not list release archive: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    std::str::from_utf8(&listing.stdout)
+        .expect("archive paths are UTF-8")
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 #[test]
@@ -46,20 +73,43 @@ fn complete_release_archive_is_deterministic_and_contains_submodules() {
     let second_bytes = fs::read(&second).expect("read second archive");
     assert_eq!(first_bytes, second_bytes, "release archives differ");
 
-    let listing = Command::new("tar")
-        .args(["-tzf"])
-        .arg(&first)
+    let real_tar_output = Command::new("sh")
+        .args(["-c", "command -v tar"])
         .output()
-        .expect("list release archive");
+        .expect("locate the system tar");
     assert!(
-        listing.status.success(),
-        "could not list release archive: {}",
-        String::from_utf8_lossy(&listing.stderr)
+        real_tar_output.status.success(),
+        "could not locate the system tar"
     );
-    let entries: Vec<&str> = std::str::from_utf8(&listing.stdout)
-        .expect("archive paths are UTF-8")
-        .lines()
-        .collect();
+    let real_tar = PathBuf::from(
+        std::str::from_utf8(&real_tar_output.stdout)
+            .expect("system tar path is UTF-8")
+            .trim(),
+    );
+    let busybox_shim = temp.join("busybox-tar");
+    fs::write(
+        &busybox_shim,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo 'tar (busybox) 1.37.0'
+    exit 0
+fi
+for arg do
+    if [ "$arg" = "--no-xattrs" ]; then
+        echo 'BusyBox tar received --no-xattrs' >&2
+        exit 64
+    fi
+done
+exec "$ARMFORTAS_TEST_REAL_TAR" "$@"
+"#,
+    )
+    .expect("write BusyBox tar shim");
+    fs::set_permissions(&busybox_shim, fs::Permissions::from_mode(0o755))
+        .expect("make BusyBox tar shim executable");
+    let busybox = build_archive_with_tar(&temp.join("busybox"), Some((&busybox_shim, &real_tar)));
+
+    let entries = archive_entries(&first);
+    let busybox_entries = archive_entries(&busybox);
     let prefix = format!("armfortas-{VERSION}/");
 
     for required in [
@@ -71,8 +121,12 @@ fn complete_release_archive_is_deterministic_and_contains_submodules() {
     ] {
         let expected = format!("{prefix}{required}");
         assert!(
-            entries.contains(&expected.as_str()),
+            entries.contains(&expected),
             "release archive is missing {expected}"
+        );
+        assert!(
+            busybox_entries.contains(&expected),
+            "BusyBox release archive is missing {expected}"
         );
     }
     assert!(
