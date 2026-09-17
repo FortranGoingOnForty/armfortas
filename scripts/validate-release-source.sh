@@ -59,15 +59,10 @@ tar -xzf "$archive" -C "$validation_dir"
 source_root="$validation_dir/$prefix"
 cd "$source_root"
 
-cargo build --release --locked --bin armfortas --bin afs
-
-target_dir=${CARGO_TARGET_DIR:-target}
-case "$target_dir" in
-    /*) ;;
-    *) target_dir="$source_root/$target_dir" ;;
-esac
-compiler="$target_dir/release/armfortas"
-alias_compiler="$target_dir/release/afs"
+install_root="$validation_dir/install"
+cargo install --path . --locked --root "$install_root"
+compiler="$install_root/bin/armfortas"
+alias_compiler="$install_root/bin/afs"
 
 "$compiler" --version | grep -F "armfortas $version ("
 "$alias_compiler" --version | grep -F "afs $version ("
