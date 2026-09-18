@@ -26,6 +26,10 @@ use crate::sema::{resolve, validate};
 
 static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
+/// OpenMP language level advertised through the `_OPENMP` predefined macro.
+/// `202111` denotes OpenMP 5.2.
+pub const OPENMP_VERSION: u32 = 202111;
+
 struct RemoveFileOnDrop(PathBuf);
 
 impl Drop for RemoveFileOnDrop {
@@ -398,6 +402,13 @@ pub struct Options {
     pub default_real_8: bool,
     pub force_implicit_none: bool,
     pub recursive_default: bool,
+    /// Enable full OpenMP compilation (`-fopenmp`).
+    pub openmp: bool,
+    /// Enable the OpenMP SIMD subset independently (`-fopenmp-simd`).
+    /// Full OpenMP implies SIMD through `openmp_simd_enabled()` without
+    /// setting this bit, so a later `-fno-openmp` preserves an explicitly
+    /// requested SIMD mode.
+    pub openmp_simd: bool,
     pub backslash_escapes: bool,
     pub free_line_length_limit: Option<usize>,
     pub free_line_length_none_compat: bool,
@@ -486,6 +497,8 @@ impl Default for Options {
             default_real_8: false,
             force_implicit_none: false,
             recursive_default: false,
+            openmp: false,
+            openmp_simd: false,
             backslash_escapes: false,
             free_line_length_limit: None,
             free_line_length_none_compat: false,
@@ -560,6 +573,12 @@ impl Options {
         } else {
             PathBuf::from(stem)
         }
+    }
+
+    /// Whether OpenMP SIMD syntax is enabled, either directly or as part of
+    /// full OpenMP compilation.
+    pub fn openmp_simd_enabled(&self) -> bool {
+        self.openmp || self.openmp_simd
     }
 
     pub(crate) fn warnings_enabled(&self) -> bool {
@@ -814,6 +833,9 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-fdefault-real-8" => opts.default_real_8 = true,
             "-fimplicit-none" => opts.force_implicit_none = true,
             "-frecursive" => opts.recursive_default = true,
+            "-fopenmp" => opts.openmp = true,
+            "-fno-openmp" => opts.openmp = false,
+            "-fopenmp-simd" => opts.openmp_simd = true,
             "-fno-stack-arrays" => opts.no_stack_arrays_compat = true,
             "-fPIC" | "-fpic" | "-fPIE" | "-fpie" | "-fno-omit-frame-pointer" => {}
             "-fpreprocessed" | "-nocpp" => {}
@@ -1220,6 +1242,17 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
         opts.cli_warnings
             .push("-frecursive is recognized but not yet implemented".into());
     }
+    if opts.openmp {
+        opts.cli_warnings.push(
+            "-fopenmp currently enables OpenMP preprocessing only; executable OpenMP directives are not yet implemented"
+                .into(),
+        );
+    } else if opts.openmp_simd {
+        opts.cli_warnings.push(
+            "-fopenmp-simd is recognized, but OpenMP SIMD directives are not yet implemented"
+                .into(),
+        );
+    }
     if opts.backslash_escapes {
         opts.cli_warnings.push(
             "-fbackslash is recognized but string escape processing is not yet implemented".into(),
@@ -1322,6 +1355,9 @@ LANGUAGE:
   -fdefault-real-8            Make default real kind 8 bytes
   -fimplicit-none             Force implicit none in all scopes
   -frecursive                 Make all procedures recursive by default
+  -fopenmp                    Enable OpenMP preprocessing (execution is not yet implemented)
+  -fno-openmp                 Disable full OpenMP compilation
+  -fopenmp-simd               Enable OpenMP SIMD syntax without the thread runtime
   -fbackslash                 Interpret backslash in strings as escape
   -fmax-stack-var-size=<n>    Stack variable size threshold (bytes)
   -fmax-errors=<n>            GNU-compatible diagnostic limit spelling
@@ -1665,6 +1701,12 @@ fn preproc_config_for_input(
         include_paths: opts.module_search_paths.clone(),
         ..crate::preprocess::PreprocConfig::for_target(&opts.target)
     };
+    if opts.openmp {
+        config.defines.insert(
+            "_OPENMP".into(),
+            crate::preprocess::MacroDef::object(&OPENMP_VERSION.to_string()),
+        );
+    }
     for (name, value) in &opts.preprocessor_defines {
         config
             .defines
@@ -4007,6 +4049,67 @@ mod tests {
         assert_eq!(
             opts.std,
             Some(crate::sema::validate::FortranStandard::F2008)
+        );
+    }
+
+    #[test]
+    fn parse_cli_tracks_full_and_simd_openmp_modes() {
+        let parse = |flags: &[&str]| {
+            let mut args = flags
+                .iter()
+                .map(|flag| (*flag).to_string())
+                .collect::<Vec<_>>();
+            args.push("hello.f90".to_string());
+            let ParsedCli::Compile(opts) =
+                parse_cli(&args).expect("OpenMP compilation mode should parse")
+            else {
+                panic!("expected compile options");
+            };
+            opts
+        };
+
+        let full = parse(&["-fopenmp"]);
+        assert!(full.openmp);
+        assert!(!full.openmp_simd);
+        assert!(full.openmp_simd_enabled());
+
+        let simd = parse(&["-fopenmp-simd"]);
+        assert!(!simd.openmp);
+        assert!(simd.openmp_simd);
+        assert!(simd.openmp_simd_enabled());
+
+        let disabled = parse(&["-fopenmp", "-fno-openmp"]);
+        assert!(!disabled.openmp);
+        assert!(!disabled.openmp_simd_enabled());
+
+        let explicit_simd = parse(&["-fopenmp-simd", "-fopenmp", "-fno-openmp"]);
+        assert!(!explicit_simd.openmp);
+        assert!(explicit_simd.openmp_simd_enabled());
+    }
+
+    #[test]
+    fn full_openmp_predefines_openmp_language_version() {
+        let full = Options {
+            openmp: true,
+            ..Options::default()
+        };
+        let config = preproc_config_for_input(&full, Path::new("input.F90"), SourceForm::FreeForm);
+        assert_eq!(
+            config
+                .defines
+                .get("_OPENMP")
+                .map(|definition| definition.body.as_str()),
+            Some("202111")
+        );
+
+        let simd = Options {
+            openmp_simd: true,
+            ..Options::default()
+        };
+        let config = preproc_config_for_input(&simd, Path::new("input.F90"), SourceForm::FreeForm);
+        assert!(
+            !config.defines.contains_key("_OPENMP"),
+            "the SIMD-only mode must not advertise full OpenMP"
         );
     }
 
