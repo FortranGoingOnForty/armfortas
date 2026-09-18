@@ -21010,6 +21010,67 @@ fn fopenmp_rejects_execution_before_ir_lowering() {
 }
 
 #[test]
+fn omp_lib_initial_runtime_surface_runs_in_serial_context() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=omp_lib_initial_runtime_surface_runs_in_serial_context count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  use, intrinsic :: omp_lib, only: openmp_version, omp_lock_kind, omp_sched_dynamic, &\n    omp_get_thread_num, omp_get_num_threads, omp_get_max_threads, omp_in_parallel, &\n    omp_set_num_threads, omp_get_wtime, omp_get_wtick\n  implicit none\n  integer(omp_lock_kind) :: lock_storage\n  real(8) :: before, after\n  lock_storage = 0_omp_lock_kind\n  if (openmp_version /= 202111) error stop 1\n  if (omp_sched_dynamic /= 2) error stop 2\n  if (kind(lock_storage) /= 8) error stop 3\n  if (omp_get_thread_num() /= 0) error stop 4\n  if (omp_get_num_threads() /= 1) error stop 5\n  if (omp_in_parallel()) error stop 6\n  call omp_set_num_threads(num_threads=3)\n  if (omp_get_max_threads() /= 3) error stop 7\n  before = omp_get_wtime()\n  after = omp_get_wtime()\n  if (before < 0.0_8 .or. after < before) error stop 8\n  if (omp_get_wtick() <= 0.0_8) error stop 9\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("omp_lib_initial", "bin");
+    let runtime_cache = unique_dir("omp_lib_runtime_cache");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            "-fopenmp",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("AFS_RUNTIME_CACHE", &runtime_cache)
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "initial omp_lib surface should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "initial omp_lib surface failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_dir_all(&runtime_cache);
+}
+
+#[test]
+fn omp_lib_procedures_enforce_function_subroutine_forms() {
+    let src = write_program(
+        "program p\n  use omp_lib, only: omp_get_thread_num, omp_set_num_threads\n  implicit none\n  call omp_get_thread_num()\n  print *, omp_set_num_threads(2)\n  call omp_set_num_threads(2.0)\nend program\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-fopenmp"]);
+    assert!(!result.status.success(), "invalid omp_lib calls compiled");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("'omp_get_thread_num' is a function")
+            && stderr.contains("'omp_set_num_threads' is a subroutine")
+            && stderr.contains("NUM_THREADS must be INTEGER"),
+        "unexpected diagnostics: {stderr}"
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn dash_capital_d_prescans_macro_argument_before_stringification() {
     let src = write_program(
         "#define STRINGIFY_(X) #X\n\

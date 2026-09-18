@@ -2343,6 +2343,7 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             validate_const_int_expr_tree(ctx, callee);
             if let Expr::Name { name } = &callee.node {
                 check_intrinsic_call_arity(ctx, stmt.span, name, args.len(), true);
+                check_intrinsic_call_types(ctx, stmt.span, name, args);
             }
             let saved = ctx.in_call_arg;
             ctx.in_call_arg = true;
@@ -6631,7 +6632,17 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                         | SymbolKind::NamedInterface
                 ) && !symbol.attrs.intrinsic
             });
-            if is_intrinsic_name(name) && !user_callable {
+            let intrinsic_name = is_intrinsic_name(name)
+                .then(|| name.to_ascii_lowercase())
+                .or_else(|| {
+                    symbol
+                        .filter(|symbol| matches!(symbol.kind, SymbolKind::IntrinsicProc))
+                        .map(|symbol| symbol.name.to_ascii_lowercase())
+                        .filter(|canonical| {
+                            crate::sema::intrinsic_modules::is_openmp_runtime_procedure(canonical)
+                        })
+                });
+            if let Some(intrinsic_name) = intrinsic_name.filter(|_| !user_callable) {
                 let arg_types: Option<Vec<_>> = args
                     .iter()
                     .map(|arg| match &arg.value {
@@ -6641,7 +6652,7 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                     })
                     .collect();
                 if let Some(arg_types) = arg_types {
-                    let key = name.to_ascii_lowercase();
+                    let key = intrinsic_name;
                     let kind_position = crate::sema::types::character_integer_result_kind_position(
                         &key,
                     )
@@ -6675,7 +6686,7 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                         };
                         return Some(type_info);
                     }
-                    if let Some(type_) = intrinsic_result_type(name, &arg_types) {
+                    if let Some(type_) = intrinsic_result_type(&key, &arg_types) {
                         return fortran_type_to_validation_type_info(type_);
                     }
                 }
@@ -7679,6 +7690,12 @@ fn intrinsic_result_rank_is_scalar(name: &str) -> bool {
             | "maxexponent"
             | "minexponent"
             | "new_line"
+            | "omp_get_max_threads"
+            | "omp_get_num_threads"
+            | "omp_get_thread_num"
+            | "omp_get_wtick"
+            | "omp_get_wtime"
+            | "omp_in_parallel"
             | "precision"
             | "present"
             | "radix"
@@ -7861,8 +7878,19 @@ fn validation_expr_rank(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<usize> {
                         | SymbolKind::ProcedurePointer
                         | SymbolKind::NamedInterface
                 ) && !symbol.attrs.intrinsic;
-                if is_intrinsic_name(name) && !user_callable {
-                    if let Some(rank) = intrinsic_call_result_rank(ctx, name, args) {
+                let intrinsic_name = is_intrinsic_name(name)
+                    .then(|| name.to_ascii_lowercase())
+                    .or_else(|| {
+                        matches!(symbol.kind, SymbolKind::IntrinsicProc)
+                            .then(|| symbol.name.to_ascii_lowercase())
+                            .filter(|canonical| {
+                                crate::sema::intrinsic_modules::is_openmp_runtime_procedure(
+                                    canonical,
+                                )
+                            })
+                    });
+                if let Some(intrinsic_name) = intrinsic_name.filter(|_| !user_callable) {
+                    if let Some(rank) = intrinsic_call_result_rank(ctx, &intrinsic_name, args) {
                         return Some(rank);
                     }
                 }
@@ -11041,7 +11069,16 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         "execute_command_line" => (1, Some(5)),
         "get_command_argument" => (1, Some(5)),
         "get_environment_variable" => (1, Some(6)),
-        "command_argument_count" | "compiler_version" | "compiler_options" => (0, Some(0)),
+        "command_argument_count"
+        | "compiler_version"
+        | "compiler_options"
+        | "omp_get_thread_num"
+        | "omp_get_num_threads"
+        | "omp_get_max_threads"
+        | "omp_in_parallel"
+        | "omp_get_wtime"
+        | "omp_get_wtick" => (0, Some(0)),
+        "omp_set_num_threads" => (1, Some(1)),
         "split" => (3, Some(4)),
         "c_f_pointer" => (2, Some(4)),
         "c_associated" => (1, Some(2)),
@@ -11071,6 +11108,7 @@ fn intrinsic_is_subroutine(name: &str) -> bool {
             | "tokenize"
             | "c_f_pointer"
             | "c_f_strpointer"
+            | "omp_set_num_threads"
     )
 }
 
@@ -11379,7 +11417,9 @@ pub(super) fn resolved_intrinsic_name(ctx: &Ctx<'_>, name: &str) -> Option<Strin
             && (symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc))
         {
             let canonical = symbol.name.to_ascii_lowercase();
-            return is_intrinsic_name(&canonical).then_some(canonical);
+            return (is_intrinsic_name(&canonical)
+                || crate::sema::intrinsic_modules::is_openmp_runtime_procedure(&canonical))
+            .then_some(canonical);
         }
         return None;
     }
@@ -11517,6 +11557,18 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
                 );
                 require_intrinsic_scalar_argument(ctx, span, &key, args, position, formal);
             }
+        }
+        "omp_set_num_threads" => {
+            require_intrinsic_argument_type(
+                ctx,
+                span,
+                &key,
+                args,
+                0,
+                "num_threads",
+                IntrinsicArgumentType::Integer,
+            );
+            require_intrinsic_scalar_argument(ctx, span, &key, args, 0, "num_threads");
         }
         _ => {}
     }

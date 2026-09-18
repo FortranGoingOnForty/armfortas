@@ -11,6 +11,21 @@ const ISO_C_BINDING: &str = "iso_c_binding";
 const ISO_FORTRAN_ENV: &str = "iso_fortran_env";
 const IEEE_MODULES: [&str; 3] = ["ieee_arithmetic", "ieee_exceptions", "ieee_features"];
 const OMP_MODULES: [&str; 2] = ["omp_lib", "omp_lib_kinds"];
+const OMP_RUNTIME_PROCEDURES: [&str; 7] = [
+    "omp_get_thread_num",
+    "omp_get_num_threads",
+    "omp_get_max_threads",
+    "omp_in_parallel",
+    "omp_set_num_threads",
+    "omp_get_wtime",
+    "omp_get_wtick",
+];
+
+pub(crate) fn is_openmp_runtime_procedure(name: &str) -> bool {
+    OMP_RUNTIME_PROCEDURES
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
 
 pub fn is_intrinsic_module(name: &str) -> bool {
     name.eq_ignore_ascii_case(ISO_C_BINDING)
@@ -449,15 +464,7 @@ fn register_openmp_modules(st: &mut SymbolTable) {
                 TypeInfo::Integer { kind: Some(4) },
                 Some(202111),
             );
-            for name in [
-                "omp_get_thread_num",
-                "omp_get_num_threads",
-                "omp_get_max_threads",
-                "omp_in_parallel",
-                "omp_set_num_threads",
-                "omp_get_wtime",
-                "omp_get_wtick",
-            ] {
+            for name in OMP_RUNTIME_PROCEDURES {
                 insert_proc(st, m, name);
             }
         }

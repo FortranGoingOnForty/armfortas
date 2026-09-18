@@ -19963,6 +19963,7 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "execute_command_line" => Some(&["command", "wait", "exitstat", "cmdstat", "cmdmsg"]),
         "c_f_pointer" => Some(&["cptr", "fptr", "shape", "lower"]),
         "c_f_strpointer" => Some(&["cstrarray", "fstrptr", "nchars"]),
+        "omp_set_num_threads" => Some(&["num_threads"]),
         "cmplx" => Some(&["x", "y", "kind"]),
         "dcmplx" => Some(&["x", "y"]),
         "reshape" => Some(&["source", "shape", "pad", "order"]),
