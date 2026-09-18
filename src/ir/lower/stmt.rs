@@ -11475,6 +11475,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             }
         }
 
+        Stmt::OpenMp(construct) => unreachable!(
+            "OpenMP {} reached IR lowering before executable support",
+            construct.name()
+        ),
+
         _ => {} // remaining statements (FORALL, WHERE, etc.) deferred
     }
 }

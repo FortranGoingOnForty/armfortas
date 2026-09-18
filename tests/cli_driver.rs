@@ -20950,6 +20950,66 @@ fn fopenmp_simd_activates_conditional_source_without_defining_openmp() {
 }
 
 #[test]
+fn fopenmp_models_supported_constructs_in_ast_dump() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: i, n\n  logical :: any_match, has_error\n  n = 4\n  any_match = .false.\n  has_error = .false.\n!$omp parallel do default(shared) private(i) &\n!$omp& reduction(.or.:any_match,has_error) schedule(dynamic)\n  do i = 1, n\n    any_match = .true.\n  end do\n!$omp end parallel do nowait\nend program\n",
+        "f90",
+    );
+    let out = unique_path("openmp_ast", "ast");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-fopenmp",
+            "--emit-ast",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "OpenMP AST dump failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let ast = std::fs::read_to_string(&out).expect("missing OpenMP AST dump");
+    for expected in ["ParallelDo", "Default(", "Reduction", "Dynamic", "Nowait"] {
+        assert!(ast.contains(expected), "missing {expected} in AST:\n{ast}");
+    }
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_rejects_execution_before_ir_lowering() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: i\n!$omp parallel do\n  do i = 1, 4\n  end do\n!$omp end parallel do\nend program\n",
+        "f90",
+    );
+    let out = unique_path("openmp_unsupported", "s");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-fopenmp",
+            "-S",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "OpenMP execution compiled silently"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("OpenMP PARALLEL DO execution is recognized but not yet implemented"),
+        "unexpected diagnostic: {stderr}"
+    );
+    assert!(!out.exists(), "unsupported OpenMP left an assembly output");
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn dash_capital_d_prescans_macro_argument_before_stringification() {
     let src = write_program(
         "#define STRINGIFY_(X) #X\n\

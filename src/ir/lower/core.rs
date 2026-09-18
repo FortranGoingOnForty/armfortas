@@ -4453,6 +4453,24 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
                 collect_name_refs_expr(e, out);
             }
         }
+        Stmt::OpenMp(construct) => {
+            for clause in construct.clauses() {
+                if let Some(names) = clause.listed_variables() {
+                    out.extend(names.iter().cloned());
+                }
+                if let Some(expr) = clause.expression() {
+                    collect_name_refs_expr(expr, out);
+                }
+            }
+            if let Some(body) = construct.region_body() {
+                for stmt in body {
+                    collect_name_refs_stmt(stmt, out);
+                }
+            }
+            if let Some(loop_stmt) = construct.loop_stmt() {
+                collect_name_refs_stmt(loop_stmt, out);
+            }
+        }
         Stmt::Declaration(decl) => collect_name_refs_decls(std::slice::from_ref(decl), out),
         Stmt::Return { value: None }
         | Stmt::Exit { .. }
@@ -8456,6 +8474,27 @@ pub(super) fn check_filtered_in_stmt(
             check_filtered_in_expr(callee, filtered);
             for a in args {
                 check_filtered_in_subscript(&a.value, filtered);
+            }
+        }
+        Stmt::OpenMp(construct) => {
+            for clause in construct.clauses() {
+                if let Some(names) = clause.listed_variables() {
+                    for name in names {
+                        check_filtered_in_expr(
+                            &crate::ast::Spanned::new(Expr::Name { name: name.clone() }, stmt.span),
+                            filtered,
+                        );
+                    }
+                }
+                if let Some(expr) = clause.expression() {
+                    check_filtered_in_expr(expr, filtered);
+                }
+            }
+            if let Some(body) = construct.region_body() {
+                check_no_filtered_refs(body, filtered);
+            }
+            if let Some(loop_stmt) = construct.loop_stmt() {
+                check_filtered_in_stmt(loop_stmt, filtered);
             }
         }
         Stmt::Namelist { .. } => {}

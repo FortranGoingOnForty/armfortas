@@ -2356,6 +2356,13 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                 validate_io_item_expr_tree(ctx, item);
             }
         }
+        Stmt::OpenMp(construct) => {
+            for clause in construct.clauses() {
+                if let Some(expr) = clause.expression() {
+                    validate_const_int_expr_tree(ctx, expr);
+                }
+            }
+        }
         Stmt::Block { .. }
         | Stmt::Declaration(_)
         | Stmt::Exit { .. }
@@ -3360,6 +3367,30 @@ fn collect_reference_stmt(
                 for name in names {
                     collect_name_reference(name, stmt.span, ReferenceRole::Value, shadowed, facts);
                 }
+            }
+        }
+        Stmt::OpenMp(construct) => {
+            for clause in construct.clauses() {
+                if let Some(names) = clause.listed_variables() {
+                    for name in names {
+                        collect_name_reference(
+                            name,
+                            stmt.span,
+                            ReferenceRole::Value,
+                            shadowed,
+                            facts,
+                        );
+                    }
+                }
+                if let Some(expr) = clause.expression() {
+                    collect_reference_expr(expr, shadowed, facts);
+                }
+            }
+            if let Some(body) = construct.region_body() {
+                collect_reference_stmts(body, shadowed, facts);
+            }
+            if let Some(loop_stmt) = construct.loop_stmt() {
+                collect_reference_stmt(loop_stmt, shadowed, facts);
             }
         }
         Stmt::Declaration(decl) => collect_reference_decl(decl, shadowed, facts),
@@ -5978,6 +6009,22 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         Stmt::Associate { assocs, body, .. } => {
             ctx.require_std(stmt.span, FortranStandard::F2003, "ASSOCIATE construct");
             validate_associate(ctx, assocs, body, stmt.span);
+        }
+
+        Stmt::OpenMp(construct) => {
+            ctx.error(
+                stmt.span,
+                format!(
+                    "OpenMP {} execution is recognized but not yet implemented",
+                    construct.name()
+                ),
+            );
+            if let Some(body) = construct.region_body() {
+                validate_stmts(ctx, body);
+            }
+            if let Some(loop_stmt) = construct.loop_stmt() {
+                validate_stmt(ctx, loop_stmt);
+            }
         }
 
         // Call in pure: callee must be pure (we check if it's known impure).
