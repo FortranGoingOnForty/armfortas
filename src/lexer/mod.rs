@@ -94,6 +94,9 @@ pub enum TokenKind {
     // ---- Special ----
     Newline,
     Comment,
+    /// An enabled OpenMP directive, with the sentinel and continuation
+    /// markers removed from `Token::text`.
+    OmpDirective,
     Eof,
 }
 
@@ -135,6 +138,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Ampersand => write!(f, "&"),
             TokenKind::Newline => write!(f, "newline"),
             TokenKind::Comment => write!(f, "comment"),
+            TokenKind::OmpDirective => write!(f, "OpenMP directive"),
             TokenKind::Eof => write!(f, "end of file"),
         }
     }
@@ -441,6 +445,13 @@ pub enum SourceForm {
     FixedForm,
 }
 
+/// Language extensions that affect lexical interpretation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LexerOptions {
+    /// Recognize OpenMP directive and conditional-compilation sentinels.
+    pub openmp: bool,
+}
+
 /// Detect source form from filename extension.
 pub fn detect_source_form(filename: &str) -> SourceForm {
     let ext = Path::new(filename)
@@ -458,10 +469,20 @@ pub fn detect_source_form(filename: &str) -> SourceForm {
 
 /// Tokenize Fortran source, automatically selecting the appropriate lexer.
 pub fn tokenize(src: &str, file_id: u32, form: SourceForm) -> Result<Vec<Token>, LexError> {
+    tokenize_with_options(src, file_id, form, LexerOptions::default())
+}
+
+/// Tokenize Fortran source with explicitly enabled language extensions.
+pub fn tokenize_with_options(
+    src: &str,
+    file_id: u32,
+    form: SourceForm,
+    options: LexerOptions,
+) -> Result<Vec<Token>, LexError> {
     let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     match form {
-        SourceForm::FreeForm => Lexer::tokenize(src, file_id),
-        SourceForm::FixedForm => fixed::tokenize_fixed(src, file_id),
+        SourceForm::FreeForm => Lexer::tokenize_with_options(src, file_id, options),
+        SourceForm::FixedForm => fixed::tokenize_fixed_with_options(src, file_id, options),
     }
 }
 
@@ -470,10 +491,21 @@ pub(crate) fn tokenize_source_view(
     file_id: u32,
     form: SourceForm,
 ) -> Result<Vec<Token>, LexError> {
+    tokenize_source_view_with_options(src, file_id, form, LexerOptions::default())
+}
+
+pub(crate) fn tokenize_source_view_with_options(
+    src: &str,
+    file_id: u32,
+    form: SourceForm,
+    options: LexerOptions,
+) -> Result<Vec<Token>, LexError> {
     let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     let result = match form {
-        SourceForm::FreeForm => Lexer::tokenize(src, file_id),
-        SourceForm::FixedForm => fixed::tokenize_fixed_source_view(src, file_id),
+        SourceForm::FreeForm => Lexer::tokenize_with_options(src, file_id, options),
+        SourceForm::FixedForm => {
+            fixed::tokenize_fixed_source_view_with_options(src, file_id, options)
+        }
     };
     result.map_err(|error| display_source_view_error(src, error))
 }
@@ -516,22 +548,36 @@ pub struct Lexer<'a> {
     line: u32,
     col: u32,
     file_id: u32,
+    options: LexerOptions,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str, file_id: u32) -> Self {
+        Self::new_with_options(src, file_id, LexerOptions::default())
+    }
+
+    pub fn new_with_options(src: &'a str, file_id: u32, options: LexerOptions) -> Self {
         Self {
             src,
             pos: 0,
             line: 1,
             col: 1,
             file_id,
+            options,
         }
     }
 
     /// Tokenize the entire source into a Vec.
     pub fn tokenize(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
-        let mut lexer = Lexer::new(src, file_id);
+        Self::tokenize_with_options(src, file_id, LexerOptions::default())
+    }
+
+    pub fn tokenize_with_options(
+        src: &str,
+        file_id: u32,
+        options: LexerOptions,
+    ) -> Result<Vec<Token>, LexError> {
+        let mut lexer = Lexer::new_with_options(src, file_id, options);
         let mut tokens = Vec::new();
         loop {
             let tok = lexer.next_token()?;
@@ -613,6 +659,140 @@ impl<'a> Lexer<'a> {
         self.pos >= self.src.len()
     }
 
+    fn at_physical_line_start(&self) -> bool {
+        self.src.as_bytes()[..self.pos]
+            .iter()
+            .rev()
+            .take_while(|&&byte| byte != b'\n')
+            .all(|&byte| matches!(byte, b' ' | b'\t' | b'\r'))
+    }
+
+    fn starts_with_ascii_case(&self, expected: &[u8]) -> bool {
+        self.src
+            .as_bytes()
+            .get(self.pos..self.pos + expected.len())
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+    }
+
+    fn at_openmp_directive_sentinel(&self) -> bool {
+        if !self.options.openmp
+            || !self.starts_with_ascii_case(b"!$omp")
+            || !self.at_physical_line_start()
+        {
+            return false;
+        }
+        matches!(
+            self.src.as_bytes().get(self.pos + 5).copied(),
+            None | Some(b' ' | b'\t' | b'\r' | b'\n' | b'&')
+        )
+    }
+
+    fn at_openmp_conditional_sentinel(&self) -> bool {
+        if !self.options.openmp
+            || self.src.as_bytes().get(self.pos..self.pos + 2) != Some(b"!$")
+            || !self.at_physical_line_start()
+            || self.at_openmp_directive_sentinel()
+        {
+            return false;
+        }
+        matches!(
+            self.src.as_bytes().get(self.pos + 2).copied(),
+            None | Some(b' ' | b'\t' | b'\r' | b'\n' | b'&')
+        )
+    }
+
+    fn consume_openmp_conditional_sentinel(&mut self) {
+        self.advance();
+        self.advance();
+    }
+
+    fn lex_openmp_directive(&mut self, start: Position) -> Result<Token, LexError> {
+        let mut text = String::new();
+        let mut continuation_line = false;
+
+        loop {
+            debug_assert!(self.at_openmp_directive_sentinel());
+            for _ in 0..5 {
+                self.advance();
+            }
+            self.skip_spaces();
+            if continuation_line && self.peek() == b'&' {
+                self.advance();
+                self.skip_spaces();
+            }
+
+            let piece_start = self.pos;
+            let mut cursor = self.pos;
+            let mut quote = None;
+            let mut comment_start = None;
+            while let Some(&byte) = self.src.as_bytes().get(cursor) {
+                if byte == b'\n' {
+                    break;
+                }
+                match quote {
+                    Some(delimiter) if byte == delimiter => {
+                        if self.src.as_bytes().get(cursor + 1) == Some(&delimiter) {
+                            cursor += 2;
+                            continue;
+                        }
+                        quote = None;
+                    }
+                    Some(_) => {}
+                    None if matches!(byte, b'\'' | b'"') => quote = Some(byte),
+                    None if byte == b'!' => {
+                        comment_start = Some(cursor);
+                        break;
+                    }
+                    None => {}
+                }
+                cursor += 1;
+            }
+
+            let content_end = comment_start.unwrap_or(cursor);
+            let raw_piece = &self.src[piece_start..content_end];
+            let trimmed = raw_piece.trim_end_matches([' ', '\t', '\r']);
+            let (piece, continued) = if let Some(piece) = trimmed.strip_suffix('&') {
+                (piece.trim_end_matches([' ', '\t', '\r']), true)
+            } else {
+                (trimmed, false)
+            };
+            if !piece.is_empty() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(piece);
+            }
+
+            while !self.at_end() && self.peek() != b'\n' {
+                self.advance_utf8_char();
+            }
+            if !continued {
+                break;
+            }
+            if self.at_end() {
+                return Err(self.err(
+                    start,
+                    "OpenMP directive continuation reaches end of file".into(),
+                ));
+            }
+            self.advance();
+            self.skip_spaces();
+            if !self.at_openmp_directive_sentinel() {
+                return Err(self.err(
+                    start,
+                    "expected !$omp sentinel on continued OpenMP directive".into(),
+                ));
+            }
+            continuation_line = true;
+        }
+
+        Ok(Token {
+            kind: TokenKind::OmpDirective,
+            text,
+            span: self.span_from(start),
+        })
+    }
+
     fn skip_spaces(&mut self) {
         while self.pos < self.src.len() && matches!(self.peek(), b' ' | b'\t' | b'\r') {
             self.advance();
@@ -674,6 +854,13 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 continue;
             }
+            if self.at_openmp_directive_sentinel() {
+                break;
+            }
+            if self.at_openmp_conditional_sentinel() {
+                self.consume_openmp_conditional_sentinel();
+                break;
+            }
             if self.peek() == b'!' {
                 // Comment-only line — skip to end.
                 while !self.at_end() && self.peek() != b'\n' {
@@ -718,6 +905,14 @@ impl<'a> Lexer<'a> {
         }
 
         let ch = self.peek();
+
+        if self.at_openmp_directive_sentinel() {
+            return self.lex_openmp_directive(start);
+        }
+        if self.at_openmp_conditional_sentinel() {
+            self.consume_openmp_conditional_sentinel();
+            return self.next_token();
+        }
 
         // Newline (statement terminator).
         if ch == b'\n' {
@@ -1187,6 +1382,10 @@ mod tests {
         Lexer::tokenize(src, 0).unwrap()
     }
 
+    fn openmp_toks(src: &str) -> Vec<Token> {
+        Lexer::tokenize_with_options(src, 0, LexerOptions { openmp: true }).unwrap()
+    }
+
     fn kinds(src: &str) -> Vec<TokenKind> {
         toks(src)
             .into_iter()
@@ -1545,6 +1744,67 @@ mod tests {
         let toks = toks("! café λ\n");
         assert_eq!(toks[0].kind, TokenKind::Comment);
         assert_eq!(toks[0].text, "! café λ");
+    }
+
+    #[test]
+    fn openmp_directive_requires_enabled_mode_and_physical_line_start() {
+        let disabled = toks("  !$omp parallel\n");
+        assert_eq!(disabled[0].kind, TokenKind::Comment);
+
+        let enabled = openmp_toks("  !$OmP parallel\n");
+        assert_eq!(enabled[0].kind, TokenKind::OmpDirective);
+        assert_eq!(enabled[0].text, "parallel");
+        assert_eq!(enabled[0].span.start, Position { line: 1, col: 3 });
+
+        let inline = openmp_toks("x = 1 !$omp parallel\n");
+        assert_eq!(inline[3].kind, TokenKind::Comment);
+    }
+
+    #[test]
+    fn openmp_directive_continuation_is_one_spanned_token() {
+        let tokens = openmp_toks(
+            "  !$omp parallel do & ! first line comment\n  !$omp& private(i)\ninteger :: x\n",
+        );
+        let directive = &tokens[0];
+        assert_eq!(directive.kind, TokenKind::OmpDirective);
+        assert_eq!(directive.text, "parallel do private(i)");
+        assert_eq!(directive.span.start, Position { line: 1, col: 3 });
+        assert_eq!(directive.span.end.line, 2);
+        assert_eq!(tokens[1].kind, TokenKind::Newline);
+        assert_eq!(tokens[2].text.to_ascii_lowercase(), "integer");
+    }
+
+    #[test]
+    fn openmp_conditional_sentinel_activates_fortran_source() {
+        let disabled = toks("  !$ integer :: x\n");
+        assert_eq!(disabled[0].kind, TokenKind::Comment);
+
+        let enabled = openmp_toks("  !$ integer :: x\n");
+        assert_eq!(enabled[0].kind, TokenKind::Identifier);
+        assert_eq!(enabled[0].text.to_ascii_lowercase(), "integer");
+        assert_eq!(enabled[0].span.start, Position { line: 1, col: 6 });
+    }
+
+    #[test]
+    fn openmp_conditional_sentinel_survives_free_form_continuation() {
+        let tokens = openmp_toks("!$ x = 1 + &\n!$& 2\n");
+        let texts = tokens
+            .iter()
+            .filter(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Eof))
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["x", "=", "1", "+", "2"]);
+    }
+
+    #[test]
+    fn openmp_directive_continuation_requires_a_repeated_sentinel() {
+        let error = Lexer::tokenize_with_options(
+            "!$omp parallel &\n  private(i)\n",
+            0,
+            LexerOptions { openmp: true },
+        )
+        .expect_err("a continued directive without a sentinel must fail");
+        assert!(error.msg.contains("expected !$omp sentinel"), "{error}");
     }
 
     // ---- Newlines ----

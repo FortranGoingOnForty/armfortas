@@ -20890,6 +20890,66 @@ fn dash_capital_d_defines_preprocessor_macro() {
 }
 
 #[test]
+fn fopenmp_preserves_directives_through_the_driver_lexer() {
+    let src = write_program(
+        "program p\n  !$omp parallel do &\n  !$omp& private(i)\n  do i = 1, 4\n  end do\nend program\n",
+        "f90",
+    );
+    let out = unique_path("openmp_tokens", "tokens");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-fopenmp",
+            "--emit-tokens",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "OpenMP token dump failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let tokens = std::fs::read_to_string(&out).expect("missing OpenMP token dump");
+    assert!(tokens.contains("OmpDirective"), "{tokens}");
+    assert!(tokens.contains("parallel do private(i)"), "{tokens}");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_simd_activates_conditional_source_without_defining_openmp() {
+    let src = write_program(
+        "#ifdef _OPENMP\nthis_must_not_be_active\n#endif\nprogram p\n  implicit none\n!$ integer :: x\n!$ x = 42\n  if (x /= 42) error stop\nend program\n",
+        "F90",
+    );
+    let out = unique_path("openmp_simd_ast", "ast");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-fopenmp-simd",
+            "--emit-ast",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "OpenMP SIMD conditional source failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let ast = std::fs::read_to_string(&out).expect("missing conditional-source AST");
+    assert!(
+        ast.contains("x"),
+        "conditional declaration was not parsed: {ast}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn dash_capital_d_prescans_macro_argument_before_stringification() {
     let src = write_program(
         "#define STRINGIFY_(X) #X\n\

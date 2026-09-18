@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ir::inst::{InstKind, Module, RuntimeFunc};
 use crate::ir::{lower, printer as ir_printer, verify};
-use crate::lexer::{detect_source_form, tokenize_source_view, SourceForm, Span};
+use crate::lexer::{
+    detect_source_form, tokenize_source_view_with_options, LexerOptions, SourceForm, Span,
+};
 use crate::parser::Parser;
 use crate::runtime::artifact::{
     find_source_workspace_from, fresh_runtime_lib, materialize_bundled_runtime,
@@ -2168,7 +2170,14 @@ fn compile_with_bundled_runtime_inner(
 
     // 3. Lex.
     let phase = phases.start("lex");
-    let tokens = match tokenize_source_view(preprocessed, 0, source_form) {
+    let tokens = match tokenize_source_view_with_options(
+        preprocessed,
+        0,
+        source_form,
+        LexerOptions {
+            openmp: opts.openmp_simd_enabled(),
+        },
+    ) {
         Ok(tokens) => tokens,
         Err(e) => {
             phase.end(&mut phases);
