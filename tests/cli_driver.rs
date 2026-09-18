@@ -21019,7 +21019,7 @@ fn omp_lib_initial_runtime_surface_runs_in_serial_context() {
         return;
     }
     let src = write_program(
-        "program p\n  use, intrinsic :: omp_lib, only: openmp_version, omp_lock_kind, omp_sched_dynamic, &\n    omp_get_thread_num, omp_get_num_threads, omp_get_max_threads, omp_in_parallel, &\n    omp_set_num_threads, omp_get_wtime, omp_get_wtick\n  implicit none\n  integer(omp_lock_kind) :: lock_storage\n  real(8) :: before, after\n  lock_storage = 0_omp_lock_kind\n  if (openmp_version /= 202111) error stop 1\n  if (omp_sched_dynamic /= 2) error stop 2\n  if (kind(lock_storage) /= 8) error stop 3\n  if (omp_get_thread_num() /= 0) error stop 4\n  if (omp_get_num_threads() /= 1) error stop 5\n  if (omp_in_parallel()) error stop 6\n  call omp_set_num_threads(num_threads=3)\n  if (omp_get_max_threads() /= 3) error stop 7\n  before = omp_get_wtime()\n  after = omp_get_wtime()\n  if (before < 0.0_8 .or. after < before) error stop 8\n  if (omp_get_wtick() <= 0.0_8) error stop 9\n  print *, 'ok'\nend program\n",
+        "program p\n  use, intrinsic :: omp_lib, only: openmp_version, omp_lock_kind, omp_sched_dynamic, &\n    omp_get_thread_num, omp_get_num_threads, omp_get_max_threads, omp_in_parallel, &\n    omp_set_num_threads, omp_get_wtime, omp_get_wtick\n  implicit none\n  integer(omp_lock_kind) :: lock_storage\n  real(8) :: before, after\n  lock_storage = 0_omp_lock_kind\n  if (openmp_version /= 202111) error stop 1\n  if (omp_sched_dynamic /= 2) error stop 2\n  if (kind(lock_storage) /= 8) error stop 3\n  if (omp_get_thread_num() /= 0) error stop 4\n  if (omp_get_num_threads() /= 1) error stop 5\n  if (omp_in_parallel()) error stop 6\n  if (omp_get_max_threads() /= 5) error stop 7\n  call omp_set_num_threads(num_threads=3)\n  if (omp_get_max_threads() /= 3) error stop 8\n  before = omp_get_wtime()\n  after = omp_get_wtime()\n  if (before < 0.0_8 .or. after < before) error stop 9\n  if (omp_get_wtick() <= 0.0_8) error stop 10\n  print *, 'ok'\nend program\n",
         "f90",
     );
     let out = unique_path("omp_lib_initial", "bin");
@@ -21039,7 +21039,10 @@ fn omp_lib_initial_runtime_surface_runs_in_serial_context() {
         "initial omp_lib surface should compile: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("failed to run binary");
+    let run = Command::new(&out)
+        .env("OMP_NUM_THREADS", "5")
+        .output()
+        .expect("failed to run binary");
     assert!(
         run.status.success(),
         "initial omp_lib surface failed:\nstdout:\n{}\nstderr:\n{}",
