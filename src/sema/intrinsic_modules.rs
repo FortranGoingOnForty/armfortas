@@ -10,11 +10,15 @@ use crate::lexer::Span;
 const ISO_C_BINDING: &str = "iso_c_binding";
 const ISO_FORTRAN_ENV: &str = "iso_fortran_env";
 const IEEE_MODULES: [&str; 3] = ["ieee_arithmetic", "ieee_exceptions", "ieee_features"];
+const OMP_MODULES: [&str; 2] = ["omp_lib", "omp_lib_kinds"];
 
 pub fn is_intrinsic_module(name: &str) -> bool {
     name.eq_ignore_ascii_case(ISO_C_BINDING)
         || name.eq_ignore_ascii_case(ISO_FORTRAN_ENV)
         || IEEE_MODULES
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        || OMP_MODULES
             .iter()
             .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
@@ -25,6 +29,7 @@ pub fn register_intrinsic_modules(st: &mut SymbolTable) {
     register_iso_c_binding(st);
     register_iso_fortran_env(st);
     register_ieee_modules(st);
+    register_openmp_modules(st);
 }
 
 fn builtin_span() -> Span {
@@ -420,5 +425,139 @@ fn register_ieee_modules(st: &mut SymbolTable) {
             _ => {}
         }
         st.pop_scope();
+    }
+}
+
+/// Register the OpenMP Fortran modules supplied by the compiler.
+///
+/// `omp_lib` re-exports the kind and named constants from `omp_lib_kinds` in
+/// the source form standardized by OpenMP. Built-in module scopes do not have
+/// an internal USE-association phase, so populate the common constants in both
+/// scopes. Procedure registration is deliberately limited to the runtime API
+/// implemented by `runtime/src/openmp.rs`; unsupported API names must not look
+/// available merely because another OpenMP implementation provides them.
+fn register_openmp_modules(st: &mut SymbolTable) {
+    for module in OMP_MODULES {
+        let m = st.push_intrinsic_module_scope(module);
+        register_openmp_constants(st, m);
+
+        if module == "omp_lib" {
+            insert_param_val(
+                st,
+                m,
+                "openmp_version",
+                TypeInfo::Integer { kind: Some(4) },
+                Some(202111),
+            );
+            for name in [
+                "omp_get_thread_num",
+                "omp_get_num_threads",
+                "omp_get_max_threads",
+                "omp_in_parallel",
+                "omp_set_num_threads",
+                "omp_get_wtime",
+                "omp_get_wtick",
+            ] {
+                insert_proc(st, m, name);
+            }
+        }
+
+        st.pop_scope();
+    }
+}
+
+fn register_openmp_constants(st: &mut SymbolTable, module: ScopeId) {
+    let ik4 = TypeInfo::Integer { kind: Some(4) };
+
+    // OpenMP 5.2 §3.1.1. The values are implementation-defined kind values;
+    // these match ARMFORTAS's LP64 runtime ABI. The 16-byte depend object is
+    // opaque to Fortran source and reserved for a later task-dependence ABI.
+    for (name, value) in [
+        ("omp_lock_kind", 8),
+        ("omp_nest_lock_kind", 8),
+        ("omp_sched_kind", 4),
+        ("omp_proc_bind_kind", 4),
+        ("omp_sync_hint_kind", 4),
+        ("omp_lock_hint_kind", 4),
+        ("omp_pause_resource_kind", 4),
+        ("omp_allocator_handle_kind", 8),
+        ("omp_alloctrait_key_kind", 4),
+        ("omp_alloctrait_val_kind", 8),
+        ("omp_memspace_handle_kind", 8),
+        ("omp_depend_kind", 16),
+        ("omp_event_handle_kind", 8),
+        ("omp_interop_kind", 8),
+        ("omp_interop_fr_kind", 4),
+        ("omp_interop_property_kind", 4),
+        ("omp_interop_rc_kind", 4),
+    ] {
+        insert_param_val(st, module, name, ik4.clone(), Some(value));
+    }
+
+    // Named constants required by the first scheduling and affinity clauses.
+    for (name, value) in [
+        ("omp_sched_static", 1),
+        ("omp_sched_dynamic", 2),
+        ("omp_sched_guided", 3),
+        ("omp_sched_auto", 4),
+        ("omp_proc_bind_false", 0),
+        ("omp_proc_bind_true", 1),
+        ("omp_proc_bind_primary", 2),
+        ("omp_proc_bind_master", 2),
+        ("omp_proc_bind_close", 3),
+        ("omp_proc_bind_spread", 4),
+        ("omp_sync_hint_none", 0),
+        ("omp_lock_hint_none", 0),
+        ("omp_sync_hint_uncontended", 1),
+        ("omp_lock_hint_uncontended", 1),
+        ("omp_sync_hint_contended", 2),
+        ("omp_lock_hint_contended", 2),
+        ("omp_sync_hint_nonspeculative", 4),
+        ("omp_lock_hint_nonspeculative", 4),
+        ("omp_sync_hint_speculative", 8),
+        ("omp_lock_hint_speculative", 8),
+        ("omp_pause_soft", 1),
+        ("omp_pause_hard", 2),
+    ] {
+        insert_param_val(st, module, name, ik4.clone(), Some(value));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_both_openmp_modules_as_intrinsic() {
+        assert!(is_intrinsic_module("OMP_LIB"));
+        assert!(is_intrinsic_module("omp_lib_kinds"));
+    }
+
+    #[test]
+    fn openmp_modules_publish_only_the_implemented_initial_surface() {
+        let mut st = SymbolTable::new();
+        register_intrinsic_modules(&mut st);
+
+        let omp_lib = st
+            .find_intrinsic_module_scope("omp_lib")
+            .expect("omp_lib scope");
+        let symbols = &st.scope(omp_lib).symbols;
+        assert_eq!(symbols["openmp_version"].const_value, Some(202111));
+        assert_eq!(symbols["omp_sched_dynamic"].const_value, Some(2));
+        assert_eq!(symbols["omp_depend_kind"].const_value, Some(16));
+        assert_eq!(
+            symbols["omp_get_thread_num"].kind,
+            SymbolKind::IntrinsicProc
+        );
+        assert!(!symbols.contains_key("omp_init_lock"));
+
+        let kinds = st
+            .find_intrinsic_module_scope("omp_lib_kinds")
+            .expect("omp_lib_kinds scope");
+        assert_eq!(
+            st.scope(kinds).symbols["omp_allocator_handle_kind"].const_value,
+            Some(8)
+        );
+        assert!(!st.scope(kinds).symbols.contains_key("openmp_version"));
     }
 }
