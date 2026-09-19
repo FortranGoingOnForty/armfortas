@@ -21043,7 +21043,7 @@ fn fopenmp_outlines_capture_free_parallel_regions() {
 #[test]
 fn fopenmp_outlined_parallel_emits_x86_64_elf_object() {
     let src = write_program(
-        "program p\n  implicit none\n!$omp parallel num_threads(2)\n  continue\n!$omp end parallel\nend program\n",
+        "program p\n  implicit none\n  integer :: shared_value\n  shared_value = 1\n!$omp parallel if(.false.) shared(shared_value)\n  shared_value = 2\n!$omp end parallel\n  if (shared_value /= 2) error stop 1\nend program\n",
         "f90",
     );
     let out = unique_path("openmp_parallel_x86", "o");
@@ -21063,6 +21063,94 @@ fn fopenmp_outlined_parallel_emits_x86_64_elf_object() {
     assert_eq!(&bytes[..4], b"\x7fELF", "OpenMP output is not ELF");
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_shared_scalar_environment_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_shared_scalar_environment_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  use omp_lib, only: omp_get_thread_num\n  implicit none\n  integer, parameter :: expected = 99\n  integer :: slot0, slot1, slot2, slot3, marker\n  real :: shared_real\n  double precision :: shared_double\n  logical :: shared_logical\n  slot0 = -1\n  slot1 = -1\n  slot2 = -1\n  slot3 = -1\n  marker = 0\n  shared_real = 0.0\n  shared_double = 0.0d0\n  shared_logical = .false.\n!$omp parallel num_threads(4) shared(slot0, slot1, slot2, slot3)\n  select case (omp_get_thread_num())\n  case (0)\n    slot0 = 10\n  case (1)\n    slot1 = 11\n  case (2)\n    slot2 = 12\n  case (3)\n    slot3 = 13\n  end select\n!$omp end parallel\n  if (slot0 /= 10 .or. slot1 /= 11 .or. slot2 /= 12 .or. slot3 /= 13) error stop 1\n!$omp parallel if(.false.) default(shared)\n  marker = expected\n  shared_real = 1.25\n  shared_double = 2.5d0\n  shared_logical = .true.\n!$omp end parallel\n  if (marker /= expected) error stop 2\n  if (shared_real /= 1.25 .or. shared_double /= 2.5d0 .or. .not. shared_logical) error stop 3\n  call set_shared(marker)\n  if (marker /= 123) error stop 4\n  print *, 'ok'\ncontains\n  subroutine set_shared(value)\n    integer, intent(inout) :: value\n!$omp parallel if(.false.) shared(value)\n    value = 123\n!$omp end parallel\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("openmp_shared_scalar", "bin");
+    let runtime_cache = unique_dir("openmp_shared_scalar_runtime_cache");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            "-fopenmp",
+            "-O3",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("AFS_RUNTIME_CACHE", &runtime_cache)
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "OpenMP shared scalar environment should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "OpenMP shared scalar environment failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_dir_all(&runtime_cache);
+}
+
+#[test]
+fn fopenmp_shared_module_scalar_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_shared_module_scalar_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_shared_state\n  implicit none\n  integer :: value = 0\ncontains\n  subroutine set_value()\n!$omp parallel if(.false.)\n    value = 321\n!$omp end parallel\n  end subroutine\nend module\nprogram p\n  use omp_shared_state, only: value, set_value\n  implicit none\n  call set_value()\n  if (value /= 321) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("openmp_shared_module_scalar", "bin");
+    let runtime_cache = unique_dir("openmp_shared_module_scalar_runtime_cache");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            "-fopenmp",
+            "-O3",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("AFS_RUNTIME_CACHE", &runtime_cache)
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "OpenMP shared module scalar should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "OpenMP shared module scalar failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_dir_all(&runtime_cache);
 }
 
 #[test]
@@ -21110,19 +21198,20 @@ fn fopenmp_capture_free_parallel_regions_run() {
 }
 
 #[test]
-fn fopenmp_rejects_parallel_data_capture_until_the_environment_is_implemented() {
+fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let src = write_program(
-        "program p\n  implicit none\n  integer :: x\n  x = 1\n!$omp parallel\n  x = x + 1\n!$omp end parallel\nend program\n",
+        "program p\n  implicit none\n  character(len=3) :: text\n  integer :: values(2)\n  text = 'abc'\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel\n  values(1) = 1\n!$omp end parallel\nend program\n",
         "f90",
     );
     let result = diagnostic_output(&src, &["-fopenmp"]);
     assert!(
         !result.status.success(),
-        "capturing PARALLEL compiled silently"
+        "unsupported shared character capture compiled silently"
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("data reference 'x' requires data-environment capture support"),
+        stderr.contains("shared variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")
+            && stderr.contains("shared array 'values' is recognized but not yet implemented"),
         "unexpected diagnostic: {stderr}"
     );
     let _ = std::fs::remove_file(&src);

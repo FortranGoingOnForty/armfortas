@@ -2568,7 +2568,7 @@ fn find_scope_for_unit(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ReferenceRole {
+pub(crate) enum ReferenceRole {
     Value,
     Callable,
     Type,

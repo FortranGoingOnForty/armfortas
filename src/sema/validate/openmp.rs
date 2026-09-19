@@ -1,22 +1,24 @@
 //! Semantic validation for executable OpenMP constructs.
 //!
-//! The first executable slice is intentionally narrow: a `PARALLEL` region
-//! may contain code that needs no captured Fortran data and may use only the
-//! `IF` and `NUM_THREADS` clauses. Keeping that boundary explicit lets the
-//! outliner execute real concurrent regions without pretending that the data
-//! environment is already implemented.
+//! The executable slice is intentionally narrow: a `PARALLEL` region may
+//! share scalar numeric or logical storage and may use `IF`, `NUM_THREADS`,
+//! `SHARED`, and `DEFAULT(SHARED)`. Keeping that boundary explicit lets the
+//! outliner execute real concurrent regions without pretending that arrays,
+//! characters, derived objects, or private data are already implemented.
 
 use std::collections::HashSet;
 
 use crate::ast::openmp::{OpenMpClause, OpenMpConstruct};
 use crate::ast::stmt::{IoControl, RankGuard, SpannedStmt, Stmt, TypeGuard};
 use crate::lexer::Span;
-use crate::sema::symtab::TypeInfo;
+use crate::sema::symtab::{SymbolKind, SymbolTable, TypeInfo};
 
 use super::core::{
     collect_default_none_nested_block_references, collect_reference_stmts, validation_expr_rank,
-    validation_expr_type_info, Ctx, ProcedureReferenceFacts, ReferenceRole,
+    validation_expr_type_info, Ctx, ProcedureReferenceFacts,
 };
+
+pub(crate) use super::core::ReferenceRole;
 
 pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &OpenMpConstruct) {
     let OpenMpConstruct::Parallel { clauses, body } = construct else {
@@ -34,14 +36,19 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
         ctx.error(span, "OpenMP PARALLEL is not allowed in a PURE procedure");
     }
 
-    validate_parallel_clauses(ctx, span, clauses);
-    validate_capture_free_body(ctx, body);
+    let explicitly_shared = validate_parallel_clauses(ctx, span, clauses);
+    validate_shared_captures(ctx, body, &explicitly_shared);
     validate_structured_block(ctx, body);
 }
 
-fn validate_parallel_clauses(ctx: &mut Ctx<'_>, span: Span, clauses: &[OpenMpClause]) {
+fn validate_parallel_clauses(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    clauses: &[OpenMpClause],
+) -> HashSet<String> {
     let mut saw_if = false;
     let mut saw_num_threads = false;
+    let mut explicitly_shared = HashSet::new();
 
     for clause in clauses {
         match clause {
@@ -92,6 +99,21 @@ fn validate_parallel_clauses(ctx: &mut Ctx<'_>, span: Span, clauses: &[OpenMpCla
                     );
                 }
             }
+            OpenMpClause::Shared(names) => {
+                let mut seen = HashSet::new();
+                for name in names {
+                    let key = name.to_ascii_lowercase();
+                    if !seen.insert(key.clone()) {
+                        ctx.error(
+                            span,
+                            format!("OpenMP SHARED list repeats variable '{}'", name),
+                        );
+                    }
+                    explicitly_shared.insert(key);
+                    validate_shared_scalar(ctx, name, span, false);
+                }
+            }
+            OpenMpClause::Default(crate::ast::openmp::OpenMpDefault::Shared) => {}
             unsupported => ctx.error(
                 span,
                 format!(
@@ -101,6 +123,7 @@ fn validate_parallel_clauses(ctx: &mut Ctx<'_>, span: Span, clauses: &[OpenMpCla
             ),
         }
     }
+    explicitly_shared
 }
 
 fn clause_name(clause: &OpenMpClause) -> &'static str {
@@ -118,23 +141,123 @@ fn clause_name(clause: &OpenMpClause) -> &'static str {
     }
 }
 
-fn validate_capture_free_body(ctx: &mut Ctx<'_>, body: &[SpannedStmt]) {
+/// Return all references in deterministic source order. Callers classify an
+/// ambiguous `name(args)` as callable or data using their resolved scope; the
+/// parser cannot distinguish a function call from an array reference alone.
+pub(crate) fn capture_references(
+    st: &SymbolTable,
+    body: &[SpannedStmt],
+) -> Vec<(String, Span, ReferenceRole)> {
     let shadowed = HashSet::new();
     let mut facts = ProcedureReferenceFacts::default();
     collect_reference_stmts(body, &shadowed, &mut facts);
-    collect_default_none_nested_block_references(ctx.st, body, &shadowed, &mut facts);
+    collect_default_none_nested_block_references(st, body, &shadowed, &mut facts);
 
-    let mut reported = HashSet::new();
-    for reference in facts.references {
-        if reference.role == ReferenceRole::Value && reported.insert(reference.name.clone()) {
-            ctx.error(
-                reference.span,
-                format!(
-                    "OpenMP PARALLEL data reference '{}' requires data-environment capture support, which is not yet implemented",
-                    reference.name
-                ),
-            );
+    facts
+        .references
+        .into_iter()
+        .map(|reference| (reference.name, reference.span, reference.role))
+        .collect()
+}
+
+fn validate_shared_captures(
+    ctx: &mut Ctx<'_>,
+    body: &[SpannedStmt],
+    explicitly_shared: &HashSet<String>,
+) {
+    let mut seen = HashSet::new();
+    for (name, span, role) in capture_references(ctx.st, body) {
+        let is_data_reference = role == ReferenceRole::Value
+            || (role == ReferenceRole::Callable
+                && ctx.lookup_lexical(&name).is_some_and(|symbol| {
+                    matches!(
+                        symbol.kind,
+                        SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::ProcedurePointer
+                    )
+                }));
+        if is_data_reference && seen.insert(name.clone()) && !explicitly_shared.contains(&name) {
+            validate_shared_scalar(ctx, &name, span, true);
         }
+    }
+}
+
+fn validate_shared_scalar(ctx: &mut Ctx<'_>, name: &str, span: Span, allow_named_constant: bool) {
+    let Some(symbol) = ctx.lookup_lexical(name) else {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP PARALLEL cannot capture '{}'; ASSOCIATE and unresolved names are not yet supported",
+                name
+            ),
+        );
+        return;
+    };
+    if symbol.kind != SymbolKind::Variable
+        && !(allow_named_constant && symbol.kind == SymbolKind::Parameter)
+    {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP PARALLEL capture of '{}' requires variable storage; named constants and other entities are not yet supported",
+                name
+            ),
+        );
+        return;
+    }
+    if !symbol.attrs.array_spec.is_empty() {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP PARALLEL shared array '{}' is recognized but not yet implemented",
+                name
+            ),
+        );
+        return;
+    }
+    if symbol.attrs.allocatable || symbol.attrs.pointer {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP PARALLEL shared allocatable or pointer '{}' is recognized but not yet implemented",
+                name
+            ),
+        );
+        return;
+    }
+    if symbol.attrs.optional {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP PARALLEL shared OPTIONAL dummy '{}' is recognized but not yet implemented",
+                name
+            ),
+        );
+        return;
+    }
+    if symbol.attrs.volatile || symbol.attrs.asynchronous {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP PARALLEL shared VOLATILE or ASYNCHRONOUS variable '{}' requires memory-model support that is not yet implemented",
+                name
+            ),
+        );
+        return;
+    }
+    if !matches!(
+        symbol.type_info.as_ref(),
+        Some(TypeInfo::Integer { .. })
+            | Some(TypeInfo::Real { .. })
+            | Some(TypeInfo::DoublePrecision)
+            | Some(TypeInfo::Logical { .. })
+    ) {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP PARALLEL shared variable '{}' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL",
+                name
+            ),
+        );
     }
 }
 
