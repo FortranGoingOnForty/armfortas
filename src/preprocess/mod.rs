@@ -13,6 +13,10 @@ use std::sync::{Arc, OnceLock};
 
 use crate::lexer::{Position, Span};
 
+const BUILTIN_OMP_LIB_HEADER_NAME: &str = "omp_lib.h";
+const BUILTIN_OMP_LIB_HEADER_FILENAME: &str = "<armfortas>/omp_lib.h";
+const BUILTIN_OMP_LIB_HEADER: &str = include_str!("../../include/omp_lib.h");
+
 /// Configuration for the preprocessor.
 #[derive(Debug, Clone)]
 pub struct PreprocConfig {
@@ -1608,39 +1612,50 @@ impl Preprocessor {
             });
         }
 
-        // Search for the file.
-        let resolved = self
-            .resolve_include(path, source_filename, search_system)
-            .ok_or_else(|| PreprocError {
+        // Search user-visible locations before the compiler-owned fallback so
+        // an explicitly supplied compatibility header keeps normal INCLUDE
+        // precedence. Cargo installs binaries but not data files, therefore
+        // the bundled header must remain available from an isolated compiler.
+        let resolved = self.resolve_include(path, source_filename, search_system);
+        let (inc_filename, content) = if let Some(resolved) = resolved {
+            let content = if self.source_view {
+                let bytes = std::fs::read(&resolved).map_err(|e| PreprocError {
+                    filename: diagnostic_filename.into(),
+                    line: diagnostic_line,
+                    msg: format!("reading {}: {}", resolved.display(), e),
+                })?;
+                crate::source_bytes::to_source_view(&bytes)
+            } else {
+                std::fs::read_to_string(&resolved).map_err(|e| PreprocError {
+                    filename: diagnostic_filename.into(),
+                    line: diagnostic_line,
+                    msg: format!("reading {}: {}", resolved.display(), e),
+                })?
+            };
+            if !self.included_files.contains(&resolved) {
+                self.included_files.push(resolved.clone());
+            }
+            (resolved.to_string_lossy().into_owned(), content)
+        } else if path == BUILTIN_OMP_LIB_HEADER_NAME {
+            let content = if self.source_view {
+                crate::source_bytes::escape_utf8(BUILTIN_OMP_LIB_HEADER)
+            } else {
+                BUILTIN_OMP_LIB_HEADER.to_string()
+            };
+            (BUILTIN_OMP_LIB_HEADER_FILENAME.to_string(), content)
+        } else {
+            return Err(PreprocError {
                 filename: diagnostic_filename.into(),
                 line: diagnostic_line,
                 msg: format!("cannot find include file: {}", path),
-            })?;
-
-        let content = if self.source_view {
-            let bytes = std::fs::read(&resolved).map_err(|e| PreprocError {
-                filename: diagnostic_filename.into(),
-                line: diagnostic_line,
-                msg: format!("reading {}: {}", resolved.display(), e),
-            })?;
-            crate::source_bytes::to_source_view(&bytes)
-        } else {
-            std::fs::read_to_string(&resolved).map_err(|e| PreprocError {
-                filename: diagnostic_filename.into(),
-                line: diagnostic_line,
-                msg: format!("reading {}: {}", resolved.display(), e),
-            })?
+            });
         };
-        if !self.included_files.contains(&resolved) {
-            self.included_files.push(resolved.clone());
-        }
 
         // Built-ins are dynamically scoped to the included source.
         let saved_file = self.defines.get("__FILE__").cloned();
         let saved_line = self.defines.get("__LINE__").cloned();
 
         self.include_depth += 1;
-        let inc_filename = resolved.to_string_lossy().into_owned();
         let included_source = Arc::new(SourceFile::new(
             Arc::from(inc_filename),
             content,
@@ -4553,6 +4568,42 @@ deep
         assert_eq!(result.source_map[2].line, 2);
 
         let _ = std::fs::remove_file(include_path);
+    }
+
+    #[test]
+    fn omp_lib_header_is_available_as_an_embedded_fallback() {
+        let result = preprocess(
+            "include 'omp_lib.h'\nprogram_body = openmp_version\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+
+        assert!(result.text.contains("openmp_version = 202111"));
+        assert!(result.text.contains("afs_omp_get_thread_num"));
+        assert!(result.included_files.is_empty());
+        assert_eq!(
+            result.source_map[0].filename,
+            BUILTIN_OMP_LIB_HEADER_FILENAME
+        );
+    }
+
+    #[test]
+    fn explicit_omp_lib_header_shadows_the_embedded_fallback() {
+        let dir =
+            std::env::temp_dir().join(format!("afs-omp-header-shadow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let include_path = dir.join(BUILTIN_OMP_LIB_HEADER_NAME);
+        std::fs::write(&include_path, "integer, parameter :: local_omp = 73\n").unwrap();
+        let config = PreprocConfig {
+            include_paths: vec![dir.clone()],
+            ..PreprocConfig::default()
+        };
+        let result = preprocess("include 'omp_lib.h'\n", &config).unwrap();
+
+        assert!(result.text.contains("local_omp = 73"));
+        assert!(!result.text.contains("openmp_version"));
+        assert_eq!(result.included_files, vec![include_path]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

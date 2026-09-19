@@ -114,6 +114,7 @@ exec "$ARMFORTAS_TEST_REAL_TAR" "$@"
 
     for required in [
         "Cargo.toml",
+        "include/omp_lib.h",
         "runtime/Cargo.toml",
         "afs-as/Cargo.toml",
         "afs-ld/Cargo.toml",
