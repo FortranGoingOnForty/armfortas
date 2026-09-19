@@ -20,6 +20,7 @@ mod helpers;
 mod init;
 mod intrinsic;
 mod intrinsic_sub;
+mod openmp;
 mod stmt;
 mod unit;
 

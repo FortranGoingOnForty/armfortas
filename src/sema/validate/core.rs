@@ -148,6 +148,9 @@ pub(super) struct Ctx<'a> {
     /// working byte-copy lowering; only the Fortran-internal character
     /// VALUE path lacks copy-in.
     pub(super) in_bind_c_unit: bool,
+    /// Full `-fopenmp` compilation is enabled. SIMD-only mode deliberately
+    /// leaves this false so threaded constructs cannot cross into lowering.
+    pub(super) openmp_full: bool,
     /// Host scopes whose storage must not be captured by the procedure
     /// currently being validated because it is reachable from a local
     /// FINAL binding and may be invoked after those scopes return.
@@ -239,6 +242,7 @@ impl<'a> Ctx<'a> {
             in_call_arg: false,
             allow_array_cond_rhs: false,
             in_bind_c_unit: false,
+            openmp_full: false,
             finalizer_capture_host_scopes: HashSet::new(),
             reported_finalizer_captures: HashSet::new(),
             reported_use_ambiguities: HashSet::new(),
@@ -514,6 +518,26 @@ pub fn validate_file_with_layouts_and_warning_groups(
     warn_deprecated: bool,
 ) -> Vec<Diagnostic> {
     let mut ctx = Ctx::new_with_layouts(st, std, type_layouts, warn_pedantic, warn_deprecated);
+    for unit in units {
+        validate_unit(&mut ctx, unit);
+    }
+    ctx.diags
+}
+
+/// Validate with the same production configuration as the driver, including
+/// whether full OpenMP execution (as opposed to SIMD-only parsing) is enabled.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_file_with_layouts_warning_groups_and_openmp(
+    units: &[SpannedUnit],
+    st: &SymbolTable,
+    std: Option<FortranStandard>,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    warn_pedantic: bool,
+    warn_deprecated: bool,
+    openmp_full: bool,
+) -> Vec<Diagnostic> {
+    let mut ctx = Ctx::new_with_layouts(st, std, type_layouts, warn_pedantic, warn_deprecated);
+    ctx.openmp_full = openmp_full;
     for unit in units {
         validate_unit(&mut ctx, unit);
     }
@@ -2544,23 +2568,23 @@ fn find_scope_for_unit(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReferenceRole {
+pub(super) enum ReferenceRole {
     Value,
     Callable,
     Type,
 }
 
 #[derive(Debug)]
-struct NameReference {
-    name: String,
-    span: Span,
-    role: ReferenceRole,
+pub(super) struct NameReference {
+    pub(super) name: String,
+    pub(super) span: Span,
+    pub(super) role: ReferenceRole,
 }
 
 #[derive(Default)]
-struct ProcedureReferenceFacts {
-    references: Vec<NameReference>,
-    calls: HashSet<String>,
+pub(super) struct ProcedureReferenceFacts {
+    pub(super) references: Vec<NameReference>,
+    pub(super) calls: HashSet<String>,
 }
 
 fn collect_name_reference(
@@ -3403,7 +3427,7 @@ fn collect_reference_stmt(
     }
 }
 
-fn collect_reference_stmts(
+pub(super) fn collect_reference_stmts(
     stmts: &[SpannedStmt],
     shadowed: &HashSet<String>,
     facts: &mut ProcedureReferenceFacts,
@@ -3418,7 +3442,7 @@ fn collect_reference_stmts(
 /// do-concurrent-block, including a BLOCK nested under another executable
 /// construct. Walk just those skipped lexical islands here while carrying
 /// every intervening construct entity that can shadow an outer variable.
-fn collect_default_none_nested_block_references(
+pub(super) fn collect_default_none_nested_block_references(
     st: &SymbolTable,
     stmts: &[SpannedStmt],
     shadowed: &HashSet<String>,
@@ -6013,13 +6037,17 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         }
 
         Stmt::OpenMp(construct) => {
-            ctx.error(
-                stmt.span,
-                format!(
-                    "OpenMP {} execution is recognized but not yet implemented",
-                    construct.name()
-                ),
-            );
+            if ctx.openmp_full {
+                super::openmp::validate_construct(ctx, stmt.span, construct);
+            } else {
+                ctx.error(
+                    stmt.span,
+                    format!(
+                        "OpenMP {} execution is recognized but not yet implemented",
+                        construct.name()
+                    ),
+                );
+            }
             if let Some(body) = construct.region_body() {
                 validate_stmts(ctx, body);
             }
@@ -6554,7 +6582,7 @@ fn validation_expr_metadata(ctx: &Ctx<'_>, expr: &SpannedExpr) -> ValidationExpr
     }
 }
 
-fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeInfo> {
+pub(super) fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeInfo> {
     if matches!(expr.node, Expr::ComponentAccess { .. }) {
         if let Some(leaf) = leaf_field_layout(ctx, expr) {
             return Some(leaf.field.type_info.clone());
@@ -7789,7 +7817,7 @@ fn intrinsic_call_result_rank(ctx: &Ctx<'_>, name: &str, args: &[Argument]) -> O
     }
 }
 
-fn validation_expr_rank(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<usize> {
+pub(super) fn validation_expr_rank(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<usize> {
     use crate::ast::expr::SectionSubscript;
 
     match &expr.node {

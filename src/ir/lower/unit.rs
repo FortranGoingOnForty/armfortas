@@ -300,6 +300,9 @@ pub(crate) fn lower_unit(
             }
 
             module.add_function(func);
+            for outlined in std::mem::take(&mut ctx.pending_functions) {
+                module.add_function(outlined);
+            }
             for pg in std::mem::take(&mut ctx.pending_globals) {
                 module.add_global(pg.global);
             }
@@ -866,6 +869,9 @@ pub(crate) fn lower_unit(
             }
 
             module.add_function(func);
+            for outlined in std::mem::take(&mut ctx.pending_functions) {
+                module.add_function(outlined);
+            }
             for pg in std::mem::take(&mut ctx.pending_globals) {
                 module.add_global(pg.global);
             }
@@ -1835,6 +1841,9 @@ pub(crate) fn lower_unit(
             }
 
             module.add_function(func);
+            for outlined in std::mem::take(&mut ctx.pending_functions) {
+                module.add_function(outlined);
+            }
             for pg in std::mem::take(&mut ctx.pending_globals) {
                 module.add_global(pg.global);
             }

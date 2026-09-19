@@ -12,6 +12,7 @@
 
 mod allocatable;
 mod core;
+mod openmp;
 mod pointer;
 mod procedure;
 mod pure_elemental;

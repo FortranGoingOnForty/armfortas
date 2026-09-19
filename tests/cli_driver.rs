@@ -21010,6 +21010,164 @@ fn fopenmp_rejects_execution_before_ir_lowering() {
 }
 
 #[test]
+fn fopenmp_outlines_capture_free_parallel_regions() {
+    let src = write_program(
+        "program p\n  implicit none\n!$omp parallel if(.true.) num_threads(2)\n  continue\n!$omp end parallel\nend program\n",
+        "f90",
+    );
+    let out = unique_path("openmp_parallel_ir", "ir");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-fopenmp",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "capture-free OpenMP PARALLEL should lower: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let ir = std::fs::read_to_string(&out).expect("missing OpenMP IR output");
+    assert!(
+        ir.contains("afs_omp_region_p_0") && ir.contains("afs_omp_parallel_region"),
+        "parallel region was not outlined through the owned runtime ABI:\n{ir}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_outlined_parallel_emits_x86_64_elf_object() {
+    let src = write_program(
+        "program p\n  implicit none\n!$omp parallel num_threads(2)\n  continue\n!$omp end parallel\nend program\n",
+        "f90",
+    );
+    let out = unique_path("openmp_parallel_x86", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-fopenmp", "--target", "x86_64-linux-musl", "-c"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "outlined OpenMP PARALLEL should cross-compile to x86_64: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let bytes = std::fs::read(&out).expect("missing x86_64 OpenMP object");
+    assert_eq!(&bytes[..4], b"\x7fELF", "OpenMP output is not ELF");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_capture_free_parallel_regions_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_capture_free_parallel_regions_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  use omp_lib, only: omp_get_thread_num, omp_get_num_threads, omp_in_parallel\n  implicit none\n  integer :: requested\n  logical :: enabled\n  requested = 4\n  enabled = .false.\n!$omp parallel num_threads(requested)\n  if (.not. omp_in_parallel()) error stop 1\n  if (omp_get_num_threads() /= 4) error stop 2\n  if (omp_get_thread_num() < 0 .or. omp_get_thread_num() >= 4) error stop 3\n!$omp parallel if(parallel: .false.) num_threads(3)\n  if (omp_get_num_threads() /= 1) error stop 4\n  if (.not. omp_in_parallel()) error stop 5\n!$omp end parallel\n!$omp end parallel\n!$omp parallel if(enabled) num_threads(3)\n  if (omp_get_num_threads() /= 1) error stop 6\n  if (omp_in_parallel()) error stop 7\n!$omp end parallel\n  if (omp_in_parallel()) error stop 8\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("openmp_parallel", "bin");
+    let runtime_cache = unique_dir("openmp_parallel_runtime_cache");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            "-fopenmp",
+            "-O3",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("AFS_RUNTIME_CACHE", &runtime_cache)
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "capture-free OpenMP PARALLEL should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "capture-free OpenMP PARALLEL failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_dir_all(&runtime_cache);
+}
+
+#[test]
+fn fopenmp_rejects_parallel_data_capture_until_the_environment_is_implemented() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: x\n  x = 1\n!$omp parallel\n  x = x + 1\n!$omp end parallel\nend program\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-fopenmp"]);
+    assert!(
+        !result.status.success(),
+        "capturing PARALLEL compiled silently"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("data reference 'x' requires data-environment capture support"),
+        "unexpected diagnostic: {stderr}"
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_validates_initial_parallel_clause_contracts() {
+    let src = write_program(
+        "program p\n  implicit none\n!$omp parallel if(1) num_threads(.true.)\n  continue\n!$omp end parallel\nend program\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-fopenmp"]);
+    assert!(
+        !result.status.success(),
+        "invalid PARALLEL clauses compiled"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("IF condition must be a scalar LOGICAL expression")
+            && stderr.contains("NUM_THREADS expression must be a scalar INTEGER"),
+        "unexpected diagnostics: {stderr}"
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_simd_does_not_enable_threaded_parallel_regions() {
+    let src = write_program(
+        "program p\n  implicit none\n!$omp parallel\n  continue\n!$omp end parallel\nend program\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-fopenmp-simd"]);
+    assert!(
+        !result.status.success(),
+        "SIMD-only mode enabled threaded PARALLEL"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("OpenMP PARALLEL execution is recognized but not yet implemented"),
+        "unexpected diagnostic: {stderr}"
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn omp_lib_initial_runtime_surface_runs_in_serial_context() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

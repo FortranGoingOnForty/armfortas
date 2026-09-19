@@ -1246,7 +1246,7 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     }
     if opts.openmp {
         opts.cli_warnings.push(
-            "-fopenmp currently enables OpenMP preprocessing only; executable OpenMP directives are not yet implemented"
+            "-fopenmp enables preview OpenMP support; capture-free PARALLEL regions are implemented and unsupported constructs or clauses are errors"
                 .into(),
         );
     } else if opts.openmp_simd {
@@ -1357,7 +1357,7 @@ LANGUAGE:
   -fdefault-real-8            Make default real kind 8 bytes
   -fimplicit-none             Force implicit none in all scopes
   -frecursive                 Make all procedures recursive by default
-  -fopenmp                    Enable OpenMP preprocessing (execution is not yet implemented)
+  -fopenmp                    Enable preview OpenMP support (capture-free PARALLEL regions)
   -fno-openmp                 Disable full OpenMP compilation
   -fopenmp-simd               Enable OpenMP SIMD syntax without the thread runtime
   -fbackslash                 Interpret backslash in strings as escape
@@ -2261,13 +2261,14 @@ fn compile_with_bundled_runtime_inner(
         external_globals.extend(crate::sema::amod::extract_module_globals(ext_mod));
     }
 
-    let diags = validate::validate_file_with_layouts_and_warning_groups(
+    let diags = validate::validate_file_with_layouts_warning_groups_and_openmp(
         &units,
         &st,
         opts.std,
         &type_layouts,
         opts.warnings_enabled() && opts.warn_pedantic,
         opts.warnings_enabled() && opts.warn_deprecated,
+        opts.openmp,
     );
     phase.end(&mut phases);
     let mut had_error = false;
