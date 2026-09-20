@@ -54917,8 +54917,9 @@ pub(super) fn lower_array_assign(
         .flatten()
         .map(|sym| sym.attrs.allocatable)
         .unwrap_or(false);
-    if local_uses_array_descriptor(dest_info) && (dest_info.allocatable || dest_symbol_allocatable)
-    {
+    let dest_has_allocatable_assignment =
+        !dest_info.is_pointer && (dest_info.allocatable || dest_symbol_allocatable);
+    if local_uses_array_descriptor(dest_info) && dest_has_allocatable_assignment {
         let dest_desc = array_descriptor_addr(b, dest_info);
         if try_lower_typed_char_allocatable_constructor_assign(b, ctx, dest_info, dest_desc, value)
         {
@@ -55510,9 +55511,7 @@ pub(super) fn lower_array_assign(
     // constructor's literal values into the destination.
     if let Expr::ArrayConstructor { values, .. } = &value.node {
         if let Some(type_name) = dest_info.derived_type.as_deref() {
-            if local_uses_array_descriptor(dest_info)
-                && (dest_info.allocatable || dest_symbol_allocatable)
-            {
+            if local_uses_array_descriptor(dest_info) && dest_has_allocatable_assignment {
                 if let Some((src_desc, _)) = lower_array_expr_descriptor(
                     b,
                     &ctx.locals,
@@ -55886,7 +55885,7 @@ pub(super) fn lower_array_assign(
         // handled by the explicit allocatable paths above.
         if dest_info.derived_type.is_none()
             && dest_info.char_kind == CharKind::None
-            && !dest_info.allocatable
+            && (!dest_info.allocatable || dest_info.is_pointer)
         {
             if let Some((src_desc, src_elem_ty)) = lower_array_expr_descriptor(
                 b,

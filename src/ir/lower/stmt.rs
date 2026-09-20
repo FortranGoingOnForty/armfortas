@@ -3531,7 +3531,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                             src_desc,
                                                             dest_elem_len,
                                                         );
-                                                    } else if !info.allocatable {
+                                                    } else if !info.allocatable || info.is_pointer {
                                                         copy_array_result_to_descriptor_dest(
                                                             b, &info, src_desc,
                                                         );
@@ -3635,7 +3635,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         src_desc,
                                                         dest_elem_len,
                                                     );
-                                                } else if !info.allocatable {
+                                                } else if !info.allocatable || info.is_pointer {
                                                     copy_array_result_to_descriptor_dest(
                                                         b, &info, src_desc,
                                                     );

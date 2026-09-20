@@ -21043,7 +21043,7 @@ fn fopenmp_outlines_capture_free_parallel_regions() {
 #[test]
 fn fopenmp_outlined_parallel_emits_x86_64_elf_object() {
     let src = write_program(
-        "program p\n  implicit none\n  integer :: shared_value, seed, scratch, values(-1:0,0:1), descriptor_values(2)\n  integer :: private_values(-1:0), first_values(2)\n  shared_value = 1\n  seed = 40\n  values = 0\n  descriptor_values = 0\n  private_values = -1\n  first_values = 40\n!$omp parallel if(.false.) default(none) shared(shared_value, values) &\n!$omp& firstprivate(seed, first_values) private(scratch, private_values)\n  scratch = seed + 2\n  private_values = first_values + 2\n  shared_value = scratch + private_values(-1) - 42\n  values(-1,0) = private_values(0)\n!$omp end parallel\n  call touch_descriptor(descriptor_values)\n  if (shared_value /= 42 .or. seed /= 40 .or. values(-1,0) /= 42 .or. descriptor_values(1) /= 42) error stop 1\n  if (any(private_values /= -1) .or. any(first_values /= 40)) error stop 2\ncontains\n  subroutine touch_descriptor(items)\n    integer, intent(inout) :: items(:)\n!$omp parallel if(.false.) default(none) shared(items)\n    items(1) = 42\n!$omp end parallel\n  end subroutine\nend program\n",
+        "program p\n  implicit none\n  integer :: shared_value, seed, scratch, values(-1:0,0:1), descriptor_values(2)\n  integer :: private_values(-1:0), first_values(2)\n  integer, allocatable :: owned(:)\n  shared_value = 1\n  seed = 40\n  values = 0\n  descriptor_values = 0\n  private_values = -1\n  first_values = 40\n  allocate(owned(-1:0))\n  owned = 0\n!$omp parallel if(.false.) default(none) shared(shared_value, values, owned) &\n!$omp& firstprivate(seed, first_values) private(scratch, private_values)\n  scratch = seed + 2\n  private_values = first_values + 2\n  shared_value = scratch + private_values(-1) - 42\n  values(-1,0) = private_values(0)\n  owned(-1) = 42\n!$omp end parallel\n  call touch_descriptor(descriptor_values)\n  if (shared_value /= 42 .or. seed /= 40 .or. values(-1,0) /= 42 .or. descriptor_values(1) /= 42 .or. owned(-1) /= 42) error stop 1\n  if (any(private_values /= -1) .or. any(first_values /= 40)) error stop 2\ncontains\n  subroutine touch_descriptor(items)\n    integer, intent(inout) :: items(:)\n!$omp parallel if(.false.) default(none) shared(items)\n    items(1) = 42\n!$omp end parallel\n  end subroutine\nend program\n",
         "f90",
     );
     let out = unique_path("openmp_parallel_x86", "o");
@@ -21409,6 +21409,52 @@ fn fopenmp_shared_descriptor_backed_dummy_arrays_run() {
 }
 
 #[test]
+fn fopenmp_shared_allocatable_and_pointer_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_shared_allocatable_and_pointer_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_owning_descriptor_state\n  use omp_lib, only: omp_get_thread_num\n  implicit none\n  real, allocatable :: module_real(:)\n  double precision, allocatable :: module_double(:)\n  logical, pointer :: module_flags(:)\n  logical, target :: flag_storage(0:3)\ncontains\n  subroutine fill_module_descriptors()\n    integer :: tid\n    allocate(module_real(0:3), module_double(0:3))\n    module_real = -1.0\n    module_double = -1.0d0\n    flag_storage = .false.\n    module_flags => flag_storage\n!$omp parallel default(none) num_threads(4) private(tid) shared(module_real, module_double, module_flags)\n    tid = omp_get_thread_num()\n    module_real(tid) = 0.5 + real(tid)\n    module_double(tid) = 10.25d0 + tid\n    module_flags(tid) = mod(tid, 2) == 0\n!$omp end parallel\n  end subroutine\n  subroutine fill_dummy_descriptors(values, view)\n    integer, allocatable, intent(inout) :: values(:)\n    integer, pointer, intent(inout) :: view(:)\n    integer :: tid\n!$omp parallel default(none) num_threads(4) private(tid) shared(values, view)\n    tid = omp_get_thread_num()\n    values(tid-1) = 300 + tid\n    view(tid-1) = 400 + tid\n!$omp end parallel\n  end subroutine\nend module\nprogram p\n  use omp_owning_descriptor_state\n  use omp_lib, only: omp_get_thread_num\n  implicit none\n  integer, allocatable :: values(:)\n  integer, target :: first_target(0:3), second_target(-1:2)\n  integer, pointer :: view(:)\n  integer :: tid\n  first_target = -1\n  second_target = -1\n  view => first_target\n!$omp parallel if(.false.) default(none) shared(values, view, second_target)\n  allocate(values(-1:2))\n  values = [11, 12, 13, 14]\n  view => second_target\n  view = [21, 22, 23, 24]\n!$omp end parallel\n  if (.not. allocated(values)) error stop 1\n  if (lbound(values, 1) /= -1 .or. ubound(values, 1) /= 2) error stop 2\n  if (any(values /= [11, 12, 13, 14])) error stop 3\n  if (.not. associated(view, second_target)) error stop 4\n  if (lbound(view, 1) /= -1 .or. ubound(view, 1) /= 2) error stop 5\n  if (any(second_target /= [21, 22, 23, 24])) error stop 6\n!$omp parallel default(none) num_threads(4) private(tid) shared(values, view)\n  tid = omp_get_thread_num()\n  values(tid-1) = 100 + tid\n  view(tid-1) = 200 + tid\n!$omp end parallel\n  if (any(values /= [100, 101, 102, 103])) error stop 7\n  if (any(second_target /= [200, 201, 202, 203])) error stop 8\n  if (any(first_target /= -1)) error stop 9\n  call fill_dummy_descriptors(values, view)\n  if (any(values /= [300, 301, 302, 303])) error stop 10\n  if (any(second_target /= [400, 401, 402, 403])) error stop 11\n  call fill_module_descriptors()\n  if (any(module_real /= [0.5, 1.5, 2.5, 3.5])) error stop 12\n  if (any(module_double /= [10.25d0, 11.25d0, 12.25d0, 13.25d0])) error stop 13\n  if (.not. associated(module_flags, flag_storage)) error stop 14\n  if (.not. module_flags(0) .or. module_flags(1) .or. .not. module_flags(2) .or. module_flags(3)) error stop 15\n!$omp parallel if(.false.) default(none) shared(values)\n  deallocate(values)\n!$omp end parallel\n  if (allocated(values)) error stop 16\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_shared_owning_descriptors", "bin");
+        let runtime_cache = unique_dir("openmp_shared_owning_descriptors_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP shared allocatable/pointer arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP shared allocatable/pointer arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_capture_free_parallel_regions_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -21455,7 +21501,7 @@ fn fopenmp_capture_free_parallel_regions_run() {
 #[test]
 fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let src = write_program(
-        "program p\n  implicit none\n  character(len=3) :: text, words(2)\n  integer, allocatable :: values(:)\n  integer, target :: target_values(2)\n  integer, volatile :: volatile_values(2)\n  text = 'abc'\n  allocate(values(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(values)\n  values(1) = 1\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\n!$omp parallel firstprivate(words)\n  continue\n!$omp end parallel\n!$omp parallel private(values)\n  continue\n!$omp end parallel\n!$omp parallel private(target_values)\n  continue\n!$omp end parallel\n!$omp parallel private(volatile_values)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_private_dummy(dummy_values)\n    integer, intent(inout) :: dummy_values(2)\n!$omp parallel private(dummy_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_automatic(n)\n    integer, intent(in) :: n\n    integer :: automatic_values(n)\n!$omp parallel firstprivate(automatic_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
+        "program p\n  implicit none\n  character(len=3) :: text, words(2)\n  character(len=3), allocatable :: dynamic_words(:)\n  integer, allocatable :: scalar, values(:)\n  integer, pointer :: scalar_pointer\n  integer, target :: target_values(2)\n  integer, volatile :: volatile_values(2)\n  text = 'abc'\n  allocate(scalar, values(2))\n  allocate(dynamic_words(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(scalar, scalar_pointer)\n  scalar = 1\n!$omp end parallel\n!$omp parallel shared(dynamic_words)\n  dynamic_words(1) = 'abc'\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\n!$omp parallel firstprivate(words)\n  continue\n!$omp end parallel\n!$omp parallel private(values)\n  continue\n!$omp end parallel\n!$omp parallel private(target_values)\n  continue\n!$omp end parallel\n!$omp parallel private(volatile_values)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_private_dummy(dummy_values)\n    integer, intent(inout) :: dummy_values(2)\n!$omp parallel private(dummy_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_automatic(n)\n    integer, intent(in) :: n\n    integer :: automatic_values(n)\n!$omp parallel firstprivate(automatic_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
         "f90",
     );
     let result = diagnostic_output(&src, &["-fopenmp"]);
@@ -21466,7 +21512,9 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains("shared variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")
-            && stderr.contains("shared allocatable or pointer 'values' is recognized but not yet implemented")
+            && stderr.contains("shared scalar allocatable or pointer 'scalar' is recognized but not yet implemented")
+            && stderr.contains("shared scalar allocatable or pointer 'scalar_pointer' is recognized but not yet implemented")
+            && stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
             && stderr.contains("shared array 'assumed_rank' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy")
             && stderr.contains("shared OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")

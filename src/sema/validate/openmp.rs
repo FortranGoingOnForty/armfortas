@@ -371,11 +371,11 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
         );
         return;
     }
-    if symbol.attrs.allocatable || symbol.attrs.pointer {
+    if (symbol.attrs.allocatable || symbol.attrs.pointer) && symbol.attrs.array_spec.is_empty() {
         ctx.error(
             span,
             format!(
-                "OpenMP PARALLEL shared allocatable or pointer '{}' is recognized but not yet implemented",
+                "OpenMP PARALLEL shared scalar allocatable or pointer '{}' is recognized but not yet implemented",
                 name
             ),
         );
@@ -402,6 +402,13 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
         return;
     }
     if !symbol.attrs.array_spec.is_empty() {
+        let descriptor_backed_allocatable_or_pointer = (symbol.attrs.allocatable
+            || symbol.attrs.pointer)
+            && symbol
+                .attrs
+                .array_spec
+                .iter()
+                .all(|spec| matches!(spec, crate::ast::decl::ArraySpec::Deferred));
         let constant_explicit_shape = symbol
             .attrs
             .array_spec
@@ -433,7 +440,8 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
                             matches!(spec, crate::ast::decl::ArraySpec::Explicit { .. })
                         })
                 });
-        if !constant_explicit_shape
+        if !descriptor_backed_allocatable_or_pointer
+            && !constant_explicit_shape
             && !runtime_explicit_shape_dummy
             && !assumed_shape_dummy
             && !assumed_size_dummy

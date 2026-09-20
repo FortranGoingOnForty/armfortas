@@ -5,10 +5,11 @@
 //! constant explicit-shape private/firstprivate numeric/logical arrays.
 //! Each region is outlined into the fixed callback shape owned by the
 //! ARMFORTAS OpenMP ABI and synchronously invoked through the runtime. Shared
-//! addresses, non-owning array descriptors, and firstprivate snapshots live in
-//! a compiler-private environment whose lifetime is bounded by the synchronous
-//! join. Private objects live in each callback invocation, using inline storage
-//! below the compiler's stack threshold and owned descriptors above it.
+//! addresses, shared owning/non-owning array descriptors, and firstprivate
+//! snapshots live in a compiler-private environment whose lifetime is bounded
+//! by the synchronous join. Private objects live in each callback invocation,
+//! using inline storage below the compiler's stack threshold and owned
+//! descriptors above it.
 
 use crate::ast::openmp::{OpenMpClause, OpenMpConstruct};
 use crate::ir::builder::FuncBuilder;
@@ -536,9 +537,11 @@ fn install_shared_captures(
                         // values in the encountering function. The descriptor
                         // materialized above is their complete cross-function
                         // view; never leak those parent ValueIds into the
-                        // outlined callback.
+                        // outlined callback. Preserve the vector length because
+                        // descriptor-backed allocatables and pointers encode
+                        // their declared rank there when `dims` is empty.
                         local.descriptor_arg = true;
-                        local.runtime_dim_upper.clear();
+                        local.runtime_dim_upper.fill(None);
                     }
                 }
                 local.by_ref = false;
