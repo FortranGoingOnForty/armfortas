@@ -519,21 +519,22 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         );
         return;
     }
-    if is_current_dummy(ctx, symbol, name) {
+    let is_dummy = is_current_dummy(ctx, symbol, name);
+    if symbol.attrs.optional {
         ctx.error(
             span,
             format!(
-                "OpenMP {} dummy argument '{}' is recognized but not yet implemented",
+                "OpenMP {} OPTIONAL dummy '{}' is recognized but not yet implemented",
                 clause, name
             ),
         );
         return;
     }
-    if symbol.attrs.allocatable || symbol.attrs.pointer || symbol.attrs.target {
+    if symbol.attrs.pointer || symbol.attrs.target {
         ctx.error(
             span,
             format!(
-                "OpenMP {} allocatable, pointer, or target variable '{}' is recognized but not yet implemented",
+                "OpenMP {} pointer or target variable '{}' is recognized but not yet implemented",
                 clause, name
             ),
         );
@@ -544,6 +545,50 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
             span,
             format!(
                 "OpenMP {} VOLATILE or ASYNCHRONOUS variable '{}' requires memory-model support that is not yet implemented",
+                clause, name
+            ),
+        );
+        return;
+    }
+    if symbol.attrs.allocatable {
+        let deferred_shape_array = !symbol.attrs.array_spec.is_empty()
+            && symbol
+                .attrs
+                .array_spec
+                .iter()
+                .all(|spec| matches!(spec, crate::ast::decl::ArraySpec::Deferred));
+        if !deferred_shape_array {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} scalar allocatable '{}' is recognized but not yet implemented",
+                    clause, name
+                ),
+            );
+            return;
+        }
+        if !matches!(
+            symbol.type_info.as_ref(),
+            Some(TypeInfo::Integer { .. })
+                | Some(TypeInfo::Real { .. })
+                | Some(TypeInfo::DoublePrecision)
+                | Some(TypeInfo::Logical { .. })
+        ) {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} allocatable array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements",
+                    clause, name
+                ),
+            );
+        }
+        return;
+    }
+    if is_dummy {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP {} dummy argument '{}' is recognized but not yet implemented",
                 clause, name
             ),
         );

@@ -2,7 +2,8 @@
 //!
 //! Semantic validation currently admits capture-free `PARALLEL` regions,
 //! numeric/logical scalar data, supported shared numeric/logical arrays, and
-//! constant explicit-shape private/firstprivate numeric/logical arrays.
+//! constant explicit-shape and allocatable private/firstprivate
+//! numeric/logical arrays.
 //! Each region is outlined into the fixed callback shape owned by the
 //! ARMFORTAS OpenMP ABI and synchronously invoked through the runtime. Shared
 //! addresses, shared owning/non-owning array descriptors, and firstprivate
@@ -13,14 +14,15 @@
 
 use crate::ast::openmp::{OpenMpClause, OpenMpConstruct};
 use crate::ir::builder::FuncBuilder;
-use crate::ir::inst::{FuncRef, Function, Param, ValueId};
+use crate::ir::inst::{CmpOp, FuncRef, Function, Param, ValueId};
 use crate::ir::types::{IntWidth, IrType};
 
 use super::alloc::rewrite_heap_promoted_declared_bounds;
 use super::core::{
     array_base_addr, array_descriptor_addr, collect_format_labels, collect_label_blocks,
-    emit_memcpy_bytes, ensure_termination, ir_scalar_byte_size, local_uses_array_descriptor,
-    materialize_array_descriptor_for_info, materialize_array_section_source_descriptor,
+    emit_memcpy_bytes, ensure_termination, ir_scalar_byte_size, local_declared_rank,
+    local_uses_array_descriptor, materialize_array_descriptor_for_info,
+    materialize_array_section_source_descriptor,
 };
 use super::ctx::{LocalInfo, LowerCtx, ProcScopeGuard};
 use super::helpers::coerce_to_type;
@@ -83,6 +85,75 @@ fn zero_array_descriptor(b: &mut FuncBuilder<'_>) -> ValueId {
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     descriptor
+}
+
+fn is_allocatable_array(info: &LocalInfo) -> bool {
+    info.allocatable && !info.is_pointer && local_declared_rank(info) > 0
+}
+
+fn is_array(info: &LocalInfo) -> bool {
+    local_declared_rank(info) > 0
+}
+
+fn capture_needs_environment(capture: &Capture) -> bool {
+    matches!(
+        capture.kind,
+        CaptureKind::Shared | CaptureKind::FirstPrivate
+    ) || (capture.kind == CaptureKind::Private && is_allocatable_array(&capture.info))
+}
+
+fn snapshot_array_descriptor(b: &mut FuncBuilder<'_>, source: ValueId) -> ValueId {
+    let snapshot = zero_array_descriptor(b);
+    emit_memcpy_bytes(b, snapshot, source, 392);
+    snapshot
+}
+
+fn allocate_allocatable_private(
+    b: &mut FuncBuilder<'_>,
+    outside: &LocalInfo,
+    source: ValueId,
+    copy_values: bool,
+) -> (LocalInfo, ValueId) {
+    debug_assert!(is_allocatable_array(outside));
+    let descriptor = zero_array_descriptor(b);
+    let allocated = b.call(
+        FuncRef::External("afs_array_allocated".into()),
+        vec![source],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero = b.const_i32(0);
+    let is_allocated = b.icmp(CmpOp::Ne, allocated, zero);
+    let allocate_bb = b.create_block("omp_allocatable_private_allocate");
+    let ready_bb = b.create_block("omp_allocatable_private_ready");
+    b.cond_branch(is_allocated, allocate_bb, vec![], ready_bb, vec![]);
+
+    b.set_block(allocate_bb);
+    let null_stat = b.const_i64(0);
+    b.call(
+        FuncRef::External("afs_allocate_like".into()),
+        vec![descriptor, source, null_stat],
+        IrType::Void,
+    );
+    if copy_values {
+        let null_stat = b.const_i64(0);
+        b.call(
+            FuncRef::External("afs_copy_array_data_no_realloc".into()),
+            vec![descriptor, source, null_stat],
+            IrType::Void,
+        );
+    }
+    b.branch(ready_bb, vec![]);
+    b.set_block(ready_bb);
+
+    let mut private = outside.clone();
+    private.addr = descriptor;
+    private.by_ref = false;
+    private.descriptor_arg = false;
+    private.inline_const = None;
+    private.is_pointer = false;
+    private.runtime_dim_upper.fill(None);
+    private.last_dim_assumed_size = false;
+    (private, descriptor)
 }
 
 fn allocate_private_array(
@@ -152,14 +223,27 @@ fn copy_array_data(
 }
 
 fn deallocate_array_descriptor(b: &mut FuncBuilder<'_>, descriptor: ValueId) {
-    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let allocated = b.call(
+        FuncRef::External("afs_array_allocated".into()),
+        vec![descriptor],
+        IrType::Int(IntWidth::I32),
+    );
     let zero = b.const_i32(0);
+    let is_allocated = b.icmp(CmpOp::Ne, allocated, zero);
+    let deallocate_bb = b.create_block("omp_array_private_deallocate");
+    let done_bb = b.create_block("omp_array_private_deallocate_done");
+    b.cond_branch(is_allocated, deallocate_bb, vec![], done_bb, vec![]);
+
+    b.set_block(deallocate_bb);
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
     b.store(zero, stat);
     b.call(
         FuncRef::External("afs_deallocate_array".into()),
         vec![descriptor, stat],
         IrType::Void,
     );
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
 }
 
 fn shared_capture_uses_descriptor(info: &LocalInfo) -> bool {
@@ -372,12 +456,7 @@ fn materialize_shared_environment(
 ) -> MaterializedEnvironment {
     let addressed_count = captures
         .iter()
-        .filter(|capture| {
-            matches!(
-                capture.kind,
-                CaptureKind::Shared | CaptureKind::FirstPrivate
-            )
-        })
+        .filter(|capture| capture_needs_environment(capture))
         .count();
     if addressed_count == 0 {
         let null = b.const_i64(0);
@@ -394,55 +473,68 @@ fn materialize_shared_environment(
     let mut cleanup_descriptors = Vec::new();
     let mut slot_index = 0i64;
     for capture in captures {
-        if !matches!(
-            capture.kind,
-            CaptureKind::Shared | CaptureKind::FirstPrivate
-        ) {
+        if !capture_needs_environment(capture) {
             continue;
         }
-        let environment_address =
-            if capture.kind == CaptureKind::FirstPrivate && !capture.info.dims.is_empty() {
-                let descriptor_copy = fixed_array_uses_heap(&capture.info, b.layout);
-                let source = if descriptor_copy {
-                    if local_uses_array_descriptor(&capture.info) {
-                        array_descriptor_addr(b, &capture.info)
-                    } else {
-                        materialize_array_descriptor_for_info(b, &capture.info)
-                    }
-                } else {
-                    array_base_addr(b, &capture.info)
-                };
-                let (snapshot, cleanup) =
-                    allocate_private_array(b, &capture.info, descriptor_copy.then_some(source));
-                copy_array_data(b, &snapshot, source, descriptor_copy);
-                cleanup_descriptors.extend(cleanup);
-                snapshot.addr
-            } else if capture.kind == CaptureKind::FirstPrivate {
-                let outside_address = if capture.info.by_ref {
-                    b.load(capture.info.addr)
-                } else {
-                    capture.info.addr
-                };
-                // Snapshot FIRSTPRIVATE before any implicit task begins. Each
-                // callback invocation copies from this stable value into its own
-                // task-local slot.
-                let snapshot = b.alloca(capture.info.ty.clone());
-                let value = b.load_typed(outside_address, capture.info.ty.clone());
-                b.store(value, snapshot);
-                snapshot
-            } else if shared_capture_uses_descriptor(&capture.info) {
+        let environment_address = if capture.kind == CaptureKind::Private
+            && is_allocatable_array(&capture.info)
+        {
+            let source = array_descriptor_addr(b, &capture.info);
+            // PRIVATE inherits only the encounter-time allocation status
+            // and bounds. This byte snapshot is deliberately non-owning:
+            // callbacks inspect its metadata but never read or free its
+            // payload pointer.
+            snapshot_array_descriptor(b, source)
+        } else if capture.kind == CaptureKind::FirstPrivate && is_allocatable_array(&capture.info) {
+            let source = array_descriptor_addr(b, &capture.info);
+            // FIRSTPRIVATE values are fixed before any implicit task can
+            // run, so the environment owns a stable deep copy until the
+            // synchronous join completes.
+            let (snapshot, cleanup) = allocate_allocatable_private(b, &capture.info, source, true);
+            cleanup_descriptors.push(cleanup);
+            snapshot.addr
+        } else if capture.kind == CaptureKind::FirstPrivate && is_array(&capture.info) {
+            let descriptor_copy = fixed_array_uses_heap(&capture.info, b.layout);
+            let source = if descriptor_copy {
                 if local_uses_array_descriptor(&capture.info) {
                     array_descriptor_addr(b, &capture.info)
-                } else if capture.info.last_dim_assumed_size {
-                    materialize_array_section_source_descriptor(b, &capture.info)
                 } else {
                     materialize_array_descriptor_for_info(b, &capture.info)
                 }
-            } else if capture.info.by_ref {
+            } else {
+                array_base_addr(b, &capture.info)
+            };
+            let (snapshot, cleanup) =
+                allocate_private_array(b, &capture.info, descriptor_copy.then_some(source));
+            copy_array_data(b, &snapshot, source, descriptor_copy);
+            cleanup_descriptors.extend(cleanup);
+            snapshot.addr
+        } else if capture.kind == CaptureKind::FirstPrivate {
+            let outside_address = if capture.info.by_ref {
                 b.load(capture.info.addr)
             } else {
                 capture.info.addr
             };
+            // Snapshot FIRSTPRIVATE before any implicit task begins. Each
+            // callback invocation copies from this stable value into its own
+            // task-local slot.
+            let snapshot = b.alloca(capture.info.ty.clone());
+            let value = b.load_typed(outside_address, capture.info.ty.clone());
+            b.store(value, snapshot);
+            snapshot
+        } else if shared_capture_uses_descriptor(&capture.info) {
+            if local_uses_array_descriptor(&capture.info) {
+                array_descriptor_addr(b, &capture.info)
+            } else if capture.info.last_dim_assumed_size {
+                materialize_array_section_source_descriptor(b, &capture.info)
+            } else {
+                materialize_array_descriptor_for_info(b, &capture.info)
+            }
+        } else if capture.info.by_ref {
+            b.load(capture.info.addr)
+        } else {
+            capture.info.addr
+        };
         let raw_address = b.ptr_to_int(environment_address);
         let index = b.const_i64(slot_index);
         let slot = b.gep(environment, vec![index], IrType::Int(IntWidth::I64));
@@ -463,12 +555,7 @@ fn install_shared_captures(
 ) -> Vec<ValueId> {
     let mut slot_index = 0i64;
     let mut cleanup_descriptors = Vec::new();
-    let environment_slots = if captures.iter().any(|capture| {
-        matches!(
-            capture.kind,
-            CaptureKind::Shared | CaptureKind::FirstPrivate
-        )
-    }) {
+    let environment_slots = if captures.iter().any(capture_needs_environment) {
         let raw_environment = b.ptr_to_int(ValueId(0));
         Some(b.int_to_ptr(raw_environment, IrType::Int(IntWidth::I64)))
     } else {
@@ -485,7 +572,24 @@ fn install_shared_captures(
                 local.addr = b.alloca(capture.info.ty.clone());
             }
             CaptureKind::Private => {
-                if capture.info.dims.is_empty() {
+                if is_allocatable_array(&capture.info) {
+                    let index = b.const_i64(slot_index);
+                    let slot = b.gep(
+                        environment_slots.expect("missing OpenMP environment slots"),
+                        vec![index],
+                        IrType::Int(IntWidth::I64),
+                    );
+                    let raw_address = b.load_typed(slot, IrType::Int(IntWidth::I64));
+                    let shape_snapshot = b.int_to_ptr(
+                        raw_address,
+                        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392),
+                    );
+                    let (private, cleanup) =
+                        allocate_allocatable_private(b, &capture.info, shape_snapshot, false);
+                    local = private;
+                    cleanup_descriptors.push(cleanup);
+                    slot_index += 1;
+                } else if !is_array(&capture.info) {
                     local.addr = b.alloca(capture.info.ty.clone());
                     local.by_ref = false;
                     local.inline_const = None;
@@ -506,9 +610,11 @@ fn install_shared_captures(
                 let captures_descriptor = capture.kind == CaptureKind::Shared
                     && shared_capture_uses_descriptor(&capture.info);
                 let firstprivate_array =
-                    capture.kind == CaptureKind::FirstPrivate && !capture.info.dims.is_empty();
-                let firstprivate_descriptor =
-                    firstprivate_array && fixed_array_uses_heap(&capture.info, b.layout);
+                    capture.kind == CaptureKind::FirstPrivate && is_array(&capture.info);
+                let firstprivate_allocatable =
+                    firstprivate_array && is_allocatable_array(&capture.info);
+                let firstprivate_descriptor = firstprivate_array
+                    && (firstprivate_allocatable || fixed_array_uses_heap(&capture.info, b.layout));
                 let captured_pointee = if captures_descriptor || firstprivate_descriptor {
                     IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392)
                 } else if firstprivate_array {
@@ -517,7 +623,12 @@ fn install_shared_captures(
                     capture.info.ty.clone()
                 };
                 let environment_address = b.int_to_ptr(raw_address, captured_pointee);
-                if firstprivate_array {
+                if firstprivate_allocatable {
+                    let (private, cleanup) =
+                        allocate_allocatable_private(b, &capture.info, environment_address, true);
+                    local = private;
+                    cleanup_descriptors.push(cleanup);
+                } else if firstprivate_array {
                     let shape_descriptor = firstprivate_descriptor.then_some(environment_address);
                     let (private, cleanup) =
                         allocate_private_array(b, &capture.info, shape_descriptor);
