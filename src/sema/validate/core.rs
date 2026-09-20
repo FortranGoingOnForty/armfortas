@@ -6910,7 +6910,7 @@ fn validation_const_int_value(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<i128>
         .map(|value| value.value)
 }
 
-fn validation_explicit_dim_bounds(
+pub(super) fn validation_explicit_dim_bounds(
     ctx: &Ctx<'_>,
     spec: &crate::ast::decl::ArraySpec,
 ) -> Option<(i128, i128)> {

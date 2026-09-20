@@ -2,10 +2,11 @@
 //!
 //! The executable slice is intentionally narrow: a `PARALLEL` region may
 //! share, privatize, or first-privatize scalar numeric/logical storage and may
-//! use `IF`, `NUM_THREADS`, `SHARED`, `PRIVATE`, `FIRSTPRIVATE`, and
-//! `DEFAULT(SHARED/NONE)`. Keeping that boundary explicit lets the outliner
-//! execute real concurrent regions without pretending that arrays, characters,
-//! or derived objects are already implemented.
+//! share fixed-shape numeric/logical arrays. It may use `IF`, `NUM_THREADS`,
+//! `SHARED`, `PRIVATE`, `FIRSTPRIVATE`, and `DEFAULT(SHARED/NONE)`. Keeping that
+//! boundary explicit lets the outliner execute real concurrent regions without
+//! pretending that descriptor-backed arrays, characters, or derived objects
+//! are already implemented.
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,8 +16,9 @@ use crate::lexer::Span;
 use crate::sema::symtab::{SymbolKind, SymbolTable, TypeInfo};
 
 use super::core::{
-    collect_default_none_nested_block_references, collect_reference_stmts, validation_expr_rank,
-    validation_expr_type_info, Ctx, ProcedureReferenceFacts,
+    collect_default_none_nested_block_references, collect_reference_stmts,
+    validation_explicit_dim_bounds, validation_expr_rank, validation_expr_type_info, Ctx,
+    ProcedureReferenceFacts,
 };
 
 pub(crate) use super::core::ReferenceRole;
@@ -111,7 +113,7 @@ fn validate_parallel_clauses(
                 for name in names {
                     let key = name.to_ascii_lowercase();
                     register_data_attribute(ctx, span, &mut data_attributes, &key, "SHARED");
-                    validate_shared_scalar(ctx, name, span, false);
+                    validate_shared_object(ctx, name, span);
                 }
             }
             OpenMpClause::Private(names) => {
@@ -321,7 +323,7 @@ fn validate_data_environment(
         }
 
         let Some(symbol) = ctx.lookup_lexical(&name) else {
-            validate_shared_scalar(ctx, &name, span, true);
+            validate_shared_object(ctx, &name, span);
             continue;
         };
         let predetermined_shared = symbol.kind == SymbolKind::Parameter
@@ -331,7 +333,7 @@ fn validate_data_environment(
                 .iter()
                 .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedSize { .. }));
         if predetermined_shared {
-            validate_shared_scalar(ctx, &name, span, true);
+            validate_shared_object(ctx, &name, span);
         } else if predetermined_private.contains(&name) {
             validate_private_scalar(ctx, &name, span, "predetermined PRIVATE");
         } else if clause_info.default_none {
@@ -343,12 +345,12 @@ fn validate_data_environment(
                 ),
             );
         } else {
-            validate_shared_scalar(ctx, &name, span, true);
+            validate_shared_object(ctx, &name, span);
         }
     }
 }
 
-fn validate_shared_scalar(ctx: &mut Ctx<'_>, name: &str, span: Span, allow_named_constant: bool) {
+fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
     let Some(symbol) = ctx.lookup_lexical(name) else {
         ctx.error(
             span,
@@ -359,23 +361,11 @@ fn validate_shared_scalar(ctx: &mut Ctx<'_>, name: &str, span: Span, allow_named
         );
         return;
     };
-    if symbol.kind != SymbolKind::Variable
-        && !(allow_named_constant && symbol.kind == SymbolKind::Parameter)
-    {
+    if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter) {
         ctx.error(
             span,
             format!(
-                "OpenMP PARALLEL capture of '{}' requires variable storage; named constants and other entities are not yet supported",
-                name
-            ),
-        );
-        return;
-    }
-    if !symbol.attrs.array_spec.is_empty() {
-        ctx.error(
-            span,
-            format!(
-                "OpenMP PARALLEL shared array '{}' is recognized but not yet implemented",
+                "OpenMP PARALLEL capture of '{}' requires a variable or named constant",
                 name
             ),
         );
@@ -409,6 +399,39 @@ fn validate_shared_scalar(ctx: &mut Ctx<'_>, name: &str, span: Span, allow_named
                 name
             ),
         );
+        return;
+    }
+    if !symbol.attrs.array_spec.is_empty() {
+        if symbol
+            .attrs
+            .array_spec
+            .iter()
+            .any(|spec| validation_explicit_dim_bounds(ctx, spec).is_none())
+        {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP PARALLEL shared array '{}' must currently have constant explicit shape",
+                    name
+                ),
+            );
+            return;
+        }
+        if !matches!(
+            symbol.type_info.as_ref(),
+            Some(TypeInfo::Integer { .. })
+                | Some(TypeInfo::Real { .. })
+                | Some(TypeInfo::DoublePrecision)
+                | Some(TypeInfo::Logical { .. })
+        ) {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP PARALLEL shared array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements",
+                    name
+                ),
+            );
+        }
         return;
     }
     if !matches!(

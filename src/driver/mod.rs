@@ -1246,7 +1246,7 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     }
     if opts.openmp {
         opts.cli_warnings.push(
-            "-fopenmp enables preview OpenMP support; scalar-data PARALLEL regions are implemented and unsupported constructs or clauses are errors"
+            "-fopenmp enables preview OpenMP support; numeric/logical scalar and fixed-shape shared-array PARALLEL regions are implemented and unsupported constructs or clauses are errors"
                 .into(),
         );
     } else if opts.openmp_simd {
@@ -1357,7 +1357,7 @@ LANGUAGE:
   -fdefault-real-8            Make default real kind 8 bytes
   -fimplicit-none             Force implicit none in all scopes
   -frecursive                 Make all procedures recursive by default
-  -fopenmp                    Enable preview OpenMP support (scalar-data PARALLEL regions)
+  -fopenmp                    Enable preview OpenMP support (initial PARALLEL data environments)
   -fno-openmp                 Disable full OpenMP compilation
   -fopenmp-simd               Enable OpenMP SIMD syntax without the thread runtime
   -fbackslash                 Interpret backslash in strings as escape

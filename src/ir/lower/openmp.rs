@@ -1,11 +1,12 @@
 //! Lowering for executable OpenMP constructs.
 //!
-//! Semantic validation currently admits capture-free and scalar-data
-//! `PARALLEL` regions. Each region is outlined into the fixed callback shape
-//! owned by the ARMFORTAS OpenMP ABI and synchronously invoked through the
-//! runtime. Shared addresses and firstprivate snapshots live in a
-//! compiler-private environment whose lifetime is bounded by the synchronous
-//! join; private objects live in each callback invocation's stack frame.
+//! Semantic validation currently admits capture-free `PARALLEL` regions,
+//! numeric/logical scalar data, and shared fixed-shape numeric/logical arrays.
+//! Each region is outlined into the fixed callback shape owned by the
+//! ARMFORTAS OpenMP ABI and synchronously invoked through the runtime. Shared
+//! addresses and firstprivate snapshots live in a compiler-private environment
+//! whose lifetime is bounded by the synchronous join; private objects live in
+//! each callback invocation's stack frame.
 
 use crate::ast::openmp::{OpenMpClause, OpenMpConstruct};
 use crate::ir::builder::FuncBuilder;
@@ -120,10 +121,10 @@ pub(super) fn lower_construct(
                 CaptureKind::Private
             } else if firstprivate_names.contains(&name) {
                 CaptureKind::FirstPrivate
-            } else if shared_names.contains(&name) {
-                CaptureKind::Shared
             } else if info.inline_const.is_some() {
                 CaptureKind::InlineConstant
+            } else if shared_names.contains(&name) {
+                CaptureKind::Shared
             } else if predetermined_private.contains(&name) {
                 CaptureKind::Private
             } else {

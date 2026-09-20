@@ -21043,7 +21043,7 @@ fn fopenmp_outlines_capture_free_parallel_regions() {
 #[test]
 fn fopenmp_outlined_parallel_emits_x86_64_elf_object() {
     let src = write_program(
-        "program p\n  implicit none\n  integer :: shared_value, seed, scratch\n  shared_value = 1\n  seed = 40\n!$omp parallel if(.false.) default(none) shared(shared_value) firstprivate(seed) private(scratch)\n  scratch = seed + 2\n  shared_value = scratch\n!$omp end parallel\n  if (shared_value /= 42 .or. seed /= 40) error stop 1\nend program\n",
+        "program p\n  implicit none\n  integer :: shared_value, seed, scratch, values(-1:0,0:1)\n  shared_value = 1\n  seed = 40\n  values = 0\n!$omp parallel if(.false.) default(none) shared(shared_value, values) firstprivate(seed) private(scratch)\n  scratch = seed + 2\n  shared_value = scratch\n  values(-1,0) = scratch\n!$omp end parallel\n  if (shared_value /= 42 .or. seed /= 40 .or. values(-1,0) /= 42) error stop 1\nend program\n",
         "f90",
     );
     let out = unique_path("openmp_parallel_x86", "o");
@@ -21273,6 +21273,50 @@ fn fopenmp_shared_module_scalar_runs() {
 }
 
 #[test]
+fn fopenmp_shared_fixed_shape_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_shared_fixed_shape_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_shared_array_state\n  use omp_lib, only: omp_get_thread_num\n  implicit none\n  integer :: module_values(0:3)\ncontains\n  subroutine fill_dummy(values)\n    integer, intent(out) :: values(0:3)\n    integer :: tid\n!$omp parallel default(none) num_threads(4) private(tid) shared(values)\n    tid = omp_get_thread_num()\n    values(tid) = 200 + tid\n!$omp end parallel\n  end subroutine\nend module\nprogram p\n  use omp_shared_array_state, only: module_values, fill_dummy\n  use omp_lib, only: omp_get_thread_num\n  implicit none\n  integer, parameter :: offsets(0:3) = [0, 1, 2, 3]\n  integer :: matrix(-1:0,0:3), dummy_values(0:3), tid\n  real :: weights(0:3)\n  double precision :: energies(0:3)\n  logical :: flags(0:3)\n  matrix = -1\n  module_values = -1\n  weights = -1.0\n  energies = -1.0d0\n  flags = .false.\n  tid = -1\n!$omp parallel default(none) num_threads(4) private(tid) shared(matrix, module_values, weights, energies, flags)\n  tid = omp_get_thread_num()\n  matrix(-1,tid) = 100 + offsets(tid)\n  matrix(0,tid) = 110 + offsets(tid)\n  module_values(tid) = 120 + tid\n  weights(tid) = 0.5 + real(tid)\n  energies(tid) = 10.25d0 + tid\n  flags(tid) = mod(tid, 2) == 0\n!$omp end parallel\n  if (tid /= -1) error stop 1\n  if (matrix(-1,0) /= 100 .or. matrix(-1,1) /= 101 .or. matrix(-1,2) /= 102 .or. matrix(-1,3) /= 103) error stop 2\n  if (matrix(0,0) /= 110 .or. matrix(0,1) /= 111 .or. matrix(0,2) /= 112 .or. matrix(0,3) /= 113) error stop 3\n  if (module_values(0) /= 120 .or. module_values(1) /= 121 .or. module_values(2) /= 122 .or. module_values(3) /= 123) error stop 4\n  if (weights(0) /= 0.5 .or. weights(1) /= 1.5 .or. weights(2) /= 2.5 .or. weights(3) /= 3.5) error stop 5\n  if (energies(0) /= 10.25d0 .or. energies(1) /= 11.25d0 .or. energies(2) /= 12.25d0 .or. energies(3) /= 13.25d0) error stop 6\n  if (.not. flags(0) .or. flags(1) .or. .not. flags(2) .or. flags(3)) error stop 7\n  call fill_dummy(dummy_values)\n  if (dummy_values(0) /= 200 .or. dummy_values(1) /= 201 .or. dummy_values(2) /= 202 .or. dummy_values(3) /= 203) error stop 8\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("openmp_shared_arrays", "bin");
+    let runtime_cache = unique_dir("openmp_shared_arrays_runtime_cache");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            "-fopenmp",
+            "-O3",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("AFS_RUNTIME_CACHE", &runtime_cache)
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "OpenMP shared fixed-shape arrays should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "OpenMP shared fixed-shape arrays failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_dir_all(&runtime_cache);
+}
+
+#[test]
 fn fopenmp_capture_free_parallel_regions_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -21319,7 +21363,7 @@ fn fopenmp_capture_free_parallel_regions_run() {
 #[test]
 fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let src = write_program(
-        "program p\n  implicit none\n  character(len=3) :: text\n  integer :: values(2)\n  text = 'abc'\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel\n  values(1) = 1\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\nend program\n",
+        "program p\n  implicit none\n  character(len=3) :: text\n  integer, allocatable :: values(:)\n  text = 'abc'\n  allocate(values(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(values)\n  values(1) = 1\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_dynamic(n, dynamic)\n    integer, intent(in) :: n\n    integer, intent(inout) :: dynamic(n)\n!$omp parallel shared(dynamic)\n    dynamic(1) = 1\n!$omp end parallel\n  end subroutine\nend program\n",
         "f90",
     );
     let result = diagnostic_output(&src, &["-fopenmp"]);
@@ -21330,7 +21374,8 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains("shared variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")
-            && stderr.contains("shared array 'values' is recognized but not yet implemented")
+            && stderr.contains("shared allocatable or pointer 'values' is recognized but not yet implemented")
+            && stderr.contains("shared array 'dynamic' must currently have constant explicit shape")
             && stderr.contains("PRIVATE variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL"),
         "unexpected diagnostic: {stderr}"
     );
