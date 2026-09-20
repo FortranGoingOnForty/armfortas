@@ -630,13 +630,15 @@ fn select_call_inst(
         None
     };
 
-    if !pending_reg_arg_moves.is_empty() {
-        mf.block_mut(mb).insts.push(MachineInst {
-            opcode: ArmOpcode::CallArgCopyStart,
-            operands: vec![],
-            def: None,
-        });
-    }
+    // Keep an exact structural boundary for every call, including calls with
+    // no register arguments. Split-bridge insertion must not fall back to
+    // guessing that an unrelated move into x0..x7 is argument setup: doing so
+    // can move the bridge store above the value's definition.
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::CallArgCopyStart,
+        operands: vec![],
+        def: None,
+    });
     for (opcode, dst, src) in pending_reg_arg_moves {
         mf.block_mut(mb).insts.push(MachineInst {
             opcode,
@@ -4427,7 +4429,17 @@ mod tests {
             b.runtime_call(crate::ir::inst::RuntimeFunc::PrintInt, vec![], IrType::Void);
             b.ret_void();
         });
-        assert!(mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Bl));
+        let insts = &mf.blocks[0].insts;
+        let call = insts
+            .iter()
+            .position(|inst| inst.opcode == ArmOpcode::Bl)
+            .expect("runtime call should lower to BL");
+        assert!(call > 0);
+        assert_eq!(
+            insts[call - 1].opcode,
+            ArmOpcode::CallArgCopyStart,
+            "zero-argument calls still need an exact split-bridge boundary"
+        );
     }
 
     #[test]
@@ -4539,7 +4551,7 @@ mod tests {
 
     #[test]
     fn select_i128_runtime_print_uses_wide_symbol_and_pair_regs() {
-        let mf = select_simple(|b| {
+        let mut mf = select_simple(|b| {
             let wide = b.const_i128(170141183460469231731687303715884105727i128);
             b.runtime_call(
                 crate::ir::inst::RuntimeFunc::PrintInt,
@@ -4548,6 +4560,7 @@ mod tests {
             );
             b.ret_void();
         });
+        crate::codegen::arm64::linearscan::parallelize_call_arg_moves(&mut mf);
         let asm = crate::codegen::emit::emit_function(&mf);
         assert!(
             asm.contains("bl _afs_print_int128"),

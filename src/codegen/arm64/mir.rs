@@ -225,9 +225,10 @@ pub enum ArmOpcode {
     Movn,    // MOVN Xd, #imm16, LSL #shift
     MovReg,  // MOV Xd, Xm  (alias: ORR Xd, XZR, Xm)
     FmovReg, // FMOV Dd, Dm
-    /// Non-emitting boundary before a call's register-argument copies. Spill
-    /// insertion preserves it so parallel-copy resolution can recover the
-    /// complete group even when reloads separate individual moves.
+    /// Non-emitting boundary before every call's register-argument copies.
+    /// Spill insertion preserves it so bridge placement is exact and
+    /// parallel-copy resolution can recover the complete group even when
+    /// reloads separate individual moves or the group is empty.
     CallArgCopyStart,
 
     // ---- Memory ----
