@@ -21043,7 +21043,7 @@ fn fopenmp_outlines_capture_free_parallel_regions() {
 #[test]
 fn fopenmp_outlined_parallel_emits_x86_64_elf_object() {
     let src = write_program(
-        "program p\n  implicit none\n  integer :: shared_value\n  shared_value = 1\n!$omp parallel if(.false.) shared(shared_value)\n  shared_value = 2\n!$omp end parallel\n  if (shared_value /= 2) error stop 1\nend program\n",
+        "program p\n  implicit none\n  integer :: shared_value, seed, scratch\n  shared_value = 1\n  seed = 40\n!$omp parallel if(.false.) shared(shared_value) firstprivate(seed) private(scratch)\n  scratch = seed + 2\n  shared_value = scratch\n!$omp end parallel\n  if (shared_value /= 42 .or. seed /= 40) error stop 1\nend program\n",
         "f90",
     );
     let out = unique_path("openmp_parallel_x86", "o");
@@ -21100,6 +21100,50 @@ fn fopenmp_shared_scalar_environment_runs() {
     assert!(
         run.status.success(),
         "OpenMP shared scalar environment failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_dir_all(&runtime_cache);
+}
+
+#[test]
+fn fopenmp_private_and_firstprivate_scalars_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_and_firstprivate_scalars_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  use omp_lib, only: omp_get_thread_num\n  implicit none\n  integer :: seed, scratch, tid, slot0, slot1, slot2, slot3\n  seed = 100\n  scratch = -1\n  tid = -1\n  slot0 = -1\n  slot1 = -1\n  slot2 = -1\n  slot3 = -1\n!$omp parallel num_threads(4) firstprivate(seed) private(scratch, tid) shared(slot0, slot1, slot2, slot3)\n  tid = omp_get_thread_num()\n  scratch = seed + tid\n  seed = seed + 1000\n  select case (tid)\n  case (0)\n    slot0 = scratch + seed\n  case (1)\n    slot1 = scratch + seed\n  case (2)\n    slot2 = scratch + seed\n  case (3)\n    slot3 = scratch + seed\n  end select\n!$omp end parallel\n  if (seed /= 100 .or. scratch /= -1 .or. tid /= -1) error stop 1\n  if (slot0 /= 1200 .or. slot1 /= 1201 .or. slot2 /= 1202 .or. slot3 /= 1203) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("openmp_private_scalars", "bin");
+    let runtime_cache = unique_dir("openmp_private_scalars_runtime_cache");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            "-fopenmp",
+            "-O3",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("AFS_RUNTIME_CACHE", &runtime_cache)
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "OpenMP PRIVATE/FIRSTPRIVATE scalars should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "OpenMP PRIVATE/FIRSTPRIVATE scalar region failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
@@ -21200,7 +21244,7 @@ fn fopenmp_capture_free_parallel_regions_run() {
 #[test]
 fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let src = write_program(
-        "program p\n  implicit none\n  character(len=3) :: text\n  integer :: values(2)\n  text = 'abc'\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel\n  values(1) = 1\n!$omp end parallel\nend program\n",
+        "program p\n  implicit none\n  character(len=3) :: text\n  integer :: values(2)\n  text = 'abc'\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel\n  values(1) = 1\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\nend program\n",
         "f90",
     );
     let result = diagnostic_output(&src, &["-fopenmp"]);
@@ -21211,7 +21255,8 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains("shared variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")
-            && stderr.contains("shared array 'values' is recognized but not yet implemented"),
+            && stderr.contains("shared array 'values' is recognized but not yet implemented")
+            && stderr.contains("PRIVATE variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL"),
         "unexpected diagnostic: {stderr}"
     );
     let _ = std::fs::remove_file(&src);
@@ -21220,7 +21265,7 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
 #[test]
 fn fopenmp_validates_initial_parallel_clause_contracts() {
     let src = write_program(
-        "program p\n  implicit none\n!$omp parallel if(1) num_threads(.true.)\n  continue\n!$omp end parallel\nend program\n",
+        "program p\n  implicit none\n  integer :: x\n!$omp parallel if(1) num_threads(.true.) shared(x) private(x)\n  continue\n!$omp end parallel\nend program\n",
         "f90",
     );
     let result = diagnostic_output(&src, &["-fopenmp"]);
@@ -21231,7 +21276,8 @@ fn fopenmp_validates_initial_parallel_clause_contracts() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains("IF condition must be a scalar LOGICAL expression")
-            && stderr.contains("NUM_THREADS expression must be a scalar INTEGER"),
+            && stderr.contains("NUM_THREADS expression must be a scalar INTEGER")
+            && stderr.contains("appears in both SHARED and PRIVATE data-sharing clauses"),
         "unexpected diagnostics: {stderr}"
     );
     let _ = std::fs::remove_file(&src);

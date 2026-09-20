@@ -1,12 +1,13 @@
 //! Semantic validation for executable OpenMP constructs.
 //!
 //! The executable slice is intentionally narrow: a `PARALLEL` region may
-//! share scalar numeric or logical storage and may use `IF`, `NUM_THREADS`,
-//! `SHARED`, and `DEFAULT(SHARED)`. Keeping that boundary explicit lets the
-//! outliner execute real concurrent regions without pretending that arrays,
-//! characters, derived objects, or private data are already implemented.
+//! share, privatize, or first-privatize scalar numeric/logical storage and may
+//! use `IF`, `NUM_THREADS`, `SHARED`, `PRIVATE`, `FIRSTPRIVATE`, and
+//! `DEFAULT(SHARED)`. Keeping that boundary explicit lets the outliner execute
+//! real concurrent regions without pretending that arrays, characters, or
+//! derived objects are already implemented.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::openmp::{OpenMpClause, OpenMpConstruct};
 use crate::ast::stmt::{IoControl, RankGuard, SpannedStmt, Stmt, TypeGuard};
@@ -48,7 +49,7 @@ fn validate_parallel_clauses(
 ) -> HashSet<String> {
     let mut saw_if = false;
     let mut saw_num_threads = false;
-    let mut explicitly_shared = HashSet::new();
+    let mut data_attributes = HashMap::new();
 
     for clause in clauses {
         match clause {
@@ -100,17 +101,24 @@ fn validate_parallel_clauses(
                 }
             }
             OpenMpClause::Shared(names) => {
-                let mut seen = HashSet::new();
                 for name in names {
                     let key = name.to_ascii_lowercase();
-                    if !seen.insert(key.clone()) {
-                        ctx.error(
-                            span,
-                            format!("OpenMP SHARED list repeats variable '{}'", name),
-                        );
-                    }
-                    explicitly_shared.insert(key);
+                    register_data_attribute(ctx, span, &mut data_attributes, &key, "SHARED");
                     validate_shared_scalar(ctx, name, span, false);
+                }
+            }
+            OpenMpClause::Private(names) => {
+                for name in names {
+                    let key = name.to_ascii_lowercase();
+                    register_data_attribute(ctx, span, &mut data_attributes, &key, "PRIVATE");
+                    validate_private_scalar(ctx, name, span, "PRIVATE");
+                }
+            }
+            OpenMpClause::FirstPrivate(names) => {
+                for name in names {
+                    let key = name.to_ascii_lowercase();
+                    register_data_attribute(ctx, span, &mut data_attributes, &key, "FIRSTPRIVATE");
+                    validate_private_scalar(ctx, name, span, "FIRSTPRIVATE");
                 }
             }
             OpenMpClause::Default(crate::ast::openmp::OpenMpDefault::Shared) => {}
@@ -123,7 +131,25 @@ fn validate_parallel_clauses(
             ),
         }
     }
-    explicitly_shared
+    data_attributes.into_keys().collect()
+}
+
+fn register_data_attribute(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    attributes: &mut HashMap<String, &'static str>,
+    name: &str,
+    attribute: &'static str,
+) {
+    if let Some(previous) = attributes.insert(name.to_string(), attribute) {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP PARALLEL variable '{}' appears in both {} and {} data-sharing clauses",
+                name, previous, attribute
+            ),
+        );
+    }
 }
 
 fn clause_name(clause: &OpenMpClause) -> &'static str {
@@ -256,6 +282,81 @@ fn validate_shared_scalar(ctx: &mut Ctx<'_>, name: &str, span: Span, allow_named
             format!(
                 "OpenMP PARALLEL shared variable '{}' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL",
                 name
+            ),
+        );
+    }
+}
+
+fn validate_private_scalar(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &str) {
+    let Some(symbol) = ctx.lookup_lexical(name) else {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP {} variable '{}' does not resolve to a visible data object",
+                clause, name
+            ),
+        );
+        return;
+    };
+    if symbol.kind != SymbolKind::Variable {
+        ctx.error(
+            span,
+            format!("OpenMP {} list item '{}' must be a variable", clause, name),
+        );
+        return;
+    }
+    if ctx.current_args.contains(&name.to_ascii_lowercase()) {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP {} dummy argument '{}' is recognized but not yet implemented",
+                clause, name
+            ),
+        );
+        return;
+    }
+    if !symbol.attrs.array_spec.is_empty() {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP {} array '{}' is recognized but not yet implemented",
+                clause, name
+            ),
+        );
+        return;
+    }
+    if symbol.attrs.allocatable || symbol.attrs.pointer || symbol.attrs.target {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP {} allocatable, pointer, or target variable '{}' is recognized but not yet implemented",
+                clause, name
+            ),
+        );
+        return;
+    }
+    if symbol.attrs.volatile || symbol.attrs.asynchronous {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP {} VOLATILE or ASYNCHRONOUS variable '{}' requires memory-model support that is not yet implemented",
+                clause, name
+            ),
+        );
+        return;
+    }
+    if !matches!(
+        symbol.type_info.as_ref(),
+        Some(TypeInfo::Integer { .. })
+            | Some(TypeInfo::Real { .. })
+            | Some(TypeInfo::DoublePrecision)
+            | Some(TypeInfo::Logical { .. })
+    ) {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP {} variable '{}' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL",
+                clause, name
             ),
         );
     }
