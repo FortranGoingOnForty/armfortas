@@ -21043,7 +21043,7 @@ fn fopenmp_outlines_capture_free_parallel_regions() {
 #[test]
 fn fopenmp_outlined_parallel_emits_x86_64_elf_object() {
     let src = write_program(
-        "program p\n  implicit none\n  integer :: shared_value, seed, scratch, values(-1:0,0:1), descriptor_values(2)\n  shared_value = 1\n  seed = 40\n  values = 0\n  descriptor_values = 0\n!$omp parallel if(.false.) default(none) shared(shared_value, values) firstprivate(seed) private(scratch)\n  scratch = seed + 2\n  shared_value = scratch\n  values(-1,0) = scratch\n!$omp end parallel\n  call touch_descriptor(descriptor_values)\n  if (shared_value /= 42 .or. seed /= 40 .or. values(-1,0) /= 42 .or. descriptor_values(1) /= 42) error stop 1\ncontains\n  subroutine touch_descriptor(items)\n    integer, intent(inout) :: items(:)\n!$omp parallel if(.false.) default(none) shared(items)\n    items(1) = 42\n!$omp end parallel\n  end subroutine\nend program\n",
+        "program p\n  implicit none\n  integer :: shared_value, seed, scratch, values(-1:0,0:1), descriptor_values(2)\n  integer :: private_values(-1:0), first_values(2)\n  shared_value = 1\n  seed = 40\n  values = 0\n  descriptor_values = 0\n  private_values = -1\n  first_values = 40\n!$omp parallel if(.false.) default(none) shared(shared_value, values) &\n!$omp& firstprivate(seed, first_values) private(scratch, private_values)\n  scratch = seed + 2\n  private_values = first_values + 2\n  shared_value = scratch + private_values(-1) - 42\n  values(-1,0) = private_values(0)\n!$omp end parallel\n  call touch_descriptor(descriptor_values)\n  if (shared_value /= 42 .or. seed /= 40 .or. values(-1,0) /= 42 .or. descriptor_values(1) /= 42) error stop 1\n  if (any(private_values /= -1) .or. any(first_values /= 40)) error stop 2\ncontains\n  subroutine touch_descriptor(items)\n    integer, intent(inout) :: items(:)\n!$omp parallel if(.false.) default(none) shared(items)\n    items(1) = 42\n!$omp end parallel\n  end subroutine\nend program\n",
         "f90",
     );
     let out = unique_path("openmp_parallel_x86", "o");
@@ -21151,6 +21151,52 @@ fn fopenmp_private_and_firstprivate_scalars_run() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_dir_all(&runtime_cache);
+}
+
+#[test]
+fn fopenmp_private_and_firstprivate_fixed_shape_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_and_firstprivate_fixed_shape_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  use omp_lib, only: omp_get_thread_num\n  implicit none\n  integer :: seed(-1:0,2:3), scratch(-1:0,2:3), large_seed(20000), large_private(20000)\n  integer :: tid, int_results(0:3), large_results(0:3)\n  real :: real_seed(2), real_scratch(2), real_results(0:3)\n  double precision :: double_seed(2), double_scratch(2), double_results(0:3)\n  logical :: logical_seed(2), logical_scratch(2), logical_results(0:3)\n  seed = 10\n  scratch = -99\n  large_seed = 7\n  large_private = -99\n  real_seed = [1.5, 2.5]\n  real_scratch = -99.0\n  double_seed = [3.0d0, 4.0d0]\n  double_scratch = -99.0d0\n  logical_seed = [.true., .false.]\n  logical_scratch = .false.\n  int_results = -1\n  large_results = -1\n  real_results = -1.0\n  double_results = -1.0d0\n  logical_results = .false.\n!$omp parallel default(none) num_threads(4) private(tid, scratch, large_private, &\n!$omp& real_scratch, double_scratch, logical_scratch) &\n!$omp& firstprivate(seed, large_seed, real_seed, double_seed, logical_seed) &\n!$omp& shared(int_results, large_results, real_results, double_results, logical_results)\n  tid = omp_get_thread_num()\n  scratch = tid\n  seed = seed + tid\n  int_results(tid) = seed(-1,2) + seed(0,3) + scratch(-1,3) + scratch(0,2)\n  large_private = 20 + tid\n  large_seed(1) = 100 + tid\n  large_results(tid) = large_seed(1) + large_seed(20000) + large_private(1) + large_private(20000)\n  real_scratch = real(tid) + 0.25\n  real_seed(1) = real_seed(1) + real(tid)\n  real_results(tid) = real_seed(1) + real_scratch(2)\n  double_scratch = dble(tid) + 0.5d0\n  double_seed(2) = double_seed(2) + dble(tid)\n  double_results(tid) = double_seed(2) + double_scratch(1)\n  logical_scratch = .false.\n  logical_scratch(1) = .true.\n  logical_seed(2) = .true.\n  logical_results(tid) = all(logical_seed) .and. logical_scratch(1) .and. .not. logical_scratch(2)\n!$omp end parallel\n  if (any(seed /= 10) .or. any(scratch /= -99)) error stop 1\n  if (any(large_seed /= 7) .or. any(large_private /= -99)) error stop 2\n  if (any(abs(real_seed - [1.5, 2.5]) > 0.0001) .or. any(real_scratch /= -99.0)) error stop 3\n  if (any(abs(double_seed - [3.0d0, 4.0d0]) > 0.0000001d0) .or. any(double_scratch /= -99.0d0)) error stop 4\n  if (.not. logical_seed(1) .or. logical_seed(2) .or. any(logical_scratch)) error stop 5\n  if (int_results(0) /= 20 .or. int_results(1) /= 24 .or. int_results(2) /= 28 .or. int_results(3) /= 32) error stop 6\n  if (large_results(0) /= 147 .or. large_results(1) /= 150 .or. large_results(2) /= 153 .or. large_results(3) /= 156) error stop 7\n  if (any(abs(real_results - [1.75, 3.75, 5.75, 7.75]) > 0.0001)) error stop 8\n  if (any(abs(double_results - [4.5d0, 6.5d0, 8.5d0, 10.5d0]) > 0.0000001d0)) error stop 9\n  if (.not. all(logical_results)) error stop 10\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_arrays", "bin");
+        let runtime_cache = unique_dir("openmp_private_arrays_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE fixed-shape arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE fixed-shape arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -21409,7 +21455,7 @@ fn fopenmp_capture_free_parallel_regions_run() {
 #[test]
 fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let src = write_program(
-        "program p\n  implicit none\n  character(len=3) :: text\n  integer, allocatable :: values(:)\n  text = 'abc'\n  allocate(values(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(values)\n  values(1) = 1\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
+        "program p\n  implicit none\n  character(len=3) :: text, words(2)\n  integer, allocatable :: values(:)\n  integer, target :: target_values(2)\n  integer, volatile :: volatile_values(2)\n  text = 'abc'\n  allocate(values(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(values)\n  values(1) = 1\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\n!$omp parallel firstprivate(words)\n  continue\n!$omp end parallel\n!$omp parallel private(values)\n  continue\n!$omp end parallel\n!$omp parallel private(target_values)\n  continue\n!$omp end parallel\n!$omp parallel private(volatile_values)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_private_dummy(dummy_values)\n    integer, intent(inout) :: dummy_values(2)\n!$omp parallel private(dummy_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_automatic(n)\n    integer, intent(in) :: n\n    integer :: automatic_values(n)\n!$omp parallel firstprivate(automatic_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
         "f90",
     );
     let result = diagnostic_output(&src, &["-fopenmp"]);
@@ -21423,7 +21469,13 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
             && stderr.contains("shared allocatable or pointer 'values' is recognized but not yet implemented")
             && stderr.contains("shared array 'assumed_rank' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy")
             && stderr.contains("shared OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
-            && stderr.contains("PRIVATE variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL"),
+            && stderr.contains("PRIVATE variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")
+            && stderr.contains("FIRSTPRIVATE array 'words' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
+            && stderr.contains("PRIVATE allocatable, pointer, or target variable 'values' is recognized but not yet implemented")
+            && stderr.contains("PRIVATE allocatable, pointer, or target variable 'target_values' is recognized but not yet implemented")
+            && stderr.contains("PRIVATE VOLATILE or ASYNCHRONOUS variable 'volatile_values' requires memory-model support that is not yet implemented")
+            && stderr.contains("PRIVATE dummy argument 'dummy_values' is recognized but not yet implemented")
+            && stderr.contains("FIRSTPRIVATE array 'automatic_values' must currently have constant explicit shape"),
         "unexpected diagnostic: {stderr}"
     );
     let _ = std::fs::remove_file(&src);

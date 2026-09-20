@@ -2169,7 +2169,11 @@ pub(crate) fn alloc_decls(
     }
 }
 
-fn rewrite_heap_promoted_declared_bounds(b: &mut FuncBuilder, desc: ValueId, dims: &[(i64, i64)]) {
+pub(super) fn rewrite_heap_promoted_declared_bounds(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    dims: &[(i64, i64)],
+) {
     if dims.is_empty() {
         return;
     }

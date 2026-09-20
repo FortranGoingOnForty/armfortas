@@ -1,22 +1,25 @@
 //! Lowering for executable OpenMP constructs.
 //!
 //! Semantic validation currently admits capture-free `PARALLEL` regions,
-//! numeric/logical scalar data, and supported shared numeric/logical arrays.
+//! numeric/logical scalar data, supported shared numeric/logical arrays, and
+//! constant explicit-shape private/firstprivate numeric/logical arrays.
 //! Each region is outlined into the fixed callback shape owned by the
 //! ARMFORTAS OpenMP ABI and synchronously invoked through the runtime. Shared
 //! addresses, non-owning array descriptors, and firstprivate snapshots live in
 //! a compiler-private environment whose lifetime is bounded by the synchronous
-//! join; private objects live in each callback invocation's stack frame.
+//! join. Private objects live in each callback invocation, using inline storage
+//! below the compiler's stack threshold and owned descriptors above it.
 
 use crate::ast::openmp::{OpenMpClause, OpenMpConstruct};
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::{FuncRef, Function, Param, ValueId};
 use crate::ir::types::{IntWidth, IrType};
 
+use super::alloc::rewrite_heap_promoted_declared_bounds;
 use super::core::{
-    array_descriptor_addr, collect_format_labels, collect_label_blocks, ensure_termination,
-    local_uses_array_descriptor, materialize_array_descriptor_for_info,
-    materialize_array_section_source_descriptor,
+    array_base_addr, array_descriptor_addr, collect_format_labels, collect_label_blocks,
+    emit_memcpy_bytes, ensure_termination, ir_scalar_byte_size, local_uses_array_descriptor,
+    materialize_array_descriptor_for_info, materialize_array_section_source_descriptor,
 };
 use super::ctx::{LocalInfo, LowerCtx, ProcScopeGuard};
 use super::helpers::coerce_to_type;
@@ -34,6 +37,128 @@ struct Capture {
     name: String,
     info: LocalInfo,
     kind: CaptureKind,
+}
+
+struct MaterializedEnvironment {
+    address: ValueId,
+    cleanup_descriptors: Vec<ValueId>,
+}
+
+const PRIVATE_ARRAY_STACK_THRESHOLD: i64 = 64 * 1024;
+
+fn fixed_array_layout(info: &LocalInfo, layout: crate::target::TargetLayout) -> Option<(u64, i64)> {
+    if info.dims.is_empty() {
+        return None;
+    }
+    let elements = info.dims.iter().fold(1_u64, |count, (_, extent)| {
+        count.saturating_mul((*extent).max(0) as u64)
+    });
+    let elem_bytes = ir_scalar_byte_size(&info.ty, layout).max(1);
+    let bytes = elements
+        .min(i64::MAX as u64)
+        .saturating_mul(elem_bytes as u64)
+        .min(i64::MAX as u64) as i64;
+    Some((elements, bytes))
+}
+
+fn fixed_array_storage_type(info: &LocalInfo, layout: crate::target::TargetLayout) -> IrType {
+    let (elements, _) = fixed_array_layout(info, layout)
+        .expect("OpenMP fixed-array storage requested for a scalar capture");
+    IrType::Array(Box::new(info.ty.clone()), elements.max(1))
+}
+
+fn fixed_array_uses_heap(info: &LocalInfo, layout: crate::target::TargetLayout) -> bool {
+    fixed_array_layout(info, layout)
+        .is_some_and(|(_, bytes)| bytes >= PRIVATE_ARRAY_STACK_THRESHOLD)
+}
+
+fn zero_array_descriptor(b: &mut FuncBuilder<'_>) -> ValueId {
+    let descriptor = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
+    let zero = b.const_i32(0);
+    let bytes = b.const_i64(392);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![descriptor, zero, bytes],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    descriptor
+}
+
+fn allocate_private_array(
+    b: &mut FuncBuilder<'_>,
+    outside: &LocalInfo,
+    shape_descriptor: Option<ValueId>,
+) -> (LocalInfo, Option<ValueId>) {
+    let mut private = outside.clone();
+    private.by_ref = false;
+    private.allocatable = false;
+    private.descriptor_arg = false;
+    private.inline_const = None;
+    private.is_pointer = false;
+    private.runtime_dim_upper.clear();
+    private.last_dim_assumed_size = false;
+
+    if !fixed_array_uses_heap(outside, b.layout) {
+        private.addr = b.alloca(fixed_array_storage_type(outside, b.layout));
+        return (private, None);
+    }
+
+    let descriptor = zero_array_descriptor(b);
+    if let Some(source) = shape_descriptor {
+        let stat = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, stat);
+        b.call(
+            FuncRef::External("afs_allocate_like".into()),
+            vec![descriptor, source, stat],
+            IrType::Void,
+        );
+    } else {
+        let (elements, _) = fixed_array_layout(outside, b.layout)
+            .expect("OpenMP heap array allocation requested for a scalar capture");
+        let elem_bytes = b.const_i64(ir_scalar_byte_size(&outside.ty, b.layout).max(1));
+        let count = b.const_i64(elements.min(i64::MAX as u64) as i64);
+        b.call(
+            FuncRef::External("afs_allocate_1d".into()),
+            vec![descriptor, elem_bytes, count],
+            IrType::Void,
+        );
+        rewrite_heap_promoted_declared_bounds(b, descriptor, &outside.dims);
+    }
+    private.addr = descriptor;
+    private.descriptor_arg = true;
+    (private, Some(descriptor))
+}
+
+fn copy_array_data(
+    b: &mut FuncBuilder<'_>,
+    destination: &LocalInfo,
+    source: ValueId,
+    descriptor_copy: bool,
+) {
+    if descriptor_copy {
+        let null_stat = b.const_i64(0);
+        b.call(
+            FuncRef::External("afs_copy_array_data_no_realloc".into()),
+            vec![destination.addr, source, null_stat],
+            IrType::Void,
+        );
+    } else {
+        let (_, bytes) = fixed_array_layout(destination, b.layout)
+            .expect("OpenMP array copy requested for a scalar capture");
+        emit_memcpy_bytes(b, destination.addr, source, bytes);
+    }
+}
+
+fn deallocate_array_descriptor(b: &mut FuncBuilder<'_>, descriptor: ValueId) {
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    b.store(zero, stat);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![descriptor, stat],
+        IrType::Void,
+    );
 }
 
 fn shared_capture_uses_descriptor(info: &LocalInfo) -> bool {
@@ -194,11 +319,22 @@ pub(super) fn lower_construct(
         {
             let mut outlined = FuncBuilder::new(&mut callback, ctx.layout);
             outlined.set_local_modules(local_modules);
-            install_shared_captures(&mut outlined, &mut outlined_ctx, &captures);
+            let cleanup_descriptors =
+                install_shared_captures(&mut outlined, &mut outlined_ctx, &captures);
             collect_label_blocks(&mut outlined, body, &mut outlined_ctx.label_blocks);
             collect_format_labels(body, &mut outlined_ctx.format_labels);
             let _scope = ProcScopeGuard::enter(outlined_ctx.proc_scope_id);
             super::stmt::lower_stmts(&mut outlined, &mut outlined_ctx, body);
+            if outlined
+                .func()
+                .block(outlined.current_block())
+                .terminator
+                .is_none()
+            {
+                for descriptor in cleanup_descriptors {
+                    deallocate_array_descriptor(&mut outlined, descriptor);
+                }
+            }
             ensure_termination(&mut outlined, None);
         }
 
@@ -215,12 +351,24 @@ pub(super) fn lower_construct(
     let flags = b.const_i32(0);
     b.call(
         FuncRef::External("afs_omp_parallel_region".into()),
-        vec![entry, environment, if_value, requested_threads, flags],
+        vec![
+            entry,
+            environment.address,
+            if_value,
+            requested_threads,
+            flags,
+        ],
         IrType::Int(IntWidth::I32),
     );
+    for descriptor in environment.cleanup_descriptors {
+        deallocate_array_descriptor(b, descriptor);
+    }
 }
 
-fn materialize_shared_environment(b: &mut FuncBuilder<'_>, captures: &[Capture]) -> ValueId {
+fn materialize_shared_environment(
+    b: &mut FuncBuilder<'_>,
+    captures: &[Capture],
+) -> MaterializedEnvironment {
     let addressed_count = captures
         .iter()
         .filter(|capture| {
@@ -232,13 +380,17 @@ fn materialize_shared_environment(b: &mut FuncBuilder<'_>, captures: &[Capture])
         .count();
     if addressed_count == 0 {
         let null = b.const_i64(0);
-        return b.int_to_ptr(null, IrType::Int(IntWidth::I8));
+        return MaterializedEnvironment {
+            address: b.int_to_ptr(null, IrType::Int(IntWidth::I8)),
+            cleanup_descriptors: Vec::new(),
+        };
     }
 
     let environment = b.alloca(IrType::Array(
         Box::new(IrType::Int(IntWidth::I64)),
         addressed_count as u64,
     ));
+    let mut cleanup_descriptors = Vec::new();
     let mut slot_index = 0i64;
     for capture in captures {
         if !matches!(
@@ -247,32 +399,49 @@ fn materialize_shared_environment(b: &mut FuncBuilder<'_>, captures: &[Capture])
         ) {
             continue;
         }
-        let captures_descriptor =
-            capture.kind == CaptureKind::Shared && shared_capture_uses_descriptor(&capture.info);
-        let outside_address = if captures_descriptor {
-            if local_uses_array_descriptor(&capture.info) {
-                array_descriptor_addr(b, &capture.info)
-            } else if capture.info.last_dim_assumed_size {
-                materialize_array_section_source_descriptor(b, &capture.info)
+        let environment_address =
+            if capture.kind == CaptureKind::FirstPrivate && !capture.info.dims.is_empty() {
+                let descriptor_copy = fixed_array_uses_heap(&capture.info, b.layout);
+                let source = if descriptor_copy {
+                    if local_uses_array_descriptor(&capture.info) {
+                        array_descriptor_addr(b, &capture.info)
+                    } else {
+                        materialize_array_descriptor_for_info(b, &capture.info)
+                    }
+                } else {
+                    array_base_addr(b, &capture.info)
+                };
+                let (snapshot, cleanup) =
+                    allocate_private_array(b, &capture.info, descriptor_copy.then_some(source));
+                copy_array_data(b, &snapshot, source, descriptor_copy);
+                cleanup_descriptors.extend(cleanup);
+                snapshot.addr
+            } else if capture.kind == CaptureKind::FirstPrivate {
+                let outside_address = if capture.info.by_ref {
+                    b.load(capture.info.addr)
+                } else {
+                    capture.info.addr
+                };
+                // Snapshot FIRSTPRIVATE before any implicit task begins. Each
+                // callback invocation copies from this stable value into its own
+                // task-local slot.
+                let snapshot = b.alloca(capture.info.ty.clone());
+                let value = b.load_typed(outside_address, capture.info.ty.clone());
+                b.store(value, snapshot);
+                snapshot
+            } else if shared_capture_uses_descriptor(&capture.info) {
+                if local_uses_array_descriptor(&capture.info) {
+                    array_descriptor_addr(b, &capture.info)
+                } else if capture.info.last_dim_assumed_size {
+                    materialize_array_section_source_descriptor(b, &capture.info)
+                } else {
+                    materialize_array_descriptor_for_info(b, &capture.info)
+                }
+            } else if capture.info.by_ref {
+                b.load(capture.info.addr)
             } else {
-                materialize_array_descriptor_for_info(b, &capture.info)
-            }
-        } else if capture.info.by_ref {
-            b.load(capture.info.addr)
-        } else {
-            capture.info.addr
-        };
-        let environment_address = if capture.kind == CaptureKind::FirstPrivate {
-            // Snapshot FIRSTPRIVATE before any implicit task begins. Each
-            // callback invocation copies from this stable value into its own
-            // task-local stack slot.
-            let snapshot = b.alloca(capture.info.ty.clone());
-            let value = b.load_typed(outside_address, capture.info.ty.clone());
-            b.store(value, snapshot);
-            snapshot
-        } else {
-            outside_address
-        };
+                capture.info.addr
+            };
         let raw_address = b.ptr_to_int(environment_address);
         let index = b.const_i64(slot_index);
         let slot = b.gep(environment, vec![index], IrType::Int(IntWidth::I64));
@@ -280,11 +449,19 @@ fn materialize_shared_environment(b: &mut FuncBuilder<'_>, captures: &[Capture])
         slot_index += 1;
     }
     let raw_environment = b.ptr_to_int(environment);
-    b.int_to_ptr(raw_environment, IrType::Int(IntWidth::I8))
+    MaterializedEnvironment {
+        address: b.int_to_ptr(raw_environment, IrType::Int(IntWidth::I8)),
+        cleanup_descriptors,
+    }
 }
 
-fn install_shared_captures(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, captures: &[Capture]) {
+fn install_shared_captures(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    captures: &[Capture],
+) -> Vec<ValueId> {
     let mut slot_index = 0i64;
+    let mut cleanup_descriptors = Vec::new();
     let environment_slots = if captures.iter().any(|capture| {
         matches!(
             capture.kind,
@@ -307,9 +484,15 @@ fn install_shared_captures(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, capt
                 local.addr = b.alloca(capture.info.ty.clone());
             }
             CaptureKind::Private => {
-                local.addr = b.alloca(capture.info.ty.clone());
-                local.by_ref = false;
-                local.inline_const = None;
+                if capture.info.dims.is_empty() {
+                    local.addr = b.alloca(capture.info.ty.clone());
+                    local.by_ref = false;
+                    local.inline_const = None;
+                } else {
+                    let (private, cleanup) = allocate_private_array(b, &capture.info, None);
+                    local = private;
+                    cleanup_descriptors.extend(cleanup);
+                }
             }
             CaptureKind::Shared | CaptureKind::FirstPrivate => {
                 let index = b.const_i64(slot_index);
@@ -321,13 +504,26 @@ fn install_shared_captures(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, capt
                 let raw_address = b.load_typed(slot, IrType::Int(IntWidth::I64));
                 let captures_descriptor = capture.kind == CaptureKind::Shared
                     && shared_capture_uses_descriptor(&capture.info);
-                let captured_pointee = if captures_descriptor {
+                let firstprivate_array =
+                    capture.kind == CaptureKind::FirstPrivate && !capture.info.dims.is_empty();
+                let firstprivate_descriptor =
+                    firstprivate_array && fixed_array_uses_heap(&capture.info, b.layout);
+                let captured_pointee = if captures_descriptor || firstprivate_descriptor {
                     IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392)
+                } else if firstprivate_array {
+                    fixed_array_storage_type(&capture.info, b.layout)
                 } else {
                     capture.info.ty.clone()
                 };
                 let environment_address = b.int_to_ptr(raw_address, captured_pointee);
-                if capture.kind == CaptureKind::FirstPrivate {
+                if firstprivate_array {
+                    let shape_descriptor = firstprivate_descriptor.then_some(environment_address);
+                    let (private, cleanup) =
+                        allocate_private_array(b, &capture.info, shape_descriptor);
+                    copy_array_data(b, &private, environment_address, firstprivate_descriptor);
+                    local = private;
+                    cleanup_descriptors.extend(cleanup);
+                } else if capture.kind == CaptureKind::FirstPrivate {
                     let private = b.alloca(capture.info.ty.clone());
                     let value = b.load_typed(environment_address, capture.info.ty.clone());
                     b.store(value, private);
@@ -351,4 +547,5 @@ fn install_shared_captures(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, capt
         }
         ctx.locals.insert(capture.name.clone(), local);
     }
+    cleanup_descriptors
 }

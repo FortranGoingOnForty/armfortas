@@ -1,8 +1,8 @@
 //! Semantic validation for executable OpenMP constructs.
 //!
 //! The executable slice is intentionally narrow: a `PARALLEL` region may
-//! share, privatize, or first-privatize scalar numeric/logical storage and may
-//! share supported numeric/logical arrays. It may use `IF`, `NUM_THREADS`,
+//! share, privatize, or first-privatize supported numeric/logical storage. It
+//! may use `IF`, `NUM_THREADS`,
 //! `SHARED`, `PRIVATE`, `FIRSTPRIVATE`, and `DEFAULT(SHARED/NONE)`. Keeping that
 //! boundary explicit lets the outliner execute real concurrent regions without
 //! pretending that owning descriptors, characters, or derived objects are
@@ -120,14 +120,14 @@ fn validate_parallel_clauses(
                 for name in names {
                     let key = name.to_ascii_lowercase();
                     register_data_attribute(ctx, span, &mut data_attributes, &key, "PRIVATE");
-                    validate_private_scalar(ctx, name, span, "PRIVATE");
+                    validate_private_object(ctx, name, span, "PRIVATE");
                 }
             }
             OpenMpClause::FirstPrivate(names) => {
                 for name in names {
                     let key = name.to_ascii_lowercase();
                     register_data_attribute(ctx, span, &mut data_attributes, &key, "FIRSTPRIVATE");
-                    validate_private_scalar(ctx, name, span, "FIRSTPRIVATE");
+                    validate_private_object(ctx, name, span, "FIRSTPRIVATE");
                 }
             }
             OpenMpClause::Default(OpenMpDefault::Shared) => {}
@@ -335,7 +335,7 @@ fn validate_data_environment(
         if predetermined_shared {
             validate_shared_object(ctx, &name, span);
         } else if predetermined_private.contains(&name) {
-            validate_private_scalar(ctx, &name, span, "predetermined PRIVATE");
+            validate_private_object(ctx, &name, span, "predetermined PRIVATE");
         } else if clause_info.default_none {
             ctx.error(
                 span,
@@ -493,7 +493,7 @@ fn is_current_dummy(ctx: &Ctx<'_>, symbol: &crate::sema::symtab::Symbol, name: &
                 .any(|arg| arg == &key))
 }
 
-fn validate_private_scalar(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &str) {
+fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &str) {
     let Some(symbol) = ctx.lookup_lexical(name) else {
         ctx.error(
             span,
@@ -521,16 +521,6 @@ fn validate_private_scalar(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         );
         return;
     }
-    if !symbol.attrs.array_spec.is_empty() {
-        ctx.error(
-            span,
-            format!(
-                "OpenMP {} array '{}' is recognized but not yet implemented",
-                clause, name
-            ),
-        );
-        return;
-    }
     if symbol.attrs.allocatable || symbol.attrs.pointer || symbol.attrs.target {
         ctx.error(
             span,
@@ -549,6 +539,39 @@ fn validate_private_scalar(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
                 clause, name
             ),
         );
+        return;
+    }
+    if !symbol.attrs.array_spec.is_empty() {
+        if symbol
+            .attrs
+            .array_spec
+            .iter()
+            .any(|spec| validation_explicit_dim_bounds(ctx, spec).is_none())
+        {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} array '{}' must currently have constant explicit shape",
+                    clause, name
+                ),
+            );
+            return;
+        }
+        if !matches!(
+            symbol.type_info.as_ref(),
+            Some(TypeInfo::Integer { .. })
+                | Some(TypeInfo::Real { .. })
+                | Some(TypeInfo::DoublePrecision)
+                | Some(TypeInfo::Logical { .. })
+        ) {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements",
+                    clause, name
+                ),
+            );
+        }
         return;
     }
     if !matches!(
