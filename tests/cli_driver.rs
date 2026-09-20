@@ -21043,7 +21043,7 @@ fn fopenmp_outlines_capture_free_parallel_regions() {
 #[test]
 fn fopenmp_outlined_parallel_emits_x86_64_elf_object() {
     let src = write_program(
-        "program p\n  implicit none\n  integer :: shared_value, seed, scratch\n  shared_value = 1\n  seed = 40\n!$omp parallel if(.false.) shared(shared_value) firstprivate(seed) private(scratch)\n  scratch = seed + 2\n  shared_value = scratch\n!$omp end parallel\n  if (shared_value /= 42 .or. seed /= 40) error stop 1\nend program\n",
+        "program p\n  implicit none\n  integer :: shared_value, seed, scratch\n  shared_value = 1\n  seed = 40\n!$omp parallel if(.false.) default(none) shared(shared_value) firstprivate(seed) private(scratch)\n  scratch = seed + 2\n  shared_value = scratch\n!$omp end parallel\n  if (shared_value /= 42 .or. seed /= 40) error stop 1\nend program\n",
         "f90",
     );
     let out = unique_path("openmp_parallel_x86", "o");
@@ -21151,6 +21151,81 @@ fn fopenmp_private_and_firstprivate_scalars_run() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_dir_all(&runtime_cache);
+}
+
+#[test]
+fn fopenmp_default_none_and_predetermined_scalars_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_default_none_and_predetermined_scalars_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  use omp_lib, only: omp_get_thread_num\n  implicit none\n  integer, parameter :: base = 100\n  integer :: i, tid, seed, slot0, slot1, slot2, slot3, marker\n  logical :: enabled\n  i = 77\n  tid = -1\n  seed = 2\n  slot0 = -1\n  slot1 = -1\n  slot2 = -1\n  slot3 = -1\n  marker = -1\n  enabled = .false.\n!$omp parallel default(none) num_threads(4) private(tid) firstprivate(seed) shared(slot0, slot1, slot2, slot3)\n  tid = omp_get_thread_num()\n  do i = 1, 3\n    seed = seed + i\n  end do\n  select case (tid)\n  case (0)\n    slot0 = base + seed\n  case (1)\n    slot1 = base + seed\n  case (2)\n    slot2 = base + seed\n  case (3)\n    slot3 = base + seed\n  end select\n!$omp end parallel\n  if (i /= 77 .or. tid /= -1 .or. seed /= 2) error stop 1\n  if (slot0 /= 108 .or. slot1 /= 108 .or. slot2 /= 108 .or. slot3 /= 108) error stop 2\n!$omp parallel if(enabled) default(none) shared(marker)\n  block\n    integer :: local_value\n    local_value = 42\n    marker = local_value\n  end block\n!$omp end parallel\n  if (marker /= 42) error stop 3\n  i = 0\n!$omp parallel if(.false.) default(none) shared(i)\n  do i = 1, 3\n    continue\n  end do\n!$omp end parallel\n  if (i /= 4) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("openmp_default_none", "bin");
+    let runtime_cache = unique_dir("openmp_default_none_runtime_cache");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            "-fopenmp",
+            "-O3",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("AFS_RUNTIME_CACHE", &runtime_cache)
+        .output()
+        .expect("spawn failed");
+    assert!(
+        compile.status.success(),
+        "OpenMP DEFAULT(NONE) scalar region should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "OpenMP DEFAULT(NONE) scalar region failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_dir_all(&runtime_cache);
+}
+
+#[test]
+fn fopenmp_default_none_rejects_implicit_data() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: explicit_value, missing_value, outer_i\n  explicit_value = 0\n  missing_value = 1\n  outer_i = 2\n!$omp parallel default(none) shared(explicit_value)\n  explicit_value = missing_value + outer_i\n  block\n    integer :: outer_i\n    do outer_i = 1, 2\n      continue\n    end do\n  end block\n!$omp end parallel\nend program\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-fopenmp"]);
+    assert!(
+        !result.status.success(),
+        "OpenMP DEFAULT(NONE) accepted implicitly scoped data"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(
+            "OpenMP DEFAULT(NONE) variable 'missing_value' must appear in a data-sharing clause"
+        ),
+        "unexpected DEFAULT(NONE) diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "OpenMP DEFAULT(NONE) variable 'outer_i' must appear in a data-sharing clause"
+        ),
+        "a shadowed BLOCK loop variable incorrectly privatized the outer variable: {stderr}"
+    );
+    assert!(
+        !stderr.contains("DEFAULT(NONE) variable 'explicit_value'"),
+        "explicitly shared data was rejected: {stderr}"
+    );
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]

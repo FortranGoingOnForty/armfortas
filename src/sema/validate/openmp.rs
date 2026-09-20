@@ -3,13 +3,13 @@
 //! The executable slice is intentionally narrow: a `PARALLEL` region may
 //! share, privatize, or first-privatize scalar numeric/logical storage and may
 //! use `IF`, `NUM_THREADS`, `SHARED`, `PRIVATE`, `FIRSTPRIVATE`, and
-//! `DEFAULT(SHARED)`. Keeping that boundary explicit lets the outliner execute
-//! real concurrent regions without pretending that arrays, characters, or
-//! derived objects are already implemented.
+//! `DEFAULT(SHARED/NONE)`. Keeping that boundary explicit lets the outliner
+//! execute real concurrent regions without pretending that arrays, characters,
+//! or derived objects are already implemented.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::openmp::{OpenMpClause, OpenMpConstruct};
+use crate::ast::openmp::{OpenMpClause, OpenMpConstruct, OpenMpDefault};
 use crate::ast::stmt::{IoControl, RankGuard, SpannedStmt, Stmt, TypeGuard};
 use crate::lexer::Span;
 use crate::sema::symtab::{SymbolKind, SymbolTable, TypeInfo};
@@ -37,16 +37,23 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
         ctx.error(span, "OpenMP PARALLEL is not allowed in a PURE procedure");
     }
 
-    let explicitly_shared = validate_parallel_clauses(ctx, span, clauses);
-    validate_shared_captures(ctx, body, &explicitly_shared);
+    let clause_info = validate_parallel_clauses(ctx, span, clauses);
+    let predetermined_private = predetermined_private_names(ctx.st, body);
+    validate_data_environment(ctx, body, &clause_info, &predetermined_private);
     validate_structured_block(ctx, body);
+}
+
+#[derive(Default)]
+struct ParallelClauseInfo {
+    explicitly_scoped: HashSet<String>,
+    default_none: bool,
 }
 
 fn validate_parallel_clauses(
     ctx: &mut Ctx<'_>,
     span: Span,
     clauses: &[OpenMpClause],
-) -> HashSet<String> {
+) -> ParallelClauseInfo {
     let mut saw_if = false;
     let mut saw_num_threads = false;
     let mut data_attributes = HashMap::new();
@@ -121,7 +128,8 @@ fn validate_parallel_clauses(
                     validate_private_scalar(ctx, name, span, "FIRSTPRIVATE");
                 }
             }
-            OpenMpClause::Default(crate::ast::openmp::OpenMpDefault::Shared) => {}
+            OpenMpClause::Default(OpenMpDefault::Shared) => {}
+            OpenMpClause::Default(OpenMpDefault::None) => {}
             unsupported => ctx.error(
                 span,
                 format!(
@@ -131,7 +139,12 @@ fn validate_parallel_clauses(
             ),
         }
     }
-    data_attributes.into_keys().collect()
+    ParallelClauseInfo {
+        explicitly_scoped: data_attributes.into_keys().collect(),
+        default_none: clauses
+            .iter()
+            .any(|clause| matches!(clause, OpenMpClause::Default(OpenMpDefault::None))),
+    }
 }
 
 fn register_data_attribute(
@@ -186,10 +199,109 @@ pub(crate) fn capture_references(
         .collect()
 }
 
-fn validate_shared_captures(
+pub(crate) fn predetermined_private_names(
+    st: &SymbolTable,
+    body: &[SpannedStmt],
+) -> HashSet<String> {
+    let mut candidates = Vec::new();
+    collect_predetermined_private_names(body, &mut candidates);
+    let references = capture_references(st, body);
+    candidates
+        .into_iter()
+        .filter_map(|(name, span)| {
+            references
+                .iter()
+                .any(|(reference, reference_span, role)| {
+                    reference == &name && reference_span == &span && *role == ReferenceRole::Value
+                })
+                .then_some(name)
+        })
+        .collect()
+}
+
+fn collect_predetermined_private_names(stmts: &[SpannedStmt], names: &mut Vec<(String, Span)>) {
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::DoLoop { var, body, .. } => {
+                if let Some(var) = var {
+                    names.push((var.to_ascii_lowercase(), stmt.span));
+                }
+                collect_predetermined_private_names(body, names);
+            }
+            Stmt::IfConstruct {
+                then_body,
+                else_ifs,
+                else_body,
+                ..
+            } => {
+                collect_predetermined_private_names(then_body, names);
+                for (_, body) in else_ifs {
+                    collect_predetermined_private_names(body, names);
+                }
+                if let Some(body) = else_body {
+                    collect_predetermined_private_names(body, names);
+                }
+            }
+            Stmt::IfStmt { action, .. }
+            | Stmt::WhereStmt { stmt: action, .. }
+            | Stmt::ForallStmt { stmt: action, .. }
+            | Stmt::Labeled { stmt: action, .. } => {
+                collect_predetermined_private_names(std::slice::from_ref(action.as_ref()), names);
+            }
+            Stmt::DoWhile { body, .. }
+            | Stmt::DoConcurrent { body, .. }
+            | Stmt::Block { body, .. }
+            | Stmt::Associate { body, .. }
+            | Stmt::ForallConstruct { body, .. } => {
+                collect_predetermined_private_names(body, names);
+            }
+            Stmt::SelectCase { cases, .. } => {
+                for case in cases {
+                    collect_predetermined_private_names(&case.body, names);
+                }
+            }
+            Stmt::SelectType { guards, .. } => {
+                for guard in guards {
+                    let body = match guard {
+                        TypeGuard::TypeIs { body, .. }
+                        | TypeGuard::ClassIs { body, .. }
+                        | TypeGuard::ClassDefault { body } => body,
+                    };
+                    collect_predetermined_private_names(body, names);
+                }
+            }
+            Stmt::SelectRank { guards, .. } => {
+                for guard in guards {
+                    let body = match guard {
+                        RankGuard::Rank { body, .. }
+                        | RankGuard::RankStar { body }
+                        | RankGuard::RankDefault { body } => body,
+                    };
+                    collect_predetermined_private_names(body, names);
+                }
+            }
+            Stmt::WhereConstruct {
+                body, elsewhere, ..
+            } => {
+                collect_predetermined_private_names(body, names);
+                for (_, body) in elsewhere {
+                    collect_predetermined_private_names(body, names);
+                }
+            }
+            // A nested OpenMP region owns a distinct data environment. Its
+            // predetermined variables must not change the enclosing region's
+            // classification.
+            Stmt::OpenMp(_) => {}
+            _ => {}
+        }
+    }
+}
+
+fn validate_data_environment(
     ctx: &mut Ctx<'_>,
     body: &[SpannedStmt],
-    explicitly_shared: &HashSet<String>,
+    clause_info: &ParallelClauseInfo,
+    predetermined_private: &HashSet<String>,
 ) {
     let mut seen = HashSet::new();
     for (name, span, role) in capture_references(ctx.st, body) {
@@ -201,7 +313,36 @@ fn validate_shared_captures(
                         SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::ProcedurePointer
                     )
                 }));
-        if is_data_reference && seen.insert(name.clone()) && !explicitly_shared.contains(&name) {
+        if !is_data_reference
+            || !seen.insert(name.clone())
+            || clause_info.explicitly_scoped.contains(&name)
+        {
+            continue;
+        }
+
+        let Some(symbol) = ctx.lookup_lexical(&name) else {
+            validate_shared_scalar(ctx, &name, span, true);
+            continue;
+        };
+        let predetermined_shared = symbol.kind == SymbolKind::Parameter
+            || symbol
+                .attrs
+                .array_spec
+                .iter()
+                .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedSize { .. }));
+        if predetermined_shared {
+            validate_shared_scalar(ctx, &name, span, true);
+        } else if predetermined_private.contains(&name) {
+            validate_private_scalar(ctx, &name, span, "predetermined PRIVATE");
+        } else if clause_info.default_none {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP DEFAULT(NONE) variable '{}' must appear in a data-sharing clause",
+                    name
+                ),
+            );
+        } else {
             validate_shared_scalar(ctx, &name, span, true);
         }
     }

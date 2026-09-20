@@ -82,6 +82,17 @@ pub(super) fn lower_construct(
         .flatten()
         .map(|name| name.to_ascii_lowercase())
         .collect();
+    let shared_names: std::collections::HashSet<_> = clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            OpenMpClause::Shared(names) => Some(names.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    let predetermined_private =
+        crate::sema::validate::openmp::predetermined_private_names(ctx.st, body);
     let mut seen_captures = std::collections::HashSet::new();
     let captures: Vec<Capture> = crate::sema::validate::openmp::capture_references(ctx.st, body)
         .into_iter()
@@ -109,8 +120,12 @@ pub(super) fn lower_construct(
                 CaptureKind::Private
             } else if firstprivate_names.contains(&name) {
                 CaptureKind::FirstPrivate
+            } else if shared_names.contains(&name) {
+                CaptureKind::Shared
             } else if info.inline_const.is_some() {
                 CaptureKind::InlineConstant
+            } else if predetermined_private.contains(&name) {
+                CaptureKind::Private
             } else {
                 CaptureKind::Shared
             };
