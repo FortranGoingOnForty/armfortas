@@ -1,19 +1,23 @@
 //! Lowering for executable OpenMP constructs.
 //!
 //! Semantic validation currently admits capture-free `PARALLEL` regions,
-//! numeric/logical scalar data, and shared fixed-shape numeric/logical arrays.
+//! numeric/logical scalar data, and supported shared numeric/logical arrays.
 //! Each region is outlined into the fixed callback shape owned by the
 //! ARMFORTAS OpenMP ABI and synchronously invoked through the runtime. Shared
-//! addresses and firstprivate snapshots live in a compiler-private environment
-//! whose lifetime is bounded by the synchronous join; private objects live in
-//! each callback invocation's stack frame.
+//! addresses, non-owning array descriptors, and firstprivate snapshots live in
+//! a compiler-private environment whose lifetime is bounded by the synchronous
+//! join; private objects live in each callback invocation's stack frame.
 
 use crate::ast::openmp::{OpenMpClause, OpenMpConstruct};
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::{FuncRef, Function, Param, ValueId};
 use crate::ir::types::{IntWidth, IrType};
 
-use super::core::{collect_format_labels, collect_label_blocks, ensure_termination};
+use super::core::{
+    array_descriptor_addr, collect_format_labels, collect_label_blocks, ensure_termination,
+    local_uses_array_descriptor, materialize_array_descriptor_for_info,
+    materialize_array_section_source_descriptor,
+};
 use super::ctx::{LocalInfo, LowerCtx, ProcScopeGuard};
 use super::helpers::coerce_to_type;
 
@@ -30,6 +34,12 @@ struct Capture {
     name: String,
     info: LocalInfo,
     kind: CaptureKind,
+}
+
+fn shared_capture_uses_descriptor(info: &LocalInfo) -> bool {
+    local_uses_array_descriptor(info)
+        || info.last_dim_assumed_size
+        || (!info.dims.is_empty() && info.runtime_dim_upper.iter().any(Option::is_some))
 }
 
 pub(super) fn lower_construct(
@@ -237,7 +247,17 @@ fn materialize_shared_environment(b: &mut FuncBuilder<'_>, captures: &[Capture])
         ) {
             continue;
         }
-        let outside_address = if capture.info.by_ref {
+        let captures_descriptor =
+            capture.kind == CaptureKind::Shared && shared_capture_uses_descriptor(&capture.info);
+        let outside_address = if captures_descriptor {
+            if local_uses_array_descriptor(&capture.info) {
+                array_descriptor_addr(b, &capture.info)
+            } else if capture.info.last_dim_assumed_size {
+                materialize_array_section_source_descriptor(b, &capture.info)
+            } else {
+                materialize_array_descriptor_for_info(b, &capture.info)
+            }
+        } else if capture.info.by_ref {
             b.load(capture.info.addr)
         } else {
             capture.info.addr
@@ -299,7 +319,14 @@ fn install_shared_captures(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, capt
                     IrType::Int(IntWidth::I64),
                 );
                 let raw_address = b.load_typed(slot, IrType::Int(IntWidth::I64));
-                let environment_address = b.int_to_ptr(raw_address, capture.info.ty.clone());
+                let captures_descriptor = capture.kind == CaptureKind::Shared
+                    && shared_capture_uses_descriptor(&capture.info);
+                let captured_pointee = if captures_descriptor {
+                    IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392)
+                } else {
+                    capture.info.ty.clone()
+                };
+                let environment_address = b.int_to_ptr(raw_address, captured_pointee);
                 if capture.kind == CaptureKind::FirstPrivate {
                     let private = b.alloca(capture.info.ty.clone());
                     let value = b.load_typed(environment_address, capture.info.ty.clone());
@@ -308,6 +335,15 @@ fn install_shared_captures(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, capt
                     local.inline_const = None;
                 } else {
                     local.addr = environment_address;
+                    if captures_descriptor {
+                        // Runtime-bound explicit-shape dummies carry bound SSA
+                        // values in the encountering function. The descriptor
+                        // materialized above is their complete cross-function
+                        // view; never leak those parent ValueIds into the
+                        // outlined callback.
+                        local.descriptor_arg = true;
+                        local.runtime_dim_upper.clear();
+                    }
                 }
                 local.by_ref = false;
                 slot_index += 1;

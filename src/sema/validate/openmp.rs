@@ -2,11 +2,11 @@
 //!
 //! The executable slice is intentionally narrow: a `PARALLEL` region may
 //! share, privatize, or first-privatize scalar numeric/logical storage and may
-//! share fixed-shape numeric/logical arrays. It may use `IF`, `NUM_THREADS`,
+//! share supported numeric/logical arrays. It may use `IF`, `NUM_THREADS`,
 //! `SHARED`, `PRIVATE`, `FIRSTPRIVATE`, and `DEFAULT(SHARED/NONE)`. Keeping that
 //! boundary explicit lets the outliner execute real concurrent regions without
-//! pretending that descriptor-backed arrays, characters, or derived objects
-//! are already implemented.
+//! pretending that owning descriptors, characters, or derived objects are
+//! already implemented.
 
 use std::collections::{HashMap, HashSet};
 
@@ -402,16 +402,46 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
         return;
     }
     if !symbol.attrs.array_spec.is_empty() {
-        if symbol
+        let constant_explicit_shape = symbol
             .attrs
             .array_spec
             .iter()
-            .any(|spec| validation_explicit_dim_bounds(ctx, spec).is_none())
+            .all(|spec| validation_explicit_dim_bounds(ctx, spec).is_some());
+        let is_dummy = is_current_dummy(ctx, symbol, name);
+        let runtime_explicit_shape_dummy = is_dummy
+            && symbol
+                .attrs
+                .array_spec
+                .iter()
+                .all(|spec| matches!(spec, crate::ast::decl::ArraySpec::Explicit { .. }));
+        let assumed_shape_dummy = is_dummy
+            && symbol.attrs.array_spec.iter().all(|spec| {
+                matches!(
+                    spec,
+                    crate::ast::decl::ArraySpec::AssumedShape { .. }
+                        | crate::ast::decl::ArraySpec::Deferred
+                )
+            });
+        let assumed_size_dummy = is_dummy
+            && symbol
+                .attrs
+                .array_spec
+                .split_last()
+                .is_some_and(|(last, leading)| {
+                    matches!(last, crate::ast::decl::ArraySpec::AssumedSize { .. })
+                        && leading.iter().all(|spec| {
+                            matches!(spec, crate::ast::decl::ArraySpec::Explicit { .. })
+                        })
+                });
+        if !constant_explicit_shape
+            && !runtime_explicit_shape_dummy
+            && !assumed_shape_dummy
+            && !assumed_size_dummy
         {
             ctx.error(
                 span,
                 format!(
-                    "OpenMP PARALLEL shared array '{}' must currently have constant explicit shape",
+                    "OpenMP PARALLEL shared array '{}' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy",
                     name
                 ),
             );
@@ -451,6 +481,18 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
     }
 }
 
+fn is_current_dummy(ctx: &Ctx<'_>, symbol: &crate::sema::symtab::Symbol, name: &str) -> bool {
+    let key = name.to_ascii_lowercase();
+    ctx.current_args.contains(&key)
+        || (symbol.scope == ctx.scope_id
+            && ctx
+                .st
+                .scope(ctx.scope_id)
+                .arg_order
+                .iter()
+                .any(|arg| arg == &key))
+}
+
 fn validate_private_scalar(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &str) {
     let Some(symbol) = ctx.lookup_lexical(name) else {
         ctx.error(
@@ -469,7 +511,7 @@ fn validate_private_scalar(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         );
         return;
     }
-    if ctx.current_args.contains(&name.to_ascii_lowercase()) {
+    if is_current_dummy(ctx, symbol, name) {
         ctx.error(
             span,
             format!(

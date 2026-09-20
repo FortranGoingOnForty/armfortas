@@ -42176,7 +42176,10 @@ pub(super) fn materialize_array_descriptor_for_info(
 /// is forwarded to an assumed-rank argument (F2018 15.5.2.4). A section such
 /// as `a(1:2, ed)` instead needs the declared leading extent so that the scalar
 /// second subscript contributes the correct column-major base offset.
-fn materialize_array_section_source_descriptor(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
+pub(super) fn materialize_array_section_source_descriptor(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+) -> ValueId {
     materialize_array_descriptor_for_info_impl(b, info, true)
 }
 

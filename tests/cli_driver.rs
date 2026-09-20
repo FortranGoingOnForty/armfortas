@@ -21043,7 +21043,7 @@ fn fopenmp_outlines_capture_free_parallel_regions() {
 #[test]
 fn fopenmp_outlined_parallel_emits_x86_64_elf_object() {
     let src = write_program(
-        "program p\n  implicit none\n  integer :: shared_value, seed, scratch, values(-1:0,0:1)\n  shared_value = 1\n  seed = 40\n  values = 0\n!$omp parallel if(.false.) default(none) shared(shared_value, values) firstprivate(seed) private(scratch)\n  scratch = seed + 2\n  shared_value = scratch\n  values(-1,0) = scratch\n!$omp end parallel\n  if (shared_value /= 42 .or. seed /= 40 .or. values(-1,0) /= 42) error stop 1\nend program\n",
+        "program p\n  implicit none\n  integer :: shared_value, seed, scratch, values(-1:0,0:1), descriptor_values(2)\n  shared_value = 1\n  seed = 40\n  values = 0\n  descriptor_values = 0\n!$omp parallel if(.false.) default(none) shared(shared_value, values) firstprivate(seed) private(scratch)\n  scratch = seed + 2\n  shared_value = scratch\n  values(-1,0) = scratch\n!$omp end parallel\n  call touch_descriptor(descriptor_values)\n  if (shared_value /= 42 .or. seed /= 40 .or. values(-1,0) /= 42 .or. descriptor_values(1) /= 42) error stop 1\ncontains\n  subroutine touch_descriptor(items)\n    integer, intent(inout) :: items(:)\n!$omp parallel if(.false.) default(none) shared(items)\n    items(1) = 42\n!$omp end parallel\n  end subroutine\nend program\n",
         "f90",
     );
     let out = unique_path("openmp_parallel_x86", "o");
@@ -21317,6 +21317,52 @@ fn fopenmp_shared_fixed_shape_arrays_run() {
 }
 
 #[test]
+fn fopenmp_shared_descriptor_backed_dummy_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_shared_descriptor_backed_dummy_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_descriptor_array_state\n  use omp_lib, only: omp_get_thread_num\n  implicit none\ncontains\n  subroutine fill_assumed(values)\n    integer, intent(inout) :: values(0:)\n    integer :: tid\n!$omp parallel default(none) num_threads(4) private(tid) shared(values)\n    tid = omp_get_thread_num()\n    values(tid) = 300 + tid\n!$omp end parallel\n  end subroutine\n  subroutine fill_assumed_default(values)\n    integer, intent(inout) :: values(:)\n    integer :: tid\n!$omp parallel default(none) num_threads(4) private(tid) shared(values)\n    tid = omp_get_thread_num()\n    values(tid+1) = 350 + tid\n!$omp end parallel\n  end subroutine\n  subroutine fill_runtime_upper(n, values)\n    integer, intent(in) :: n\n    integer, intent(inout) :: values(0:n-1)\n    integer :: tid\n!$omp parallel default(none) num_threads(4) private(tid) shared(values)\n    tid = omp_get_thread_num()\n    values(tid) = 375 + tid\n!$omp end parallel\n  end subroutine\n  subroutine fill_runtime(n, values)\n    integer, intent(in) :: n\n    integer, intent(inout) :: values(-n:n-1,2:3)\n    integer :: tid\n!$omp parallel default(none) num_threads(4) private(tid) shared(values)\n    tid = omp_get_thread_num()\n    values(tid-2,2) = 400 + tid\n    values(tid-2,3) = 500 + tid\n!$omp end parallel\n  end subroutine\n  subroutine fill_assumed_size(n, values)\n    integer, intent(in) :: n\n    integer, intent(inout) :: values(0:n-1,*)\n    integer :: tid\n!$omp parallel default(none) num_threads(4) private(tid) shared(values)\n    tid = omp_get_thread_num()\n    values(tid,1) = 600 + tid\n    values(tid,2) = 700 + tid\n!$omp end parallel\n  end subroutine\nend module\nprogram p\n  use omp_descriptor_array_state, only: fill_assumed, fill_assumed_default, fill_runtime_upper, fill_runtime, fill_assumed_size\n  implicit none\n  integer :: backing(8), default_backing(8), upper_values(0:3), runtime_values(-2:1,2:3), assumed_size_values(0:3,1:2)\n  backing = -1\n  default_backing = -1\n  upper_values = -1\n  runtime_values = -1\n  assumed_size_values = -1\n  call fill_assumed(backing(1:8:2))\n  call fill_assumed_default(default_backing(1:8:2))\n  call fill_runtime_upper(4, upper_values)\n  call fill_runtime(2, runtime_values)\n  call fill_assumed_size(4, assumed_size_values)\n  if (backing(1) /= 300 .or. backing(3) /= 301 .or. backing(5) /= 302 .or. backing(7) /= 303) error stop 1\n  if (backing(2) /= -1 .or. backing(4) /= -1 .or. backing(6) /= -1 .or. backing(8) /= -1) error stop 2\n  if (default_backing(1) /= 350 .or. default_backing(3) /= 351 .or. default_backing(5) /= 352 .or. default_backing(7) /= 353) error stop 3\n  if (default_backing(2) /= -1 .or. default_backing(4) /= -1 .or. default_backing(6) /= -1 .or. default_backing(8) /= -1) error stop 4\n  if (upper_values(0) /= 375 .or. upper_values(1) /= 376 .or. upper_values(2) /= 377 .or. upper_values(3) /= 378) error stop 5\n  if (runtime_values(-2,2) /= 400 .or. runtime_values(-1,2) /= 401 .or. runtime_values(0,2) /= 402 .or. runtime_values(1,2) /= 403) error stop 6\n  if (runtime_values(-2,3) /= 500 .or. runtime_values(-1,3) /= 501 .or. runtime_values(0,3) /= 502 .or. runtime_values(1,3) /= 503) error stop 7\n  if (assumed_size_values(0,1) /= 600 .or. assumed_size_values(1,1) /= 601 .or. assumed_size_values(2,1) /= 602 .or. assumed_size_values(3,1) /= 603) error stop 8\n  if (assumed_size_values(0,2) /= 700 .or. assumed_size_values(1,2) /= 701 .or. assumed_size_values(2,2) /= 702 .or. assumed_size_values(3,2) /= 703) error stop 9\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_shared_descriptor_arrays", "bin");
+        let runtime_cache = unique_dir("openmp_shared_descriptor_arrays_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP shared descriptor-backed dummy arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP shared descriptor-backed dummy arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_capture_free_parallel_regions_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -21363,7 +21409,7 @@ fn fopenmp_capture_free_parallel_regions_run() {
 #[test]
 fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let src = write_program(
-        "program p\n  implicit none\n  character(len=3) :: text\n  integer, allocatable :: values(:)\n  text = 'abc'\n  allocate(values(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(values)\n  values(1) = 1\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_dynamic(n, dynamic)\n    integer, intent(in) :: n\n    integer, intent(inout) :: dynamic(n)\n!$omp parallel shared(dynamic)\n    dynamic(1) = 1\n!$omp end parallel\n  end subroutine\nend program\n",
+        "program p\n  implicit none\n  character(len=3) :: text\n  integer, allocatable :: values(:)\n  text = 'abc'\n  allocate(values(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(values)\n  values(1) = 1\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
         "f90",
     );
     let result = diagnostic_output(&src, &["-fopenmp"]);
@@ -21375,7 +21421,8 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
     assert!(
         stderr.contains("shared variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")
             && stderr.contains("shared allocatable or pointer 'values' is recognized but not yet implemented")
-            && stderr.contains("shared array 'dynamic' must currently have constant explicit shape")
+            && stderr.contains("shared array 'assumed_rank' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy")
+            && stderr.contains("shared OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL"),
         "unexpected diagnostic: {stderr}"
     );
