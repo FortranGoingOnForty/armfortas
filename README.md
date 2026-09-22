@@ -86,8 +86,10 @@ afs --version
 
 ## Preview limitations
 
-- OpenMP is not implemented. ARMFORTAS does not silently treat OpenMP as a
-  supported parallel-execution mode.
+- OpenMP host execution is an experimental, explicitly bounded preview aligned
+  with the OpenMP 5.2 language baseline. `parallel` regions and the data forms
+  listed in [OPENMP.md](OPENMP.md) execute in parallel; unsupported constructs,
+  clauses, and data forms are rejected rather than silently run as serial code.
 - `afs-as` is the default in-process assembler, but the system linker remains
   the default. `AFS_LD=1` opts into the standalone `afs-ld` linker while its
   parity campaign continues.

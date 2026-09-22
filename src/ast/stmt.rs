@@ -238,6 +238,9 @@ pub enum Stmt {
         groups: Vec<(String, Vec<String>)>,
     },
 
+    // ---- OpenMP ----
+    OpenMp(super::openmp::OpenMpConstruct),
+
     // ---- Declaration (embedded in statement context) ----
     Declaration(SpannedDecl),
 }

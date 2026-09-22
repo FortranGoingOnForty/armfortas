@@ -148,6 +148,9 @@ pub(super) struct Ctx<'a> {
     /// working byte-copy lowering; only the Fortran-internal character
     /// VALUE path lacks copy-in.
     pub(super) in_bind_c_unit: bool,
+    /// Full `-fopenmp` compilation is enabled. SIMD-only mode deliberately
+    /// leaves this false so threaded constructs cannot cross into lowering.
+    pub(super) openmp_full: bool,
     /// Host scopes whose storage must not be captured by the procedure
     /// currently being validated because it is reachable from a local
     /// FINAL binding and may be invoked after those scopes return.
@@ -239,6 +242,7 @@ impl<'a> Ctx<'a> {
             in_call_arg: false,
             allow_array_cond_rhs: false,
             in_bind_c_unit: false,
+            openmp_full: false,
             finalizer_capture_host_scopes: HashSet::new(),
             reported_finalizer_captures: HashSet::new(),
             reported_use_ambiguities: HashSet::new(),
@@ -514,6 +518,26 @@ pub fn validate_file_with_layouts_and_warning_groups(
     warn_deprecated: bool,
 ) -> Vec<Diagnostic> {
     let mut ctx = Ctx::new_with_layouts(st, std, type_layouts, warn_pedantic, warn_deprecated);
+    for unit in units {
+        validate_unit(&mut ctx, unit);
+    }
+    ctx.diags
+}
+
+/// Validate with the same production configuration as the driver, including
+/// whether full OpenMP execution (as opposed to SIMD-only parsing) is enabled.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_file_with_layouts_warning_groups_and_openmp(
+    units: &[SpannedUnit],
+    st: &SymbolTable,
+    std: Option<FortranStandard>,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    warn_pedantic: bool,
+    warn_deprecated: bool,
+    openmp_full: bool,
+) -> Vec<Diagnostic> {
+    let mut ctx = Ctx::new_with_layouts(st, std, type_layouts, warn_pedantic, warn_deprecated);
+    ctx.openmp_full = openmp_full;
     for unit in units {
         validate_unit(&mut ctx, unit);
     }
@@ -2343,6 +2367,7 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             validate_const_int_expr_tree(ctx, callee);
             if let Expr::Name { name } = &callee.node {
                 check_intrinsic_call_arity(ctx, stmt.span, name, args.len(), true);
+                check_intrinsic_call_types(ctx, stmt.span, name, args);
             }
             let saved = ctx.in_call_arg;
             ctx.in_call_arg = true;
@@ -2354,6 +2379,13 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
         Stmt::Print { items, .. } => {
             for item in items {
                 validate_io_item_expr_tree(ctx, item);
+            }
+        }
+        Stmt::OpenMp(construct) => {
+            for clause in construct.clauses() {
+                if let Some(expr) = clause.expression() {
+                    validate_const_int_expr_tree(ctx, expr);
+                }
             }
         }
         Stmt::Block { .. }
@@ -2536,23 +2568,23 @@ fn find_scope_for_unit(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReferenceRole {
+pub(crate) enum ReferenceRole {
     Value,
     Callable,
     Type,
 }
 
 #[derive(Debug)]
-struct NameReference {
-    name: String,
-    span: Span,
-    role: ReferenceRole,
+pub(super) struct NameReference {
+    pub(super) name: String,
+    pub(super) span: Span,
+    pub(super) role: ReferenceRole,
 }
 
 #[derive(Default)]
-struct ProcedureReferenceFacts {
-    references: Vec<NameReference>,
-    calls: HashSet<String>,
+pub(super) struct ProcedureReferenceFacts {
+    pub(super) references: Vec<NameReference>,
+    pub(super) calls: HashSet<String>,
 }
 
 fn collect_name_reference(
@@ -3362,6 +3394,30 @@ fn collect_reference_stmt(
                 }
             }
         }
+        Stmt::OpenMp(construct) => {
+            for clause in construct.clauses() {
+                if let Some(names) = clause.listed_variables() {
+                    for name in names {
+                        collect_name_reference(
+                            name,
+                            stmt.span,
+                            ReferenceRole::Value,
+                            shadowed,
+                            facts,
+                        );
+                    }
+                }
+                if let Some(expr) = clause.expression() {
+                    collect_reference_expr(expr, shadowed, facts);
+                }
+            }
+            if let Some(body) = construct.region_body() {
+                collect_reference_stmts(body, shadowed, facts);
+            }
+            if let Some(loop_stmt) = construct.loop_stmt() {
+                collect_reference_stmt(loop_stmt, shadowed, facts);
+            }
+        }
         Stmt::Declaration(decl) => collect_reference_decl(decl, shadowed, facts),
         Stmt::Exit { .. }
         | Stmt::Cycle { .. }
@@ -3371,7 +3427,7 @@ fn collect_reference_stmt(
     }
 }
 
-fn collect_reference_stmts(
+pub(super) fn collect_reference_stmts(
     stmts: &[SpannedStmt],
     shadowed: &HashSet<String>,
     facts: &mut ProcedureReferenceFacts,
@@ -3386,7 +3442,7 @@ fn collect_reference_stmts(
 /// do-concurrent-block, including a BLOCK nested under another executable
 /// construct. Walk just those skipped lexical islands here while carrying
 /// every intervening construct entity that can shadow an outer variable.
-fn collect_default_none_nested_block_references(
+pub(super) fn collect_default_none_nested_block_references(
     st: &SymbolTable,
     stmts: &[SpannedStmt],
     shadowed: &HashSet<String>,
@@ -5980,6 +6036,26 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             validate_associate(ctx, assocs, body, stmt.span);
         }
 
+        Stmt::OpenMp(construct) => {
+            if ctx.openmp_full {
+                super::openmp::validate_construct(ctx, stmt.span, construct);
+            } else {
+                ctx.error(
+                    stmt.span,
+                    format!(
+                        "OpenMP {} execution is recognized but not yet implemented",
+                        construct.name()
+                    ),
+                );
+            }
+            if let Some(body) = construct.region_body() {
+                validate_stmts(ctx, body);
+            }
+            if let Some(loop_stmt) = construct.loop_stmt() {
+                validate_stmt(ctx, loop_stmt);
+            }
+        }
+
         // Call in pure: callee must be pure (we check if it's known impure).
         Stmt::Call { callee, args, .. } => {
             if let Expr::Name { name } = &callee.node {
@@ -6506,7 +6582,7 @@ fn validation_expr_metadata(ctx: &Ctx<'_>, expr: &SpannedExpr) -> ValidationExpr
     }
 }
 
-fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeInfo> {
+pub(super) fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeInfo> {
     if matches!(expr.node, Expr::ComponentAccess { .. }) {
         if let Some(leaf) = leaf_field_layout(ctx, expr) {
             return Some(leaf.field.type_info.clone());
@@ -6584,7 +6660,17 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                         | SymbolKind::NamedInterface
                 ) && !symbol.attrs.intrinsic
             });
-            if is_intrinsic_name(name) && !user_callable {
+            let intrinsic_name = is_intrinsic_name(name)
+                .then(|| name.to_ascii_lowercase())
+                .or_else(|| {
+                    symbol
+                        .filter(|symbol| matches!(symbol.kind, SymbolKind::IntrinsicProc))
+                        .map(|symbol| symbol.name.to_ascii_lowercase())
+                        .filter(|canonical| {
+                            crate::sema::intrinsic_modules::is_openmp_runtime_procedure(canonical)
+                        })
+                });
+            if let Some(intrinsic_name) = intrinsic_name.filter(|_| !user_callable) {
                 let arg_types: Option<Vec<_>> = args
                     .iter()
                     .map(|arg| match &arg.value {
@@ -6594,7 +6680,7 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                     })
                     .collect();
                 if let Some(arg_types) = arg_types {
-                    let key = name.to_ascii_lowercase();
+                    let key = intrinsic_name;
                     let kind_position = crate::sema::types::character_integer_result_kind_position(
                         &key,
                     )
@@ -6628,7 +6714,7 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                         };
                         return Some(type_info);
                     }
-                    if let Some(type_) = intrinsic_result_type(name, &arg_types) {
+                    if let Some(type_) = intrinsic_result_type(&key, &arg_types) {
                         return fortran_type_to_validation_type_info(type_);
                     }
                 }
@@ -6824,7 +6910,7 @@ fn validation_const_int_value(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<i128>
         .map(|value| value.value)
 }
 
-fn validation_explicit_dim_bounds(
+pub(super) fn validation_explicit_dim_bounds(
     ctx: &Ctx<'_>,
     spec: &crate::ast::decl::ArraySpec,
 ) -> Option<(i128, i128)> {
@@ -7632,6 +7718,12 @@ fn intrinsic_result_rank_is_scalar(name: &str) -> bool {
             | "maxexponent"
             | "minexponent"
             | "new_line"
+            | "omp_get_max_threads"
+            | "omp_get_num_threads"
+            | "omp_get_thread_num"
+            | "omp_get_wtick"
+            | "omp_get_wtime"
+            | "omp_in_parallel"
             | "precision"
             | "present"
             | "radix"
@@ -7725,7 +7817,7 @@ fn intrinsic_call_result_rank(ctx: &Ctx<'_>, name: &str, args: &[Argument]) -> O
     }
 }
 
-fn validation_expr_rank(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<usize> {
+pub(super) fn validation_expr_rank(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<usize> {
     use crate::ast::expr::SectionSubscript;
 
     match &expr.node {
@@ -7814,8 +7906,19 @@ fn validation_expr_rank(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<usize> {
                         | SymbolKind::ProcedurePointer
                         | SymbolKind::NamedInterface
                 ) && !symbol.attrs.intrinsic;
-                if is_intrinsic_name(name) && !user_callable {
-                    if let Some(rank) = intrinsic_call_result_rank(ctx, name, args) {
+                let intrinsic_name = is_intrinsic_name(name)
+                    .then(|| name.to_ascii_lowercase())
+                    .or_else(|| {
+                        matches!(symbol.kind, SymbolKind::IntrinsicProc)
+                            .then(|| symbol.name.to_ascii_lowercase())
+                            .filter(|canonical| {
+                                crate::sema::intrinsic_modules::is_openmp_runtime_procedure(
+                                    canonical,
+                                )
+                            })
+                    });
+                if let Some(intrinsic_name) = intrinsic_name.filter(|_| !user_callable) {
+                    if let Some(rank) = intrinsic_call_result_rank(ctx, &intrinsic_name, args) {
                         return Some(rank);
                     }
                 }
@@ -10994,7 +11097,16 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         "execute_command_line" => (1, Some(5)),
         "get_command_argument" => (1, Some(5)),
         "get_environment_variable" => (1, Some(6)),
-        "command_argument_count" | "compiler_version" | "compiler_options" => (0, Some(0)),
+        "command_argument_count"
+        | "compiler_version"
+        | "compiler_options"
+        | "omp_get_thread_num"
+        | "omp_get_num_threads"
+        | "omp_get_max_threads"
+        | "omp_in_parallel"
+        | "omp_get_wtime"
+        | "omp_get_wtick" => (0, Some(0)),
+        "omp_set_num_threads" => (1, Some(1)),
         "split" => (3, Some(4)),
         "c_f_pointer" => (2, Some(4)),
         "c_associated" => (1, Some(2)),
@@ -11024,6 +11136,7 @@ fn intrinsic_is_subroutine(name: &str) -> bool {
             | "tokenize"
             | "c_f_pointer"
             | "c_f_strpointer"
+            | "omp_set_num_threads"
     )
 }
 
@@ -11332,7 +11445,9 @@ pub(super) fn resolved_intrinsic_name(ctx: &Ctx<'_>, name: &str) -> Option<Strin
             && (symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc))
         {
             let canonical = symbol.name.to_ascii_lowercase();
-            return is_intrinsic_name(&canonical).then_some(canonical);
+            return (is_intrinsic_name(&canonical)
+                || crate::sema::intrinsic_modules::is_openmp_runtime_procedure(&canonical))
+            .then_some(canonical);
         }
         return None;
     }
@@ -11470,6 +11585,18 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
                 );
                 require_intrinsic_scalar_argument(ctx, span, &key, args, position, formal);
             }
+        }
+        "omp_set_num_threads" => {
+            require_intrinsic_argument_type(
+                ctx,
+                span,
+                &key,
+                args,
+                0,
+                "num_threads",
+                IntrinsicArgumentType::Integer,
+            );
+            require_intrinsic_scalar_argument(ctx, span, &key, args, 0, "num_threads");
         }
         _ => {}
     }

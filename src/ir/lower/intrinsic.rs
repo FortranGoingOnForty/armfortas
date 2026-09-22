@@ -1564,6 +1564,19 @@ pub(crate) fn lower_intrinsic(
             vec![],
             IrType::Int(IntWidth::I32),
         )),
+        "omp_get_thread_num"
+        | "omp_get_num_threads"
+        | "omp_get_max_threads"
+        | "omp_in_parallel" => Some(b.call(
+            FuncRef::External(format!("afs_{name}")),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        )),
+        "omp_get_wtime" | "omp_get_wtick" => Some(b.call(
+            FuncRef::External(format!("afs_{name}")),
+            vec![],
+            IrType::Float(FloatWidth::F64),
+        )),
         "is_iostat_end" => args.first().map(|status| {
             let zero = match b
                 .func()

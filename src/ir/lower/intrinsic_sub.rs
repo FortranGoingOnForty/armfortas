@@ -323,6 +323,16 @@ pub(crate) fn lower_intrinsic_subroutine(
     }
 
     match name {
+        "omp_set_num_threads" => {
+            let count = nth_arg_val(b, ctx, args, 0, 0);
+            let count = coerce_to_type(b, count, &IrType::Int(IntWidth::I32));
+            b.call(
+                FuncRef::External("afs_omp_set_num_threads".into()),
+                vec![count],
+                IrType::Void,
+            );
+            true
+        }
         "move_alloc" => {
             let from_expr = args.first().and_then(|arg| {
                 let arg = arg.as_ref()?;

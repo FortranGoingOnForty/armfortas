@@ -6,6 +6,7 @@
 
 pub mod decl;
 pub mod expr;
+pub mod openmp;
 pub mod stmt;
 pub mod unit;
 

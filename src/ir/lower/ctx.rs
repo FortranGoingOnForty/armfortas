@@ -8,7 +8,7 @@
 //! where the type already crossed a module boundary — namely
 //! `CharKind`, which `sema::amod` constructs by name).
 
-use crate::ir::inst::{BlockId, ValueId};
+use crate::ir::inst::{BlockId, Function, ValueId};
 use crate::ir::types::IrType;
 use crate::sema::symtab::SymbolTable;
 use crate::sema::validate::FortranStandard;
@@ -295,12 +295,19 @@ pub(super) struct LowerCtx<'a> {
     /// program-unit lowerer flushes these into the IR module after the
     /// function body is complete.
     pub(super) pending_globals: Vec<PendingGlobal>,
+    /// Compiler-outlined helper functions discovered while lowering this
+    /// procedure. OpenMP regions can nest, so callbacks accumulate here until
+    /// the owning program unit is ready to append them to the IR module.
+    pub(super) pending_functions: Vec<Function>,
     /// Stable procedure-specific prefix used for SAVE global symbols.
     pub(super) save_owner: String,
     /// Lexical BLOCK ordinal within this procedure. Ordinals are assigned
     /// by deterministic AST traversal, so symbol names do not depend on
     /// source paths, temporary directories, or compilation-unit order.
     next_block_save_scope: u64,
+    /// Deterministic ordinal for OpenMP regions directly nested in this
+    /// function. Nested callbacks have their own owner name and ordinal.
+    next_openmp_region: u64,
     pub(super) st: &'a SymbolTable,
     /// Module-scoped globals visible by (lowercase module name,
     /// lowercase variable name). Populated by the lower_file
@@ -400,8 +407,10 @@ impl<'a> LowerCtx<'a> {
             construct_exits: Vec::new(),
             lexical_cleanups: Vec::new(),
             pending_globals: Vec::new(),
+            pending_functions: Vec::new(),
             save_owner,
             next_block_save_scope: 0,
+            next_openmp_region: 0,
             st,
             globals,
             type_layouts,
@@ -434,6 +443,19 @@ impl<'a> LowerCtx<'a> {
         // separator cannot collide with a procedure local such as
         // `block_0_value` when save_global_name appends the entity name.
         format!("{}.block.{}", self.save_owner, ordinal)
+    }
+
+    pub(super) fn next_openmp_region_name(&mut self) -> String {
+        let ordinal = self.next_openmp_region;
+        self.next_openmp_region = self
+            .next_openmp_region
+            .checked_add(1)
+            .expect("OpenMP region ordinal overflow");
+        format!(
+            "afs_omp_region_{}_{}",
+            super::core::sanitize_internal_host_symbol(&self.save_owner),
+            ordinal
+        )
     }
 
     pub(super) fn capture_procedure_locals(&mut self) {

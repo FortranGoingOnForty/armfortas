@@ -1585,7 +1585,12 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "iachar" | "ichar" => Some(FortranType::default_integer()),
 
         // System / misc.
-        "command_argument_count" => Some(FortranType::default_integer()),
+        "command_argument_count"
+        | "omp_get_thread_num"
+        | "omp_get_num_threads"
+        | "omp_get_max_threads" => Some(FortranType::default_integer()),
+        "omp_in_parallel" => Some(FortranType::default_logical()),
+        "omp_get_wtime" | "omp_get_wtick" => Some(FortranType::double_precision()),
         "null" => Some(FortranType::Unknown), // null pointer — type from context
         "new_line" => match args.first()? {
             FortranType::Character { kind, .. } => Some(FortranType::Character {

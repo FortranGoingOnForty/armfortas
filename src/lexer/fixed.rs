@@ -8,19 +8,44 @@
 //!
 //! Produces the same Token types as the free-form lexer.
 
-use super::{is_keyword, is_known_dot_op, LexError, Position, Span, Token, TokenKind};
+use std::borrow::Cow;
+
+use super::{
+    is_keyword, is_known_dot_op, LexError, LexerOptions, Position, Span, Token, TokenKind,
+};
 
 /// Tokenize fixed-form Fortran source.
 pub fn tokenize_fixed(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
-    tokenize_fixed_impl(src, file_id, false)
+    tokenize_fixed_with_options(src, file_id, LexerOptions::default())
 }
 
 pub(crate) fn tokenize_fixed_source_view(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
-    tokenize_fixed_impl(src, file_id, true)
+    tokenize_fixed_source_view_with_options(src, file_id, LexerOptions::default())
 }
 
-fn tokenize_fixed_impl(src: &str, file_id: u32, source_view: bool) -> Result<Vec<Token>, LexError> {
-    let statements = preprocess_lines(src, file_id, source_view)?;
+pub fn tokenize_fixed_with_options(
+    src: &str,
+    file_id: u32,
+    options: LexerOptions,
+) -> Result<Vec<Token>, LexError> {
+    tokenize_fixed_impl(src, file_id, false, options)
+}
+
+pub(crate) fn tokenize_fixed_source_view_with_options(
+    src: &str,
+    file_id: u32,
+    options: LexerOptions,
+) -> Result<Vec<Token>, LexError> {
+    tokenize_fixed_impl(src, file_id, true, options)
+}
+
+fn tokenize_fixed_impl(
+    src: &str,
+    file_id: u32,
+    source_view: bool,
+    options: LexerOptions,
+) -> Result<Vec<Token>, LexError> {
+    let statements = preprocess_lines(src, file_id, source_view, options)?;
     let mut tokens = Vec::new();
 
     for stmt in &statements {
@@ -28,6 +53,18 @@ fn tokenize_fixed_impl(src: &str, file_id: u32, source_view: bool) -> Result<Vec
             FixedLine::Comment { text, span } => {
                 tokens.push(Token {
                     kind: TokenKind::Comment,
+                    text: text.clone(),
+                    span: *span,
+                });
+                tokens.push(Token {
+                    kind: TokenKind::Newline,
+                    text: "\n".into(),
+                    span: *span,
+                });
+            }
+            FixedLine::OmpDirective { text, span } => {
+                tokens.push(Token {
+                    kind: TokenKind::OmpDirective,
                     text: text.clone(),
                     span: *span,
                 });
@@ -1311,6 +1348,10 @@ enum FixedLine {
         text: String,
         span: Span,
     },
+    OmpDirective {
+        text: String,
+        span: Span,
+    },
     Statement {
         label: Option<String>,
         body: MappedFixedText,
@@ -1320,6 +1361,48 @@ enum FixedLine {
     Blank {
         span: Span,
     },
+}
+
+fn is_fixed_openmp_directive(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    matches!(bytes.first(), Some(b'C' | b'c' | b'*' | b'!'))
+        && bytes.get(1) == Some(&b'$')
+        && bytes
+            .get(2..5)
+            .is_some_and(|name| name.eq_ignore_ascii_case(b"omp"))
+}
+
+fn is_fixed_openmp_continuation(line: &str, source_view: bool) -> bool {
+    let bytes = fixed_line_bytes(line, source_view);
+    bytes
+        .get(5)
+        .is_some_and(|&marker| !matches!(marker, b' ' | b'0' | b'\t'))
+}
+
+fn fixed_openmp_directive_body(line: &str, source_view: bool) -> String {
+    let bytes = fixed_line_bytes(line, source_view);
+    let start = 6.min(bytes.len());
+    let end = 72.min(bytes.len());
+    fixed_piece(&bytes[start..end], source_view)
+        .trim()
+        .to_string()
+}
+
+fn activate_fixed_openmp_conditional_line(line: &str, openmp: bool) -> Cow<'_, str> {
+    if !openmp || is_fixed_openmp_directive(line) {
+        return Cow::Borrowed(line);
+    }
+    let bytes = line.as_bytes();
+    let is_sentinel = matches!(bytes.first(), Some(b'C' | b'c' | b'*' | b'!'))
+        && bytes.get(1) == Some(&b'$')
+        && matches!(bytes.get(2), None | Some(b' ' | b'\t'));
+    if !is_sentinel {
+        return Cow::Borrowed(line);
+    }
+
+    let mut activated = line.to_string();
+    activated.replace_range(..2, "  ");
+    Cow::Owned(activated)
 }
 
 fn is_fixed_comment_record(line: &str) -> bool {
@@ -1356,13 +1439,17 @@ fn preprocess_lines(
     src: &str,
     file_id: u32,
     source_view: bool,
+    options: LexerOptions,
 ) -> Result<Vec<FixedLine>, LexError> {
-    let lines: Vec<&str> = src.lines().collect();
+    let lines: Vec<Cow<'_, str>> = src
+        .lines()
+        .map(|line| activate_fixed_openmp_conditional_line(line, options.openmp))
+        .collect();
     let mut result = Vec::new();
     let mut i = 0;
 
     while i < lines.len() {
-        let line = lines[i];
+        let line = lines[i].as_ref();
         let line_num = (i + 1) as u32;
 
         // Blank line.
@@ -1381,6 +1468,59 @@ fn preprocess_lines(
                 },
             });
             i += 1;
+            continue;
+        }
+
+        if options.openmp && is_fixed_openmp_directive(line) {
+            if is_fixed_openmp_continuation(line, source_view) {
+                let marker = Position {
+                    line: line_num,
+                    col: 6,
+                };
+                return Err(LexError {
+                    span: Span {
+                        file_id,
+                        start: marker,
+                        end: marker,
+                    },
+                    msg: "orphan fixed-form OpenMP directive continuation".into(),
+                });
+            }
+
+            let start_line = line_num;
+            let mut end_line = line_num;
+            let mut end_col = line.len() as u32;
+            let mut text = fixed_openmp_directive_body(line, source_view);
+            i += 1;
+            while i < lines.len()
+                && is_fixed_openmp_directive(&lines[i])
+                && is_fixed_openmp_continuation(&lines[i], source_view)
+            {
+                let piece = fixed_openmp_directive_body(&lines[i], source_view);
+                if !piece.is_empty() {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(&piece);
+                }
+                end_line = (i + 1) as u32;
+                end_col = lines[i].len() as u32;
+                i += 1;
+            }
+            result.push(FixedLine::OmpDirective {
+                text,
+                span: Span {
+                    file_id,
+                    start: Position {
+                        line: start_line,
+                        col: 1,
+                    },
+                    end: Position {
+                        line: end_line,
+                        col: end_col,
+                    },
+                },
+            });
             continue;
         }
 
@@ -1424,11 +1564,12 @@ fn preprocess_lines(
             // it belongs to this statement only when a continuation follows.
             let gap_start = i;
             let mut gap_end = gap_start;
-            while gap_end < lines.len() && is_fixed_continuation_gap(lines[gap_end]) {
+            while gap_end < lines.len() && is_fixed_continuation_gap(&lines[gap_end]) {
                 gap_end += 1;
             }
             if gap_end > gap_start {
-                if gap_end == lines.len() || !is_continuation_line_impl(lines[gap_end], source_view)
+                if gap_end == lines.len()
+                    || !is_continuation_line_impl(&lines[gap_end], source_view)
                 {
                     break;
                 }
@@ -1445,7 +1586,7 @@ fn preprocess_lines(
             }
 
             // Check column 6 for continuation marker.
-            let next = lines[i];
+            let next = lines[i].as_ref();
             if is_continuation_line_impl(next, source_view) {
                 let (_, cont_body, cont_col) = extract_fixed_columns(next, source_view);
                 full_body.append(MappedFixedText::from_piece(
@@ -1571,6 +1712,10 @@ mod tests {
         tokenize_fixed(src, 0).unwrap()
     }
 
+    fn fixed_openmp_toks(src: &str) -> Vec<Token> {
+        tokenize_fixed_with_options(src, 0, LexerOptions { openmp: true }).unwrap()
+    }
+
     fn fixed_kinds(src: &str) -> Vec<TokenKind> {
         fixed_toks(src)
             .into_iter()
@@ -1655,6 +1800,63 @@ mod tests {
     fn comment_bang() {
         let k = fixed_kinds("!     This is a comment\n");
         assert_eq!(k, vec![TokenKind::Comment]);
+    }
+
+    #[test]
+    fn fixed_openmp_directive_sentinels_require_enabled_mode() {
+        for source in [
+            "C$OMP PARALLEL\n",
+            "c$omp parallel\n",
+            "*$OMP PARALLEL\n",
+            "!$omp parallel\n",
+        ] {
+            assert_eq!(fixed_toks(source)[0].kind, TokenKind::Comment, "{source}");
+            let tokens = fixed_openmp_toks(source);
+            assert_eq!(tokens[0].kind, TokenKind::OmpDirective, "{source}");
+            assert_eq!(tokens[0].text.to_ascii_lowercase(), "parallel");
+            assert_eq!(tokens[0].span.start, Position { line: 1, col: 1 });
+        }
+    }
+
+    #[test]
+    fn fixed_openmp_continuation_is_one_spanned_token() {
+        let tokens = fixed_openmp_toks("C$OMP PARALLEL DO\nC$OMP& PRIVATE(I)\n      INTEGER X\n");
+        assert_eq!(tokens[0].kind, TokenKind::OmpDirective);
+        assert_eq!(
+            tokens[0].text.to_ascii_lowercase(),
+            "parallel do private(i)"
+        );
+        assert_eq!(tokens[0].span.start, Position { line: 1, col: 1 });
+        assert_eq!(tokens[0].span.end.line, 2);
+        assert_eq!(tokens[1].kind, TokenKind::Newline);
+        assert_eq!(tokens[2].text.to_ascii_lowercase(), "integer");
+    }
+
+    #[test]
+    fn fixed_openmp_conditional_sentinels_activate_source() {
+        for source in [
+            "C$    INTEGER X\n",
+            "c$    INTEGER X\n",
+            "*$    INTEGER X\n",
+            "!$    INTEGER X\n",
+        ] {
+            assert_eq!(fixed_toks(source)[0].kind, TokenKind::Comment, "{source}");
+            let tokens = fixed_openmp_toks(source);
+            assert_eq!(tokens[0].kind, TokenKind::Identifier, "{source}");
+            assert_eq!(tokens[0].text.to_ascii_lowercase(), "integer");
+            assert_eq!(tokens[0].span.start, Position { line: 1, col: 7 });
+        }
+    }
+
+    #[test]
+    fn fixed_openmp_conditional_sentinel_preserves_continuation_columns() {
+        let tokens = fixed_openmp_toks("C$    X = 1 +\nC$   & 2\n");
+        let texts = tokens
+            .iter()
+            .filter(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Eof))
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["X", "=", "1", "+", "2"]);
     }
 
     // ---- Statement labels ----
@@ -2445,7 +2647,7 @@ C     Hello World
             "\n",
             "     +  2\n",
         );
-        let lines = preprocess_lines(src, 0, false).unwrap();
+        let lines = preprocess_lines(src, 0, false, LexerOptions::default()).unwrap();
         let statements = lines
             .iter()
             .filter(|line| matches!(line, FixedLine::Statement { .. }))
@@ -2465,12 +2667,13 @@ C     Hello World
     #[test]
     fn noncontinuation_after_gap_run_preserves_physical_order() {
         let src = "      X = 1\nC boundary comment\n\n      Y = 2\n";
-        let lines = preprocess_lines(src, 0, false).unwrap();
+        let lines = preprocess_lines(src, 0, false, LexerOptions::default()).unwrap();
         let kinds: Vec<&str> = lines
             .iter()
             .map(|line| match line {
                 FixedLine::Statement { .. } => "statement",
                 FixedLine::Comment { .. } => "comment",
+                FixedLine::OmpDirective { .. } => "OpenMP directive",
                 FixedLine::Blank { .. } => "blank",
             })
             .collect();
@@ -2491,7 +2694,7 @@ C     Hello World
         }
         src.push_str("     +  2\n");
 
-        let lines = preprocess_lines(&src, 0, false).unwrap();
+        let lines = preprocess_lines(&src, 0, false, LexerOptions::default()).unwrap();
         assert_eq!(
             lines
                 .iter()

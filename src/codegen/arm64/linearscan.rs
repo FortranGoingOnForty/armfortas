@@ -1821,6 +1821,10 @@ fn rewrite_call_arg_copies(pending_moves: Vec<MachineInst>) -> Vec<MachineInst> 
 }
 
 fn rewrite_marked_call_arg_copies(group: Vec<MachineInst>) -> Vec<MachineInst> {
+    if group.is_empty() {
+        return Vec::new();
+    }
+
     let mut pending = Vec::new();
     let mut reload_prefix = Vec::new();
     for inst in group {
@@ -2690,6 +2694,28 @@ mod tests {
                 .all(|inst| inst.opcode != ArmOpcode::CallArgCopyStart),
             "parallel-copy resolution must consume the marker"
         );
+    }
+
+    #[test]
+    fn parallelize_call_arg_moves_accepts_empty_marked_group() {
+        let mut mf = MachineFunction::new("test".into());
+        mf.blocks[0].insts.extend([
+            MachineInst {
+                opcode: ArmOpcode::CallArgCopyStart,
+                operands: vec![],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::Bl,
+                operands: vec![MachineOperand::Extern("_callee".into())],
+                def: None,
+            },
+        ]);
+
+        parallelize_call_arg_moves(&mut mf);
+
+        assert_eq!(mf.blocks[0].insts.len(), 1);
+        assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::Bl);
     }
 
     #[test]

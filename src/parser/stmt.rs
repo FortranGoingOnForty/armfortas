@@ -17,6 +17,10 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         let start = self.current_span();
 
+        if self.peek() == &TokenKind::OmpDirective {
+            return self.parse_openmp_construct();
+        }
+
         // Check for statement label: a decimal integer at statement start.
         // In Fortran, any statement can be prefixed by a label (e.g. `10 i = i + 1`).
         // Disambiguate from arithmetic IF branch targets (which appear after a `)`) by

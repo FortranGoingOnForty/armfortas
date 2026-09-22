@@ -12,6 +12,7 @@
 
 mod allocatable;
 mod core;
+pub(crate) mod openmp;
 mod pointer;
 mod procedure;
 mod pure_elemental;

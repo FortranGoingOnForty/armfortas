@@ -4453,6 +4453,24 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
                 collect_name_refs_expr(e, out);
             }
         }
+        Stmt::OpenMp(construct) => {
+            for clause in construct.clauses() {
+                if let Some(names) = clause.listed_variables() {
+                    out.extend(names.iter().cloned());
+                }
+                if let Some(expr) = clause.expression() {
+                    collect_name_refs_expr(expr, out);
+                }
+            }
+            if let Some(body) = construct.region_body() {
+                for stmt in body {
+                    collect_name_refs_stmt(stmt, out);
+                }
+            }
+            if let Some(loop_stmt) = construct.loop_stmt() {
+                collect_name_refs_stmt(loop_stmt, out);
+            }
+        }
         Stmt::Declaration(decl) => collect_name_refs_decls(std::slice::from_ref(decl), out),
         Stmt::Return { value: None }
         | Stmt::Exit { .. }
@@ -8456,6 +8474,27 @@ pub(super) fn check_filtered_in_stmt(
             check_filtered_in_expr(callee, filtered);
             for a in args {
                 check_filtered_in_subscript(&a.value, filtered);
+            }
+        }
+        Stmt::OpenMp(construct) => {
+            for clause in construct.clauses() {
+                if let Some(names) = clause.listed_variables() {
+                    for name in names {
+                        check_filtered_in_expr(
+                            &crate::ast::Spanned::new(Expr::Name { name: name.clone() }, stmt.span),
+                            filtered,
+                        );
+                    }
+                }
+                if let Some(expr) = clause.expression() {
+                    check_filtered_in_expr(expr, filtered);
+                }
+            }
+            if let Some(body) = construct.region_body() {
+                check_no_filtered_refs(body, filtered);
+            }
+            if let Some(loop_stmt) = construct.loop_stmt() {
+                check_filtered_in_stmt(loop_stmt, filtered);
             }
         }
         Stmt::Namelist { .. } => {}
@@ -19924,6 +19963,7 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "execute_command_line" => Some(&["command", "wait", "exitstat", "cmdstat", "cmdmsg"]),
         "c_f_pointer" => Some(&["cptr", "fptr", "shape", "lower"]),
         "c_f_strpointer" => Some(&["cstrarray", "fstrptr", "nchars"]),
+        "omp_set_num_threads" => Some(&["num_threads"]),
         "cmplx" => Some(&["x", "y", "kind"]),
         "dcmplx" => Some(&["x", "y"]),
         "reshape" => Some(&["source", "shape", "pad", "order"]),
@@ -42136,7 +42176,10 @@ pub(super) fn materialize_array_descriptor_for_info(
 /// is forwarded to an assumed-rank argument (F2018 15.5.2.4). A section such
 /// as `a(1:2, ed)` instead needs the declared leading extent so that the scalar
 /// second subscript contributes the correct column-major base offset.
-fn materialize_array_section_source_descriptor(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
+pub(super) fn materialize_array_section_source_descriptor(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+) -> ValueId {
     materialize_array_descriptor_for_info_impl(b, info, true)
 }
 
@@ -54874,8 +54917,9 @@ pub(super) fn lower_array_assign(
         .flatten()
         .map(|sym| sym.attrs.allocatable)
         .unwrap_or(false);
-    if local_uses_array_descriptor(dest_info) && (dest_info.allocatable || dest_symbol_allocatable)
-    {
+    let dest_has_allocatable_assignment =
+        !dest_info.is_pointer && (dest_info.allocatable || dest_symbol_allocatable);
+    if local_uses_array_descriptor(dest_info) && dest_has_allocatable_assignment {
         let dest_desc = array_descriptor_addr(b, dest_info);
         if try_lower_typed_char_allocatable_constructor_assign(b, ctx, dest_info, dest_desc, value)
         {
@@ -55467,9 +55511,7 @@ pub(super) fn lower_array_assign(
     // constructor's literal values into the destination.
     if let Expr::ArrayConstructor { values, .. } = &value.node {
         if let Some(type_name) = dest_info.derived_type.as_deref() {
-            if local_uses_array_descriptor(dest_info)
-                && (dest_info.allocatable || dest_symbol_allocatable)
-            {
+            if local_uses_array_descriptor(dest_info) && dest_has_allocatable_assignment {
                 if let Some((src_desc, _)) = lower_array_expr_descriptor(
                     b,
                     &ctx.locals,
@@ -55843,7 +55885,7 @@ pub(super) fn lower_array_assign(
         // handled by the explicit allocatable paths above.
         if dest_info.derived_type.is_none()
             && dest_info.char_kind == CharKind::None
-            && !dest_info.allocatable
+            && (!dest_info.allocatable || dest_info.is_pointer)
         {
             if let Some((src_desc, src_elem_ty)) = lower_array_expr_descriptor(
                 b,

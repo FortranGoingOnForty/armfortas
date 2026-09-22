@@ -249,6 +249,13 @@ pub(super) fn check_pure_stmt_expr_calls(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 check_pure_expr_calls(ctx, item);
             }
         }
+        Stmt::OpenMp(construct) => {
+            for clause in construct.clauses() {
+                if let Some(expr) = clause.expression() {
+                    check_pure_expr_calls(ctx, expr);
+                }
+            }
+        }
         Stmt::Block { .. }
         | Stmt::Declaration(_)
         | Stmt::Exit { .. }

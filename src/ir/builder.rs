@@ -55,6 +55,12 @@ impl<'a> FuncBuilder<'a> {
         self.local_modules = m;
     }
 
+    /// Clone the compilation unit's local-module set for an outlined helper
+    /// built while this function is still being lowered.
+    pub(crate) fn local_modules(&self) -> std::rc::Rc<std::collections::HashSet<String>> {
+        self.local_modules.clone()
+    }
+
     /// True if `module_lc` (lowercase module name) is defined in this
     /// compilation unit and therefore has its memory helpers emitted here.
     pub fn owner_module_is_local(&self, module_lc: &str) -> bool {
