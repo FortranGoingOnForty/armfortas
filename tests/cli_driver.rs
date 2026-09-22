@@ -4382,7 +4382,10 @@ fn nonadvancing_a1_read_returns_before_newline_or_eof() {
         .write_all(b"Z")
         .expect("cannot write one byte to child stdin");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    // The child must finish while stdin is still open. Leave enough time for
+    // process scheduling in the heavily parallel CLI suite without turning a
+    // genuine newline/EOF wait into an unbounded test hang.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if child
             .try_wait()
@@ -4394,7 +4397,7 @@ fn nonadvancing_a1_read_returns_before_newline_or_eof() {
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("nonadvancing A1 read blocked waiting for newline or EOF");
+            panic!("nonadvancing A1 read did not finish within 10s with stdin open");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
