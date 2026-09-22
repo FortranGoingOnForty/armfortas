@@ -732,9 +732,11 @@ mod tests {
         assert_eq!(group.active_threads.load(Ordering::Acquire), 1);
     }
 
+    type NestedState = (i32, i32, i32, i32, i32);
+
     #[derive(Default)]
     struct NestedObservations {
-        states: Mutex<Vec<(i32, i32, i32, i32, i32)>>,
+        states: Mutex<Vec<NestedState>>,
     }
 
     unsafe extern "C" fn nested_inactive_task(
