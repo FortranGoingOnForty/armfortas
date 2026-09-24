@@ -314,10 +314,33 @@ pub(super) fn lower_construct(
                 ParallelRegionBody::WorksharingDo { clauses, loop_stmt },
             );
         }
-        OpenMpConstruct::Critical { .. } => unreachable!(
-            "unsupported OpenMP {} construct passed semantic validation",
-            construct.name()
-        ),
+        OpenMpConstruct::Critical { name, body } => {
+            lower_critical_region(b, ctx, name.as_deref(), body)
+        }
+    }
+}
+
+fn lower_critical_region(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    name: Option<&str>,
+    body: &[SpannedStmt],
+) {
+    let name = name.unwrap_or_default().to_ascii_lowercase();
+    let name_ptr = b.const_string(name.as_bytes());
+    let name_len = b.const_i64(name.len() as i64);
+    b.call(
+        FuncRef::External("afs_omp_critical_enter".into()),
+        vec![name_ptr, name_len],
+        IrType::Int(IntWidth::I32),
+    );
+    super::stmt::lower_stmts(b, ctx, body);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.call(
+            FuncRef::External("afs_omp_critical_exit".into()),
+            vec![name_ptr, name_len],
+            IrType::Int(IntWidth::I32),
+        );
     }
 }
 

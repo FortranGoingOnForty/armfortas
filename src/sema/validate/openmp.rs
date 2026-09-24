@@ -2,8 +2,8 @@
 //!
 //! The executable slice is intentionally narrow: `PARALLEL` data environments
 //! support selected numeric/logical storage, while canonical worksharing `DO`
-//! and combined `PARALLEL DO` support contiguous and explicit-chunk static
-//! schedules.
+//! and combined `PARALLEL DO` support the implemented static/dynamic schedules.
+//! Named and unnamed `CRITICAL` regions retain process-wide lock identity.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
 //! regions without pretending later schedules, loop clauses, characters, or
 //! derived objects are already implemented.
@@ -52,10 +52,10 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             validate_data_environment(ctx, loop_body, &clause_info, &predetermined_private);
             validate_worksharing_loop(ctx, span, clauses, loop_stmt, true);
         }
-        OpenMpConstruct::Critical { .. } => ctx.error(
-            span,
-            "OpenMP CRITICAL execution is recognized but not yet implemented",
-        ),
+        OpenMpConstruct::Critical { body, .. } => {
+            reject_in_pure(ctx, span, "CRITICAL");
+            validate_structured_block(ctx, body);
+        }
     }
 }
 
@@ -1221,7 +1221,7 @@ fn reject_transfer(ctx: &mut Ctx<'_>, span: Span, statement: &str) {
     ctx.error(
         span,
         format!(
-            "{} is not yet supported inside an outlined OpenMP PARALLEL region",
+            "{} is not yet supported inside an OpenMP structured block",
             statement
         ),
     );
@@ -1235,7 +1235,7 @@ fn reject_io_branches(ctx: &mut Ctx<'_>, span: Span, controls: &[IoControl]) {
     }) {
         ctx.error(
             span,
-            "I/O ERR=/END=/EOR= transfer is not yet supported inside an outlined OpenMP PARALLEL region",
+            "I/O ERR=/END=/EOR= transfer is not yet supported inside an OpenMP structured block",
         );
     }
 }

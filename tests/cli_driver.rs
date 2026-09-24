@@ -21460,6 +21460,221 @@ end program
 }
 
 #[test]
+fn fopenmp_named_and_unnamed_critical_regions_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_named_and_unnamed_critical_regions_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: i, named_count, unnamed_count
+  named_count = 0
+  unnamed_count = 0
+!$omp critical(serial_entry)
+  named_count = named_count + 1
+!$omp end critical(serial_entry)
+!$omp parallel default(none) num_threads(4) private(i) shared(named_count,unnamed_count)
+  do i = 1, 500
+!$omp critical(Update_Count)
+    named_count = named_count + 1
+!$omp end critical(update_count)
+!$omp critical
+    unnamed_count = unnamed_count + 1
+!$omp end critical
+  end do
+!$omp end parallel
+  if (named_count /= 2001) error stop 1
+  if (unnamed_count /= 2000) error stop 2
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_critical", "bin");
+        let runtime_cache = unique_dir("openmp_critical_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP CRITICAL regions should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+            .expect("OpenMP CRITICAL binary timed out");
+        assert!(
+            run.status.success(),
+            "OpenMP CRITICAL regions failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_named_critical_identity_crosses_translation_units() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_named_critical_identity_crosses_translation_units count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("openmp_critical_cross_tu");
+    let state_src = write_program_in(
+        &dir,
+        "critical_state.f90",
+        "module critical_state
+  implicit none
+  integer :: count = 0
+  integer :: inside = 0
+  logical :: overlapped = .false.
+end module
+",
+    );
+    let left_src = write_program_in(
+        &dir,
+        "bump_left.f90",
+        "subroutine bump_left()
+  use iso_fortran_env, only: real64
+  use omp_lib, only: omp_get_wtime
+  use critical_state
+  implicit none
+  real(real64) :: deadline
+!$omp critical(Output_Lock)
+  inside = inside + 1
+  if (inside /= 1) overlapped = .true.
+  deadline = omp_get_wtime() + 0.00005_real64
+  do while (omp_get_wtime() < deadline)
+  end do
+  count = count + 1
+  inside = inside - 1
+!$omp end critical(Output_Lock)
+end subroutine
+",
+    );
+    let right_src = write_program_in(
+        &dir,
+        "bump_right.f90",
+        "subroutine bump_right()
+  use iso_fortran_env, only: real64
+  use omp_lib, only: omp_get_wtime
+  use critical_state
+  implicit none
+  real(real64) :: deadline
+!$omp critical(output_lock)
+  inside = inside + 1
+  if (inside /= 1) overlapped = .true.
+  deadline = omp_get_wtime() + 0.00005_real64
+  do while (omp_get_wtime() < deadline)
+  end do
+  count = count + 1
+  inside = inside - 1
+!$omp end critical(output_lock)
+end subroutine
+",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  use critical_state
+  implicit none
+  integer :: i
+!$omp parallel default(none) num_threads(4) private(i)
+  do i = 1, 25
+    if (mod(omp_get_thread_num(), 2) == 0) then
+      call bump_left()
+    else
+      call bump_right()
+    end if
+  end do
+!$omp end parallel
+  if (count /= 100) error stop 1
+  if (inside /= 0 .or. overlapped) error stop 2
+  print *, 'ok'
+end program
+",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let state_obj = dir.join(format!("critical_state_{opt}.o"));
+        let left_obj = dir.join(format!("bump_left_{opt}.o"));
+        let right_obj = dir.join(format!("bump_right_{opt}.o"));
+        let main_obj = dir.join(format!("main_{opt}.o"));
+        for (source, object) in [
+            (&state_src, &state_obj),
+            (&left_src, &left_obj),
+            (&right_src, &right_obj),
+            (&main_src, &main_obj),
+        ] {
+            let compile = Command::new(compiler("armfortas"))
+                .current_dir(&dir)
+                .args(["-fopenmp", opt, "-c", "-I"])
+                .arg(&dir)
+                .arg("-J")
+                .arg(&dir)
+                .arg(source)
+                .arg("-o")
+                .arg(object)
+                .output()
+                .expect("cross-TU OpenMP CRITICAL compile failed to spawn");
+            assert!(
+                compile.status.success(),
+                "{} should compile at {opt}: {}",
+                source.display(),
+                String::from_utf8_lossy(&compile.stderr)
+            );
+        }
+
+        let out = dir.join(format!("critical_cross_tu_{opt}.bin"));
+        let runtime_cache = dir.join(format!("runtime_cache_{opt}"));
+        let link = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .arg("-fopenmp")
+            .args([&state_obj, &left_obj, &right_obj, &main_obj])
+            .arg("-o")
+            .arg(&out)
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("cross-TU OpenMP CRITICAL link failed to spawn");
+        assert!(
+            link.status.success(),
+            "cross-TU OpenMP CRITICAL objects should link at {opt}: {}",
+            String::from_utf8_lossy(&link.stderr)
+        );
+        let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+            .expect("cross-TU OpenMP CRITICAL binary timed out");
+        assert!(
+            run.status.success(),
+            "cross-TU OpenMP CRITICAL failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
     let cases = [
         (
@@ -21469,6 +21684,14 @@ fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
         (
             "program p\ninteger :: i\n!$omp parallel\n!$omp do schedule(dynamic)\ndo i=1,4\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
             "OpenMP SCHEDULE(DYNAMIC) is recognized but not yet implemented",
+        ),
+        (
+            "subroutine s\n!$omp critical\nreturn\n!$omp end critical\nend subroutine\n",
+            "RETURN is not yet supported inside an OpenMP structured block",
+        ),
+        (
+            "pure subroutine s\n!$omp critical\ncontinue\n!$omp end critical\nend subroutine\n",
+            "OpenMP CRITICAL is not allowed in a PURE procedure",
         ),
         (
             "program p\ninteger :: i\n!$omp parallel do schedule(static,0)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
@@ -21560,7 +21783,9 @@ fn fopenmp_worksharing_emits_x86_64_elf_object() {
 !$omp parallel do collapse(2) num_threads(3) schedule(dynamic,2) reduction(+:total)
   do i = 3, 1, -1
     do j = 1, 3
+!$omp critical(x86_worksharing)
       values(i,j) = i + j
+!$omp end critical(x86_worksharing)
       total = total + values(i,j)
     end do
   end do
