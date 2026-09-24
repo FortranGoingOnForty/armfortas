@@ -594,6 +594,119 @@ pub extern "C" fn afs_omp_static_chunk_bounds(
     1
 }
 
+/// Compute the rectangular logical shape used by `collapse(2)` lowering.
+///
+/// The compiler reconstructs the two source indices from a flattened signed
+/// i64 logical index. Reject shapes whose individual or product trip counts
+/// cannot be represented by that ABI instead of allowing wrapped iteration
+/// counts to silently lose work.
+#[no_mangle]
+pub extern "C" fn afs_omp_collapse2_shape(
+    outer_lower: i64,
+    outer_upper: i64,
+    outer_step: i64,
+    inner_lower: i64,
+    inner_upper: i64,
+    inner_step: i64,
+    outer_count: *mut i64,
+    inner_count: *mut i64,
+    total_count: *mut i64,
+) -> i32 {
+    if outer_count.is_null() || inner_count.is_null() || total_count.is_null() {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+    unsafe {
+        *outer_count = 0;
+        *inner_count = 0;
+        *total_count = 0;
+    }
+    if outer_step == 0 || inner_step == 0 {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+
+    let outer_iterations = loop_iteration_count(
+        i128::from(outer_lower),
+        i128::from(outer_upper),
+        i128::from(outer_step),
+    );
+    let inner_iterations = loop_iteration_count(
+        i128::from(inner_lower),
+        i128::from(inner_upper),
+        i128::from(inner_step),
+    );
+    let Some(total_iterations) = outer_iterations.checked_mul(inner_iterations) else {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    };
+    let Ok(outer_iterations) = i64::try_from(outer_iterations) else {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    };
+    let Ok(inner_iterations) = i64::try_from(inner_iterations) else {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    };
+    let Ok(total_iterations) = i64::try_from(total_iterations) else {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    };
+
+    unsafe {
+        *outer_count = outer_iterations;
+        *inner_count = inner_iterations;
+        *total_count = total_iterations;
+    }
+    AFS_OMP_SUCCESS
+}
+
+/// Reconstruct both source indices for one flattened `collapse(2)` iteration.
+///
+/// This remains a runtime operation so sparse ranges spanning the signed i64
+/// domain use i128 intermediate products rather than overflowing generated
+/// target arithmetic.
+#[no_mangle]
+pub extern "C" fn afs_omp_collapse2_indices(
+    flat_index: i64,
+    outer_count: i64,
+    inner_count: i64,
+    outer_lower: i64,
+    outer_step: i64,
+    inner_lower: i64,
+    inner_step: i64,
+    outer_value: *mut i64,
+    inner_value: *mut i64,
+) -> i32 {
+    if outer_value.is_null() || inner_value.is_null() {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+    unsafe {
+        *outer_value = 0;
+        *inner_value = 0;
+    }
+    if flat_index < 0 || outer_count <= 0 || inner_count <= 0 || outer_step == 0 || inner_step == 0
+    {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+
+    let flat_index = i128::from(flat_index);
+    let outer_count = i128::from(outer_count);
+    let inner_count = i128::from(inner_count);
+    if flat_index >= outer_count * inner_count {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+    let outer_index = flat_index / inner_count;
+    let inner_index = flat_index % inner_count;
+    let reconstructed_outer = i128::from(outer_lower) + outer_index * i128::from(outer_step);
+    let reconstructed_inner = i128::from(inner_lower) + inner_index * i128::from(inner_step);
+    let Ok(reconstructed_outer) = i64::try_from(reconstructed_outer) else {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    };
+    let Ok(reconstructed_inner) = i64::try_from(reconstructed_inner) else {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    };
+    unsafe {
+        *outer_value = reconstructed_outer;
+        *inner_value = reconstructed_inner;
+    }
+    AFS_OMP_SUCCESS
+}
+
 fn loop_iteration_count(lower: i128, upper: i128, step: i128) -> i128 {
     if step > 0 {
         if lower > upper {
@@ -906,6 +1019,114 @@ mod tests {
                 -AFS_OMP_ERROR_INVALID_LOOP
             );
         }
+    }
+
+    fn collapse2_shape(
+        outer: (i64, i64, i64),
+        inner: (i64, i64, i64),
+    ) -> Result<(i64, i64, i64), i32> {
+        let mut outer_count = -1;
+        let mut inner_count = -1;
+        let mut total_count = -1;
+        let status = afs_omp_collapse2_shape(
+            outer.0,
+            outer.1,
+            outer.2,
+            inner.0,
+            inner.1,
+            inner.2,
+            &mut outer_count,
+            &mut inner_count,
+            &mut total_count,
+        );
+        if status == AFS_OMP_SUCCESS {
+            Ok((outer_count, inner_count, total_count))
+        } else {
+            Err(status)
+        }
+    }
+
+    #[test]
+    fn collapse2_shape_flattens_rectangular_positive_and_negative_spaces() {
+        assert_eq!(collapse2_shape((1, 3, 1), (8, 2, -2)), Ok((3, 4, 12)));
+        assert_eq!(collapse2_shape((3, 1, -1), (-2, 2, 2)), Ok((3, 3, 9)));
+        assert_eq!(collapse2_shape((1, 0, 1), (1, 4, 1)), Ok((0, 4, 0)));
+        assert_eq!(collapse2_shape((1, 4, 1), (0, 1, -1)), Ok((4, 0, 0)));
+    }
+
+    #[test]
+    fn collapse2_shape_rejects_zero_steps_and_unrepresentable_products() {
+        assert_eq!(
+            collapse2_shape((1, 2, 0), (1, 2, 1)),
+            Err(-AFS_OMP_ERROR_INVALID_LOOP)
+        );
+        assert_eq!(
+            collapse2_shape((i64::MIN, i64::MAX, 1), (1, 0, 1)),
+            Err(-AFS_OMP_ERROR_INVALID_LOOP)
+        );
+        assert_eq!(
+            collapse2_shape((0, i64::MAX, 1), (1, 2, 1)),
+            Err(-AFS_OMP_ERROR_INVALID_LOOP)
+        );
+        let mut outer_count = -1;
+        let mut inner_count = -1;
+        let mut total_count = -1;
+        assert_eq!(
+            afs_omp_collapse2_shape(
+                1,
+                2,
+                0,
+                1,
+                2,
+                1,
+                &mut outer_count,
+                &mut inner_count,
+                &mut total_count,
+            ),
+            -AFS_OMP_ERROR_INVALID_LOOP
+        );
+        assert_eq!((outer_count, inner_count, total_count), (0, 0, 0));
+    }
+
+    fn collapse2_indices(
+        flat_index: i64,
+        shape: (i64, i64),
+        outer: (i64, i64),
+        inner: (i64, i64),
+    ) -> Result<(i64, i64), i32> {
+        let mut outer_value = -1;
+        let mut inner_value = -1;
+        let status = afs_omp_collapse2_indices(
+            flat_index,
+            shape.0,
+            shape.1,
+            outer.0,
+            outer.1,
+            inner.0,
+            inner.1,
+            &mut outer_value,
+            &mut inner_value,
+        );
+        if status == AFS_OMP_SUCCESS {
+            Ok((outer_value, inner_value))
+        } else {
+            Err(status)
+        }
+    }
+
+    #[test]
+    fn collapse2_indices_reconstruct_order_without_i64_intermediate_overflow() {
+        assert_eq!(collapse2_indices(0, (3, 2), (1, 2), (8, -3)), Ok((1, 8)));
+        assert_eq!(collapse2_indices(3, (3, 2), (1, 2), (8, -3)), Ok((3, 5)));
+        assert_eq!(collapse2_indices(5, (3, 2), (1, 2), (8, -3)), Ok((5, 5)));
+        assert_eq!(
+            collapse2_indices(4, (3, 2), (i64::MIN, i64::MAX), (i64::MAX, -i64::MAX),),
+            Ok((i64::MAX - 1, i64::MAX))
+        );
+        assert_eq!(
+            collapse2_indices(6, (3, 2), (1, 1), (1, 1)),
+            Err(-AFS_OMP_ERROR_INVALID_LOOP)
+        );
     }
 
     #[test]
