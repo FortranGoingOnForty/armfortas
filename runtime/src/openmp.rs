@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, OnceLock};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::time::Instant;
 
 pub const AFS_OMP_ABI_VERSION: u32 = 1;
@@ -29,6 +29,16 @@ pub const AFS_OMP_ERROR_UNSUPPORTED_FLAGS: i32 = 2;
 pub const AFS_OMP_ERROR_TEAM_PANIC: i32 = 3;
 pub const AFS_OMP_ERROR_NO_TEAM: i32 = 4;
 pub const AFS_OMP_ERROR_INVALID_LOOP: i32 = 5;
+pub const AFS_OMP_ERROR_INVALID_REDUCTION: i32 = 6;
+
+pub const AFS_OMP_REDUCTION_ADD: i32 = 1;
+pub const AFS_OMP_REDUCTION_MULTIPLY: i32 = 2;
+pub const AFS_OMP_REDUCTION_MAX: i32 = 3;
+pub const AFS_OMP_REDUCTION_MIN: i32 = 4;
+pub const AFS_OMP_REDUCTION_AND: i32 = 5;
+pub const AFS_OMP_REDUCTION_OR: i32 = 6;
+pub const AFS_OMP_REDUCTION_EQV: i32 = 7;
+pub const AFS_OMP_REDUCTION_NEQV: i32 = 8;
 
 pub type AfsOmpRegionEntry = unsafe extern "C" fn(*mut c_void, i32, i32);
 
@@ -253,6 +263,13 @@ struct TeamContext {
     active: bool,
     contention_group: Arc<ContentionGroup>,
     barrier: Arc<Barrier>,
+    reduction: Arc<Mutex<ReductionWorkspace>>,
+}
+
+#[derive(Debug, Default)]
+struct ReductionWorkspace {
+    slots: Vec<i64>,
+    result: i64,
 }
 
 #[derive(Debug, Default)]
@@ -372,6 +389,7 @@ fn run_implicit_task(
     inherited_requested_threads: i32,
     contention_group: Arc<ContentionGroup>,
     barrier: Arc<Barrier>,
+    reduction: Arc<Mutex<ReductionWorkspace>>,
 ) {
     let _guard = enter_team(
         TeamContext {
@@ -380,6 +398,7 @@ fn run_implicit_task(
             active: team_size > 1,
             contention_group,
             barrier,
+            reduction,
         },
         inherited_requested_threads,
     );
@@ -427,12 +446,14 @@ pub extern "C" fn afs_omp_parallel_region(
     let team_size = i32::try_from(reserved_threads.saturating_add(1)).unwrap_or(i32::MAX);
     let environment = environment as usize;
     let barrier = Arc::new(Barrier::new(team_size as usize));
+    let reduction = Arc::new(Mutex::new(ReductionWorkspace::default()));
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         std::thread::scope(|scope| {
             for thread_num in 1..team_size {
                 let contention_group = Arc::clone(&contention_group);
                 let barrier = Arc::clone(&barrier);
+                let reduction = Arc::clone(&reduction);
                 scope.spawn(move || {
                     run_implicit_task(
                         entry,
@@ -442,6 +463,7 @@ pub extern "C" fn afs_omp_parallel_region(
                         inherited_requested_threads,
                         contention_group,
                         barrier,
+                        reduction,
                     );
                 });
             }
@@ -453,6 +475,7 @@ pub extern "C" fn afs_omp_parallel_region(
                 inherited_requested_threads,
                 Arc::clone(&contention_group),
                 Arc::clone(&barrier),
+                Arc::clone(&reduction),
             );
         });
     }));
@@ -482,6 +505,90 @@ pub extern "C" fn afs_omp_barrier() -> i32 {
         return AFS_OMP_ERROR_NO_TEAM;
     };
     barrier.wait();
+    AFS_OMP_SUCCESS
+}
+
+fn combine_i64_reduction(operator: i32, left: i64, right: i64) -> Option<i64> {
+    match operator {
+        AFS_OMP_REDUCTION_ADD => Some(left.wrapping_add(right)),
+        AFS_OMP_REDUCTION_MULTIPLY => Some(left.wrapping_mul(right)),
+        AFS_OMP_REDUCTION_MAX => Some(left.max(right)),
+        AFS_OMP_REDUCTION_MIN => Some(left.min(right)),
+        AFS_OMP_REDUCTION_AND => Some(i64::from(left != 0 && right != 0)),
+        AFS_OMP_REDUCTION_OR => Some(i64::from(left != 0 || right != 0)),
+        AFS_OMP_REDUCTION_EQV => Some(i64::from((left != 0) == (right != 0))),
+        AFS_OMP_REDUCTION_NEQV => Some(i64::from((left != 0) != (right != 0))),
+        _ => None,
+    }
+}
+
+/// Combine one signed-integer or logical private value across the current team.
+///
+/// Every implicit task must call this entry point in the same order. Values are
+/// stored by thread number and thread zero combines the original value followed
+/// by private values in ascending thread-number order. The two team barriers
+/// make the result available to every caller before the workspace is reused by
+/// a later reduction.
+#[no_mangle]
+pub extern "C" fn afs_omp_reduce_i64(
+    operator: i32,
+    private_value: i64,
+    original_value: i64,
+    result: *mut i64,
+) -> i32 {
+    if result.is_null() || combine_i64_reduction(operator, 0, 0).is_none() {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    }
+    let context = THREAD_STATE.with(|state| {
+        let state = state.borrow();
+        state.teams.last().map(|team| {
+            (
+                team.thread_num,
+                team.team_size,
+                Arc::clone(&team.barrier),
+                Arc::clone(&team.reduction),
+            )
+        })
+    });
+    let Some((thread_num, team_size, barrier, reduction)) = context else {
+        return AFS_OMP_ERROR_NO_TEAM;
+    };
+
+    {
+        let mut workspace = reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let team_size = usize::try_from(team_size).unwrap_or(0);
+        if workspace.slots.len() != team_size {
+            workspace.slots.resize(team_size, 0);
+        }
+        workspace.slots[thread_num as usize] = private_value;
+    }
+    barrier.wait();
+
+    if thread_num == 0 {
+        let mut workspace = reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        workspace.result =
+            workspace
+                .slots
+                .iter()
+                .copied()
+                .fold(original_value, |combined, value| {
+                    combine_i64_reduction(operator, combined, value)
+                        .expect("validated OpenMP reduction operator became invalid")
+                });
+    }
+    barrier.wait();
+
+    let combined = reduction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .result;
+    unsafe {
+        *result = combined;
+    }
     AFS_OMP_SUCCESS
 }
 
@@ -793,7 +900,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
-    use std::sync::Mutex;
 
     fn reset_thread_state() {
         THREAD_STATE.with(|state| *state.borrow_mut() = ThreadState::default());
@@ -898,6 +1004,79 @@ mod tests {
         assert!(observations
             .all_arrived_after_barrier
             .load(Ordering::SeqCst));
+    }
+
+    #[derive(Default)]
+    struct ReductionObservations {
+        values: Mutex<Vec<(i32, [i64; 8])>>,
+    }
+
+    unsafe extern "C" fn reduce_task(environment: *mut c_void, thread_num: i32, _team_size: i32) {
+        let observations = unsafe { &*(environment as *const ReductionObservations) };
+        let mut values = [0; 8];
+        let private = i64::from(thread_num) + 1;
+        let inputs = [
+            (AFS_OMP_REDUCTION_ADD, private, 10),
+            (AFS_OMP_REDUCTION_MULTIPLY, private, 2),
+            (AFS_OMP_REDUCTION_MAX, i64::from(thread_num) - 2, -9),
+            (AFS_OMP_REDUCTION_MIN, i64::from(thread_num) - 2, 9),
+            (AFS_OMP_REDUCTION_AND, i64::from(thread_num != 3), 1),
+            (AFS_OMP_REDUCTION_OR, i64::from(thread_num == 2), 0),
+            (AFS_OMP_REDUCTION_EQV, i64::from(thread_num % 2 == 0), 1),
+            (AFS_OMP_REDUCTION_NEQV, i64::from(thread_num % 2 == 0), 0),
+        ];
+        for (index, (operator, private, original)) in inputs.into_iter().enumerate() {
+            assert_eq!(
+                afs_omp_reduce_i64(operator, private, original, &mut values[index]),
+                AFS_OMP_SUCCESS
+            );
+        }
+        observations
+            .values
+            .lock()
+            .unwrap()
+            .push((thread_num, values));
+    }
+
+    #[test]
+    fn integer_and_logical_reductions_combine_in_thread_order() {
+        reset_thread_state();
+        let observations = ReductionObservations::default();
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(reduce_task),
+                &observations as *const ReductionObservations as *mut c_void,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        let mut values = observations.values.into_inner().unwrap();
+        values.sort_unstable_by_key(|(thread_num, _)| *thread_num);
+        assert_eq!(values.len(), 4);
+        for (_, values) in values {
+            assert_eq!(values, [20, 48, 1, -2, 0, 1, 1, 0]);
+        }
+    }
+
+    #[test]
+    fn reduction_runtime_rejects_invalid_context_or_arguments() {
+        reset_thread_state();
+        let mut result = -1;
+        assert_eq!(
+            afs_omp_reduce_i64(AFS_OMP_REDUCTION_ADD, 1, 2, &mut result),
+            AFS_OMP_ERROR_NO_TEAM
+        );
+        assert_eq!(
+            afs_omp_reduce_i64(99, 1, 2, &mut result),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(
+            afs_omp_reduce_i64(AFS_OMP_REDUCTION_ADD, 1, 2, std::ptr::null_mut()),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(result, -1);
     }
 
     fn static_bounds(
