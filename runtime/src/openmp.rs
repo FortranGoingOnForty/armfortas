@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex, OnceLock};
+use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 pub const AFS_OMP_ABI_VERSION: u32 = 1;
@@ -30,6 +30,7 @@ pub const AFS_OMP_ERROR_TEAM_PANIC: i32 = 3;
 pub const AFS_OMP_ERROR_NO_TEAM: i32 = 4;
 pub const AFS_OMP_ERROR_INVALID_LOOP: i32 = 5;
 pub const AFS_OMP_ERROR_INVALID_REDUCTION: i32 = 6;
+pub const AFS_OMP_ERROR_INVALID_CRITICAL: i32 = 7;
 
 pub const AFS_OMP_REDUCTION_ADD: i32 = 1;
 pub const AFS_OMP_REDUCTION_MULTIPLY: i32 = 2;
@@ -517,6 +518,79 @@ pub extern "C" fn afs_omp_barrier() -> i32 {
         return AFS_OMP_ERROR_NO_TEAM;
     };
     barrier.wait();
+    AFS_OMP_SUCCESS
+}
+
+#[derive(Debug, Default)]
+struct CriticalLock {
+    held: Mutex<bool>,
+    available: Condvar,
+}
+
+fn critical_lock(name: *const u8, name_len: i64) -> Result<Arc<CriticalLock>, i32> {
+    let Ok(name_len) = usize::try_from(name_len) else {
+        return Err(AFS_OMP_ERROR_INVALID_CRITICAL);
+    };
+    if name_len > 0 && name.is_null() {
+        return Err(AFS_OMP_ERROR_INVALID_CRITICAL);
+    }
+    let mut key = if name_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(name, name_len) }.to_vec()
+    };
+    key.make_ascii_lowercase();
+
+    static LOCKS: OnceLock<Mutex<std::collections::HashMap<Vec<u8>, Arc<CriticalLock>>>> =
+        OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(Arc::clone(locks.entry(key).or_default()))
+}
+
+/// Enter a named or unnamed OpenMP critical region.
+///
+/// Lock identity is process-wide and based on the case-insensitive Fortran
+/// name bytes. A zero-length name denotes the single global unnamed critical
+/// region. The registry lives in the runtime rather than generated objects so
+/// separately compiled procedures resolve the same name to the same lock.
+#[no_mangle]
+pub extern "C" fn afs_omp_critical_enter(name: *const u8, name_len: i64) -> i32 {
+    let Ok(lock) = critical_lock(name, name_len) else {
+        return AFS_OMP_ERROR_INVALID_CRITICAL;
+    };
+    let mut held = lock
+        .held
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *held {
+        held = lock
+            .available
+            .wait(held)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    *held = true;
+    AFS_OMP_SUCCESS
+}
+
+/// Leave the matching OpenMP critical region.
+#[no_mangle]
+pub extern "C" fn afs_omp_critical_exit(name: *const u8, name_len: i64) -> i32 {
+    let Ok(lock) = critical_lock(name, name_len) else {
+        return AFS_OMP_ERROR_INVALID_CRITICAL;
+    };
+    let mut held = lock
+        .held
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !*held {
+        return AFS_OMP_ERROR_INVALID_CRITICAL;
+    }
+    *held = false;
+    drop(held);
+    lock.available.notify_one();
     AFS_OMP_SUCCESS
 }
 
@@ -1075,6 +1149,68 @@ mod tests {
         assert!(observations
             .all_arrived_after_barrier
             .load(Ordering::SeqCst));
+    }
+
+    struct CriticalObservations {
+        counter: AtomicUsize,
+    }
+
+    unsafe extern "C" fn critical_task(
+        environment: *mut c_void,
+        _thread_num: i32,
+        _team_size: i32,
+    ) {
+        let observations = unsafe { &*(environment as *const CriticalObservations) };
+        for _ in 0..500 {
+            assert_eq!(
+                afs_omp_critical_enter(b"OUTPUT_LOCK".as_ptr(), 11),
+                AFS_OMP_SUCCESS
+            );
+            let value = observations.counter.load(Ordering::Relaxed);
+            std::thread::yield_now();
+            observations.counter.store(value + 1, Ordering::Relaxed);
+            assert_eq!(
+                afs_omp_critical_exit(b"output_lock".as_ptr(), 11),
+                AFS_OMP_SUCCESS
+            );
+        }
+    }
+
+    #[test]
+    fn named_critical_serializes_a_team_with_process_wide_identity() {
+        reset_thread_state();
+        let observations = CriticalObservations {
+            counter: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(critical_task),
+                &observations as *const CriticalObservations as *mut c_void,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(observations.counter.load(Ordering::Relaxed), 2_000);
+    }
+
+    #[test]
+    fn critical_runtime_supports_unnamed_regions_and_rejects_invalid_calls() {
+        assert_eq!(afs_omp_critical_enter(std::ptr::null(), 0), AFS_OMP_SUCCESS);
+        assert_eq!(afs_omp_critical_exit(b"".as_ptr(), 0), AFS_OMP_SUCCESS);
+        assert_eq!(
+            afs_omp_critical_enter(std::ptr::null(), 1),
+            AFS_OMP_ERROR_INVALID_CRITICAL
+        );
+        assert_eq!(
+            afs_omp_critical_enter(b"invalid".as_ptr(), -1),
+            AFS_OMP_ERROR_INVALID_CRITICAL
+        );
+        assert_eq!(
+            afs_omp_critical_exit(b"not_held".as_ptr(), 8),
+            AFS_OMP_ERROR_INVALID_CRITICAL
+        );
     }
 
     #[derive(Default)]
