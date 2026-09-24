@@ -21356,6 +21356,163 @@ end program
 }
 
 #[test]
+fn fopenmp_private_and_firstprivate_pointer_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_and_firstprivate_pointer_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_pointer_private_state
+  implicit none
+  real, target :: module_target(-1:1)
+  real, pointer :: module_view(:)
+contains
+  subroutine check_module(result)
+    integer, intent(out) :: result
+    module_target = [1.5, 2.5, 3.5]
+    module_view => module_target
+!$omp parallel if(.false.) default(none) firstprivate(module_view) shared(result)
+    if (.not. associated(module_view)) error stop 21
+    if (lbound(module_view, 1) /= -1 .or. ubound(module_view, 1) /= 1) error stop 22
+    module_view(-1) = 4.5
+    result = nint(sum(module_view))
+    nullify(module_view)
+    if (associated(module_view)) error stop 23
+!$omp end parallel
+    if (.not. associated(module_view, module_target)) error stop 24
+    if (any(abs(module_target - [4.5, 2.5, 3.5]) > 0.0001)) error stop 25
+  end subroutine
+
+  subroutine check_dummy_first(view, result)
+    integer, pointer, intent(in) :: view(:)
+    integer, intent(out) :: result
+!$omp parallel if(.false.) default(none) firstprivate(view) shared(result)
+    if (.not. associated(view)) error stop 31
+    if (lbound(view, 1) /= -2 .or. ubound(view, 1) /= 1) error stop 32
+    result = sum(view)
+!$omp end parallel
+  end subroutine
+
+  subroutine check_dummy_private(view, target_values, result)
+    integer, pointer, intent(inout) :: view(:)
+    integer, target, intent(inout) :: target_values(:)
+    integer, intent(out) :: result
+!$omp parallel if(.false.) default(none) private(view) shared(target_values, result)
+    view => target_values
+    view = [10, 20, 30, 40]
+    result = sum(view)
+    nullify(view)
+!$omp end parallel
+  end subroutine
+end module
+
+program p
+  use omp_pointer_private_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer, target :: original(-2:1), rebound(0:3), strided_target(0:7)
+  logical, target :: flags(0:3)
+  integer, pointer :: view(:), strided_view(:), empty_view(:)
+  logical, pointer :: flag_view(:)
+  integer :: tid, private_seen(0:3), first_seen(0:3)
+  integer :: module_result, dummy_first_result, dummy_private_result
+
+  original = [1, 2, 3, 4]
+  rebound = -1
+  strided_target = -1
+  flags = .false.
+  private_seen = -1
+  first_seen = -1
+  view => original
+  strided_view => strided_target(0:6:2)
+  nullify(empty_view)
+  flag_view => flags
+
+!$omp parallel default(none) num_threads(4) private(view, tid) shared(rebound, private_seen)
+  tid = omp_get_thread_num()
+  view => rebound(tid:tid)
+  if (lbound(view, 1) /= 1 .or. ubound(view, 1) /= 1) error stop 1
+  view(1) = 100 + tid
+  private_seen(tid) = view(1)
+  nullify(view)
+!$omp end parallel
+  if (.not. associated(view, original)) error stop 2
+  if (any(original /= [1, 2, 3, 4])) error stop 3
+  if (any(rebound /= [100, 101, 102, 103])) error stop 4
+  if (any(private_seen /= rebound)) error stop 5
+
+!$omp parallel default(none) num_threads(4) private(tid) &
+!$omp& firstprivate(view, flag_view, strided_view, empty_view) shared(first_seen)
+  tid = omp_get_thread_num()
+  if (.not. associated(view) .or. .not. associated(flag_view)) error stop 6
+  if (.not. associated(strided_view) .or. associated(empty_view)) error stop 17
+  if (lbound(view, 1) /= -2 .or. ubound(view, 1) /= 1) error stop 7
+  if (lbound(strided_view, 1) /= 1 .or. ubound(strided_view, 1) /= 4) error stop 18
+  view(tid-2) = 200 + tid
+  flag_view(tid) = .true.
+  strided_view(tid+1) = 300 + tid
+  first_seen(tid) = view(tid-2)
+  nullify(view)
+  nullify(flag_view)
+  nullify(strided_view)
+!$omp end parallel
+  if (.not. associated(view, original) .or. .not. associated(flag_view, flags)) error stop 8
+  if (.not. associated(strided_view) .or. associated(empty_view)) error stop 19
+  if (any(original /= [200, 201, 202, 203])) error stop 9
+  if (.not. all(flags)) error stop 10
+  if (any(first_seen /= original)) error stop 11
+  if (any(strided_target /= [300, -1, 301, -1, 302, -1, 303, -1])) error stop 20
+
+  call check_module(module_result)
+  if (module_result /= 11) error stop 12
+  call check_dummy_first(view, dummy_first_result)
+  if (dummy_first_result /= 806) error stop 13
+  call check_dummy_private(view, rebound, dummy_private_result)
+  if (dummy_private_result /= 100) error stop 14
+  if (.not. associated(view, original)) error stop 15
+  if (any(rebound /= [10, 20, 30, 40])) error stop 16
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_pointers", "bin");
+        let runtime_cache = unique_dir("openmp_private_pointers_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE pointer arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE pointer arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_default_none_and_predetermined_scalars_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -21691,7 +21848,8 @@ fn fopenmp_rejects_unsupported_private_descriptor_shapes() {
   implicit none
   character(len=3), allocatable :: words(:)
   integer, allocatable :: scalar
-  integer, pointer :: view(:)
+  integer, pointer :: scalar_view
+  character(len=3), pointer :: character_view(:)
   integer, target :: target_values(2)
   allocate(words(2), scalar)
 !$omp parallel private(scalar)
@@ -21700,13 +21858,22 @@ fn fopenmp_rejects_unsupported_private_descriptor_shapes() {
 !$omp parallel firstprivate(words)
   words(1) = 'abc'
 !$omp end parallel
-!$omp parallel private(view, target_values)
+!$omp parallel private(scalar_view, target_values)
+  continue
+!$omp end parallel
+!$omp parallel firstprivate(character_view)
   continue
 !$omp end parallel
 contains
   subroutine use_optional(optional_values)
     integer, allocatable, intent(inout), optional :: optional_values(:)
 !$omp parallel private(optional_values)
+    continue
+!$omp end parallel
+  end subroutine
+  subroutine use_intent_in(intent_view)
+    integer, pointer, intent(in) :: intent_view(:)
+!$omp parallel private(intent_view)
     continue
 !$omp end parallel
   end subroutine
@@ -21723,9 +21890,11 @@ end program
     assert!(
         stderr.contains("PRIVATE scalar allocatable 'scalar' is recognized but not yet implemented")
             && stderr.contains("FIRSTPRIVATE allocatable array 'words' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
-            && stderr.contains("PRIVATE pointer or target variable 'view' is recognized but not yet implemented")
+            && stderr.contains("PRIVATE scalar or non-deferred-shape pointer 'scalar_view' is recognized but not yet implemented")
+            && stderr.contains("FIRSTPRIVATE pointer array 'character_view' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
             && stderr.contains("PRIVATE pointer or target variable 'target_values' is recognized but not yet implemented")
-            && stderr.contains("PRIVATE OPTIONAL dummy 'optional_values' is recognized but not yet implemented"),
+            && stderr.contains("PRIVATE OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
+            && stderr.contains("PRIVATE pointer 'intent_view' may not have INTENT(IN)"),
         "unexpected diagnostic: {stderr}"
     );
     let _ = std::fs::remove_file(&src);
