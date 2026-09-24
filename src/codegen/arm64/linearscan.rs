@@ -1292,19 +1292,21 @@ pub fn coalesce_moves(mf: &mut MachineFunction) {
 /// position of a `Bl`/`Blr` in the function: insert a `str
 /// pre_phys, [fp, bridge_slot]` immediately before the call and,
 /// if the post-half got its own register, an `ldr post_phys, [fp,
-/// bridge_slot]` immediately after.  Spilled post-halves rely on
-/// the existing per-use spill-load path, which already loads from
-/// `bridge_slot` thanks to `apply_allocation`'s position-aware
-/// operand rewrite.
+/// bridge_slot]` after the call's fixed ABI result registers have
+/// been copied out. Spilled post-halves rely on the existing per-use
+/// spill-load path, which already loads from `bridge_slot` thanks to
+/// `apply_allocation`'s position-aware operand rewrite.
 pub fn insert_split_bridges(mf: &mut MachineFunction, splits: &[SplitRecord]) {
-    if splits.is_empty() {
-        return;
-    }
     let mut call_seen: u32 = 0;
     for block_idx in 0..mf.blocks.len() {
         let mut new_insts: Vec<MachineInst> = Vec::with_capacity(mf.blocks[block_idx].insts.len());
         let original = std::mem::take(&mut mf.blocks[block_idx].insts);
+        let mut pending_post_call_bridges = Vec::new();
         for inst in original.into_iter() {
+            if inst.opcode == ArmOpcode::CallResultCopyEnd {
+                new_insts.append(&mut pending_post_call_bridges);
+                continue;
+            }
             let is_call = matches!(inst.opcode, ArmOpcode::Bl | ArmOpcode::Blr);
             if is_call {
                 let idx = call_seen;
@@ -1361,7 +1363,7 @@ pub fn insert_split_bridges(mf: &mut MachineFunction, splits: &[SplitRecord]) {
                             PhysReg::Fp(_) | PhysReg::Fp32(_) => ArmOpcode::LdrFpImm,
                             _ => ArmOpcode::LdrImm,
                         };
-                        new_insts.push(MachineInst {
+                        pending_post_call_bridges.push(MachineInst {
                             opcode: load_op,
                             operands: vec![
                                 MachineOperand::PhysReg(p),
@@ -1375,6 +1377,10 @@ pub fn insert_split_bridges(mf: &mut MachineFunction, splits: &[SplitRecord]) {
                 call_seen += 1;
             }
         }
+        // Hand-written MIR tests and older producers may omit the result-copy
+        // boundary. Keep their historical end-of-block fallback without
+        // weakening the explicit boundary used by selected code.
+        new_insts.append(&mut pending_post_call_bridges);
         mf.blocks[block_idx].insts = new_insts;
     }
 }
@@ -1615,6 +1621,11 @@ pub fn parallelize_call_arg_moves(mf: &mut MachineFunction) {
     for block in &mut mf.blocks {
         let mut rebuilt: Vec<MachineInst> = Vec::with_capacity(block.insts.len());
         for inst in std::mem::take(&mut block.insts) {
+            if inst.opcode == ArmOpcode::CallResultCopyEnd {
+                // Naive allocation does not run split-bridge insertion, so it
+                // consumes the otherwise structural-only boundary here.
+                continue;
+            }
             if matches!(inst.opcode, ArmOpcode::Bl | ArmOpcode::Blr) {
                 if let Some(marker_index) = rebuilt
                     .iter()
@@ -2616,6 +2627,74 @@ mod tests {
             "wide-offset reload should target d0 directly"
         );
         assert_eq!(insts[3].opcode, ArmOpcode::Bl);
+    }
+
+    #[test]
+    fn split_bridge_reload_waits_for_call_result_copy() {
+        let mut mf = MachineFunction::new("test".into());
+        mf.blocks[0].insts.extend([
+            MachineInst {
+                opcode: ArmOpcode::CallArgCopyStart,
+                operands: vec![],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::Bl,
+                operands: vec![MachineOperand::Extern("_callee".into())],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp32(6)),
+                    MachineOperand::PhysReg(PhysReg::Gp32(0)),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::CallResultCopyEnd,
+                operands: vec![],
+                def: None,
+            },
+        ]);
+        let split = SplitRecord {
+            vreg: VRegId(999),
+            call_position: 0,
+            call_index: 0,
+            pre_phys: PhysReg::Gp32(5),
+            post: PostHalf::Allocated(PhysReg::Gp32(0)),
+            bridge_slot: -8,
+        };
+
+        insert_split_bridges(&mut mf, &[split]);
+
+        let insts = &mf.blocks[0].insts;
+        let call = insts
+            .iter()
+            .position(|inst| inst.opcode == ArmOpcode::Bl)
+            .expect("call should remain");
+        let result_copy = insts
+            .iter()
+            .position(|inst| {
+                inst.opcode == ArmOpcode::MovReg
+                    && inst.operands
+                        == vec![
+                            MachineOperand::PhysReg(PhysReg::Gp32(6)),
+                            MachineOperand::PhysReg(PhysReg::Gp32(0)),
+                        ]
+            })
+            .expect("call result should be copied from w0");
+        let bridge_reload = insts
+            .iter()
+            .position(|inst| {
+                inst.opcode == ArmOpcode::LdrImm
+                    && inst.operands.first() == Some(&MachineOperand::PhysReg(PhysReg::Gp32(0)))
+            })
+            .expect("split bridge should reload its post-call half");
+        assert!(call < result_copy && result_copy < bridge_reload);
+        assert!(insts
+            .iter()
+            .all(|inst| inst.opcode != ArmOpcode::CallResultCopyEnd));
     }
 
     #[test]

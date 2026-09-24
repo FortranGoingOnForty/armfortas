@@ -230,6 +230,10 @@ pub enum ArmOpcode {
     /// parallel-copy resolution can recover the complete group even when
     /// reloads separate individual moves or the group is empty.
     CallArgCopyStart,
+    /// Non-emitting boundary after a call's ABI result has been copied out of
+    /// the fixed return registers. Split-bridge reloads must stay below this
+    /// marker or they can overwrite x0/d0 before the result is captured.
+    CallResultCopyEnd,
 
     // ---- Memory ----
     StrImm,   // STR Xt, [Xn, #imm]
