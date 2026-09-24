@@ -23106,12 +23106,127 @@ end program
 }
 
 #[test]
+fn fopenmp_private_derived_scalars_preserve_allocatable_topology() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_derived_scalars_preserve_allocatable_topology count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_private_owning_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: finalized(0:3) = -1
+  type :: item_t
+    integer :: code = 5
+    character(len=:), allocatable :: payload
+  end type
+  type :: owning_state
+    type(item_t), allocatable :: items(:)
+    integer, allocatable :: values(:)
+    character(len=:), allocatable :: label
+    integer :: guard = 11
+  contains
+    final :: finish_state
+  end type
+contains
+  subroutine finish_state(state)
+    type(owning_state) :: state
+    integer :: tid
+    tid = omp_get_thread_num()
+    finalized(tid) = state%guard + state%items(0)%code + state%values(-1) + &
+      len(state%items(0)%payload) + len(state%label)
+  end subroutine
+end module
+
+program p
+  use omp_private_owning_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  type(owning_state) :: state
+  integer :: i, tid, observed(0:3)
+  allocate(state%items(0:1), state%values(-1:0))
+  state%items(0)%code = 70
+  state%items(0)%payload = 'alpha'
+  state%items(1)%code = 80
+  state%values = [700, 800]
+  state%label = 'parent'
+  state%guard = 99
+  observed = -1
+!$omp parallel do default(none) num_threads(4) schedule(static) &
+!$omp& private(state,tid) shared(observed)
+  do i = 1, 4
+    tid = omp_get_thread_num()
+    if (.not. allocated(state%items) .or. .not. allocated(state%values)) error stop 1
+    if (.not. allocated(state%label) .or. .not. allocated(state%items(0)%payload)) error stop 2
+    if (allocated(state%items(1)%payload)) error stop 3
+    if (lbound(state%items, 1) /= 0 .or. ubound(state%items, 1) /= 1) error stop 4
+    if (lbound(state%values, 1) /= -1 .or. ubound(state%values, 1) /= 0) error stop 5
+    if (len(state%label) /= 6 .or. len(state%items(0)%payload) /= 5) error stop 6
+    if (state%guard /= 11 .or. any(state%items%code /= 5)) error stop 7
+    state%values(-1) = 100 + tid
+    state%items(0)%code = 200 + tid
+    state%items(0)%payload = 'task!'
+    state%label = 'worker'
+    observed(tid) = state%guard + state%items(0)%code + state%values(-1)
+  end do
+!$omp end parallel do
+  if (any(observed /= [311,313,315,317])) error stop 8
+  if (any(finalized /= [322,324,326,328])) error stop 9
+  if (state%guard /= 99 .or. any(state%items%code /= [70,80])) error stop 10
+  if (any(state%values /= [700,800])) error stop 11
+  if (state%items(0)%payload /= 'alpha' .or. allocated(state%items(1)%payload)) error stop 12
+  if (state%label /= 'parent') error stop 13
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_owning_derived", "bin");
+        let runtime_cache = unique_dir("openmp_private_owning_derived_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PRIVATE owning derived scalar should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PRIVATE owning derived scalar failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_rejects_unimplemented_derived_private_ownership() {
     let src = write_program(
         "program p
   implicit none
+  type :: base_state
+    integer :: value = 1
+  end type
   type :: owning_state
-    integer, allocatable :: values(:)
+    class(base_state), allocatable :: polymorphic
   end type
   type :: assigned_state
     integer :: value = 1
@@ -23145,7 +23260,7 @@ end program
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains(
-            "OpenMP PRIVATE derived-type variable 'owning' with allocatable components is recognized but not yet implemented"
+            "OpenMP PRIVATE derived-type variable 'owning' with polymorphic allocatable components is recognized but not yet implemented"
         ) && stderr.contains(
             "OpenMP FIRSTPRIVATE derived-type variable 'assigned' with type-bound defined assignment is recognized but not yet implemented"
         ),

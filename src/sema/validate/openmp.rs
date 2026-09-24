@@ -1157,13 +1157,17 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         };
         if clause == "PRIVATE"
             && ctx.type_layouts.is_some_and(|layouts| {
-                derived_layout_has_allocatable_components(layouts, layout, &mut HashSet::new())
+                derived_layout_has_polymorphic_allocatable_components(
+                    layouts,
+                    layout,
+                    &mut HashSet::new(),
+                )
             })
         {
             ctx.error(
                 span,
                 format!(
-                    "OpenMP {} derived-type variable '{}' with allocatable components is recognized but not yet implemented",
+                    "OpenMP {} derived-type variable '{}' with polymorphic allocatable components is recognized but not yet implemented",
                     clause, name
                 ),
             );
@@ -1197,7 +1201,7 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
     }
 }
 
-fn derived_layout_has_allocatable_components(
+fn derived_layout_has_polymorphic_allocatable_components(
     layouts: &crate::sema::type_layout::TypeLayoutRegistry,
     layout: &crate::sema::type_layout::TypeLayout,
     active: &mut HashSet<String>,
@@ -1206,8 +1210,13 @@ fn derived_layout_has_allocatable_components(
     if !active.insert(key.clone()) {
         return false;
     }
-    let has_allocatable = layout.fields.iter().any(|field| {
-        if field.allocatable {
+    let has_unsupported = layout.fields.iter().any(|field| {
+        if field.allocatable
+            && matches!(
+                field.type_info,
+                TypeInfo::Class(_) | TypeInfo::ClassStar | TypeInfo::TypeStar
+            )
+        {
             return true;
         }
         if field.pointer {
@@ -1219,11 +1228,11 @@ fn derived_layout_has_allocatable_components(
         layouts
             .get_related(layout, type_name)
             .is_some_and(|nested| {
-                derived_layout_has_allocatable_components(layouts, nested, active)
+                derived_layout_has_polymorphic_allocatable_components(layouts, nested, active)
             })
     });
     active.remove(&key);
-    has_allocatable
+    has_unsupported
 }
 
 fn validate_structured_block(ctx: &mut Ctx<'_>, stmts: &[SpannedStmt]) {

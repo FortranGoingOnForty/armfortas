@@ -24,10 +24,12 @@ use crate::ir::types::{IntWidth, IrType};
 use super::alloc::rewrite_heap_promoted_declared_bounds;
 use super::core::{
     array_base_addr, array_descriptor_addr, collect_format_labels, collect_label_blocks,
-    derived_storage_ir_type, emit_derived_value_copy, emit_memcpy_bytes, ensure_termination,
-    initialize_derived_storage, insert_implicit_dealloc, ir_scalar_byte_size, local_declared_rank,
-    local_uses_array_descriptor, lower_do_loop, materialize_array_descriptor_for_info,
-    materialize_array_section_source_descriptor, DoLoopBody, DoLoopFields,
+    derived_layout_needs_component_deallocation, derived_storage_ir_type,
+    emit_derived_private_allocation_copy, emit_derived_value_copy, emit_memcpy_bytes,
+    ensure_termination, initialize_derived_storage, insert_implicit_dealloc, ir_scalar_byte_size,
+    local_declared_rank, local_uses_array_descriptor, lower_do_loop,
+    materialize_array_descriptor_for_info, materialize_array_section_source_descriptor, DoLoopBody,
+    DoLoopFields,
 };
 use super::ctx::{LocalInfo, LowerCtx, ProcScopeGuard};
 use super::helpers::coerce_to_type;
@@ -119,11 +121,23 @@ fn is_array(info: &LocalInfo) -> bool {
     local_declared_rank(info) > 0
 }
 
-fn capture_needs_environment(capture: &Capture) -> bool {
+fn capture_needs_environment(
+    capture: &Capture,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> bool {
     matches!(
         capture.kind,
         CaptureKind::Shared | CaptureKind::FirstPrivate
     ) || (capture.kind == CaptureKind::Private && is_allocatable_array(&capture.info))
+        || (capture.kind == CaptureKind::Private
+            && capture
+                .info
+                .derived_type
+                .as_deref()
+                .and_then(|name| type_layouts.get(name))
+                .is_some_and(|layout| {
+                    derived_layout_needs_component_deallocation(layout, type_layouts)
+                }))
 }
 
 fn snapshot_array_descriptor(b: &mut FuncBuilder<'_>, source: ValueId) -> ValueId {
@@ -1251,7 +1265,7 @@ fn materialize_shared_environment(
 ) -> MaterializedEnvironment {
     let addressed_count = captures
         .iter()
-        .filter(|capture| capture_needs_environment(capture))
+        .filter(|capture| capture_needs_environment(capture, type_layouts))
         .count();
     let environment_slots = addressed_count + usize::from(worksharing_chunk.is_some());
     if environment_slots == 0 {
@@ -1272,7 +1286,7 @@ fn materialize_shared_environment(
     let mut derived_snapshots = std::collections::HashMap::new();
     let mut slot_index = 0i64;
     for capture in captures {
-        if !capture_needs_environment(capture) {
+        if !capture_needs_environment(capture, type_layouts) {
             continue;
         }
         let environment_address = if capture.kind == CaptureKind::Private
@@ -1314,7 +1328,11 @@ fn materialize_shared_environment(
             copy_array_data(b, &snapshot, source, descriptor_copy);
             cleanup_descriptors.extend(cleanup);
             snapshot.addr
-        } else if capture.kind == CaptureKind::FirstPrivate && capture.info.derived_type.is_some() {
+        } else if matches!(
+            capture.kind,
+            CaptureKind::Private | CaptureKind::FirstPrivate
+        ) && capture.info.derived_type.is_some()
+        {
             let outside_address = if capture.info.by_ref {
                 b.load(capture.info.addr)
             } else {
@@ -1330,7 +1348,7 @@ fn materialize_shared_environment(
             let snapshot = b.alloca(storage_ty);
             let layout = type_layouts
                 .get(type_name)
-                .expect("validated OpenMP firstprivate derived scalar has no type layout");
+                .expect("validated OpenMP private derived scalar has no type layout");
             initialize_derived_storage(b, snapshot, layout, type_layouts);
             emit_derived_value_copy(b, type_layouts, type_name, snapshot, outside_address);
             let mut snapshot_info = capture.info.clone();
@@ -1393,7 +1411,10 @@ fn install_shared_captures(
 ) -> InstalledCaptureCleanup {
     let mut slot_index = 0i64;
     let mut cleanup = InstalledCaptureCleanup::default();
-    let environment_slots = if captures.iter().any(capture_needs_environment) {
+    let environment_slots = if captures
+        .iter()
+        .any(|capture| capture_needs_environment(capture, ctx.type_layouts))
+    {
         let raw_environment = b.ptr_to_int(ValueId(0));
         Some(b.int_to_ptr(raw_environment, IrType::Int(IntWidth::I64)))
     } else {
@@ -1434,6 +1455,27 @@ fn install_shared_captures(
                     cleanup.array_descriptors.push(cleanup_descriptor);
                     slot_index += 1;
                 } else if !is_array(&capture.info) {
+                    let owning_type = local.derived_type.as_deref().and_then(|name| {
+                        ctx.type_layouts.get(name).and_then(|layout| {
+                            derived_layout_needs_component_deallocation(layout, ctx.type_layouts)
+                                .then(|| name.to_string())
+                        })
+                    });
+                    let allocation_source = owning_type.as_deref().map(|type_name| {
+                        let index = b.const_i64(slot_index);
+                        let slot = b.gep(
+                            environment_slots.expect("missing OpenMP environment slots"),
+                            vec![index],
+                            IrType::Int(IntWidth::I64),
+                        );
+                        let raw_address = b.load_typed(slot, IrType::Int(IntWidth::I64));
+                        let storage_ty = derived_storage_ir_type(type_name, ctx.type_layouts)
+                            .expect(
+                                "validated OpenMP private derived scalar has no storage layout",
+                            );
+                        slot_index += 1;
+                        b.int_to_ptr(raw_address, storage_ty)
+                    });
                     let storage_ty = local
                         .derived_type
                         .as_deref()
@@ -1448,6 +1490,15 @@ fn install_shared_captures(
                             .get(type_name)
                             .expect("validated OpenMP private derived scalar has no type layout");
                         initialize_derived_storage(b, local.addr, layout, ctx.type_layouts);
+                        if let Some(source) = allocation_source {
+                            emit_derived_private_allocation_copy(
+                                b,
+                                ctx.type_layouts,
+                                type_name,
+                                local.addr,
+                                source,
+                            );
+                        }
                     }
                 } else {
                     let (private, cleanup_descriptor) =

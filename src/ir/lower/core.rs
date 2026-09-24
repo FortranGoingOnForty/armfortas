@@ -62600,6 +62600,168 @@ pub(super) fn emit_derived_value_copy(
     emit_derived_value_copy_guarded(b, type_layouts, layout, dest_ptr, src_ptr);
 }
 
+/// Mirror the allocation topology required for an OpenMP PRIVATE derived
+/// object without copying the original object's values. The destination must
+/// already have been default-initialized. OpenMP requires every allocatable
+/// subobject to inherit its encounter-time allocation status and, for arrays,
+/// its bounds; ordinary component values remain default-initialized or
+/// undefined according to the base language.
+pub(super) fn emit_derived_private_allocation_copy(
+    b: &mut FuncBuilder,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    type_name: &str,
+    dest_ptr: ValueId,
+    src_ptr: ValueId,
+) {
+    let Some(layout) = type_layouts.get(type_name) else {
+        return;
+    };
+    emit_derived_private_allocation_copy_inline(b, type_layouts, layout, dest_ptr, src_ptr);
+}
+
+fn emit_derived_private_allocation_copy_inline(
+    b: &mut FuncBuilder,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    layout: &crate::sema::type_layout::TypeLayout,
+    dest_ptr: ValueId,
+    src_ptr: ValueId,
+) {
+    for field in &layout.fields {
+        let offset = b.const_i64(field.offset as i64);
+        let dest_field = b.gep(dest_ptr, vec![offset], IrType::Int(IntWidth::I8));
+        let src_field = b.gep(src_ptr, vec![offset], IrType::Int(IntWidth::I8));
+
+        if field.allocatable && is_deferred_char_component_field(field) {
+            let allocated = b.call(
+                FuncRef::External("afs_string_allocated".into()),
+                vec![src_field],
+                IrType::Int(IntWidth::I32),
+            );
+            let zero_i32 = b.const_i32(0);
+            let is_allocated = b.icmp(CmpOp::Ne, allocated, zero_i32);
+            let allocate_bb = b.create_block("omp_private_char_allocate");
+            let done_bb = b.create_block("omp_private_char_ready");
+            b.cond_branch(is_allocated, allocate_bb, vec![], done_bb, vec![]);
+
+            b.set_block(allocate_bb);
+            let (_, len) = load_string_descriptor_view(b, src_field);
+            let null_stat = b.const_i64(0);
+            b.call(
+                FuncRef::External("afs_allocate_string".into()),
+                vec![dest_field, len, null_stat],
+                IrType::Void,
+            );
+            b.branch(done_bb, vec![]);
+            b.set_block(done_bb);
+            continue;
+        }
+
+        if field.allocatable && field.size == 392 {
+            let source_allocated = b.call(
+                FuncRef::External("afs_array_allocated".into()),
+                vec![src_field],
+                IrType::Int(IntWidth::I32),
+            );
+            let zero_i32 = b.const_i32(0);
+            let is_allocated = b.icmp(CmpOp::Ne, source_allocated, zero_i32);
+            let allocate_bb = b.create_block("omp_private_array_allocate");
+            let done_bb = b.create_block("omp_private_array_ready");
+            b.cond_branch(is_allocated, allocate_bb, vec![], done_bb, vec![]);
+
+            b.set_block(allocate_bb);
+            let null_stat = b.const_i64(0);
+            b.call(
+                FuncRef::External("afs_allocate_like".into()),
+                vec![dest_field, src_field, null_stat],
+                IrType::Void,
+            );
+
+            if let Some(nested_name) = field_derived_type_name(field) {
+                if let Some(nested_layout) = type_layouts.get_related(layout, &nested_name) {
+                    let dest_base =
+                        b.load_typed(dest_field, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    let src_base =
+                        b.load_typed(src_field, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                    let count = array_descriptor_total_elements_dynamic(b, src_field);
+                    let zero = b.const_i64(0);
+                    let check_bb = b.create_block("omp_private_derived_array_check");
+                    let check_idx = b.add_block_param(check_bb, IrType::Int(IntWidth::I64));
+                    let body_bb = b.create_block("omp_private_derived_array_body");
+                    let body_idx = b.add_block_param(body_bb, IrType::Int(IntWidth::I64));
+                    let array_done_bb = b.create_block("omp_private_derived_array_done");
+                    b.branch(check_bb, vec![zero]);
+
+                    b.set_block(check_bb);
+                    let finished = b.icmp(CmpOp::Ge, check_idx, count);
+                    b.cond_branch(finished, array_done_bb, vec![], body_bb, vec![check_idx]);
+
+                    b.set_block(body_bb);
+                    let elem_bytes = b.const_i64(nested_layout.size as i64);
+                    let elem_offset = b.imul(body_idx, elem_bytes);
+                    let dest_elem = b.gep(dest_base, vec![elem_offset], IrType::Int(IntWidth::I8));
+                    let src_elem = b.gep(src_base, vec![elem_offset], IrType::Int(IntWidth::I8));
+                    initialize_derived_storage(b, dest_elem, nested_layout, type_layouts);
+                    emit_derived_private_allocation_copy_inline(
+                        b,
+                        type_layouts,
+                        nested_layout,
+                        dest_elem,
+                        src_elem,
+                    );
+                    let one = b.const_i64(1);
+                    let next_idx = b.iadd(body_idx, one);
+                    b.branch(check_bb, vec![next_idx]);
+                    b.set_block(array_done_bb);
+                }
+            }
+
+            b.branch(done_bb, vec![]);
+            b.set_block(done_bb);
+            continue;
+        }
+
+        if field.pointer || field.allocatable {
+            continue;
+        }
+
+        let Some(nested_name) = field_derived_type_name(field) else {
+            continue;
+        };
+        let Some(nested_layout) = type_layouts.get_related(layout, &nested_name) else {
+            continue;
+        };
+
+        if field.dims.is_empty() {
+            emit_derived_private_allocation_copy_inline(
+                b,
+                type_layouts,
+                nested_layout,
+                dest_field,
+                src_field,
+            );
+            continue;
+        }
+
+        let elem_count: i64 = field.dims.iter().map(|(_, extent)| *extent).product();
+        if elem_count <= 0 {
+            continue;
+        }
+        let elem_bytes = nested_layout.size as i64;
+        for idx in 0..elem_count {
+            let byte_offset = b.const_i64(idx * elem_bytes);
+            let dest_elem = b.gep(dest_field, vec![byte_offset], IrType::Int(IntWidth::I8));
+            let src_elem = b.gep(src_field, vec![byte_offset], IrType::Int(IntWidth::I8));
+            emit_derived_private_allocation_copy_inline(
+                b,
+                type_layouts,
+                nested_layout,
+                dest_elem,
+                src_elem,
+            );
+        }
+    }
+}
+
 fn emit_derived_value_copy_guarded(
     b: &mut FuncBuilder,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
