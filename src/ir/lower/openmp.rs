@@ -24,8 +24,9 @@ use crate::ir::types::{IntWidth, IrType};
 use super::alloc::rewrite_heap_promoted_declared_bounds;
 use super::core::{
     array_base_addr, array_descriptor_addr, collect_format_labels, collect_label_blocks,
-    emit_memcpy_bytes, ensure_termination, ir_scalar_byte_size, local_declared_rank,
-    local_uses_array_descriptor, lower_do_loop, materialize_array_descriptor_for_info,
+    derived_storage_ir_type, emit_memcpy_bytes, ensure_termination, initialize_derived_storage,
+    insert_implicit_dealloc, ir_scalar_byte_size, local_declared_rank, local_uses_array_descriptor,
+    lower_do_loop, materialize_array_descriptor_for_info,
     materialize_array_section_source_descriptor, DoLoopBody, DoLoopFields,
 };
 use super::ctx::{LocalInfo, LowerCtx, ProcScopeGuard};
@@ -50,6 +51,12 @@ struct MaterializedEnvironment {
     address: ValueId,
     cleanup_descriptors: Vec<ValueId>,
     worksharing_chunk_slot: Option<i64>,
+}
+
+#[derive(Default)]
+struct InstalledCaptureCleanup {
+    array_descriptors: Vec<ValueId>,
+    private_derived_scalars: std::collections::HashMap<String, LocalInfo>,
 }
 
 struct ScalarReductionBinding {
@@ -536,8 +543,7 @@ fn lower_parallel_region(
         {
             let mut outlined = FuncBuilder::new(&mut callback, ctx.layout);
             outlined.set_local_modules(local_modules);
-            let cleanup_descriptors =
-                install_shared_captures(&mut outlined, &mut outlined_ctx, &captures);
+            let cleanup = install_shared_captures(&mut outlined, &mut outlined_ctx, &captures);
             let parallel_reductions = match region_body {
                 ParallelRegionBody::Statements(_) => {
                     prepare_scalar_reductions(&mut outlined, &mut outlined_ctx, clauses)
@@ -580,7 +586,21 @@ fn lower_parallel_region(
                 .is_none()
             {
                 finish_scalar_reductions(&mut outlined, &parallel_reductions, ValueId(1));
-                for descriptor in cleanup_descriptors {
+                if !cleanup.private_derived_scalars.is_empty() {
+                    let closure_locals = outlined_ctx.locals.clone();
+                    insert_implicit_dealloc(
+                        &mut outlined,
+                        &cleanup.private_derived_scalars,
+                        &closure_locals,
+                        outlined_ctx.type_layouts,
+                        outlined_ctx.st,
+                        outlined_ctx.internal_funcs,
+                        Some(outlined_ctx.contained_host_refs),
+                        None,
+                        true,
+                    );
+                }
+                for descriptor in cleanup.array_descriptors {
                     deallocate_array_descriptor(&mut outlined, descriptor);
                 }
             }
@@ -1309,9 +1329,9 @@ fn install_shared_captures(
     b: &mut FuncBuilder<'_>,
     ctx: &mut LowerCtx<'_>,
     captures: &[Capture],
-) -> Vec<ValueId> {
+) -> InstalledCaptureCleanup {
     let mut slot_index = 0i64;
-    let mut cleanup_descriptors = Vec::new();
+    let mut cleanup = InstalledCaptureCleanup::default();
     let environment_slots = if captures.iter().any(capture_needs_environment) {
         let raw_environment = b.ptr_to_int(ValueId(0));
         Some(b.int_to_ptr(raw_environment, IrType::Int(IntWidth::I64)))
@@ -1347,19 +1367,32 @@ fn install_shared_captures(
                         raw_address,
                         IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392),
                     );
-                    let (private, cleanup) =
+                    let (private, cleanup_descriptor) =
                         allocate_allocatable_private(b, &capture.info, shape_snapshot, false);
                     local = private;
-                    cleanup_descriptors.push(cleanup);
+                    cleanup.array_descriptors.push(cleanup_descriptor);
                     slot_index += 1;
                 } else if !is_array(&capture.info) {
-                    local.addr = b.alloca(capture.info.ty.clone());
+                    let storage_ty = local
+                        .derived_type
+                        .as_deref()
+                        .and_then(|name| derived_storage_ir_type(name, ctx.type_layouts))
+                        .unwrap_or_else(|| capture.info.ty.clone());
+                    local.addr = b.alloca(storage_ty);
                     local.by_ref = false;
                     local.inline_const = None;
+                    if let Some(type_name) = local.derived_type.as_deref() {
+                        let layout = ctx
+                            .type_layouts
+                            .get(type_name)
+                            .expect("validated OpenMP private derived scalar has no type layout");
+                        initialize_derived_storage(b, local.addr, layout, ctx.type_layouts);
+                    }
                 } else {
-                    let (private, cleanup) = allocate_private_array(b, &capture.info, None);
+                    let (private, cleanup_descriptor) =
+                        allocate_private_array(b, &capture.info, None);
                     local = private;
-                    cleanup_descriptors.extend(cleanup);
+                    cleanup.array_descriptors.extend(cleanup_descriptor);
                 }
             }
             CaptureKind::Shared | CaptureKind::FirstPrivate => {
@@ -1392,17 +1425,17 @@ fn install_shared_captures(
                 if firstprivate_pointer {
                     local = allocate_pointer_private(b, &capture.info, Some(environment_address));
                 } else if firstprivate_allocatable {
-                    let (private, cleanup) =
+                    let (private, cleanup_descriptor) =
                         allocate_allocatable_private(b, &capture.info, environment_address, true);
                     local = private;
-                    cleanup_descriptors.push(cleanup);
+                    cleanup.array_descriptors.push(cleanup_descriptor);
                 } else if firstprivate_array {
                     let shape_descriptor = firstprivate_descriptor.then_some(environment_address);
-                    let (private, cleanup) =
+                    let (private, cleanup_descriptor) =
                         allocate_private_array(b, &capture.info, shape_descriptor);
                     copy_array_data(b, &private, environment_address, firstprivate_descriptor);
                     local = private;
-                    cleanup_descriptors.extend(cleanup);
+                    cleanup.array_descriptors.extend(cleanup_descriptor);
                 } else if capture.kind == CaptureKind::FirstPrivate {
                     let private = b.alloca(capture.info.ty.clone());
                     let value = b.load_typed(environment_address, capture.info.ty.clone());
@@ -1427,7 +1460,17 @@ fn install_shared_captures(
                 slot_index += 1;
             }
         }
+        if capture.kind == CaptureKind::Private
+            && !is_array(&local)
+            && !local.allocatable
+            && !local.is_pointer
+            && local.derived_type.is_some()
+        {
+            cleanup
+                .private_derived_scalars
+                .insert(capture.name.clone(), local.clone());
+        }
         ctx.locals.insert(capture.name.clone(), local);
     }
-    cleanup_descriptors
+    cleanup
 }
