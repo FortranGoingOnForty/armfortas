@@ -22656,13 +22656,14 @@ fn fopenmp_private_derived_scalars_initialize_and_finalize() {
   type :: worker_state
     type(nested_state) :: nested
     integer :: value = 11
+    integer :: guard = 5
   contains
     final :: finish_worker
   end type
 contains
   subroutine finish_worker(state)
     type(worker_state) :: state
-    finalized(omp_get_thread_num()) = state%value + state%nested%stamp
+    finalized(omp_get_thread_num()) = state%value + state%nested%stamp + state%guard
   end subroutine
 end module
 
@@ -22674,19 +22675,20 @@ program p
   integer :: i, tid, observed(0:3)
   state%value = 900
   state%nested%stamp = 100
+  state%guard = 700
   observed = -1
 !$omp parallel do default(none) num_threads(4) schedule(static) &
 !$omp& private(state,tid) shared(observed)
   do i = 1, 4
     tid = omp_get_thread_num()
-    observed(tid) = state%value + state%nested%stamp
+    observed(tid) = state%value + state%nested%stamp + state%guard
     state%value = 20 + tid
     state%nested%stamp = 3
   end do
 !$omp end parallel do
-  if (state%value /= 900 .or. state%nested%stamp /= 100) error stop 1
-  if (any(observed /= [17,17,17,17])) error stop 2
-  if (any(finalized /= [23,24,25,26])) error stop 3
+  if (state%value /= 900 .or. state%nested%stamp /= 100 .or. state%guard /= 700) error stop 1
+  if (any(observed /= [22,22,22,22])) error stop 2
+  if (any(finalized /= [28,29,30,31])) error stop 3
   print *, 'ok'
 end program
 ",

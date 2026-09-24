@@ -24,10 +24,10 @@ use crate::ir::types::{IntWidth, IrType};
 use super::alloc::rewrite_heap_promoted_declared_bounds;
 use super::core::{
     array_base_addr, array_descriptor_addr, collect_format_labels, collect_label_blocks,
-    emit_memcpy_bytes, ensure_termination, initialize_derived_storage, insert_implicit_dealloc,
-    ir_scalar_byte_size, local_declared_rank, local_uses_array_descriptor, lower_do_loop,
-    materialize_array_descriptor_for_info, materialize_array_section_source_descriptor, DoLoopBody,
-    DoLoopFields,
+    derived_storage_ir_type, emit_memcpy_bytes, ensure_termination, initialize_derived_storage,
+    insert_implicit_dealloc, ir_scalar_byte_size, local_declared_rank, local_uses_array_descriptor,
+    lower_do_loop, materialize_array_descriptor_for_info,
+    materialize_array_section_source_descriptor, DoLoopBody, DoLoopFields,
 };
 use super::ctx::{LocalInfo, LowerCtx, ProcScopeGuard};
 use super::helpers::coerce_to_type;
@@ -1373,7 +1373,12 @@ fn install_shared_captures(
                     cleanup.array_descriptors.push(cleanup_descriptor);
                     slot_index += 1;
                 } else if !is_array(&capture.info) {
-                    local.addr = b.alloca(capture.info.ty.clone());
+                    let storage_ty = local
+                        .derived_type
+                        .as_deref()
+                        .and_then(|name| derived_storage_ir_type(name, ctx.type_layouts))
+                        .unwrap_or_else(|| capture.info.ty.clone());
+                    local.addr = b.alloca(storage_ty);
                     local.by_ref = false;
                     local.inline_const = None;
                     if let Some(type_name) = local.derived_type.as_deref() {
