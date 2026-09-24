@@ -151,6 +151,9 @@ pub(super) struct Ctx<'a> {
     /// Full `-fopenmp` compilation is enabled. SIMD-only mode deliberately
     /// leaves this false so threaded constructs cannot cross into lowering.
     pub(super) openmp_full: bool,
+    /// Number of lexically enclosing OpenMP parallel regions. Worksharing DO
+    /// constructs bind to the innermost such team and are invalid without it.
+    pub(super) openmp_parallel_depth: usize,
     /// Host scopes whose storage must not be captured by the procedure
     /// currently being validated because it is reachable from a local
     /// FINAL binding and may be invoked after those scopes return.
@@ -243,6 +246,7 @@ impl<'a> Ctx<'a> {
             allow_array_cond_rhs: false,
             in_bind_c_unit: false,
             openmp_full: false,
+            openmp_parallel_depth: 0,
             finalizer_capture_host_scopes: HashSet::new(),
             reported_finalizer_captures: HashSet::new(),
             reported_use_ambiguities: HashSet::new(),
@@ -6049,7 +6053,17 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 );
             }
             if let Some(body) = construct.region_body() {
+                let enters_parallel = matches!(
+                    construct,
+                    crate::ast::openmp::OpenMpConstruct::Parallel { .. }
+                );
+                if enters_parallel {
+                    ctx.openmp_parallel_depth += 1;
+                }
                 validate_stmts(ctx, body);
+                if enters_parallel {
+                    ctx.openmp_parallel_depth -= 1;
+                }
             }
             if let Some(loop_stmt) = construct.loop_stmt() {
                 validate_stmt(ctx, loop_stmt);

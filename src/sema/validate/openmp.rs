@@ -1,16 +1,15 @@
 //! Semantic validation for executable OpenMP constructs.
 //!
-//! The executable slice is intentionally narrow: a `PARALLEL` region may
-//! share, privatize, or first-privatize supported numeric/logical storage. It
-//! may use `IF`, `NUM_THREADS`,
-//! `SHARED`, `PRIVATE`, `FIRSTPRIVATE`, and `DEFAULT(SHARED/NONE)`. Keeping that
-//! boundary explicit lets the outliner execute real concurrent regions without
-//! pretending that owning descriptors, characters, or derived objects are
-//! already implemented.
+//! The executable slice is intentionally narrow: `PARALLEL` data environments
+//! support selected numeric/logical storage, while canonical worksharing `DO`
+//! and combined `PARALLEL DO` support the initial contiguous static schedule.
+//! Keeping that boundary explicit lets the outliner execute real concurrent
+//! regions without pretending later schedules, loop clauses, characters, or
+//! derived objects are already implemented.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::openmp::{OpenMpClause, OpenMpConstruct, OpenMpDefault};
+use crate::ast::openmp::{OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpScheduleKind};
 use crate::ast::stmt::{IoControl, RankGuard, SpannedStmt, Stmt, TypeGuard};
 use crate::lexer::Span;
 use crate::sema::symtab::{Intent, SymbolKind, SymbolTable, TypeInfo};
@@ -24,25 +23,46 @@ use super::core::{
 pub(crate) use super::core::ReferenceRole;
 
 pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &OpenMpConstruct) {
-    let OpenMpConstruct::Parallel { clauses, body } = construct else {
+    match construct {
+        OpenMpConstruct::Parallel { clauses, body } => {
+            reject_in_pure(ctx, span, "PARALLEL");
+            let clause_info = validate_parallel_clauses(ctx, span, clauses, false);
+            let predetermined_private = predetermined_private_names(ctx.st, body);
+            validate_data_environment(ctx, body, &clause_info, &predetermined_private);
+            validate_structured_block(ctx, body);
+        }
+        OpenMpConstruct::Do { clauses, loop_stmt } => {
+            reject_in_pure(ctx, span, "DO");
+            if ctx.openmp_parallel_depth == 0 {
+                ctx.error(
+                    span,
+                    "OpenMP DO must be closely nested inside an OpenMP PARALLEL region",
+                );
+            }
+            validate_worksharing_loop(ctx, span, clauses, loop_stmt, false);
+        }
+        OpenMpConstruct::ParallelDo { clauses, loop_stmt } => {
+            reject_in_pure(ctx, span, "PARALLEL DO");
+            let clause_info = validate_parallel_clauses(ctx, span, clauses, true);
+            let loop_body = std::slice::from_ref(loop_stmt.as_ref());
+            let predetermined_private = predetermined_private_names(ctx.st, loop_body);
+            validate_data_environment(ctx, loop_body, &clause_info, &predetermined_private);
+            validate_worksharing_loop(ctx, span, clauses, loop_stmt, true);
+        }
+        OpenMpConstruct::Critical { .. } => ctx.error(
+            span,
+            "OpenMP CRITICAL execution is recognized but not yet implemented",
+        ),
+    }
+}
+
+fn reject_in_pure(ctx: &mut Ctx<'_>, span: Span, construct: &str) {
+    if ctx.in_pure {
         ctx.error(
             span,
-            format!(
-                "OpenMP {} execution is recognized but not yet implemented",
-                construct.name()
-            ),
+            format!("OpenMP {construct} is not allowed in a PURE procedure"),
         );
-        return;
-    };
-
-    if ctx.in_pure {
-        ctx.error(span, "OpenMP PARALLEL is not allowed in a PURE procedure");
     }
-
-    let clause_info = validate_parallel_clauses(ctx, span, clauses);
-    let predetermined_private = predetermined_private_names(ctx.st, body);
-    validate_data_environment(ctx, body, &clause_info, &predetermined_private);
-    validate_structured_block(ctx, body);
 }
 
 #[derive(Default)]
@@ -55,6 +75,7 @@ fn validate_parallel_clauses(
     ctx: &mut Ctx<'_>,
     span: Span,
     clauses: &[OpenMpClause],
+    combined_do: bool,
 ) -> ParallelClauseInfo {
     let mut saw_if = false;
     let mut saw_num_threads = false;
@@ -132,6 +153,10 @@ fn validate_parallel_clauses(
             }
             OpenMpClause::Default(OpenMpDefault::Shared) => {}
             OpenMpClause::Default(OpenMpDefault::None) => {}
+            OpenMpClause::Schedule { .. } if combined_do => {}
+            OpenMpClause::Nowait if combined_do => {
+                ctx.error(span, "OpenMP PARALLEL DO may not specify NOWAIT")
+            }
             unsupported => ctx.error(
                 span,
                 format!(
@@ -146,6 +171,148 @@ fn validate_parallel_clauses(
         default_none: clauses
             .iter()
             .any(|clause| matches!(clause, OpenMpClause::Default(OpenMpDefault::None))),
+    }
+}
+
+fn validate_worksharing_loop(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    clauses: &[OpenMpClause],
+    loop_stmt: &SpannedStmt,
+    combined_do: bool,
+) {
+    let Stmt::DoLoop {
+        var,
+        start,
+        end,
+        step,
+        body,
+        ..
+    } = &loop_stmt.node
+    else {
+        ctx.error(span, "OpenMP DO must be followed by a counted DO loop");
+        return;
+    };
+    let (Some(var), Some(start), Some(end)) = (var.as_deref(), start.as_ref(), end.as_ref()) else {
+        ctx.error(span, "OpenMP DO must be followed by a counted DO loop");
+        return;
+    };
+
+    let loop_key = var.to_ascii_lowercase();
+    let Some(symbol) = ctx.lookup_lexical(var) else {
+        ctx.error(
+            loop_stmt.span,
+            format!("OpenMP DO iteration variable '{var}' is not declared"),
+        );
+        return;
+    };
+    if symbol.kind != SymbolKind::Variable
+        || !symbol.attrs.array_spec.is_empty()
+        || !matches!(symbol.type_info.as_ref(), Some(TypeInfo::Integer { .. }))
+    {
+        ctx.error(
+            loop_stmt.span,
+            format!("OpenMP DO iteration variable '{var}' must be a scalar INTEGER variable"),
+        );
+    }
+    for (label, expr) in [("lower bound", start), ("upper bound", end)]
+        .into_iter()
+        .chain(step.iter().map(|expr| ("increment", expr)))
+    {
+        if validation_expr_rank(ctx, expr) != Some(0)
+            || !matches!(
+                validation_expr_type_info(ctx, expr),
+                Some(TypeInfo::Integer { .. })
+            )
+        {
+            ctx.error(
+                expr.span,
+                format!("OpenMP DO {label} must be a scalar INTEGER expression"),
+            );
+        }
+    }
+
+    for clause in clauses {
+        match clause {
+            OpenMpClause::Schedule {
+                kind: OpenMpScheduleKind::Static,
+                chunk_size: None,
+            }
+            | OpenMpClause::Nowait => {}
+            OpenMpClause::Schedule {
+                kind: OpenMpScheduleKind::Static,
+                chunk_size: Some(_),
+            } => ctx.error(
+                span,
+                "OpenMP SCHEDULE(STATIC, chunk_size) is recognized but not yet implemented",
+            ),
+            OpenMpClause::Schedule { kind, .. } => ctx.error(
+                span,
+                format!(
+                    "OpenMP SCHEDULE({}) is recognized but not yet implemented",
+                    schedule_kind_name(*kind)
+                ),
+            ),
+            OpenMpClause::Private(names)
+                if !combined_do
+                    && names
+                        .iter()
+                        .all(|name| name.eq_ignore_ascii_case(&loop_key)) => {}
+            OpenMpClause::Private(_)
+            | OpenMpClause::FirstPrivate(_)
+                if !combined_do => ctx.error(
+                    span,
+                    format!(
+                        "OpenMP {} clause on DO is recognized but not yet implemented",
+                        clause_name(clause)
+                    ),
+                ),
+            OpenMpClause::FirstPrivate(names)
+                if combined_do
+                    && names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&loop_key)) => ctx.error(
+                            span,
+                            format!(
+                                "OpenMP PARALLEL DO iteration variable '{var}' may not appear in FIRSTPRIVATE"
+                            ),
+                        ),
+            OpenMpClause::Private(_)
+            | OpenMpClause::FirstPrivate(_)
+            | OpenMpClause::Shared(_)
+            | OpenMpClause::Default(_)
+            | OpenMpClause::If { .. }
+            | OpenMpClause::NumThreads(_)
+                if combined_do => {}
+            OpenMpClause::Collapse(_) | OpenMpClause::Reduction { .. } => ctx.error(
+                span,
+                format!(
+                    "OpenMP {} clause on {} is recognized but not yet implemented",
+                    clause_name(clause),
+                    if combined_do { "PARALLEL DO" } else { "DO" }
+                ),
+            ),
+            OpenMpClause::Shared(_)
+            | OpenMpClause::Default(_)
+            | OpenMpClause::If { .. }
+            | OpenMpClause::NumThreads(_) => unreachable!(
+                "parser admitted a parallel-only clause on standalone OpenMP DO"
+            ),
+            OpenMpClause::Private(_) | OpenMpClause::FirstPrivate(_) => {
+                unreachable!("OpenMP DO data clause escaped construct-specific validation")
+            }
+        }
+    }
+    validate_structured_block(ctx, body);
+}
+
+fn schedule_kind_name(kind: OpenMpScheduleKind) -> &'static str {
+    match kind {
+        OpenMpScheduleKind::Static => "STATIC",
+        OpenMpScheduleKind::Dynamic => "DYNAMIC",
+        OpenMpScheduleKind::Guided => "GUIDED",
+        OpenMpScheduleKind::Runtime => "RUNTIME",
+        OpenMpScheduleKind::Auto => "AUTO",
     }
 }
 
@@ -290,9 +457,14 @@ fn collect_predetermined_private_names(stmts: &[SpannedStmt], names: &mut Vec<(S
                     collect_predetermined_private_names(body, names);
                 }
             }
-            // A nested OpenMP region owns a distinct data environment. Its
-            // predetermined variables must not change the enclosing region's
-            // classification.
+            // A standalone worksharing DO uses the current parallel team's
+            // implicit tasks, so its associated loop variable must be
+            // available as private state in that enclosing callback. A
+            // nested PARALLEL or combined PARALLEL DO owns a distinct data
+            // environment and must not affect this region's classification.
+            Stmt::OpenMp(OpenMpConstruct::Do { loop_stmt, .. }) => {
+                collect_predetermined_private_names(std::slice::from_ref(loop_stmt.as_ref()), names)
+            }
             Stmt::OpenMp(_) => {}
             _ => {}
         }

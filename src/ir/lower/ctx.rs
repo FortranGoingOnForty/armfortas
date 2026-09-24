@@ -308,6 +308,9 @@ pub(super) struct LowerCtx<'a> {
     /// Deterministic ordinal for OpenMP regions directly nested in this
     /// function. Nested callbacks have their own owner name and ordinal.
     next_openmp_region: u64,
+    /// Current implicit-task identity while lowering an outlined OpenMP
+    /// callback. Standalone worksharing constructs require this team context.
+    pub(super) openmp_team: Option<(ValueId, ValueId)>,
     pub(super) st: &'a SymbolTable,
     /// Module-scoped globals visible by (lowercase module name,
     /// lowercase variable name). Populated by the lower_file
@@ -411,6 +414,7 @@ impl<'a> LowerCtx<'a> {
             save_owner,
             next_block_save_scope: 0,
             next_openmp_region: 0,
+            openmp_team: None,
             st,
             globals,
             type_layouts,
