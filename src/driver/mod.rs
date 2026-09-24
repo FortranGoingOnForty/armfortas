@@ -1246,7 +1246,7 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     }
     if opts.openmp {
         opts.cli_warnings.push(
-            "-fopenmp enables preview OpenMP support; PARALLEL data environments, static and combined dynamic DO worksharing, COLLAPSE(2), and scalar INTEGER/LOGICAL reductions are implemented and unsupported constructs or clauses are errors"
+            "-fopenmp enables preview OpenMP support; PARALLEL data environments, static and combined dynamic DO worksharing, COLLAPSE(2), scalar INTEGER/LOGICAL reductions, and named/unnamed CRITICAL regions are implemented and unsupported constructs or clauses are errors"
                 .into(),
         );
     } else if opts.openmp_simd {
