@@ -22728,6 +22728,110 @@ end program
 }
 
 #[test]
+fn fopenmp_firstprivate_derived_scalars_copy_and_finalize() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_firstprivate_derived_scalars_copy_and_finalize count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_firstprivate_shadow
+  implicit none
+  type :: worker_state
+    integer :: unrelated = -99
+  end type
+end module
+
+module omp_firstprivate_derived_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: finalized(0:3) = -1
+  integer, target :: shared_target = 50
+  type :: nested_state
+    integer :: stamp = 6
+  end type
+  type :: worker_state
+    type(nested_state) :: nested
+    integer :: value = 11
+    integer, pointer :: reference => null()
+  contains
+    final :: finish_worker
+  end type
+contains
+  subroutine finish_worker(state)
+    type(worker_state) :: state
+    integer :: pointed
+    pointed = 0
+    if (associated(state%reference)) pointed = state%reference
+    finalized(omp_get_thread_num()) = state%value + state%nested%stamp + pointed
+  end subroutine
+end module
+
+program p
+  use omp_firstprivate_derived_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  type(worker_state) :: state
+  integer :: i, tid, observed(0:3)
+  state%value = 100
+  state%nested%stamp = 7
+  state%reference => shared_target
+  observed = -1
+!$omp parallel do default(none) num_threads(4) schedule(static) &
+!$omp& firstprivate(state) private(tid) shared(observed,shared_target)
+  do i = 1, 4
+    tid = omp_get_thread_num()
+    if (.not. associated(state%reference, shared_target)) error stop 1
+    observed(tid) = state%value + state%nested%stamp + state%reference
+    state%value = 20 + tid
+    state%nested%stamp = 3
+  end do
+!$omp end parallel do
+  if (state%value /= 100 .or. state%nested%stamp /= 7) error stop 2
+  if (.not. associated(state%reference, shared_target)) error stop 3
+  if (any(observed /= [157,157,157,157])) error stop 4
+  if (any(finalized /= [73,74,75,76])) error stop 5
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_firstprivate_derived", "bin");
+        let runtime_cache = unique_dir("openmp_firstprivate_derived_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP FIRSTPRIVATE derived scalars should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP FIRSTPRIVATE derived scalars failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_rejects_unimplemented_derived_private_ownership() {
     let src = write_program(
         "program p
@@ -22735,17 +22839,29 @@ fn fopenmp_rejects_unimplemented_derived_private_ownership() {
   type :: owning_state
     integer, allocatable :: values(:)
   end type
-  type :: plain_state
+  type :: assigned_state
     integer :: value = 1
+  contains
+    procedure :: assign_state
+    generic :: assignment(=) => assign_state
   end type
-  type(owning_state) :: owning
-  type(plain_state) :: copied
+  type(owning_state) :: owning, copied
+  type(assigned_state) :: assigned
 !$omp parallel private(owning)
   continue
 !$omp end parallel
 !$omp parallel firstprivate(copied)
   continue
 !$omp end parallel
+!$omp parallel firstprivate(assigned)
+  continue
+!$omp end parallel
+contains
+  subroutine assign_state(lhs, rhs)
+    class(assigned_state), intent(out) :: lhs
+    type(assigned_state), intent(in) :: rhs
+    lhs%value = rhs%value
+  end subroutine
 end program
 ",
         "f90",
@@ -22760,7 +22876,9 @@ end program
         stderr.contains(
             "OpenMP PRIVATE derived-type variable 'owning' with allocatable components is recognized but not yet implemented"
         ) && stderr.contains(
-            "OpenMP FIRSTPRIVATE derived-type variable 'copied' is recognized but not yet implemented"
+            "OpenMP FIRSTPRIVATE derived-type variable 'copied' with allocatable components is recognized but not yet implemented"
+        ) && stderr.contains(
+            "OpenMP FIRSTPRIVATE derived-type variable 'assigned' with type-bound defined assignment is recognized but not yet implemented"
         ),
         "unexpected diagnostic: {stderr}"
     );

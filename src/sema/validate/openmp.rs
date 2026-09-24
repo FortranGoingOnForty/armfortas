@@ -1120,7 +1120,7 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         return;
     }
     if let Some(TypeInfo::Derived(type_name)) = symbol.type_info.as_ref() {
-        if clause != "PRIVATE" {
+        if clause != "PRIVATE" && clause != "FIRSTPRIVATE" {
             ctx.error(
                 span,
                 format!(
@@ -1140,8 +1140,8 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
             ctx.error(
                 span,
                 format!(
-                    "OpenMP PRIVATE derived-type variable '{}' has no available type layout",
-                    name
+                    "OpenMP {} derived-type variable '{}' has no available type layout",
+                    clause, name
                 ),
             );
             return;
@@ -1152,7 +1152,17 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
             ctx.error(
                 span,
                 format!(
-                    "OpenMP PRIVATE derived-type variable '{}' with allocatable components is recognized but not yet implemented",
+                    "OpenMP {} derived-type variable '{}' with allocatable components is recognized but not yet implemented",
+                    clause, name
+                ),
+            );
+            return;
+        }
+        if clause == "FIRSTPRIVATE" && !layout.bound_proc_candidates("assignment(=)").is_empty() {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP FIRSTPRIVATE derived-type variable '{}' with type-bound defined assignment is recognized but not yet implemented",
                     name
                 ),
             );
