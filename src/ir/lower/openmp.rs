@@ -11,7 +11,9 @@
 //! threshold and owned descriptors above it.
 
 use crate::ast::expr::Expr;
-use crate::ast::openmp::{OpenMpClause, OpenMpConstruct, OpenMpScheduleKind};
+use crate::ast::openmp::{
+    OpenMpClause, OpenMpConstruct, OpenMpReductionOperator, OpenMpScheduleKind,
+};
 use crate::ast::stmt::{SpannedStmt, Stmt};
 use crate::ast::Spanned;
 use crate::ir::builder::FuncBuilder;
@@ -47,6 +49,13 @@ struct MaterializedEnvironment {
     address: ValueId,
     cleanup_descriptors: Vec<ValueId>,
     worksharing_chunk_slot: Option<i64>,
+}
+
+struct ScalarReductionBinding {
+    name: String,
+    operator: OpenMpReductionOperator,
+    shared: LocalInfo,
+    private: LocalInfo,
 }
 
 const PRIVATE_ARRAY_STACK_THRESHOLD: i64 = 64 * 1024;
@@ -356,7 +365,8 @@ fn lower_parallel_region(
             | OpenMpClause::FirstPrivate(_)
             | OpenMpClause::Default(_)
             | OpenMpClause::Schedule { .. }
-            | OpenMpClause::Collapse(_) => {}
+            | OpenMpClause::Collapse(_)
+            | OpenMpClause::Reduction { .. } => {}
             _ => unreachable!("unsupported OpenMP PARALLEL clause passed semantic validation"),
         }
     }
@@ -391,7 +401,7 @@ fn lower_parallel_region(
     let predetermined_private =
         crate::sema::validate::openmp::predetermined_private_names(ctx.st, capture_body);
     let mut seen_captures = std::collections::HashSet::new();
-    let captures: Vec<Capture> =
+    let mut captures: Vec<Capture> =
         crate::sema::validate::openmp::capture_references(ctx.st, capture_body)
             .into_iter()
             .filter(|(name, _, role)| {
@@ -430,6 +440,25 @@ fn lower_parallel_region(
                 Capture { name, info, kind }
             })
             .collect();
+    for clause in clauses {
+        let OpenMpClause::Reduction { variables, .. } = clause else {
+            continue;
+        };
+        for name in variables {
+            let key = name.to_ascii_lowercase();
+            if !seen_captures.insert(key.clone()) {
+                continue;
+            }
+            let info = ctx.locals.get(&key).cloned().unwrap_or_else(|| {
+                panic!("validated OpenMP reduction capture '{key}' has no lowering binding")
+            });
+            captures.push(Capture {
+                name: key,
+                info,
+                kind: CaptureKind::Shared,
+            });
+        }
+    }
     let environment = materialize_shared_environment(b, &captures, worksharing_chunk);
     let worksharing_chunk_slot = environment.worksharing_chunk_slot;
 
@@ -485,6 +514,12 @@ fn lower_parallel_region(
             outlined.set_local_modules(local_modules);
             let cleanup_descriptors =
                 install_shared_captures(&mut outlined, &mut outlined_ctx, &captures);
+            let parallel_reductions = match region_body {
+                ParallelRegionBody::Statements(_) => {
+                    prepare_scalar_reductions(&mut outlined, &mut outlined_ctx, clauses)
+                }
+                ParallelRegionBody::WorksharingDo { .. } => Vec::new(),
+            };
             let outlined_worksharing_chunk = worksharing_chunk_slot.map(|slot_index| {
                 let raw_environment = outlined.ptr_to_int(ValueId(0));
                 let environment_slots =
@@ -520,6 +555,7 @@ fn lower_parallel_region(
                 .terminator
                 .is_none()
             {
+                finish_scalar_reductions(&mut outlined, &parallel_reductions, ValueId(1));
                 for descriptor in cleanup_descriptors {
                     deallocate_array_descriptor(&mut outlined, descriptor);
                 }
@@ -551,6 +587,150 @@ fn lower_parallel_region(
     );
     for descriptor in environment.cleanup_descriptors {
         deallocate_array_descriptor(b, descriptor);
+    }
+}
+
+fn reduction_runtime_operator(operator: OpenMpReductionOperator) -> i32 {
+    match operator {
+        OpenMpReductionOperator::Add => 1,
+        OpenMpReductionOperator::Multiply => 2,
+        OpenMpReductionOperator::Max => 3,
+        OpenMpReductionOperator::Min => 4,
+        OpenMpReductionOperator::And => 5,
+        OpenMpReductionOperator::Or => 6,
+        OpenMpReductionOperator::Eqv => 7,
+        OpenMpReductionOperator::Neqv => 8,
+    }
+}
+
+fn scalar_reduction_identity(
+    b: &mut FuncBuilder<'_>,
+    operator: OpenMpReductionOperator,
+    info: &LocalInfo,
+) -> ValueId {
+    if info.logical_kind.is_some() || info.ty == IrType::Bool {
+        let identity = matches!(
+            operator,
+            OpenMpReductionOperator::And | OpenMpReductionOperator::Eqv
+        );
+        let value = b.const_bool(identity);
+        return coerce_to_type(b, value, &info.ty);
+    }
+
+    let IrType::Int(width) = &info.ty else {
+        unreachable!("non-integer OpenMP scalar reduction passed semantic validation")
+    };
+    let bits = width.bits();
+    let (least, greatest) = if bits == 128 {
+        (i128::MIN, i128::MAX)
+    } else {
+        let magnitude = 1_i128 << (bits - 1);
+        (-magnitude, magnitude - 1)
+    };
+    let value = match operator {
+        OpenMpReductionOperator::Multiply => 1,
+        OpenMpReductionOperator::Max => least,
+        OpenMpReductionOperator::Min => greatest,
+        OpenMpReductionOperator::Add => 0,
+        _ => unreachable!("logical OpenMP reduction applied to INTEGER"),
+    };
+    b.const_int(value, *width)
+}
+
+fn prepare_scalar_reductions(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    clauses: &[OpenMpClause],
+) -> Vec<ScalarReductionBinding> {
+    let mut bindings = Vec::new();
+    for clause in clauses {
+        let OpenMpClause::Reduction {
+            operator,
+            variables,
+        } = clause
+        else {
+            continue;
+        };
+        for name in variables {
+            let key = name.to_ascii_lowercase();
+            let shared = ctx.locals.get(&key).cloned().unwrap_or_else(|| {
+                panic!("validated OpenMP reduction variable '{key}' has no lowering binding")
+            });
+            let mut private = shared.clone();
+            private.addr = b.alloca(private.ty.clone());
+            private.by_ref = false;
+            private.inline_const = None;
+            let identity = scalar_reduction_identity(b, *operator, &private);
+            b.store(identity, private.addr);
+            ctx.locals.insert(key.clone(), private.clone());
+            bindings.push(ScalarReductionBinding {
+                name: key,
+                operator: *operator,
+                shared,
+                private,
+            });
+        }
+    }
+    bindings
+}
+
+fn scalar_storage_address(b: &mut FuncBuilder<'_>, info: &LocalInfo) -> ValueId {
+    if info.by_ref {
+        b.load(info.addr)
+    } else {
+        info.addr
+    }
+}
+
+fn finish_scalar_reductions(
+    b: &mut FuncBuilder<'_>,
+    bindings: &[ScalarReductionBinding],
+    thread_num: ValueId,
+) {
+    for binding in bindings {
+        let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
+        let private = coerce_to_type(b, private, &IrType::Int(IntWidth::I64));
+        let shared_address = scalar_storage_address(b, &binding.shared);
+        let original = b.load_typed(shared_address, binding.shared.ty.clone());
+        let original = coerce_to_type(b, original, &IrType::Int(IntWidth::I64));
+        let result_address = b.alloca(IrType::Int(IntWidth::I64));
+        let operator = b.const_i32(reduction_runtime_operator(binding.operator));
+        let status = b.call(
+            FuncRef::External("afs_omp_reduce_i64".into()),
+            vec![operator, private, original, result_address],
+            IrType::Int(IntWidth::I32),
+        );
+        let zero = b.const_i32(0);
+        let invalid = b.icmp(CmpOp::Ne, status, zero);
+        let error_bb = b.create_block("omp_reduction_invalid");
+        let ready_bb = b.create_block("omp_reduction_ready");
+        b.cond_branch(invalid, error_bb, vec![], ready_bb, vec![]);
+        b.set_block(error_bb);
+        b.runtime_call(
+            crate::ir::inst::RuntimeFunc::ErrorStop,
+            vec![],
+            IrType::Void,
+        );
+        b.branch(ready_bb, vec![]);
+
+        b.set_block(ready_bb);
+        let thread_zero = b.icmp(CmpOp::Eq, thread_num, zero);
+        let store_bb = b.create_block("omp_reduction_store");
+        let done_bb = b.create_block("omp_reduction_done");
+        b.cond_branch(thread_zero, store_bb, vec![], done_bb, vec![]);
+        b.set_block(store_bb);
+        let result = b.load_typed(result_address, IrType::Int(IntWidth::I64));
+        let result = coerce_to_type(b, result, &binding.shared.ty);
+        b.store(result, shared_address);
+        b.branch(done_bb, vec![]);
+        b.set_block(done_bb);
+    }
+}
+
+fn restore_scalar_reductions(ctx: &mut LowerCtx<'_>, bindings: &[ScalarReductionBinding]) {
+    for binding in bindings {
+        ctx.locals
+            .insert(binding.name.clone(), binding.shared.clone());
     }
 }
 
@@ -722,6 +902,7 @@ fn lower_worksharing_loop(
             inner_count,
         }
     });
+    let reductions = prepare_scalar_reductions(b, ctx, clauses);
 
     let first_addr = b.alloca(i64_ty.clone());
     let last_addr = b.alloca(i64_ty.clone());
@@ -915,6 +1096,7 @@ fn lower_worksharing_loop(
     restore_temp_binding(ctx, first_name, saved_first);
     restore_temp_binding(ctx, last_name, saved_last);
     restore_temp_binding(ctx, step_name, saved_step);
+    restore_scalar_reductions(ctx, &reductions);
     if b.func().block(b.current_block()).terminator.is_none() {
         b.branch(advance_bb.unwrap_or(done_bb), vec![]);
     }
@@ -929,6 +1111,7 @@ fn lower_worksharing_loop(
     }
 
     b.set_block(done_bb);
+    finish_scalar_reductions(b, &reductions, thread_num);
     if !suppress_barrier && !nowait {
         b.call(
             FuncRef::External("afs_omp_barrier".into()),

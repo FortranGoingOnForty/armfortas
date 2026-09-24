@@ -21269,6 +21269,106 @@ end program
 }
 
 #[test]
+fn fopenmp_scalar_integer_and_logical_reductions_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_scalar_integer_and_logical_reductions_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer(kind=1) :: isum
+  integer(kind=2) :: iprod
+  integer :: i, j, imax, count, untouched
+  integer(kind=8) :: imin, total
+  logical(kind=1) :: all_positive, saw_three
+  logical :: equivalence, inequivalence
+  isum = 5_1
+  iprod = 2_2
+  imax = -100
+  imin = 100_8
+  all_positive = .true.
+  saw_three = .false.
+  equivalence = .false.
+  inequivalence = .true.
+!$omp parallel do default(none) num_threads(2) schedule(static) private(i) &
+!$omp& reduction(+:isum) reduction(*:iprod) reduction(max:imax) reduction(min:imin) &
+!$omp& reduction(.and.:all_positive) reduction(.or.:saw_three) &
+!$omp& reduction(.eqv.:equivalence) reduction(.neqv.:inequivalence)
+  do i = 1, 4
+    isum = isum + int(i, kind=1)
+    iprod = iprod * int(i, kind=2)
+    imax = max(imax, i-3)
+    imin = min(imin, int(8-i, kind=8))
+    all_positive = all_positive .and. (i > 0)
+    saw_three = saw_three .or. (i == 3)
+    equivalence = equivalence .eqv. (mod(i,2) == 1)
+    inequivalence = inequivalence .neqv. (mod(i,2) == 1)
+  end do
+!$omp end parallel do
+  if (isum /= 15_1 .or. iprod /= 48_2) error stop 1
+  if (imax /= 1 .or. imin /= 4_8) error stop 2
+  if (.not. all_positive .or. .not. saw_three) error stop 3
+  if (equivalence .or. .not. inequivalence) error stop 4
+
+  count = 7
+  untouched = 13
+!$omp parallel default(none) num_threads(4) reduction(+:count,untouched)
+  count = count + 1
+!$omp end parallel
+  if (count /= 11 .or. untouched /= 13) error stop 5
+
+  total = 10_8
+!$omp parallel do collapse(2) default(none) num_threads(3) private(i,j) reduction(+:total)
+  do i = 1, 2
+    do j = 1, 3
+      total = total + int(10*i+j, kind=8)
+    end do
+  end do
+!$omp end parallel do
+  if (total /= 112_8) error stop 6
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_scalar_reductions", "bin");
+        let runtime_cache = unique_dir("openmp_scalar_reductions_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP scalar reductions should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP scalar reductions failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
     let cases = [
         (
@@ -21312,6 +21412,26 @@ fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
             "OpenMP PARALLEL DO associated iteration variables may not appear in SHARED",
         ),
         (
+            "program p\ninteger :: i\n!$omp parallel do reduction(+:i)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP PARALLEL DO associated iteration variables may not appear in REDUCTION",
+        ),
+        (
+            "program p\ninteger :: i,total\n!$omp parallel\n!$omp do reduction(+:total)\ndo i=1,4\ntotal=total+i\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
+            "OpenMP REDUCTION clause on standalone DO is recognized but not yet implemented",
+        ),
+        (
+            "program p\ninteger :: i\nreal :: total\n!$omp parallel do reduction(+:total)\ndo i=1,4\ntotal=total+real(i)\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP + REDUCTION currently requires a scalar INTEGER of kind 1, 2, 4, or 8",
+        ),
+        (
+            "program p\ninteger :: i,total(2)\n!$omp parallel do reduction(+:total)\ndo i=1,4\ntotal(1)=total(1)+i\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP REDUCTION variable 'total' must currently be a nonallocatable, nonpointer scalar",
+        ),
+        (
+            "program p\ninteger :: i,total\n!$omp parallel do shared(total) reduction(+:total)\ndo i=1,4\ntotal=total+i\nend do\n!$omp end parallel do\nend program\n",
+            "appears in both SHARED and REDUCTION data-sharing clauses",
+        ),
+        (
             "program p\ninteger :: i\n!$omp parallel do\ndo i=1,4\nend do\n!$omp end parallel do nowait\nend program\n",
             "OpenMP PARALLEL DO may not specify NOWAIT",
         ),
@@ -21343,12 +21463,14 @@ fn fopenmp_worksharing_emits_x86_64_elf_object() {
     let src = write_program(
         "program p
   implicit none
-  integer :: i, j, values(3,3)
+  integer :: i, j, values(3,3), total
   values = 0
-!$omp parallel do collapse(2) num_threads(3) schedule(static,2)
+  total = 7
+!$omp parallel do collapse(2) num_threads(3) schedule(static,2) reduction(+:total)
   do i = 3, 1, -1
     do j = 1, 3
       values(i,j) = i + j
+      total = total + values(i,j)
     end do
   end do
 !$omp end parallel do

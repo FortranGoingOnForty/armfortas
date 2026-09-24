@@ -10,7 +10,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::openmp::{OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpScheduleKind};
+use crate::ast::openmp::{
+    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionOperator, OpenMpScheduleKind,
+};
 use crate::ast::stmt::{IoControl, RankGuard, SpannedStmt, Stmt, TypeGuard};
 use crate::lexer::Span;
 use crate::sema::symtab::{Intent, SymbolKind, SymbolTable, TypeInfo};
@@ -150,6 +152,16 @@ fn validate_parallel_clauses(
                     let key = name.to_ascii_lowercase();
                     register_data_attribute(ctx, span, &mut data_attributes, &key, "FIRSTPRIVATE");
                     validate_private_object(ctx, name, span, "FIRSTPRIVATE");
+                }
+            }
+            OpenMpClause::Reduction {
+                operator,
+                variables,
+            } => {
+                for name in variables {
+                    let key = name.to_ascii_lowercase();
+                    register_data_attribute(ctx, span, &mut data_attributes, &key, "REDUCTION");
+                    validate_reduction_object(ctx, name, span, *operator);
                 }
             }
             OpenMpClause::Default(OpenMpDefault::Shared) => {}
@@ -435,13 +447,21 @@ fn validate_worksharing_loop(
             | OpenMpClause::NumThreads(_)
                 if combined_do => {}
             OpenMpClause::Collapse(_) => {}
+            OpenMpClause::Reduction { variables, .. }
+                if combined_do
+                    && variables
+                        .iter()
+                        .any(|name| associated_loop_keys.contains(&name.to_ascii_lowercase())) =>
+            {
+                ctx.error(
+                    span,
+                    "OpenMP PARALLEL DO associated iteration variables may not appear in REDUCTION",
+                )
+            }
+            OpenMpClause::Reduction { .. } if combined_do => {}
             OpenMpClause::Reduction { .. } => ctx.error(
                 span,
-                format!(
-                    "OpenMP {} clause on {} is recognized but not yet implemented",
-                    clause_name(clause),
-                    if combined_do { "PARALLEL DO" } else { "DO" }
-                ),
+                "OpenMP REDUCTION clause on standalone DO is recognized but not yet implemented",
             ),
             OpenMpClause::Shared(_)
             | OpenMpClause::Default(_)
@@ -455,6 +475,101 @@ fn validate_worksharing_loop(
         }
     }
     validate_structured_block(ctx, outer_loop.body);
+}
+
+fn validate_reduction_object(
+    ctx: &mut Ctx<'_>,
+    name: &str,
+    span: Span,
+    operator: OpenMpReductionOperator,
+) {
+    let Some(symbol) = ctx.lookup_lexical(name) else {
+        ctx.error(
+            span,
+            format!("OpenMP REDUCTION variable '{name}' does not resolve to a visible data object"),
+        );
+        return;
+    };
+    if symbol.kind != SymbolKind::Variable {
+        ctx.error(
+            span,
+            format!("OpenMP REDUCTION list item '{name}' must be a variable"),
+        );
+        return;
+    }
+    if !symbol.attrs.array_spec.is_empty() || symbol.attrs.allocatable || symbol.attrs.pointer {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP REDUCTION variable '{name}' must currently be a nonallocatable, nonpointer scalar"
+            ),
+        );
+        return;
+    }
+    if symbol.attrs.optional
+        || symbol.attrs.volatile
+        || symbol.attrs.asynchronous
+        || symbol.attrs.intent == Some(Intent::In)
+    {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP REDUCTION variable '{name}' may not currently be OPTIONAL, VOLATILE, ASYNCHRONOUS, or INTENT(IN)"
+            ),
+        );
+        return;
+    }
+
+    let valid = match (operator, symbol.type_info.as_ref()) {
+        (
+            OpenMpReductionOperator::Add
+            | OpenMpReductionOperator::Multiply
+            | OpenMpReductionOperator::Max
+            | OpenMpReductionOperator::Min,
+            Some(TypeInfo::Integer { kind }),
+        ) => matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8),
+        (
+            OpenMpReductionOperator::And
+            | OpenMpReductionOperator::Or
+            | OpenMpReductionOperator::Eqv
+            | OpenMpReductionOperator::Neqv,
+            Some(TypeInfo::Logical { kind }),
+        ) => matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8),
+        _ => false,
+    };
+    if !valid {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP {} REDUCTION currently requires a scalar {} of kind 1, 2, 4, or 8",
+                reduction_operator_name(operator),
+                if matches!(
+                    operator,
+                    OpenMpReductionOperator::And
+                        | OpenMpReductionOperator::Or
+                        | OpenMpReductionOperator::Eqv
+                        | OpenMpReductionOperator::Neqv
+                ) {
+                    "LOGICAL"
+                } else {
+                    "INTEGER"
+                }
+            ),
+        );
+    }
+}
+
+fn reduction_operator_name(operator: OpenMpReductionOperator) -> &'static str {
+    match operator {
+        OpenMpReductionOperator::Add => "+",
+        OpenMpReductionOperator::Multiply => "*",
+        OpenMpReductionOperator::Max => "MAX",
+        OpenMpReductionOperator::Min => "MIN",
+        OpenMpReductionOperator::And => ".AND.",
+        OpenMpReductionOperator::Or => ".OR.",
+        OpenMpReductionOperator::Eqv => ".EQV.",
+        OpenMpReductionOperator::Neqv => ".NEQV.",
+    }
 }
 
 fn schedule_kind_name(kind: OpenMpScheduleKind) -> &'static str {
