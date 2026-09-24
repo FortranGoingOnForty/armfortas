@@ -21003,14 +21003,19 @@ fn fopenmp_parallel_do_static_runs() {
   values = 0
 !$omp parallel do default(none) num_threads(4) schedule(static) &
 !$omp& private(i,tid) firstprivate(seed) shared(values)
-  do i = 1, 17
+  outer_work: do i = 1, 17
+    if (mod(i,5) == 0) cycle outer_work
     tid = omp_get_thread_num()
     values(i) = seed + i
-  end do
+  end do outer_work
 !$omp end parallel do
   if (i /= -77 .or. seed /= 100) error stop 1
   do i = 1, 17
-    if (values(i) /= 100 + i) error stop 2
+    if (mod(i,5) == 0) then
+      if (values(i) /= 0) error stop 2
+    else
+      if (values(i) /= 100 + i) error stop 2
+    end if
   end do
 
   owners = -1
@@ -21182,18 +21187,21 @@ fn fopenmp_collapse_two_static_runs() {
 !$omp parallel do collapse(depth) default(none) num_threads(3) schedule(static) &
 !$omp& private(i,j,tid) shared(values,owners)
   do i = 1_8, 3_8
-    do j = 8, 2, -2
+    inner_work: do j = 8, 2, -2
+      if (j == 6) cycle inner_work
       tid = omp_get_thread_num()
       values(int(i),(10-j)/2) = int(100_8*i) + j
       owners(int(i),(10-j)/2) = tid
-    end do
+    end do inner_work
   end do
 !$omp end parallel do
   if (i /= -91_8 .or. j /= -92) error stop 1
-  if (values(1,1) /= 108 .or. values(1,2) /= 106 .or. values(1,3) /= 104 .or. values(1,4) /= 102) error stop 2
-  if (values(2,1) /= 208 .or. values(2,2) /= 206 .or. values(2,3) /= 204 .or. values(2,4) /= 202) error stop 3
-  if (values(3,1) /= 308 .or. values(3,2) /= 306 .or. values(3,3) /= 304 .or. values(3,4) /= 302) error stop 4
-  if (any(owners(1,:) /= 0) .or. any(owners(2,:) /= 1) .or. any(owners(3,:) /= 2)) error stop 5
+  if (values(1,1) /= 108 .or. values(1,2) /= 0 .or. values(1,3) /= 104 .or. values(1,4) /= 102) error stop 2
+  if (values(2,1) /= 208 .or. values(2,2) /= 0 .or. values(2,3) /= 204 .or. values(2,4) /= 202) error stop 3
+  if (values(3,1) /= 308 .or. values(3,2) /= 0 .or. values(3,3) /= 304 .or. values(3,4) /= 302) error stop 4
+  if (owners(1,1) /= 0 .or. owners(1,2) /= -1 .or. owners(1,3) /= 0 .or. owners(1,4) /= 0) error stop 5
+  if (owners(2,1) /= 1 .or. owners(2,2) /= -1 .or. owners(2,3) /= 1 .or. owners(2,4) /= 1) error stop 5
+  if (owners(3,1) /= 2 .or. owners(3,2) /= -1 .or. owners(3,3) /= 2 .or. owners(3,4) /= 2) error stop 5
 
   values = 0
 !$omp parallel do collapse(1) num_threads(3) schedule(static) shared(values) private(i)
@@ -21388,13 +21396,18 @@ fn fopenmp_parallel_do_dynamic_reductions_run() {
 !$omp parallel do default(none) num_threads(4) schedule(dynamic) &
 !$omp& private(i) shared(values) reduction(.or.:any_match)
   do i = 1, 23
+    if (mod(i,2) == 0) cycle
     values(i) = 2*i
     any_match = any_match .or. (i == 17)
   end do
 !$omp end parallel do
   if (.not. any_match) error stop 1
   do i = 1, 23
-    if (values(i) /= 2*i) error stop 2
+    if (mod(i,2) == 0) then
+      if (values(i) /= 0) error stop 2
+    else
+      if (values(i) /= 2*i) error stop 2
+    end if
   end do
 
   chunk = 3
@@ -21475,7 +21488,10 @@ fn fopenmp_named_and_unnamed_critical_regions_run() {
   named_count = 0
   unnamed_count = 0
 !$omp critical(serial_entry)
-  named_count = named_count + 1
+  do i = 1, 4
+    if (mod(i,2) == 0) cycle
+    named_count = named_count + 1
+  end do
 !$omp end critical(serial_entry)
 !$omp parallel default(none) num_threads(4) private(i) shared(named_count,unnamed_count)
   do i = 1, 500
@@ -21487,7 +21503,7 @@ fn fopenmp_named_and_unnamed_critical_regions_run() {
 !$omp end critical
   end do
 !$omp end parallel
-  if (named_count /= 2001) error stop 1
+  if (named_count /= 2002) error stop 1
   if (unnamed_count /= 2000) error stop 2
   print *, 'ok'
 end program
@@ -21692,6 +21708,14 @@ fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
         (
             "pure subroutine s\n!$omp critical\ncontinue\n!$omp end critical\nend subroutine\n",
             "OpenMP CRITICAL is not allowed in a PURE procedure",
+        ),
+        (
+            "program p\ninteger :: i\nouter: do i=1,2\n!$omp critical\ncycle outer\n!$omp end critical\nend do outer\nend program\n",
+            "CYCLE is not yet supported inside an OpenMP structured block",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do collapse(2)\nouter: do i=1,2\ninner: do j=1,2\ncycle outer\nend do inner\nend do outer\n!$omp end parallel do\nend program\n",
+            "CYCLE is not yet supported inside an OpenMP structured block",
         ),
         (
             "program p\ninteger :: i\n!$omp parallel do schedule(static,0)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
