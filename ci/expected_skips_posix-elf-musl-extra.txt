@@ -1544,6 +1544,7 @@ cli_driver external_procedure_names_are_case_insensitive_across_files 1
 # OpenMP native E2E regressions added by the host parallel foundation.
 cli_driver embedded_omp_lib_header_calls_the_owned_runtime 1
 cli_driver fopenmp_capture_free_parallel_regions_run 1
+cli_driver fopenmp_collapse_two_static_runs 1
 cli_driver fopenmp_default_none_and_predetermined_scalars_run 1
 cli_driver fopenmp_parallel_do_static_runs 1
 cli_driver fopenmp_private_and_firstprivate_allocatable_arrays_run 1

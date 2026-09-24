@@ -1357,7 +1357,7 @@ LANGUAGE:
   -fdefault-real-8            Make default real kind 8 bytes
   -fimplicit-none             Force implicit none in all scopes
   -frecursive                 Make all procedures recursive by default
-  -fopenmp                    Enable preview OpenMP support (initial PARALLEL data environments)
+  -fopenmp                    Enable preview OpenMP PARALLEL and static DO support
   -fno-openmp                 Disable full OpenMP compilation
   -fopenmp-simd               Enable OpenMP SIMD syntax without the thread runtime
   -fbackslash                 Interpret backslash in strings as escape

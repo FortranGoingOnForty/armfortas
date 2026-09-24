@@ -355,7 +355,8 @@ fn lower_parallel_region(
             | OpenMpClause::Private(_)
             | OpenMpClause::FirstPrivate(_)
             | OpenMpClause::Default(_)
-            | OpenMpClause::Schedule { .. } => {}
+            | OpenMpClause::Schedule { .. }
+            | OpenMpClause::Collapse(_) => {}
             _ => unreachable!("unsupported OpenMP PARALLEL clause passed semantic validation"),
         }
     }
@@ -553,6 +554,53 @@ fn lower_parallel_region(
     }
 }
 
+struct CollapsedLoopSource<'a> {
+    inner_var: &'a str,
+    inner_body: &'a [SpannedStmt],
+    outer_lower: ValueId,
+    outer_step: ValueId,
+    inner_lower: ValueId,
+    inner_step: ValueId,
+    outer_count: ValueId,
+    inner_count: ValueId,
+}
+
+fn worksharing_collapse_depth(ctx: &LowerCtx<'_>, clauses: &[OpenMpClause]) -> i64 {
+    clauses
+        .iter()
+        .find_map(|clause| match clause {
+            OpenMpClause::Collapse(depth) => Some(
+                super::core::eval_const_int_in_scope_or_any_scope(
+                    depth,
+                    &std::collections::HashMap::new(),
+                    ctx.st,
+                )
+                .expect("validated OpenMP COLLAPSE depth is not constant"),
+            ),
+            _ => None,
+        })
+        .unwrap_or(1)
+}
+
+fn privatize_worksharing_variable(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    var: &str,
+) -> (String, LocalInfo, LocalInfo) {
+    let key = var.to_ascii_lowercase();
+    let mut private = ctx
+        .locals
+        .get(&key)
+        .cloned()
+        .expect("validated OpenMP DO variable has no lowering binding");
+    let saved = private.clone();
+    private.addr = b.alloca(private.ty.clone());
+    private.by_ref = false;
+    private.inline_const = None;
+    ctx.locals.insert(key.clone(), private.clone());
+    (key, saved, private)
+}
+
 fn lower_worksharing_loop(
     b: &mut FuncBuilder<'_>,
     ctx: &mut LowerCtx<'_>,
@@ -594,23 +642,91 @@ fn lower_worksharing_loop(
         })
     });
 
-    // Every implicit task computes the same logical iteration space before
-    // replacing the associated iteration variable with its private binding.
-    let lower_raw = super::expr::lower_expr_ctx(b, ctx, start);
-    let lower = coerce_to_type(b, lower_raw, &i64_ty);
-    let upper_raw = super::expr::lower_expr_ctx(b, ctx, end);
-    let upper = coerce_to_type(b, upper_raw, &i64_ty);
-    let step = if let Some(step) = step {
+    // Every implicit task computes the same source iteration space before
+    // replacing either associated iteration variable with private storage.
+    let outer_lower_raw = super::expr::lower_expr_ctx(b, ctx, start);
+    let outer_lower = coerce_to_type(b, outer_lower_raw, &i64_ty);
+    let outer_upper_raw = super::expr::lower_expr_ctx(b, ctx, end);
+    let outer_upper = coerce_to_type(b, outer_upper_raw, &i64_ty);
+    let outer_step = if let Some(step) = step {
         let raw = super::expr::lower_expr_ctx(b, ctx, step);
         coerce_to_type(b, raw, &i64_ty)
     } else {
         b.const_i64(1)
     };
 
+    let collapse_two = worksharing_collapse_depth(ctx, clauses) == 2;
+    let mut lower = outer_lower;
+    let mut upper = outer_upper;
+    let mut schedule_step = outer_step;
+    let mut shape_status = None;
+    let collapsed = collapse_two.then(|| {
+        let [inner_stmt] = body.as_slice() else {
+            unreachable!("non-perfect COLLAPSE(2) nest passed semantic validation")
+        };
+        let Stmt::DoLoop {
+            var: Some(inner_var),
+            start: Some(inner_start),
+            end: Some(inner_end),
+            step: inner_step,
+            body: inner_body,
+            ..
+        } = &inner_stmt.node
+        else {
+            unreachable!("non-canonical COLLAPSE(2) loop passed semantic validation")
+        };
+        let inner_lower_raw = super::expr::lower_expr_ctx(b, ctx, inner_start);
+        let inner_lower = coerce_to_type(b, inner_lower_raw, &i64_ty);
+        let inner_upper_raw = super::expr::lower_expr_ctx(b, ctx, inner_end);
+        let inner_upper = coerce_to_type(b, inner_upper_raw, &i64_ty);
+        let inner_step = if let Some(inner_step) = inner_step {
+            let raw = super::expr::lower_expr_ctx(b, ctx, inner_step);
+            coerce_to_type(b, raw, &i64_ty)
+        } else {
+            b.const_i64(1)
+        };
+
+        let outer_count_addr = b.alloca(i64_ty.clone());
+        let inner_count_addr = b.alloca(i64_ty.clone());
+        let total_count_addr = b.alloca(i64_ty.clone());
+        shape_status = Some(b.call(
+            FuncRef::External("afs_omp_collapse2_shape".into()),
+            vec![
+                outer_lower,
+                outer_upper,
+                outer_step,
+                inner_lower,
+                inner_upper,
+                inner_step,
+                outer_count_addr,
+                inner_count_addr,
+                total_count_addr,
+            ],
+            IrType::Int(IntWidth::I32),
+        ));
+        let outer_count = b.load_typed(outer_count_addr, i64_ty.clone());
+        let inner_count = b.load_typed(inner_count_addr, i64_ty.clone());
+        let total_count = b.load_typed(total_count_addr, i64_ty.clone());
+        lower = b.const_i64(0);
+        let one = b.const_i64(1);
+        upper = b.isub(total_count, one);
+        schedule_step = one;
+        CollapsedLoopSource {
+            inner_var,
+            inner_body,
+            outer_lower,
+            outer_step,
+            inner_lower,
+            inner_step,
+            outer_count,
+            inner_count,
+        }
+    });
+
     let first_addr = b.alloca(i64_ty.clone());
     let last_addr = b.alloca(i64_ty.clone());
     let step_addr = b.alloca(i64_ty.clone());
-    b.store(step, step_addr);
+    b.store(schedule_step, step_addr);
     let chunk_index_addr = chunk_size.map(|_| {
         let address = b.alloca(i64_ty.clone());
         let zero = b.const_i64(0);
@@ -628,17 +744,23 @@ fn lower_worksharing_loop(
     ctx.insert_scalar(last_name.clone(), last_addr, i64_ty.clone());
     ctx.insert_scalar(step_name.clone(), step_addr, i64_ty);
 
-    let key = var.to_ascii_lowercase();
-    let mut private_var = ctx
-        .locals
-        .get(&key)
-        .cloned()
-        .expect("validated OpenMP DO variable has no lowering binding");
-    let saved_var = private_var.clone();
-    private_var.addr = b.alloca(private_var.ty.clone());
-    private_var.by_ref = false;
-    private_var.inline_const = None;
-    ctx.locals.insert(key.clone(), private_var);
+    let (outer_key, saved_outer, private_outer) = privatize_worksharing_variable(b, ctx, var);
+    let private_inner = collapsed
+        .as_ref()
+        .map(|collapsed| privatize_worksharing_variable(b, ctx, collapsed.inner_var));
+    let collapsed_value_addrs = collapsed.as_ref().map(|_| {
+        (
+            b.alloca(IrType::Int(IntWidth::I64)),
+            b.alloca(IrType::Int(IntWidth::I64)),
+        )
+    });
+    let flat_name = "$afs_omp_flat".to_string();
+    let flat_binding = collapsed.as_ref().map(|_| {
+        let saved = ctx.locals.remove(&flat_name);
+        let address = b.alloca(IrType::Int(IntWidth::I64));
+        ctx.insert_scalar(flat_name.clone(), address, IrType::Int(IntWidth::I64));
+        (address, saved)
+    });
 
     let error_bb = b.create_block("omp_do_invalid");
     let dispatch_bb = b.create_block("omp_do_dispatch");
@@ -646,7 +768,13 @@ fn lower_worksharing_loop(
     let work_bb = b.create_block("omp_do_work");
     let advance_bb = chunk_size.map(|_| b.create_block("omp_do_next_chunk"));
     let done_bb = b.create_block("omp_do_done");
-    b.branch(dispatch_bb, vec![]);
+    if let Some(shape_status) = shape_status {
+        let zero = b.const_i32(0);
+        let invalid_shape = b.icmp(CmpOp::Lt, shape_status, zero);
+        b.cond_branch(invalid_shape, error_bb, vec![], dispatch_bb, vec![]);
+    } else {
+        b.branch(dispatch_bb, vec![]);
+    }
 
     b.set_block(dispatch_bb);
     let status = if let (Some(chunk_size), Some(chunk_index_addr)) = (chunk_size, chunk_index_addr)
@@ -657,7 +785,7 @@ fn lower_worksharing_loop(
             vec![
                 lower,
                 upper,
-                step,
+                schedule_step,
                 chunk_size,
                 thread_num,
                 team_size,
@@ -671,7 +799,13 @@ fn lower_worksharing_loop(
         b.call(
             FuncRef::External("afs_omp_static_bounds".into()),
             vec![
-                lower, upper, step, thread_num, team_size, first_addr, last_addr,
+                lower,
+                upper,
+                schedule_step,
+                thread_num,
+                team_size,
+                first_addr,
+                last_addr,
             ],
             IrType::Int(IntWidth::I32),
         )
@@ -711,24 +845,73 @@ fn lower_worksharing_loop(
         },
         loop_stmt.span,
     ));
-    let private_var_name = Some(var.clone());
+    let private_var_name = Some(if collapsed.is_some() {
+        flat_name.clone()
+    } else {
+        var.clone()
+    });
+    let unnamed_loop = None;
+    let lowered_body = if let (
+        Some(collapsed),
+        Some((flat_addr, _)),
+        Some((_, _, inner)),
+        Some((outer_value_addr, inner_value_addr)),
+    ) = (
+        collapsed.as_ref(),
+        flat_binding.as_ref(),
+        private_inner.as_ref(),
+        collapsed_value_addrs,
+    ) {
+        DoLoopBody::CollapsedTwo {
+            flat_addr: *flat_addr,
+            outer_count: collapsed.outer_count,
+            inner_count: collapsed.inner_count,
+            outer_addr: private_outer.addr,
+            outer_ty: private_outer.ty.clone(),
+            outer_lower: collapsed.outer_lower,
+            outer_step: collapsed.outer_step,
+            outer_value_addr,
+            inner_addr: inner.addr,
+            inner_ty: inner.ty.clone(),
+            inner_lower: collapsed.inner_lower,
+            inner_step: collapsed.inner_step,
+            inner_value_addr,
+            statements: collapsed.inner_body,
+        }
+    } else {
+        DoLoopBody::Statements(body)
+    };
     lower_do_loop(
         b,
         ctx,
         DoLoopFields {
-            cycle_name: name,
-            exit_name: name,
+            cycle_name: if collapsed.is_some() {
+                &unnamed_loop
+            } else {
+                name
+            },
+            exit_name: if collapsed.is_some() {
+                &unnamed_loop
+            } else {
+                name
+            },
             var: &private_var_name,
             start: &first_expr,
             end: &last_expr,
             step: &step_expr,
-            body: DoLoopBody::Statements(body),
+            body: lowered_body,
             concurrent: false,
             locality: &[],
             span: loop_stmt.span,
         },
     );
-    ctx.locals.insert(key, saved_var);
+    ctx.locals.insert(outer_key, saved_outer);
+    if let Some((inner_key, saved_inner, _)) = private_inner {
+        ctx.locals.insert(inner_key, saved_inner);
+    }
+    if let Some((_, saved_flat)) = flat_binding {
+        restore_temp_binding(ctx, flat_name, saved_flat);
+    }
     restore_temp_binding(ctx, first_name, saved_first);
     restore_temp_binding(ctx, last_name, saved_last);
     restore_temp_binding(ctx, step_name, saved_step);

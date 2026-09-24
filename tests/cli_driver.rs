@@ -21159,6 +21159,116 @@ end program
 }
 
 #[test]
+fn fopenmp_collapse_two_static_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_collapse_two_static_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer, parameter :: depth = 2
+  integer(kind=8) :: i
+  integer :: j, tid
+  integer :: values(3,4), owners(3,4), cyclic(-1:1,3), passed(0:2)
+  i = -91_8
+  j = -92
+  values = 0
+  owners = -1
+!$omp parallel do collapse(depth) default(none) num_threads(3) schedule(static) &
+!$omp& private(i,j,tid) shared(values,owners)
+  do i = 1_8, 3_8
+    do j = 8, 2, -2
+      tid = omp_get_thread_num()
+      values(int(i),(10-j)/2) = int(100_8*i) + j
+      owners(int(i),(10-j)/2) = tid
+    end do
+  end do
+!$omp end parallel do
+  if (i /= -91_8 .or. j /= -92) error stop 1
+  if (values(1,1) /= 108 .or. values(1,2) /= 106 .or. values(1,3) /= 104 .or. values(1,4) /= 102) error stop 2
+  if (values(2,1) /= 208 .or. values(2,2) /= 206 .or. values(2,3) /= 204 .or. values(2,4) /= 202) error stop 3
+  if (values(3,1) /= 308 .or. values(3,2) /= 306 .or. values(3,3) /= 304 .or. values(3,4) /= 302) error stop 4
+  if (any(owners(1,:) /= 0) .or. any(owners(2,:) /= 1) .or. any(owners(3,:) /= 2)) error stop 5
+
+  values = 0
+!$omp parallel do collapse(1) num_threads(3) schedule(static) shared(values) private(i)
+  do i = 1_8, 3_8
+    values(int(i),1) = int(i)
+  end do
+!$omp end parallel do
+  if (any(values(:,1) /= [1,2,3])) error stop 6
+  values = 0
+!$omp parallel do collapse(2) num_threads(3) schedule(static) shared(values) private(i,j)
+  do i = 1_8, 0_8
+    do j = 1, 4
+      values(1,j) = 99
+    end do
+  end do
+!$omp end parallel do
+  if (any(values /= 0)) error stop 7
+
+  cyclic = -1
+  passed = 0
+!$omp parallel default(none) num_threads(3) private(tid) shared(cyclic,passed)
+  tid = omp_get_thread_num()
+!$omp do collapse(2) schedule(static,2)
+  do i = -1_8, 1_8
+    do j = 6, 2, -2
+      cyclic(int(i), (8-j)/2) = tid
+    end do
+  end do
+!$omp end do
+  if (sum(cyclic) == 7) passed(tid) = 1
+!$omp end parallel
+  if (i /= -91_8 .or. j /= -92) error stop 8
+  if (any(passed /= 1)) error stop 9
+  if (cyclic(-1,1) /= 0 .or. cyclic(-1,2) /= 0 .or. cyclic(-1,3) /= 1) error stop 10
+  if (cyclic(0,1) /= 1 .or. cyclic(0,2) /= 2 .or. cyclic(0,3) /= 2) error stop 11
+  if (cyclic(1,1) /= 0 .or. cyclic(1,2) /= 0 .or. cyclic(1,3) /= 1) error stop 12
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_collapse_two", "bin");
+        let runtime_cache = unique_dir("openmp_collapse_two_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP COLLAPSE(2) should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP COLLAPSE(2) failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
     let cases = [
         (
@@ -21176,6 +21286,30 @@ fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
         (
             "program p\ninteger :: i\n!$omp parallel do schedule(static,1.5)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
             "OpenMP SCHEDULE chunk size must be a scalar INTEGER expression",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do collapse(3)\ndo i=1,4\ndo j=1,4\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP COLLAPSE(3) is recognized but only COLLAPSE(2) is implemented",
+        ),
+        (
+            "program p\ninteger :: i,j,n\nn=2\n!$omp parallel do collapse(n)\ndo i=1,4\ndo j=1,4\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP COLLAPSE argument must be a constant expression",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do collapse(0)\ndo i=1,4\ndo j=1,4\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP COLLAPSE argument must be positive",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do collapse(2)\ndo i=1,4\nj=0\ndo j=1,4\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP COLLAPSE(2) requires a perfectly nested second counted DO loop",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do collapse(2)\ndo i=1,4\ndo j=1,i\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP COLLAPSE(2) currently requires a rectangular loop nest",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do collapse(2) shared(j)\ndo i=1,4\ndo j=1,4\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP PARALLEL DO associated iteration variables may not appear in SHARED",
         ),
         (
             "program p\ninteger :: i\n!$omp parallel do\ndo i=1,4\nend do\n!$omp end parallel do nowait\nend program\n",
@@ -21209,11 +21343,13 @@ fn fopenmp_worksharing_emits_x86_64_elf_object() {
     let src = write_program(
         "program p
   implicit none
-  integer :: i, values(9)
+  integer :: i, j, values(3,3)
   values = 0
-!$omp parallel do num_threads(3) schedule(static,2)
-  do i = 9, 1, -1
-    values(i) = i
+!$omp parallel do collapse(2) num_threads(3) schedule(static,2)
+  do i = 3, 1, -1
+    do j = 1, 3
+      values(i,j) = i + j
+    end do
   end do
 !$omp end parallel do
 end program

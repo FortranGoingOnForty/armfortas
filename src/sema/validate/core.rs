@@ -2647,7 +2647,7 @@ fn collect_reference_ac_value(
     }
 }
 
-fn collect_reference_expr(
+pub(super) fn collect_reference_expr(
     expr: &crate::ast::expr::SpannedExpr,
     shadowed: &HashSet<String>,
     facts: &mut ProcedureReferenceFacts,
