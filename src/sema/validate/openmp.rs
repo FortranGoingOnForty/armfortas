@@ -1,7 +1,7 @@
 //! Semantic validation for executable OpenMP constructs.
 //!
 //! The executable slice is intentionally narrow: `PARALLEL` data environments
-//! support selected numeric/logical storage, while canonical worksharing `DO`
+//! support selected numeric/logical storage and private derived scalars, while canonical worksharing `DO`
 //! and combined `PARALLEL DO` support the implemented static/dynamic schedules.
 //! Named and unnamed `CRITICAL` regions retain process-wide lock identity.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
@@ -1119,6 +1119,46 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         }
         return;
     }
+    if let Some(TypeInfo::Derived(type_name)) = symbol.type_info.as_ref() {
+        if clause != "PRIVATE" {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} derived-type variable '{}' is recognized but not yet implemented",
+                    clause, name
+                ),
+            );
+            return;
+        }
+        let layout = ctx.type_layouts.and_then(|layouts| {
+            layouts
+                .get_for_scope(ctx.scope_id, type_name)
+                .or_else(|| layouts.get_for_scope(symbol.scope, type_name))
+                .or_else(|| layouts.get(type_name))
+        });
+        let Some(layout) = layout else {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP PRIVATE derived-type variable '{}' has no available type layout",
+                    name
+                ),
+            );
+            return;
+        };
+        if ctx.type_layouts.is_some_and(|layouts| {
+            derived_layout_has_allocatable_components(layouts, layout, &mut HashSet::new())
+        }) {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP PRIVATE derived-type variable '{}' with allocatable components is recognized but not yet implemented",
+                    name
+                ),
+            );
+        }
+        return;
+    }
     if !matches!(
         symbol.type_info.as_ref(),
         Some(TypeInfo::Integer { .. })
@@ -1134,6 +1174,35 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
             ),
         );
     }
+}
+
+fn derived_layout_has_allocatable_components(
+    layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    layout: &crate::sema::type_layout::TypeLayout,
+    active: &mut HashSet<String>,
+) -> bool {
+    let key = layouts.canonical_key_for_layout(layout);
+    if !active.insert(key.clone()) {
+        return false;
+    }
+    let has_allocatable = layout.fields.iter().any(|field| {
+        if field.allocatable {
+            return true;
+        }
+        if field.pointer {
+            return false;
+        }
+        let TypeInfo::Derived(type_name) = &field.type_info else {
+            return false;
+        };
+        layouts
+            .get_related(layout, type_name)
+            .is_some_and(|nested| {
+                derived_layout_has_allocatable_components(layouts, nested, active)
+            })
+    });
+    active.remove(&key);
+    has_allocatable
 }
 
 fn validate_structured_block(ctx: &mut Ctx<'_>, stmts: &[SpannedStmt]) {

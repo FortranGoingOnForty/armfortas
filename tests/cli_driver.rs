@@ -22637,6 +22637,135 @@ fn fopenmp_capture_free_parallel_regions_run() {
 }
 
 #[test]
+fn fopenmp_private_derived_scalars_initialize_and_finalize() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_derived_scalars_initialize_and_finalize count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_private_derived_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: finalized(0:3) = -1
+  type :: nested_state
+    integer :: stamp = 6
+  end type
+  type :: worker_state
+    type(nested_state) :: nested
+    integer :: value = 11
+  contains
+    final :: finish_worker
+  end type
+contains
+  subroutine finish_worker(state)
+    type(worker_state) :: state
+    finalized(omp_get_thread_num()) = state%value + state%nested%stamp
+  end subroutine
+end module
+
+program p
+  use omp_private_derived_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  type(worker_state) :: state
+  integer :: i, tid, observed(0:3)
+  state%value = 900
+  state%nested%stamp = 100
+  observed = -1
+!$omp parallel do default(none) num_threads(4) schedule(static) &
+!$omp& private(state,tid) shared(observed)
+  do i = 1, 4
+    tid = omp_get_thread_num()
+    observed(tid) = state%value + state%nested%stamp
+    state%value = 20 + tid
+    state%nested%stamp = 3
+  end do
+!$omp end parallel do
+  if (state%value /= 900 .or. state%nested%stamp /= 100) error stop 1
+  if (any(observed /= [17,17,17,17])) error stop 2
+  if (any(finalized /= [23,24,25,26])) error stop 3
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_derived", "bin");
+        let runtime_cache = unique_dir("openmp_private_derived_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PRIVATE derived scalars should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PRIVATE derived scalars failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_rejects_unimplemented_derived_private_ownership() {
+    let src = write_program(
+        "program p
+  implicit none
+  type :: owning_state
+    integer, allocatable :: values(:)
+  end type
+  type :: plain_state
+    integer :: value = 1
+  end type
+  type(owning_state) :: owning
+  type(plain_state) :: copied
+!$omp parallel private(owning)
+  continue
+!$omp end parallel
+!$omp parallel firstprivate(copied)
+  continue
+!$omp end parallel
+end program
+",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-fopenmp"]);
+    assert!(
+        !result.status.success(),
+        "unsupported derived private ownership compiled silently"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(
+            "OpenMP PRIVATE derived-type variable 'owning' with allocatable components is recognized but not yet implemented"
+        ) && stderr.contains(
+            "OpenMP FIRSTPRIVATE derived-type variable 'copied' is recognized but not yet implemented"
+        ),
+        "unexpected diagnostic: {stderr}"
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let src = write_program(
         "program p\n  implicit none\n  character(len=3) :: text, words(2)\n  character(len=3), allocatable :: dynamic_words(:)\n  integer, allocatable :: scalar, values(:)\n  integer, pointer :: scalar_pointer\n  integer, target :: target_values(2)\n  integer, volatile :: volatile_values(2)\n  text = 'abc'\n  allocate(scalar, values(2))\n  allocate(dynamic_words(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(scalar, scalar_pointer)\n  scalar = 1\n!$omp end parallel\n!$omp parallel shared(dynamic_words)\n  dynamic_words(1) = 'abc'\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\n!$omp parallel firstprivate(words)\n  continue\n!$omp end parallel\n!$omp parallel private(values)\n  continue\n!$omp end parallel\n!$omp parallel private(target_values)\n  continue\n!$omp end parallel\n!$omp parallel private(volatile_values)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_private_dummy(dummy_values)\n    integer, intent(inout) :: dummy_values(2)\n!$omp parallel private(dummy_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_automatic(n)\n    integer, intent(in) :: n\n    integer :: automatic_values(n)\n!$omp parallel firstprivate(automatic_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
