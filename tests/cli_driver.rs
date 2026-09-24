@@ -22501,6 +22501,88 @@ fn fopenmp_shared_fixed_shape_arrays_run() {
 }
 
 #[test]
+fn fopenmp_shared_fixed_character_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_shared_fixed_character_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_shared_character_state
+  implicit none
+  character(len=8), save :: labels(0:3)
+end module
+program p
+  use omp_shared_character_state, only: labels
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  character(len=12), allocatable :: paths(:)
+  integer :: tid
+  allocate(paths(-1:2))
+  labels = 'missing'
+  paths = 'missing'
+!$omp parallel default(none) num_threads(4) private(tid) shared(labels, paths)
+  tid = omp_get_thread_num()
+  if (tid == 0) then
+    labels(0) = 'zero'
+    paths(-1) = 'path-zero'
+  else if (tid == 1) then
+    labels(1) = 'one'
+    paths(0) = 'path-one'
+  else if (tid == 2) then
+    labels(2) = 'two'
+    paths(1) = 'path-two'
+  else
+    labels(3) = 'three'
+    paths(2) = 'path-three'
+  end if
+!$omp end parallel
+  if (lbound(paths, 1) /= -1 .or. ubound(paths, 1) /= 2) error stop 1
+  if (labels(0) /= 'zero' .or. labels(1) /= 'one') error stop 2
+  if (labels(2) /= 'two' .or. labels(3) /= 'three') error stop 3
+  if (paths(-1) /= 'path-zero' .or. paths(0) /= 'path-one') error stop 4
+  if (paths(1) /= 'path-two' .or. paths(2) /= 'path-three') error stop 5
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_shared_fixed_character_arrays", "bin");
+        let runtime_cache = unique_dir("openmp_shared_fixed_character_arrays_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP shared fixed CHARACTER arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP shared fixed CHARACTER arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_shared_descriptor_backed_dummy_arrays_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -22888,7 +22970,7 @@ end program
 #[test]
 fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let src = write_program(
-        "program p\n  implicit none\n  character(len=3) :: text, words(2)\n  character(len=3), allocatable :: dynamic_words(:)\n  integer, allocatable :: scalar, values(:)\n  integer, pointer :: scalar_pointer\n  integer, target :: target_values(2)\n  integer, volatile :: volatile_values(2)\n  text = 'abc'\n  allocate(scalar, values(2))\n  allocate(dynamic_words(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(scalar, scalar_pointer)\n  scalar = 1\n!$omp end parallel\n!$omp parallel shared(dynamic_words)\n  dynamic_words(1) = 'abc'\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\n!$omp parallel firstprivate(words)\n  continue\n!$omp end parallel\n!$omp parallel private(values)\n  continue\n!$omp end parallel\n!$omp parallel private(target_values)\n  continue\n!$omp end parallel\n!$omp parallel private(volatile_values)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_private_dummy(dummy_values)\n    integer, intent(inout) :: dummy_values(2)\n!$omp parallel private(dummy_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_automatic(n)\n    integer, intent(in) :: n\n    integer :: automatic_values(n)\n!$omp parallel firstprivate(automatic_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
+        "program p\n  implicit none\n  character(len=3) :: text, words(2)\n  character(len=:), allocatable :: dynamic_words(:)\n  integer, allocatable :: scalar, values(:)\n  integer, pointer :: scalar_pointer\n  integer, target :: target_values(2)\n  integer, volatile :: volatile_values(2)\n  text = 'abc'\n  allocate(scalar, values(2))\n  allocate(character(len=3) :: dynamic_words(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(scalar, scalar_pointer)\n  scalar = 1\n!$omp end parallel\n!$omp parallel shared(dynamic_words)\n  dynamic_words(1) = 'abc'\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\n!$omp parallel firstprivate(words)\n  continue\n!$omp end parallel\n!$omp parallel private(values)\n  continue\n!$omp end parallel\n!$omp parallel private(target_values)\n  continue\n!$omp end parallel\n!$omp parallel private(volatile_values)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_character(assumed_words)\n    character(len=*), intent(inout) :: assumed_words(:)\n!$omp parallel shared(assumed_words)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_private_dummy(dummy_values)\n    integer, intent(inout) :: dummy_values(2)\n!$omp parallel private(dummy_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_automatic(n)\n    integer, intent(in) :: n\n    integer :: automatic_values(n)\n!$omp parallel firstprivate(automatic_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
         "f90",
     );
     let result = diagnostic_output(&src, &["-fopenmp"]);
@@ -22901,7 +22983,8 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
         stderr.contains("shared variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")
             && stderr.contains("shared scalar allocatable or pointer 'scalar' is recognized but not yet implemented")
             && stderr.contains("shared scalar allocatable or pointer 'scalar_pointer' is recognized but not yet implemented")
-            && stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
+            && stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER elements")
+            && stderr.contains("shared array 'assumed_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER elements")
             && stderr.contains("shared array 'assumed_rank' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy")
             && stderr.contains("shared OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")
