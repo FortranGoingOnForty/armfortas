@@ -323,7 +323,10 @@ fn parse_clauses(
         }
         let name = cursor.identifier("OpenMP clause name")?;
         let lower = name.to_ascii_lowercase();
-        if !seen.insert(lower.clone()) {
+        // REDUCTION is repeatable; semantic validation diagnoses a list item
+        // that appears in more than one data-sharing clause. Other clauses in
+        // the currently modeled subset are unique.
+        if lower != "reduction" && !seen.insert(lower.clone()) {
             return Err(cursor.error(format!("duplicate OpenMP {lower} clause")));
         }
         let clause = match lower.as_str() {
@@ -773,6 +776,30 @@ mod tests {
         assert!(clauses
             .iter()
             .any(|clause| matches!(clause, OpenMpClause::Nowait)));
+    }
+
+    #[test]
+    fn parses_multiple_reduction_clauses() {
+        let stmt = parse(
+            "!$omp parallel do reduction(+:total) reduction(max:largest) &\n\
+             !$omp& reduction(.or.:failed)\n\
+             do i = 1, n\n\
+               total = total + i\n\
+             end do\n\
+             !$omp end parallel do\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::ParallelDo { clauses, .. }) = stmt.node else {
+            panic!("expected parallel-do construct");
+        };
+        assert_eq!(
+            clauses
+                .iter()
+                .filter(|clause| matches!(clause, OpenMpClause::Reduction { .. }))
+                .count(),
+            3
+        );
     }
 
     #[test]
