@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::openmp::{OpenMpClause, OpenMpConstruct, OpenMpDefault};
 use crate::ast::stmt::{IoControl, RankGuard, SpannedStmt, Stmt, TypeGuard};
 use crate::lexer::Span;
-use crate::sema::symtab::{SymbolKind, SymbolTable, TypeInfo};
+use crate::sema::symtab::{Intent, SymbolKind, SymbolTable, TypeInfo};
 
 use super::core::{
     collect_default_none_nested_block_references, collect_reference_stmts,
@@ -530,7 +530,17 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         );
         return;
     }
-    if symbol.attrs.pointer || symbol.attrs.target {
+    if symbol.attrs.volatile || symbol.attrs.asynchronous {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP {} VOLATILE or ASYNCHRONOUS variable '{}' requires memory-model support that is not yet implemented",
+                clause, name
+            ),
+        );
+        return;
+    }
+    if symbol.attrs.target {
         ctx.error(
             span,
             format!(
@@ -540,14 +550,48 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         );
         return;
     }
-    if symbol.attrs.volatile || symbol.attrs.asynchronous {
-        ctx.error(
-            span,
-            format!(
-                "OpenMP {} VOLATILE or ASYNCHRONOUS variable '{}' requires memory-model support that is not yet implemented",
-                clause, name
-            ),
-        );
+    if symbol.attrs.pointer {
+        let deferred_shape_array = !symbol.attrs.array_spec.is_empty()
+            && symbol
+                .attrs
+                .array_spec
+                .iter()
+                .all(|spec| matches!(spec, crate::ast::decl::ArraySpec::Deferred));
+        if !deferred_shape_array {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} scalar or non-deferred-shape pointer '{}' is recognized but not yet implemented",
+                    clause, name
+                ),
+            );
+            return;
+        }
+        if clause != "FIRSTPRIVATE" && symbol.attrs.intent == Some(Intent::In) {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} pointer '{}' may not have INTENT(IN)",
+                    clause, name
+                ),
+            );
+            return;
+        }
+        if !matches!(
+            symbol.type_info.as_ref(),
+            Some(TypeInfo::Integer { .. })
+                | Some(TypeInfo::Real { .. })
+                | Some(TypeInfo::DoublePrecision)
+                | Some(TypeInfo::Logical { .. })
+        ) {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} pointer array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements",
+                    clause, name
+                ),
+            );
+        }
         return;
     }
     if symbol.attrs.allocatable {
