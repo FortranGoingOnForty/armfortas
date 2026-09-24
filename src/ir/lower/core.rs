@@ -31098,6 +31098,22 @@ impl DoConcurrentLocalityState {
 /// DO loop fields bundled for passing without too many args.
 pub(super) enum DoLoopBody<'a> {
     Statements(&'a [SpannedStmt]),
+    CollapsedTwo {
+        flat_addr: ValueId,
+        outer_count: ValueId,
+        inner_count: ValueId,
+        outer_addr: ValueId,
+        outer_ty: IrType,
+        outer_lower: ValueId,
+        outer_step: ValueId,
+        outer_value_addr: ValueId,
+        inner_addr: ValueId,
+        inner_ty: IrType,
+        inner_lower: ValueId,
+        inner_step: ValueId,
+        inner_value_addr: ValueId,
+        statements: &'a [SpannedStmt],
+    },
     ConcurrentTail {
         source_name: &'a Option<String>,
         controls: &'a [ConcurrentControl],
@@ -31614,6 +31630,55 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
 fn lower_do_loop_body(b: &mut FuncBuilder, ctx: &mut LowerCtx, body: DoLoopBody<'_>) {
     match body {
         DoLoopBody::Statements(stmts) => super::stmt::lower_stmts(b, ctx, stmts),
+        DoLoopBody::CollapsedTwo {
+            flat_addr,
+            outer_count,
+            inner_count,
+            outer_addr,
+            outer_ty,
+            outer_lower,
+            outer_step,
+            outer_value_addr,
+            inner_addr,
+            inner_ty,
+            inner_lower,
+            inner_step,
+            inner_value_addr,
+            statements,
+        } => {
+            let flat_index = b.load_typed(flat_addr, IrType::Int(IntWidth::I64));
+            let status = b.call(
+                FuncRef::External("afs_omp_collapse2_indices".into()),
+                vec![
+                    flat_index,
+                    outer_count,
+                    inner_count,
+                    outer_lower,
+                    outer_step,
+                    inner_lower,
+                    inner_step,
+                    outer_value_addr,
+                    inner_value_addr,
+                ],
+                IrType::Int(IntWidth::I32),
+            );
+            let zero = b.const_i32(0);
+            let invalid = b.icmp(CmpOp::Lt, status, zero);
+            let error_bb = b.create_block("omp_collapse_index_invalid");
+            let ready_bb = b.create_block("omp_collapse_index_ready");
+            b.cond_branch(invalid, error_bb, vec![], ready_bb, vec![]);
+            b.set_block(error_bb);
+            b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
+            b.branch(ready_bb, vec![]);
+            b.set_block(ready_bb);
+            let outer_value = b.load_typed(outer_value_addr, IrType::Int(IntWidth::I64));
+            let inner_value = b.load_typed(inner_value_addr, IrType::Int(IntWidth::I64));
+            let outer_value = coerce_to_type(b, outer_value, &outer_ty);
+            let inner_value = coerce_to_type(b, inner_value, &inner_ty);
+            b.store(outer_value, outer_addr);
+            b.store(inner_value, inner_addr);
+            super::stmt::lower_stmts(b, ctx, statements);
+        }
         DoLoopBody::ConcurrentTail {
             source_name,
             controls,

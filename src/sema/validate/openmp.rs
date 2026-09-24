@@ -16,7 +16,7 @@ use crate::lexer::Span;
 use crate::sema::symtab::{Intent, SymbolKind, SymbolTable, TypeInfo};
 
 use super::core::{
-    collect_default_none_nested_block_references, collect_reference_stmts,
+    collect_default_none_nested_block_references, collect_reference_expr, collect_reference_stmts,
     validation_const_int_value, validation_explicit_dim_bounds, validation_expr_rank,
     validation_expr_type_info, Ctx, ProcedureReferenceFacts,
 };
@@ -155,6 +155,7 @@ fn validate_parallel_clauses(
             OpenMpClause::Default(OpenMpDefault::Shared) => {}
             OpenMpClause::Default(OpenMpDefault::None) => {}
             OpenMpClause::Schedule { .. } if combined_do => {}
+            OpenMpClause::Collapse(_) if combined_do => {}
             OpenMpClause::Nowait if combined_do => {
                 ctx.error(span, "OpenMP PARALLEL DO may not specify NOWAIT")
             }
@@ -175,13 +176,20 @@ fn validate_parallel_clauses(
     }
 }
 
-fn validate_worksharing_loop(
+struct AssociatedLoop<'a> {
+    var: &'a str,
+    start: &'a crate::ast::expr::SpannedExpr,
+    end: &'a crate::ast::expr::SpannedExpr,
+    step: Option<&'a crate::ast::expr::SpannedExpr>,
+    body: &'a [SpannedStmt],
+}
+
+fn validate_associated_loop<'a>(
     ctx: &mut Ctx<'_>,
-    span: Span,
-    clauses: &[OpenMpClause],
-    loop_stmt: &SpannedStmt,
-    combined_do: bool,
-) {
+    directive_span: Span,
+    loop_stmt: &'a SpannedStmt,
+    description: &str,
+) -> Option<AssociatedLoop<'a>> {
     let Stmt::DoLoop {
         var,
         start,
@@ -191,21 +199,26 @@ fn validate_worksharing_loop(
         ..
     } = &loop_stmt.node
     else {
-        ctx.error(span, "OpenMP DO must be followed by a counted DO loop");
-        return;
+        ctx.error(
+            directive_span,
+            format!("OpenMP {description} must be a counted DO loop"),
+        );
+        return None;
     };
     let (Some(var), Some(start), Some(end)) = (var.as_deref(), start.as_ref(), end.as_ref()) else {
-        ctx.error(span, "OpenMP DO must be followed by a counted DO loop");
-        return;
+        ctx.error(
+            directive_span,
+            format!("OpenMP {description} must be a counted DO loop"),
+        );
+        return None;
     };
 
-    let loop_key = var.to_ascii_lowercase();
     let Some(symbol) = ctx.lookup_lexical(var) else {
         ctx.error(
             loop_stmt.span,
             format!("OpenMP DO iteration variable '{var}' is not declared"),
         );
-        return;
+        return None;
     };
     if symbol.kind != SymbolKind::Variable
         || !symbol.attrs.array_spec.is_empty()
@@ -231,6 +244,122 @@ fn validate_worksharing_loop(
                 format!("OpenMP DO {label} must be a scalar INTEGER expression"),
             );
         }
+    }
+
+    Some(AssociatedLoop {
+        var,
+        start,
+        end,
+        step: step.as_ref(),
+        body,
+    })
+}
+
+fn validate_collapse_depth(ctx: &mut Ctx<'_>, span: Span, clauses: &[OpenMpClause]) -> usize {
+    let mut depth = 1;
+    let mut saw_collapse = false;
+    for clause in clauses {
+        let OpenMpClause::Collapse(argument) = clause else {
+            continue;
+        };
+        if std::mem::replace(&mut saw_collapse, true) {
+            ctx.error(span, "OpenMP DO may not repeat the COLLAPSE clause");
+            continue;
+        }
+        if validation_expr_rank(ctx, argument) != Some(0)
+            || !matches!(
+                validation_expr_type_info(ctx, argument),
+                Some(TypeInfo::Integer { .. })
+            )
+        {
+            ctx.error(
+                argument.span,
+                "OpenMP COLLAPSE argument must be a scalar INTEGER constant expression",
+            );
+            continue;
+        }
+        match validation_const_int_value(ctx, argument) {
+            Some(value @ 1..=2) => depth = value as usize,
+            Some(value) if value <= 0 => {
+                ctx.error(argument.span, "OpenMP COLLAPSE argument must be positive")
+            }
+            Some(value) => ctx.error(
+                argument.span,
+                format!(
+                    "OpenMP COLLAPSE({value}) is recognized but only COLLAPSE(2) is implemented"
+                ),
+            ),
+            None => ctx.error(
+                argument.span,
+                "OpenMP COLLAPSE argument must be a constant expression",
+            ),
+        }
+    }
+    depth
+}
+
+fn expression_references_name(expr: &crate::ast::expr::SpannedExpr, name: &str) -> bool {
+    let mut facts = ProcedureReferenceFacts::default();
+    collect_reference_expr(expr, &HashSet::new(), &mut facts);
+    let key = name.to_ascii_lowercase();
+    facts
+        .references
+        .iter()
+        .any(|reference| reference.name == key)
+}
+
+fn validate_worksharing_loop(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    clauses: &[OpenMpClause],
+    loop_stmt: &SpannedStmt,
+    combined_do: bool,
+) {
+    let Some(outer_loop) = validate_associated_loop(ctx, span, loop_stmt, "DO") else {
+        return;
+    };
+    let collapse_depth = validate_collapse_depth(ctx, span, clauses);
+    let mut associated_loop_keys = HashSet::from([outer_loop.var.to_ascii_lowercase()]);
+    if collapse_depth == 2 {
+        let inner_stmt = if outer_loop.body.len() == 1 {
+            outer_loop.body.first()
+        } else {
+            None
+        };
+        let Some(inner_stmt) = inner_stmt else {
+            ctx.error(
+                loop_stmt.span,
+                "OpenMP COLLAPSE(2) requires a perfectly nested second counted DO loop",
+            );
+            return;
+        };
+        let Some(inner_loop) =
+            validate_associated_loop(ctx, span, inner_stmt, "COLLAPSE(2) associated loop")
+        else {
+            return;
+        };
+        if inner_loop.var.eq_ignore_ascii_case(outer_loop.var) {
+            ctx.error(
+                inner_stmt.span,
+                "OpenMP COLLAPSE(2) associated loops must use distinct iteration variables",
+            );
+        }
+        for expr in [
+            Some(inner_loop.start),
+            Some(inner_loop.end),
+            inner_loop.step,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if expression_references_name(expr, outer_loop.var) {
+                ctx.error(
+                    expr.span,
+                    "OpenMP COLLAPSE(2) currently requires a rectangular loop nest",
+                );
+            }
+        }
+        associated_loop_keys.insert(inner_loop.var.to_ascii_lowercase());
     }
 
     for clause in clauses {
@@ -272,7 +401,7 @@ fn validate_worksharing_loop(
                 if !combined_do
                     && names
                         .iter()
-                        .all(|name| name.eq_ignore_ascii_case(&loop_key)) => {}
+                        .all(|name| associated_loop_keys.contains(&name.to_ascii_lowercase())) => {}
             OpenMpClause::Private(_)
             | OpenMpClause::FirstPrivate(_)
                 if !combined_do => ctx.error(
@@ -286,11 +415,17 @@ fn validate_worksharing_loop(
                 if combined_do
                     && names
                         .iter()
-                        .any(|name| name.eq_ignore_ascii_case(&loop_key)) => ctx.error(
+                        .any(|name| associated_loop_keys.contains(&name.to_ascii_lowercase())) => ctx.error(
                             span,
-                            format!(
-                                "OpenMP PARALLEL DO iteration variable '{var}' may not appear in FIRSTPRIVATE"
-                            ),
+                            "OpenMP PARALLEL DO associated iteration variables may not appear in FIRSTPRIVATE",
+                        ),
+            OpenMpClause::Shared(names)
+                if combined_do
+                    && names
+                        .iter()
+                        .any(|name| associated_loop_keys.contains(&name.to_ascii_lowercase())) => ctx.error(
+                            span,
+                            "OpenMP PARALLEL DO associated iteration variables may not appear in SHARED",
                         ),
             OpenMpClause::Private(_)
             | OpenMpClause::FirstPrivate(_)
@@ -299,7 +434,8 @@ fn validate_worksharing_loop(
             | OpenMpClause::If { .. }
             | OpenMpClause::NumThreads(_)
                 if combined_do => {}
-            OpenMpClause::Collapse(_) | OpenMpClause::Reduction { .. } => ctx.error(
+            OpenMpClause::Collapse(_) => {}
+            OpenMpClause::Reduction { .. } => ctx.error(
                 span,
                 format!(
                     "OpenMP {} clause on {} is recognized but not yet implemented",
@@ -318,7 +454,7 @@ fn validate_worksharing_loop(
             }
         }
     }
-    validate_structured_block(ctx, body);
+    validate_structured_block(ctx, outer_loop.body);
 }
 
 fn schedule_kind_name(kind: OpenMpScheduleKind) -> &'static str {
