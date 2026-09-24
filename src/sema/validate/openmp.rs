@@ -1155,9 +1155,11 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
             );
             return;
         };
-        if ctx.type_layouts.is_some_and(|layouts| {
-            derived_layout_has_allocatable_components(layouts, layout, &mut HashSet::new())
-        }) {
+        if clause == "PRIVATE"
+            && ctx.type_layouts.is_some_and(|layouts| {
+                derived_layout_has_allocatable_components(layouts, layout, &mut HashSet::new())
+            })
+        {
             ctx.error(
                 span,
                 format!(
