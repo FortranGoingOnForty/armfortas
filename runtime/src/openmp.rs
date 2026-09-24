@@ -514,17 +514,7 @@ pub extern "C" fn afs_omp_static_bounds(
     let lower = i128::from(lower);
     let upper = i128::from(upper);
     let step = i128::from(step);
-    let iterations = if step > 0 {
-        if lower > upper {
-            0
-        } else {
-            ((upper - lower) / step) + 1
-        }
-    } else if lower < upper {
-        0
-    } else {
-        ((lower - upper) / -step) + 1
-    };
+    let iterations = loop_iteration_count(lower, upper, step);
     if iterations == 0 {
         return 0;
     }
@@ -547,6 +537,75 @@ pub extern "C" fn afs_omp_static_bounds(
         *last = local_last as i64;
     }
     1
+}
+
+/// Compute one thread's `chunk_index`th interval for
+/// `schedule(static, chunk_size)`.
+///
+/// Chunks are assigned round-robin in thread-number order. A positive result
+/// writes the next interval for this thread, zero means that this thread has
+/// no chunk at the requested index, and a negative result reports invalid
+/// inputs. As with [`afs_omp_static_bounds`], i128 intermediates keep bound
+/// arithmetic defined throughout the representable i64 iteration space.
+#[no_mangle]
+pub extern "C" fn afs_omp_static_chunk_bounds(
+    lower: i64,
+    upper: i64,
+    step: i64,
+    chunk_size: i64,
+    thread_num: i32,
+    team_size: i32,
+    chunk_index: i64,
+    first: *mut i64,
+    last: *mut i64,
+) -> i32 {
+    if step == 0
+        || chunk_size <= 0
+        || team_size <= 0
+        || thread_num < 0
+        || thread_num >= team_size
+        || chunk_index < 0
+        || first.is_null()
+        || last.is_null()
+    {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+
+    let lower = i128::from(lower);
+    let upper = i128::from(upper);
+    let step = i128::from(step);
+    let iterations = loop_iteration_count(lower, upper, step);
+    let chunk_size = i128::from(chunk_size);
+    let global_chunk = i128::from(thread_num) + i128::from(chunk_index) * i128::from(team_size);
+    let total_chunks = (iterations + chunk_size - 1) / chunk_size;
+    if global_chunk >= total_chunks {
+        return 0;
+    }
+    let first_index = global_chunk * chunk_size;
+    let local_iterations = chunk_size.min(iterations - first_index);
+    let local_first = lower + first_index * step;
+    let local_last = local_first + (local_iterations - 1) * step;
+    debug_assert!(i64::try_from(local_first).is_ok());
+    debug_assert!(i64::try_from(local_last).is_ok());
+    unsafe {
+        *first = local_first as i64;
+        *last = local_last as i64;
+    }
+    1
+}
+
+fn loop_iteration_count(lower: i128, upper: i128, step: i128) -> i128 {
+    if step > 0 {
+        if lower > upper {
+            0
+        } else {
+            ((upper - lower) / step) + 1
+        }
+    } else if lower < upper {
+        0
+    } else {
+        ((lower - upper) / -step) + 1
+    }
 }
 
 #[no_mangle]
@@ -744,6 +803,32 @@ mod tests {
         (status == 1).then_some((first, last))
     }
 
+    fn static_chunk_bounds(
+        lower: i64,
+        upper: i64,
+        step: i64,
+        chunk_size: i64,
+        thread_num: i32,
+        team_size: i32,
+        chunk_index: i64,
+    ) -> Option<(i64, i64)> {
+        let mut first = 0;
+        let mut last = 0;
+        let status = afs_omp_static_chunk_bounds(
+            lower,
+            upper,
+            step,
+            chunk_size,
+            thread_num,
+            team_size,
+            chunk_index,
+            &mut first,
+            &mut last,
+        );
+        assert!(status >= 0, "unexpected static-chunk error {status}");
+        (status == 1).then_some((first, last))
+    }
+
     #[test]
     fn static_bounds_partition_positive_and_negative_iteration_spaces() {
         assert_eq!(static_bounds(1, 10, 1, 0, 3), Some((1, 4)));
@@ -773,6 +858,54 @@ mod tests {
             afs_omp_static_bounds(1, 2, 0, 0, 1, std::ptr::null_mut(), std::ptr::null_mut()),
             -AFS_OMP_ERROR_INVALID_LOOP
         );
+    }
+
+    #[test]
+    fn static_chunk_bounds_assign_round_robin_positive_and_negative_chunks() {
+        assert_eq!(static_chunk_bounds(1, 10, 1, 2, 0, 3, 0), Some((1, 2)));
+        assert_eq!(static_chunk_bounds(1, 10, 1, 2, 1, 3, 0), Some((3, 4)));
+        assert_eq!(static_chunk_bounds(1, 10, 1, 2, 2, 3, 0), Some((5, 6)));
+        assert_eq!(static_chunk_bounds(1, 10, 1, 2, 0, 3, 1), Some((7, 8)));
+        assert_eq!(static_chunk_bounds(1, 10, 1, 2, 1, 3, 1), Some((9, 10)));
+        assert_eq!(static_chunk_bounds(1, 10, 1, 2, 2, 3, 1), None);
+
+        assert_eq!(static_chunk_bounds(10, -2, -3, 2, 0, 3, 0), Some((10, 7)));
+        assert_eq!(static_chunk_bounds(10, -2, -3, 2, 1, 3, 0), Some((4, 1)));
+        assert_eq!(static_chunk_bounds(10, -2, -3, 2, 2, 3, 0), Some((-2, -2)));
+    }
+
+    #[test]
+    fn static_chunk_bounds_reject_invalid_descriptions_and_handle_i64_bounds() {
+        assert_eq!(
+            static_chunk_bounds(i64::MIN, i64::MAX, i64::MAX, 2, 0, 2, 0),
+            Some((i64::MIN, -1))
+        );
+        assert_eq!(
+            static_chunk_bounds(i64::MIN, i64::MAX, i64::MAX, 2, 1, 2, 0),
+            Some((i64::MAX - 1, i64::MAX - 1))
+        );
+        assert_eq!(
+            static_chunk_bounds(1, 10, 1, i64::MAX, i32::MAX - 1, i32::MAX, i64::MAX),
+            None
+        );
+        let mut first = 0;
+        let mut last = 0;
+        for invalid_chunk in [0, -1] {
+            assert_eq!(
+                afs_omp_static_chunk_bounds(
+                    1,
+                    10,
+                    1,
+                    invalid_chunk,
+                    0,
+                    2,
+                    0,
+                    &mut first,
+                    &mut last,
+                ),
+                -AFS_OMP_ERROR_INVALID_LOOP
+            );
+        }
     }
 
     #[test]
