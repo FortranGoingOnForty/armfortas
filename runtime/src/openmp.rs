@@ -1,6 +1,7 @@
 //! ARMFORTAS-owned OpenMP host runtime ABI.
 //!
-//! ABI version 1 uses a synchronous, fixed-signature parallel-region call:
+//! ABI version 1 uses a synchronous, fixed-signature parallel-region call and
+//! compiler-private barrier/static-worksharing entry points:
 //!
 //! ```text
 //! i32 afs_omp_parallel_region(entry, environment, if_value,
@@ -18,7 +19,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Barrier, OnceLock};
 use std::time::Instant;
 
 pub const AFS_OMP_ABI_VERSION: u32 = 1;
@@ -26,6 +27,8 @@ pub const AFS_OMP_SUCCESS: i32 = 0;
 pub const AFS_OMP_ERROR_NULL_ENTRY: i32 = 1;
 pub const AFS_OMP_ERROR_UNSUPPORTED_FLAGS: i32 = 2;
 pub const AFS_OMP_ERROR_TEAM_PANIC: i32 = 3;
+pub const AFS_OMP_ERROR_NO_TEAM: i32 = 4;
+pub const AFS_OMP_ERROR_INVALID_LOOP: i32 = 5;
 
 pub type AfsOmpRegionEntry = unsafe extern "C" fn(*mut c_void, i32, i32);
 
@@ -249,6 +252,7 @@ struct TeamContext {
     team_size: i32,
     active: bool,
     contention_group: Arc<ContentionGroup>,
+    barrier: Arc<Barrier>,
 }
 
 #[derive(Debug, Default)]
@@ -367,6 +371,7 @@ fn run_implicit_task(
     team_size: i32,
     inherited_requested_threads: i32,
     contention_group: Arc<ContentionGroup>,
+    barrier: Arc<Barrier>,
 ) {
     let _guard = enter_team(
         TeamContext {
@@ -374,6 +379,7 @@ fn run_implicit_task(
             team_size,
             active: team_size > 1,
             contention_group,
+            barrier,
         },
         inherited_requested_threads,
     );
@@ -420,11 +426,13 @@ pub extern "C" fn afs_omp_parallel_region(
     );
     let team_size = i32::try_from(reserved_threads.saturating_add(1)).unwrap_or(i32::MAX);
     let environment = environment as usize;
+    let barrier = Arc::new(Barrier::new(team_size as usize));
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         std::thread::scope(|scope| {
             for thread_num in 1..team_size {
                 let contention_group = Arc::clone(&contention_group);
+                let barrier = Arc::clone(&barrier);
                 scope.spawn(move || {
                     run_implicit_task(
                         entry,
@@ -433,6 +441,7 @@ pub extern "C" fn afs_omp_parallel_region(
                         team_size,
                         inherited_requested_threads,
                         contention_group,
+                        barrier,
                     );
                 });
             }
@@ -443,6 +452,7 @@ pub extern "C" fn afs_omp_parallel_region(
                 team_size,
                 inherited_requested_threads,
                 Arc::clone(&contention_group),
+                Arc::clone(&barrier),
             );
         });
     }));
@@ -452,6 +462,149 @@ pub extern "C" fn afs_omp_parallel_region(
         AFS_OMP_SUCCESS
     } else {
         AFS_OMP_ERROR_TEAM_PANIC
+    }
+}
+
+/// Wait until every implicit task in the current team reaches this point.
+///
+/// The barrier is reusable, so successive worksharing constructs in one
+/// parallel region share the same team synchronization object.
+#[no_mangle]
+pub extern "C" fn afs_omp_barrier() -> i32 {
+    let barrier = THREAD_STATE.with(|state| {
+        state
+            .borrow()
+            .teams
+            .last()
+            .map(|team| Arc::clone(&team.barrier))
+    });
+    let Some(barrier) = barrier else {
+        return AFS_OMP_ERROR_NO_TEAM;
+    };
+    barrier.wait();
+    AFS_OMP_SUCCESS
+}
+
+/// Compute one thread's contiguous `schedule(static)` iteration interval.
+///
+/// A positive result means `first` and `last` were written. Zero means this
+/// thread has no iterations. A negative result reports an invalid loop/team
+/// description. Intermediate arithmetic uses i128 so every representable i64
+/// Fortran loop bound is partitioned without overflowing in the runtime.
+#[no_mangle]
+pub extern "C" fn afs_omp_static_bounds(
+    lower: i64,
+    upper: i64,
+    step: i64,
+    thread_num: i32,
+    team_size: i32,
+    first: *mut i64,
+    last: *mut i64,
+) -> i32 {
+    if step == 0
+        || team_size <= 0
+        || thread_num < 0
+        || thread_num >= team_size
+        || first.is_null()
+        || last.is_null()
+    {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+
+    let lower = i128::from(lower);
+    let upper = i128::from(upper);
+    let step = i128::from(step);
+    let iterations = loop_iteration_count(lower, upper, step);
+    if iterations == 0 {
+        return 0;
+    }
+
+    let team_size = i128::from(team_size);
+    let thread_num = i128::from(thread_num);
+    let base = iterations / team_size;
+    let remainder = iterations % team_size;
+    let local_iterations = base + i128::from(thread_num < remainder);
+    if local_iterations == 0 {
+        return 0;
+    }
+    let first_index = thread_num * base + thread_num.min(remainder);
+    let local_first = lower + first_index * step;
+    let local_last = local_first + (local_iterations - 1) * step;
+    debug_assert!(i64::try_from(local_first).is_ok());
+    debug_assert!(i64::try_from(local_last).is_ok());
+    unsafe {
+        *first = local_first as i64;
+        *last = local_last as i64;
+    }
+    1
+}
+
+/// Compute one thread's `chunk_index`th interval for
+/// `schedule(static, chunk_size)`.
+///
+/// Chunks are assigned round-robin in thread-number order. A positive result
+/// writes the next interval for this thread, zero means that this thread has
+/// no chunk at the requested index, and a negative result reports invalid
+/// inputs. As with [`afs_omp_static_bounds`], i128 intermediates keep bound
+/// arithmetic defined throughout the representable i64 iteration space.
+#[no_mangle]
+pub extern "C" fn afs_omp_static_chunk_bounds(
+    lower: i64,
+    upper: i64,
+    step: i64,
+    chunk_size: i64,
+    thread_num: i32,
+    team_size: i32,
+    chunk_index: i64,
+    first: *mut i64,
+    last: *mut i64,
+) -> i32 {
+    if step == 0
+        || chunk_size <= 0
+        || team_size <= 0
+        || thread_num < 0
+        || thread_num >= team_size
+        || chunk_index < 0
+        || first.is_null()
+        || last.is_null()
+    {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+
+    let lower = i128::from(lower);
+    let upper = i128::from(upper);
+    let step = i128::from(step);
+    let iterations = loop_iteration_count(lower, upper, step);
+    let chunk_size = i128::from(chunk_size);
+    let global_chunk = i128::from(thread_num) + i128::from(chunk_index) * i128::from(team_size);
+    let total_chunks = (iterations + chunk_size - 1) / chunk_size;
+    if global_chunk >= total_chunks {
+        return 0;
+    }
+    let first_index = global_chunk * chunk_size;
+    let local_iterations = chunk_size.min(iterations - first_index);
+    let local_first = lower + first_index * step;
+    let local_last = local_first + (local_iterations - 1) * step;
+    debug_assert!(i64::try_from(local_first).is_ok());
+    debug_assert!(i64::try_from(local_last).is_ok());
+    unsafe {
+        *first = local_first as i64;
+        *last = local_last as i64;
+    }
+    1
+}
+
+fn loop_iteration_count(lower: i128, upper: i128, step: i128) -> i128 {
+    if step > 0 {
+        if lower > upper {
+            0
+        } else {
+            ((upper - lower) / step) + 1
+        }
+    } else if lower < upper {
+        0
+    } else {
+        ((lower - upper) / -step) + 1
     }
 }
 
@@ -526,6 +679,7 @@ pub extern "C" fn afs_omp_get_wtick() -> f64 {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::Mutex;
 
     fn reset_thread_state() {
@@ -587,6 +741,171 @@ mod tests {
             vec![(0, 4, 1, 1), (1, 4, 1, 1), (2, 4, 1, 1), (3, 4, 1, 1)]
         );
         assert_eq!(afs_omp_get_level(), 0, "team context leaked after join");
+    }
+
+    struct BarrierObservations {
+        arrived: AtomicUsize,
+        all_arrived_after_barrier: AtomicBool,
+    }
+
+    unsafe extern "C" fn synchronize_task(
+        environment: *mut c_void,
+        _thread_num: i32,
+        team_size: i32,
+    ) {
+        let observations = unsafe { &*(environment as *const BarrierObservations) };
+        observations.arrived.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(afs_omp_barrier(), AFS_OMP_SUCCESS);
+        if observations.arrived.load(Ordering::SeqCst) != team_size as usize {
+            observations
+                .all_arrived_after_barrier
+                .store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn team_barrier_waits_for_every_implicit_task() {
+        reset_thread_state();
+        assert_eq!(afs_omp_barrier(), AFS_OMP_ERROR_NO_TEAM);
+        let observations = BarrierObservations {
+            arrived: AtomicUsize::new(0),
+            all_arrived_after_barrier: AtomicBool::new(true),
+        };
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(synchronize_task),
+                &observations as *const BarrierObservations as *mut c_void,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(observations.arrived.load(Ordering::SeqCst), 4);
+        assert!(observations
+            .all_arrived_after_barrier
+            .load(Ordering::SeqCst));
+    }
+
+    fn static_bounds(
+        lower: i64,
+        upper: i64,
+        step: i64,
+        thread_num: i32,
+        team_size: i32,
+    ) -> Option<(i64, i64)> {
+        let mut first = 0;
+        let mut last = 0;
+        let status = afs_omp_static_bounds(
+            lower, upper, step, thread_num, team_size, &mut first, &mut last,
+        );
+        assert!(status >= 0, "unexpected static-bounds error {status}");
+        (status == 1).then_some((first, last))
+    }
+
+    fn static_chunk_bounds(
+        lower: i64,
+        upper: i64,
+        step: i64,
+        chunk_size: i64,
+        thread_num: i32,
+        team_size: i32,
+        chunk_index: i64,
+    ) -> Option<(i64, i64)> {
+        let mut first = 0;
+        let mut last = 0;
+        let status = afs_omp_static_chunk_bounds(
+            lower,
+            upper,
+            step,
+            chunk_size,
+            thread_num,
+            team_size,
+            chunk_index,
+            &mut first,
+            &mut last,
+        );
+        assert!(status >= 0, "unexpected static-chunk error {status}");
+        (status == 1).then_some((first, last))
+    }
+
+    #[test]
+    fn static_bounds_partition_positive_and_negative_iteration_spaces() {
+        assert_eq!(static_bounds(1, 10, 1, 0, 3), Some((1, 4)));
+        assert_eq!(static_bounds(1, 10, 1, 1, 3), Some((5, 7)));
+        assert_eq!(static_bounds(1, 10, 1, 2, 3), Some((8, 10)));
+
+        assert_eq!(static_bounds(10, -2, -3, 0, 3), Some((10, 7)));
+        assert_eq!(static_bounds(10, -2, -3, 1, 3), Some((4, 1)));
+        assert_eq!(static_bounds(10, -2, -3, 2, 3), Some((-2, -2)));
+        assert_eq!(static_bounds(1, 0, 1, 0, 4), None);
+        assert_eq!(static_bounds(0, 1, -1, 0, 4), None);
+    }
+
+    #[test]
+    fn static_bounds_handle_sparse_and_extreme_i64_ranges() {
+        assert_eq!(static_bounds(2, 2, 1, 0, 4), Some((2, 2)));
+        assert_eq!(static_bounds(2, 2, 1, 1, 4), None);
+        assert_eq!(
+            static_bounds(i64::MIN, i64::MAX, i64::MAX, 0, 2),
+            Some((i64::MIN, -1))
+        );
+        assert_eq!(
+            static_bounds(i64::MIN, i64::MAX, i64::MAX, 1, 2),
+            Some((i64::MAX - 1, i64::MAX - 1))
+        );
+        assert_eq!(
+            afs_omp_static_bounds(1, 2, 0, 0, 1, std::ptr::null_mut(), std::ptr::null_mut()),
+            -AFS_OMP_ERROR_INVALID_LOOP
+        );
+    }
+
+    #[test]
+    fn static_chunk_bounds_assign_round_robin_positive_and_negative_chunks() {
+        assert_eq!(static_chunk_bounds(1, 10, 1, 2, 0, 3, 0), Some((1, 2)));
+        assert_eq!(static_chunk_bounds(1, 10, 1, 2, 1, 3, 0), Some((3, 4)));
+        assert_eq!(static_chunk_bounds(1, 10, 1, 2, 2, 3, 0), Some((5, 6)));
+        assert_eq!(static_chunk_bounds(1, 10, 1, 2, 0, 3, 1), Some((7, 8)));
+        assert_eq!(static_chunk_bounds(1, 10, 1, 2, 1, 3, 1), Some((9, 10)));
+        assert_eq!(static_chunk_bounds(1, 10, 1, 2, 2, 3, 1), None);
+
+        assert_eq!(static_chunk_bounds(10, -2, -3, 2, 0, 3, 0), Some((10, 7)));
+        assert_eq!(static_chunk_bounds(10, -2, -3, 2, 1, 3, 0), Some((4, 1)));
+        assert_eq!(static_chunk_bounds(10, -2, -3, 2, 2, 3, 0), Some((-2, -2)));
+    }
+
+    #[test]
+    fn static_chunk_bounds_reject_invalid_descriptions_and_handle_i64_bounds() {
+        assert_eq!(
+            static_chunk_bounds(i64::MIN, i64::MAX, i64::MAX, 2, 0, 2, 0),
+            Some((i64::MIN, -1))
+        );
+        assert_eq!(
+            static_chunk_bounds(i64::MIN, i64::MAX, i64::MAX, 2, 1, 2, 0),
+            Some((i64::MAX - 1, i64::MAX - 1))
+        );
+        assert_eq!(
+            static_chunk_bounds(1, 10, 1, i64::MAX, i32::MAX - 1, i32::MAX, i64::MAX),
+            None
+        );
+        let mut first = 0;
+        let mut last = 0;
+        for invalid_chunk in [0, -1] {
+            assert_eq!(
+                afs_omp_static_chunk_bounds(
+                    1,
+                    10,
+                    1,
+                    invalid_chunk,
+                    0,
+                    2,
+                    0,
+                    &mut first,
+                    &mut last,
+                ),
+                -AFS_OMP_ERROR_INVALID_LOOP
+            );
+        }
     }
 
     #[test]

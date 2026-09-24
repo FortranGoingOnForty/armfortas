@@ -1,18 +1,19 @@
 //! Lowering for executable OpenMP constructs.
 //!
-//! Semantic validation currently admits capture-free `PARALLEL` regions,
-//! numeric/logical scalar data, supported shared numeric/logical arrays, and
-//! constant explicit-shape, allocatable, and pointer private/firstprivate
-//! numeric/logical arrays.
-//! Each region is outlined into the fixed callback shape owned by the
-//! ARMFORTAS OpenMP ABI and synchronously invoked through the runtime. Shared
-//! addresses, shared owning/non-owning array descriptors, and firstprivate
-//! snapshots live in a compiler-private environment whose lifetime is bounded
-//! by the synchronous join. Private objects live in each callback invocation,
-//! using inline storage below the compiler's stack threshold and owned
-//! descriptors above it.
+//! Semantic validation admits `PARALLEL`, canonical static worksharing `DO`,
+//! and combined `PARALLEL DO` regions over the supported numeric/logical data
+//! environment. Parallel regions are outlined into the fixed callback shape
+//! owned by the ARMFORTAS OpenMP ABI and synchronously invoked through the
+//! runtime. Shared addresses, shared owning/non-owning array descriptors, and
+//! firstprivate snapshots live in a compiler-private environment whose
+//! lifetime is bounded by the synchronous join. Private objects live in each
+//! callback invocation, using inline storage below the compiler's stack
+//! threshold and owned descriptors above it.
 
-use crate::ast::openmp::{OpenMpClause, OpenMpConstruct};
+use crate::ast::expr::Expr;
+use crate::ast::openmp::{OpenMpClause, OpenMpConstruct, OpenMpScheduleKind};
+use crate::ast::stmt::{SpannedStmt, Stmt};
+use crate::ast::Spanned;
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::{CmpOp, FuncRef, Function, Param, ValueId};
 use crate::ir::types::{IntWidth, IrType};
@@ -21,8 +22,8 @@ use super::alloc::rewrite_heap_promoted_declared_bounds;
 use super::core::{
     array_base_addr, array_descriptor_addr, collect_format_labels, collect_label_blocks,
     emit_memcpy_bytes, ensure_termination, ir_scalar_byte_size, local_declared_rank,
-    local_uses_array_descriptor, materialize_array_descriptor_for_info,
-    materialize_array_section_source_descriptor,
+    local_uses_array_descriptor, lower_do_loop, materialize_array_descriptor_for_info,
+    materialize_array_section_source_descriptor, DoLoopBody, DoLoopFields,
 };
 use super::ctx::{LocalInfo, LowerCtx, ProcScopeGuard};
 use super::helpers::coerce_to_type;
@@ -45,6 +46,7 @@ struct Capture {
 struct MaterializedEnvironment {
     address: ValueId,
     cleanup_descriptors: Vec<ValueId>,
+    worksharing_chunk_slot: Option<i64>,
 }
 
 const PRIVATE_ARRAY_STACK_THRESHOLD: i64 = 64 * 1024;
@@ -285,15 +287,49 @@ pub(super) fn lower_construct(
     ctx: &mut LowerCtx<'_>,
     construct: &OpenMpConstruct,
 ) {
-    let OpenMpConstruct::Parallel { clauses, body } = construct else {
-        unreachable!(
+    match construct {
+        OpenMpConstruct::Parallel { clauses, body } => {
+            lower_parallel_region(b, ctx, clauses, body, ParallelRegionBody::Statements(body));
+        }
+        OpenMpConstruct::Do { clauses, loop_stmt } => {
+            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, None);
+        }
+        OpenMpConstruct::ParallelDo { clauses, loop_stmt } => {
+            let capture_body = std::slice::from_ref(loop_stmt.as_ref());
+            lower_parallel_region(
+                b,
+                ctx,
+                clauses,
+                capture_body,
+                ParallelRegionBody::WorksharingDo { clauses, loop_stmt },
+            );
+        }
+        OpenMpConstruct::Critical { .. } => unreachable!(
             "unsupported OpenMP {} construct passed semantic validation",
             construct.name()
-        );
-    };
+        ),
+    }
+}
 
+#[derive(Clone, Copy)]
+enum ParallelRegionBody<'a> {
+    Statements(&'a [SpannedStmt]),
+    WorksharingDo {
+        clauses: &'a [OpenMpClause],
+        loop_stmt: &'a SpannedStmt,
+    },
+}
+
+fn lower_parallel_region(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    clauses: &[OpenMpClause],
+    capture_body: &[SpannedStmt],
+    region_body: ParallelRegionBody<'_>,
+) {
     let mut if_value = b.const_i32(1);
     let mut requested_threads = b.const_i32(0);
+    let mut worksharing_chunk = None;
     for clause in clauses {
         match clause {
             OpenMpClause::If { condition, .. } => {
@@ -305,10 +341,21 @@ pub(super) fn lower_construct(
                 let raw = super::expr::lower_expr_ctx(b, ctx, count);
                 requested_threads = coerce_to_type(b, raw, &IrType::Int(IntWidth::I32));
             }
+            OpenMpClause::Schedule {
+                kind: OpenMpScheduleKind::Static,
+                chunk_size: Some(chunk_size),
+            } => {
+                // A combined construct evaluates the schedule expression in
+                // the encountering context. This preserves the original list
+                // item when that variable is also privatized by the construct.
+                let raw = super::expr::lower_expr_ctx(b, ctx, chunk_size);
+                worksharing_chunk = Some(coerce_to_type(b, raw, &IrType::Int(IntWidth::I64)));
+            }
             OpenMpClause::Shared(_)
             | OpenMpClause::Private(_)
             | OpenMpClause::FirstPrivate(_)
-            | OpenMpClause::Default(_) => {}
+            | OpenMpClause::Default(_)
+            | OpenMpClause::Schedule { .. } => {}
             _ => unreachable!("unsupported OpenMP PARALLEL clause passed semantic validation"),
         }
     }
@@ -341,47 +388,49 @@ pub(super) fn lower_construct(
         .map(|name| name.to_ascii_lowercase())
         .collect();
     let predetermined_private =
-        crate::sema::validate::openmp::predetermined_private_names(ctx.st, body);
+        crate::sema::validate::openmp::predetermined_private_names(ctx.st, capture_body);
     let mut seen_captures = std::collections::HashSet::new();
-    let captures: Vec<Capture> = crate::sema::validate::openmp::capture_references(ctx.st, body)
-        .into_iter()
-        .filter(|(name, _, role)| {
-            (*role == crate::sema::validate::openmp::ReferenceRole::Value
-                || (*role == crate::sema::validate::openmp::ReferenceRole::Callable
-                    && ctx
-                        .st
-                        .lookup_local_then_any(ctx.proc_scope_id, name)
-                        .is_some_and(|symbol| {
-                            matches!(
-                                symbol.kind,
-                                crate::sema::symtab::SymbolKind::Variable
-                                    | crate::sema::symtab::SymbolKind::Parameter
-                                    | crate::sema::symtab::SymbolKind::ProcedurePointer
-                            )
-                        })))
-                && seen_captures.insert(name.clone())
-        })
-        .map(|(name, _, _)| {
-            let info = ctx.locals.get(&name).cloned().unwrap_or_else(|| {
-                panic!("validated OpenMP shared capture '{name}' has no lowering binding")
-            });
-            let kind = if private_names.contains(&name) {
-                CaptureKind::Private
-            } else if firstprivate_names.contains(&name) {
-                CaptureKind::FirstPrivate
-            } else if info.inline_const.is_some() {
-                CaptureKind::InlineConstant
-            } else if shared_names.contains(&name) {
-                CaptureKind::Shared
-            } else if predetermined_private.contains(&name) {
-                CaptureKind::Private
-            } else {
-                CaptureKind::Shared
-            };
-            Capture { name, info, kind }
-        })
-        .collect();
-    let environment = materialize_shared_environment(b, &captures);
+    let captures: Vec<Capture> =
+        crate::sema::validate::openmp::capture_references(ctx.st, capture_body)
+            .into_iter()
+            .filter(|(name, _, role)| {
+                (*role == crate::sema::validate::openmp::ReferenceRole::Value
+                    || (*role == crate::sema::validate::openmp::ReferenceRole::Callable
+                        && ctx
+                            .st
+                            .lookup_local_then_any(ctx.proc_scope_id, name)
+                            .is_some_and(|symbol| {
+                                matches!(
+                                    symbol.kind,
+                                    crate::sema::symtab::SymbolKind::Variable
+                                        | crate::sema::symtab::SymbolKind::Parameter
+                                        | crate::sema::symtab::SymbolKind::ProcedurePointer
+                                )
+                            })))
+                    && seen_captures.insert(name.clone())
+            })
+            .map(|(name, _, _)| {
+                let info = ctx.locals.get(&name).cloned().unwrap_or_else(|| {
+                    panic!("validated OpenMP shared capture '{name}' has no lowering binding")
+                });
+                let kind = if private_names.contains(&name) {
+                    CaptureKind::Private
+                } else if firstprivate_names.contains(&name) {
+                    CaptureKind::FirstPrivate
+                } else if info.inline_const.is_some() {
+                    CaptureKind::InlineConstant
+                } else if shared_names.contains(&name) {
+                    CaptureKind::Shared
+                } else if predetermined_private.contains(&name) {
+                    CaptureKind::Private
+                } else {
+                    CaptureKind::Shared
+                };
+                Capture { name, info, kind }
+            })
+            .collect();
+    let environment = materialize_shared_environment(b, &captures, worksharing_chunk);
+    let worksharing_chunk_slot = environment.worksharing_chunk_slot;
 
     let callback_name = ctx.next_openmp_region_name();
     let local_modules = b.local_modules();
@@ -428,16 +477,42 @@ pub(super) fn lower_construct(
         );
         outlined_ctx.filtered_names = ctx.filtered_names.clone();
         outlined_ctx.proc_scope_id = ctx.proc_scope_id;
+        outlined_ctx.openmp_team = Some((ValueId(1), ValueId(2)));
 
         {
             let mut outlined = FuncBuilder::new(&mut callback, ctx.layout);
             outlined.set_local_modules(local_modules);
             let cleanup_descriptors =
                 install_shared_captures(&mut outlined, &mut outlined_ctx, &captures);
-            collect_label_blocks(&mut outlined, body, &mut outlined_ctx.label_blocks);
-            collect_format_labels(body, &mut outlined_ctx.format_labels);
+            let outlined_worksharing_chunk = worksharing_chunk_slot.map(|slot_index| {
+                let raw_environment = outlined.ptr_to_int(ValueId(0));
+                let environment_slots =
+                    outlined.int_to_ptr(raw_environment, IrType::Int(IntWidth::I64));
+                let index = outlined.const_i64(slot_index);
+                let slot = outlined.gep(environment_slots, vec![index], IrType::Int(IntWidth::I64));
+                outlined.load_typed(slot, IrType::Int(IntWidth::I64))
+            });
+            collect_label_blocks(&mut outlined, capture_body, &mut outlined_ctx.label_blocks);
+            collect_format_labels(capture_body, &mut outlined_ctx.format_labels);
             let _scope = ProcScopeGuard::enter(outlined_ctx.proc_scope_id);
-            super::stmt::lower_stmts(&mut outlined, &mut outlined_ctx, body);
+            match region_body {
+                ParallelRegionBody::Statements(body) => {
+                    super::stmt::lower_stmts(&mut outlined, &mut outlined_ctx, body)
+                }
+                ParallelRegionBody::WorksharingDo { clauses, loop_stmt } => {
+                    // The worksharing barrier and the immediately following
+                    // parallel-region join are observably equivalent here:
+                    // a combined construct has no intervening statements.
+                    lower_worksharing_loop(
+                        &mut outlined,
+                        &mut outlined_ctx,
+                        clauses,
+                        loop_stmt,
+                        true,
+                        outlined_worksharing_chunk,
+                    );
+                }
+            }
             if outlined
                 .func()
                 .block(outlined.current_block())
@@ -478,25 +553,237 @@ pub(super) fn lower_construct(
     }
 }
 
+fn lower_worksharing_loop(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    clauses: &[OpenMpClause],
+    loop_stmt: &SpannedStmt,
+    suppress_barrier: bool,
+    precomputed_chunk: Option<ValueId>,
+) {
+    let Stmt::DoLoop {
+        name,
+        var: Some(var),
+        start: Some(start),
+        end: Some(end),
+        step,
+        body,
+        ..
+    } = &loop_stmt.node
+    else {
+        unreachable!("non-canonical OpenMP DO passed semantic validation")
+    };
+    let (thread_num, team_size) = ctx
+        .openmp_team
+        .expect("OpenMP DO lowered outside an outlined team callback");
+    let nowait = clauses
+        .iter()
+        .any(|clause| matches!(clause, OpenMpClause::Nowait));
+    let i64_ty = IrType::Int(IntWidth::I64);
+    let chunk_expr = clauses.iter().find_map(|clause| match clause {
+        OpenMpClause::Schedule {
+            kind: OpenMpScheduleKind::Static,
+            chunk_size,
+        } => chunk_size.as_ref(),
+        _ => None,
+    });
+    let chunk_size = precomputed_chunk.or_else(|| {
+        chunk_expr.map(|chunk_size| {
+            let raw = super::expr::lower_expr_ctx(b, ctx, chunk_size);
+            coerce_to_type(b, raw, &i64_ty)
+        })
+    });
+
+    // Every implicit task computes the same logical iteration space before
+    // replacing the associated iteration variable with its private binding.
+    let lower_raw = super::expr::lower_expr_ctx(b, ctx, start);
+    let lower = coerce_to_type(b, lower_raw, &i64_ty);
+    let upper_raw = super::expr::lower_expr_ctx(b, ctx, end);
+    let upper = coerce_to_type(b, upper_raw, &i64_ty);
+    let step = if let Some(step) = step {
+        let raw = super::expr::lower_expr_ctx(b, ctx, step);
+        coerce_to_type(b, raw, &i64_ty)
+    } else {
+        b.const_i64(1)
+    };
+
+    let first_addr = b.alloca(i64_ty.clone());
+    let last_addr = b.alloca(i64_ty.clone());
+    let step_addr = b.alloca(i64_ty.clone());
+    b.store(step, step_addr);
+    let chunk_index_addr = chunk_size.map(|_| {
+        let address = b.alloca(i64_ty.clone());
+        let zero = b.const_i64(0);
+        b.store(zero, address);
+        address
+    });
+
+    let first_name = "$afs_omp_first".to_string();
+    let last_name = "$afs_omp_last".to_string();
+    let step_name = "$afs_omp_step".to_string();
+    let saved_first = ctx.locals.remove(&first_name);
+    let saved_last = ctx.locals.remove(&last_name);
+    let saved_step = ctx.locals.remove(&step_name);
+    ctx.insert_scalar(first_name.clone(), first_addr, i64_ty.clone());
+    ctx.insert_scalar(last_name.clone(), last_addr, i64_ty.clone());
+    ctx.insert_scalar(step_name.clone(), step_addr, i64_ty);
+
+    let key = var.to_ascii_lowercase();
+    let mut private_var = ctx
+        .locals
+        .get(&key)
+        .cloned()
+        .expect("validated OpenMP DO variable has no lowering binding");
+    let saved_var = private_var.clone();
+    private_var.addr = b.alloca(private_var.ty.clone());
+    private_var.by_ref = false;
+    private_var.inline_const = None;
+    ctx.locals.insert(key.clone(), private_var);
+
+    let error_bb = b.create_block("omp_do_invalid");
+    let dispatch_bb = b.create_block("omp_do_dispatch");
+    let status_ok_bb = b.create_block("omp_do_status_ok");
+    let work_bb = b.create_block("omp_do_work");
+    let advance_bb = chunk_size.map(|_| b.create_block("omp_do_next_chunk"));
+    let done_bb = b.create_block("omp_do_done");
+    b.branch(dispatch_bb, vec![]);
+
+    b.set_block(dispatch_bb);
+    let status = if let (Some(chunk_size), Some(chunk_index_addr)) = (chunk_size, chunk_index_addr)
+    {
+        let chunk_index = b.load_typed(chunk_index_addr, IrType::Int(IntWidth::I64));
+        b.call(
+            FuncRef::External("afs_omp_static_chunk_bounds".into()),
+            vec![
+                lower,
+                upper,
+                step,
+                chunk_size,
+                thread_num,
+                team_size,
+                chunk_index,
+                first_addr,
+                last_addr,
+            ],
+            IrType::Int(IntWidth::I32),
+        )
+    } else {
+        b.call(
+            FuncRef::External("afs_omp_static_bounds".into()),
+            vec![
+                lower, upper, step, thread_num, team_size, first_addr, last_addr,
+            ],
+            IrType::Int(IntWidth::I32),
+        )
+    };
+    let zero = b.const_i32(0);
+    let invalid = b.icmp(CmpOp::Lt, status, zero);
+    b.cond_branch(invalid, error_bb, vec![], status_ok_bb, vec![]);
+
+    b.set_block(error_bb);
+    b.runtime_call(
+        crate::ir::inst::RuntimeFunc::ErrorStop,
+        vec![],
+        IrType::Void,
+    );
+    b.branch(done_bb, vec![]);
+
+    b.set_block(status_ok_bb);
+    let has_work = b.icmp(CmpOp::Gt, status, zero);
+    b.cond_branch(has_work, work_bb, vec![], done_bb, vec![]);
+
+    b.set_block(work_bb);
+    let first_expr = Some(Spanned::new(
+        Expr::Name {
+            name: first_name.clone(),
+        },
+        loop_stmt.span,
+    ));
+    let last_expr = Some(Spanned::new(
+        Expr::Name {
+            name: last_name.clone(),
+        },
+        loop_stmt.span,
+    ));
+    let step_expr = Some(Spanned::new(
+        Expr::Name {
+            name: step_name.clone(),
+        },
+        loop_stmt.span,
+    ));
+    let private_var_name = Some(var.clone());
+    lower_do_loop(
+        b,
+        ctx,
+        DoLoopFields {
+            cycle_name: name,
+            exit_name: name,
+            var: &private_var_name,
+            start: &first_expr,
+            end: &last_expr,
+            step: &step_expr,
+            body: DoLoopBody::Statements(body),
+            concurrent: false,
+            locality: &[],
+            span: loop_stmt.span,
+        },
+    );
+    ctx.locals.insert(key, saved_var);
+    restore_temp_binding(ctx, first_name, saved_first);
+    restore_temp_binding(ctx, last_name, saved_last);
+    restore_temp_binding(ctx, step_name, saved_step);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(advance_bb.unwrap_or(done_bb), vec![]);
+    }
+
+    if let (Some(advance_bb), Some(chunk_index_addr)) = (advance_bb, chunk_index_addr) {
+        b.set_block(advance_bb);
+        let chunk_index = b.load_typed(chunk_index_addr, IrType::Int(IntWidth::I64));
+        let one = b.const_i64(1);
+        let next_chunk = b.iadd(chunk_index, one);
+        b.store(next_chunk, chunk_index_addr);
+        b.branch(dispatch_bb, vec![]);
+    }
+
+    b.set_block(done_bb);
+    if !suppress_barrier && !nowait {
+        b.call(
+            FuncRef::External("afs_omp_barrier".into()),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        );
+    }
+}
+
+fn restore_temp_binding(ctx: &mut LowerCtx<'_>, name: String, saved: Option<LocalInfo>) {
+    ctx.locals.remove(&name);
+    if let Some(saved) = saved {
+        ctx.locals.insert(name, saved);
+    }
+}
+
 fn materialize_shared_environment(
     b: &mut FuncBuilder<'_>,
     captures: &[Capture],
+    worksharing_chunk: Option<ValueId>,
 ) -> MaterializedEnvironment {
     let addressed_count = captures
         .iter()
         .filter(|capture| capture_needs_environment(capture))
         .count();
-    if addressed_count == 0 {
+    let environment_slots = addressed_count + usize::from(worksharing_chunk.is_some());
+    if environment_slots == 0 {
         let null = b.const_i64(0);
         return MaterializedEnvironment {
             address: b.int_to_ptr(null, IrType::Int(IntWidth::I8)),
             cleanup_descriptors: Vec::new(),
+            worksharing_chunk_slot: None,
         };
     }
 
     let environment = b.alloca(IrType::Array(
         Box::new(IrType::Int(IntWidth::I64)),
-        addressed_count as u64,
+        environment_slots as u64,
     ));
     let mut cleanup_descriptors = Vec::new();
     let mut slot_index = 0i64;
@@ -575,10 +862,17 @@ fn materialize_shared_environment(
         b.store(raw_address, slot);
         slot_index += 1;
     }
+    let worksharing_chunk_slot = worksharing_chunk.map(|chunk_size| {
+        let index = b.const_i64(slot_index);
+        let slot = b.gep(environment, vec![index], IrType::Int(IntWidth::I64));
+        b.store(chunk_size, slot);
+        slot_index
+    });
     let raw_environment = b.ptr_to_int(environment);
     MaterializedEnvironment {
         address: b.int_to_ptr(raw_environment, IrType::Int(IntWidth::I8)),
         cleanup_descriptors,
+        worksharing_chunk_slot,
     }
 }
 

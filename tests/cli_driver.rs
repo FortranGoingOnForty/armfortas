@@ -20983,32 +20983,259 @@ fn fopenmp_models_supported_constructs_in_ast_dump() {
 }
 
 #[test]
-fn fopenmp_rejects_execution_before_ir_lowering() {
+fn fopenmp_parallel_do_static_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_parallel_do_static_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     let src = write_program(
-        "program p\n  implicit none\n  integer :: i\n!$omp parallel do\n  do i = 1, 4\n  end do\n!$omp end parallel do\nend program\n",
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: i, tid, seed, chunk
+  integer :: values(17), owners(10), sparse(3), cyclic(10)
+  integer(kind=8) :: k
+  i = -77
+  seed = 100
+  values = 0
+!$omp parallel do default(none) num_threads(4) schedule(static) &
+!$omp& private(i,tid) firstprivate(seed) shared(values)
+  do i = 1, 17
+    tid = omp_get_thread_num()
+    values(i) = seed + i
+  end do
+!$omp end parallel do
+  if (i /= -77 .or. seed /= 100) error stop 1
+  do i = 1, 17
+    if (values(i) /= 100 + i) error stop 2
+  end do
+
+  owners = -1
+!$omp parallel do num_threads(3) schedule(static)
+  do i = 10, 1, -1
+    owners(11-i) = omp_get_thread_num()
+  end do
+!$omp end parallel do
+  if (any(owners /= [0,0,0,0,1,1,1,2,2,2])) error stop 3
+
+  sparse = 0
+!$omp parallel do num_threads(8) schedule(static)
+  do k = 2147483648_8, 2147483650_8
+    sparse(int(k - 2147483647_8)) = int(k - 2147483647_8)
+  end do
+!$omp end parallel do
+  if (any(sparse /= [1,2,3])) error stop 4
+
+  chunk = 2
+  cyclic = -1
+!$omp parallel do default(none) num_threads(3) schedule(static,chunk) &
+!$omp& private(i) firstprivate(chunk) shared(cyclic)
+  do i = 1, 10
+    cyclic(i) = omp_get_thread_num()
+  end do
+!$omp end parallel do
+  if (any(cyclic /= [0,0,1,1,2,2,0,0,1,1])) error stop 5
+  print *, 'ok'
+end program
+",
         "f90",
     );
-    let out = unique_path("openmp_unsupported", "s");
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_parallel_do_static", "bin");
+        let runtime_cache = unique_dir("openmp_parallel_do_static_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PARALLEL DO should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PARALLEL DO failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_standalone_do_static_barrier_and_nowait_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_standalone_do_static_barrier_and_nowait_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: i, tid, chunk
+  integer :: values(19), more(8), owners(10), passed(0:3)
+  i = -91
+  values = 0
+  more = 0
+  owners = -1
+  passed = 0
+  chunk = 2
+!$omp parallel default(none) num_threads(4) private(tid) shared(values,more,owners,passed,chunk)
+  tid = omp_get_thread_num()
+!$omp do schedule(static)
+  do i = 19, 1, -2
+    values(i) = i
+  end do
+!$omp end do
+  if (sum(values) == 100) passed(tid) = 1
+!$omp do schedule(static)
+  do i = 1, 8
+    more(i) = i
+  end do
+!$omp end do nowait
+!$omp do schedule(static,chunk)
+  do i = 10, 1, -1
+    owners(11-i) = tid
+  end do
+!$omp end do
+!$omp end parallel
+  if (i /= -91) error stop 1
+  if (any(passed /= 1)) error stop 2
+  if (any(more /= [1,2,3,4,5,6,7,8])) error stop 3
+  if (any(owners /= [0,0,1,1,2,2,3,3,0,0])) error stop 4
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_standalone_do_static", "bin");
+        let runtime_cache = unique_dir("openmp_standalone_do_static_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "standalone OpenMP DO should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "standalone OpenMP DO failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
+    let cases = [
+        (
+            "program p\ninteger :: i\n!$omp do\ndo i=1,4\nend do\n!$omp end do\nend program\n",
+            "OpenMP DO must be closely nested inside an OpenMP PARALLEL region",
+        ),
+        (
+            "program p\ninteger :: i\n!$omp parallel do schedule(dynamic)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP SCHEDULE(DYNAMIC) is recognized but not yet implemented",
+        ),
+        (
+            "program p\ninteger :: i\n!$omp parallel do schedule(static,0)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP SCHEDULE chunk size must be positive",
+        ),
+        (
+            "program p\ninteger :: i\n!$omp parallel do schedule(static,1.5)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP SCHEDULE chunk size must be a scalar INTEGER expression",
+        ),
+        (
+            "program p\ninteger :: i\n!$omp parallel do\ndo i=1,4\nend do\n!$omp end parallel do nowait\nend program\n",
+            "OpenMP PARALLEL DO may not specify NOWAIT",
+        ),
+    ];
+    for (source, expected) in cases {
+        let src = write_program(source, "f90");
+        let out = unique_path("openmp_worksharing_rejected", "s");
+        let result = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                "-S",
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("spawn failed");
+        assert!(!result.status.success(), "unsupported OpenMP DO compiled");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(expected), "unexpected diagnostic: {stderr}");
+        assert!(!out.exists(), "unsupported OpenMP DO left assembly output");
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
+fn fopenmp_worksharing_emits_x86_64_elf_object() {
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: i, values(9)
+  values = 0
+!$omp parallel do num_threads(3) schedule(static,2)
+  do i = 9, 1, -1
+    values(i) = i
+  end do
+!$omp end parallel do
+end program
+",
+        "f90",
+    );
+    let out = unique_path("openmp_worksharing_x86", "o");
     let result = Command::new(compiler("armfortas"))
-        .args([
-            "-fopenmp",
-            "-S",
-            src.to_str().unwrap(),
-            "-o",
-            out.to_str().unwrap(),
-        ])
+        .args(["-fopenmp", "--target", "x86_64-linux-musl", "-c"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
         .output()
         .expect("spawn failed");
     assert!(
-        !result.status.success(),
-        "OpenMP execution compiled silently"
+        result.status.success(),
+        "OpenMP worksharing should cross-compile to x86_64: {}",
+        String::from_utf8_lossy(&result.stderr)
     );
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(
-        stderr.contains("OpenMP PARALLEL DO execution is recognized but not yet implemented"),
-        "unexpected diagnostic: {stderr}"
-    );
-    assert!(!out.exists(), "unsupported OpenMP left an assembly output");
+    let bytes = std::fs::read(&out).expect("missing x86_64 OpenMP worksharing object");
+    assert_eq!(&bytes[..4], b"\x7fELF", "OpenMP output is not ELF");
+    let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
 

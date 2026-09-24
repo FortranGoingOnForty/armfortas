@@ -1246,7 +1246,7 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     }
     if opts.openmp {
         opts.cli_warnings.push(
-            "-fopenmp enables preview OpenMP support; numeric/logical scalar, shared-array, and fixed-shape private-array PARALLEL regions are implemented and unsupported constructs or clauses are errors"
+            "-fopenmp enables preview OpenMP support; numeric/logical PARALLEL data environments and initial static DO worksharing are implemented and unsupported constructs or clauses are errors"
                 .into(),
         );
     } else if opts.openmp_simd {
