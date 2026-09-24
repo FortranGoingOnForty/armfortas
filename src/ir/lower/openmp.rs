@@ -24,9 +24,9 @@ use crate::ir::types::{IntWidth, IrType};
 use super::alloc::rewrite_heap_promoted_declared_bounds;
 use super::core::{
     array_base_addr, array_descriptor_addr, collect_format_labels, collect_label_blocks,
-    derived_storage_ir_type, emit_memcpy_bytes, ensure_termination, initialize_derived_storage,
-    insert_implicit_dealloc, ir_scalar_byte_size, local_declared_rank, local_uses_array_descriptor,
-    lower_do_loop, materialize_array_descriptor_for_info,
+    derived_storage_ir_type, emit_derived_value_copy, emit_memcpy_bytes, ensure_termination,
+    initialize_derived_storage, insert_implicit_dealloc, ir_scalar_byte_size, local_declared_rank,
+    local_uses_array_descriptor, lower_do_loop, materialize_array_descriptor_for_info,
     materialize_array_section_source_descriptor, DoLoopBody, DoLoopFields,
 };
 use super::ctx::{LocalInfo, LowerCtx, ProcScopeGuard};
@@ -490,7 +490,24 @@ fn lower_parallel_region(
             });
         }
     }
-    let environment = materialize_shared_environment(b, &captures, worksharing_chunk);
+    for capture in &mut captures {
+        let Some(type_name) = capture.info.derived_type.as_deref() else {
+            continue;
+        };
+        let canonical = ctx
+            .proc_scope_id
+            .and_then(|scope| ctx.type_layouts.canonical_name_for_scope(scope, type_name))
+            .or_else(|| {
+                ctx.type_layouts
+                    .get(type_name)
+                    .map(|layout| ctx.type_layouts.canonical_key_for_layout(layout))
+            });
+        if let Some(canonical) = canonical {
+            capture.info.derived_type = Some(canonical);
+        }
+    }
+    let environment =
+        materialize_shared_environment(b, &captures, worksharing_chunk, ctx.type_layouts);
     let worksharing_chunk_slot = environment.worksharing_chunk_slot;
 
     let callback_name = ctx.next_openmp_region_name();
@@ -1215,6 +1232,7 @@ fn materialize_shared_environment(
     b: &mut FuncBuilder<'_>,
     captures: &[Capture],
     worksharing_chunk: Option<ValueId>,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> MaterializedEnvironment {
     let addressed_count = captures
         .iter()
@@ -1279,6 +1297,22 @@ fn materialize_shared_environment(
             copy_array_data(b, &snapshot, source, descriptor_copy);
             cleanup_descriptors.extend(cleanup);
             snapshot.addr
+        } else if capture.kind == CaptureKind::FirstPrivate && capture.info.derived_type.is_some() {
+            let outside_address = if capture.info.by_ref {
+                b.load(capture.info.addr)
+            } else {
+                capture.info.addr
+            };
+            let type_name = capture
+                .info
+                .derived_type
+                .as_deref()
+                .expect("derived FIRSTPRIVATE capture lost its type name");
+            let storage_ty = derived_storage_ir_type(type_name, type_layouts)
+                .expect("validated OpenMP firstprivate derived scalar has no storage layout");
+            let snapshot = b.alloca(storage_ty);
+            emit_derived_value_copy(b, type_layouts, type_name, snapshot, outside_address);
+            snapshot
         } else if capture.kind == CaptureKind::FirstPrivate {
             let outside_address = if capture.info.by_ref {
                 b.load(capture.info.addr)
@@ -1418,6 +1452,13 @@ fn install_shared_captures(
                     IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392)
                 } else if firstprivate_array {
                     fixed_array_storage_type(&capture.info, b.layout)
+                } else if capture.kind == CaptureKind::FirstPrivate {
+                    capture
+                        .info
+                        .derived_type
+                        .as_deref()
+                        .and_then(|name| derived_storage_ir_type(name, ctx.type_layouts))
+                        .unwrap_or_else(|| capture.info.ty.clone())
                 } else {
                     capture.info.ty.clone()
                 };
@@ -1437,9 +1478,29 @@ fn install_shared_captures(
                     local = private;
                     cleanup.array_descriptors.extend(cleanup_descriptor);
                 } else if capture.kind == CaptureKind::FirstPrivate {
-                    let private = b.alloca(capture.info.ty.clone());
-                    let value = b.load_typed(environment_address, capture.info.ty.clone());
-                    b.store(value, private);
+                    let storage_ty = capture
+                        .info
+                        .derived_type
+                        .as_deref()
+                        .and_then(|name| derived_storage_ir_type(name, ctx.type_layouts))
+                        .unwrap_or_else(|| capture.info.ty.clone());
+                    let private = b.alloca(storage_ty);
+                    if let Some(type_name) = capture.info.derived_type.as_deref() {
+                        let layout = ctx.type_layouts.get(type_name).expect(
+                            "validated OpenMP firstprivate derived scalar has no type layout",
+                        );
+                        initialize_derived_storage(b, private, layout, ctx.type_layouts);
+                        emit_derived_value_copy(
+                            b,
+                            ctx.type_layouts,
+                            type_name,
+                            private,
+                            environment_address,
+                        );
+                    } else {
+                        let value = b.load_typed(environment_address, capture.info.ty.clone());
+                        b.store(value, private);
+                    }
                     local.addr = private;
                     local.inline_const = None;
                 } else {
@@ -1460,8 +1521,10 @@ fn install_shared_captures(
                 slot_index += 1;
             }
         }
-        if capture.kind == CaptureKind::Private
-            && !is_array(&local)
+        if matches!(
+            capture.kind,
+            CaptureKind::Private | CaptureKind::FirstPrivate
+        ) && !is_array(&local)
             && !local.allocatable
             && !local.is_pointer
             && local.derived_type.is_some()

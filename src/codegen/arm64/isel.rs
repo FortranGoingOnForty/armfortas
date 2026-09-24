@@ -750,6 +750,11 @@ fn select_call_inst(
     } else {
         ctx.get_vreg(mf, inst.id, RegClass::Gp64);
     }
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::CallResultCopyEnd,
+        operands: vec![],
+        def: None,
+    });
 }
 
 /// Instruction selection context.
@@ -4439,6 +4444,11 @@ mod tests {
             insts[call - 1].opcode,
             ArmOpcode::CallArgCopyStart,
             "zero-argument calls still need an exact split-bridge boundary"
+        );
+        assert_eq!(
+            insts[call + 1].opcode,
+            ArmOpcode::CallResultCopyEnd,
+            "void calls should close their result-copy boundary immediately"
         );
     }
 
