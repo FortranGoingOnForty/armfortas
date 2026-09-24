@@ -11,7 +11,7 @@
 //! threshold and owned descriptors above it.
 
 use crate::ast::expr::Expr;
-use crate::ast::openmp::{OpenMpClause, OpenMpConstruct};
+use crate::ast::openmp::{OpenMpClause, OpenMpConstruct, OpenMpScheduleKind};
 use crate::ast::stmt::{SpannedStmt, Stmt};
 use crate::ast::Spanned;
 use crate::ir::builder::FuncBuilder;
@@ -46,6 +46,7 @@ struct Capture {
 struct MaterializedEnvironment {
     address: ValueId,
     cleanup_descriptors: Vec<ValueId>,
+    worksharing_chunk_slot: Option<i64>,
 }
 
 const PRIVATE_ARRAY_STACK_THRESHOLD: i64 = 64 * 1024;
@@ -291,7 +292,7 @@ pub(super) fn lower_construct(
             lower_parallel_region(b, ctx, clauses, body, ParallelRegionBody::Statements(body));
         }
         OpenMpConstruct::Do { clauses, loop_stmt } => {
-            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false);
+            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, None);
         }
         OpenMpConstruct::ParallelDo { clauses, loop_stmt } => {
             let capture_body = std::slice::from_ref(loop_stmt.as_ref());
@@ -328,6 +329,7 @@ fn lower_parallel_region(
 ) {
     let mut if_value = b.const_i32(1);
     let mut requested_threads = b.const_i32(0);
+    let mut worksharing_chunk = None;
     for clause in clauses {
         match clause {
             OpenMpClause::If { condition, .. } => {
@@ -338,6 +340,16 @@ fn lower_parallel_region(
             OpenMpClause::NumThreads(count) => {
                 let raw = super::expr::lower_expr_ctx(b, ctx, count);
                 requested_threads = coerce_to_type(b, raw, &IrType::Int(IntWidth::I32));
+            }
+            OpenMpClause::Schedule {
+                kind: OpenMpScheduleKind::Static,
+                chunk_size: Some(chunk_size),
+            } => {
+                // A combined construct evaluates the schedule expression in
+                // the encountering context. This preserves the original list
+                // item when that variable is also privatized by the construct.
+                let raw = super::expr::lower_expr_ctx(b, ctx, chunk_size);
+                worksharing_chunk = Some(coerce_to_type(b, raw, &IrType::Int(IntWidth::I64)));
             }
             OpenMpClause::Shared(_)
             | OpenMpClause::Private(_)
@@ -417,7 +429,8 @@ fn lower_parallel_region(
                 Capture { name, info, kind }
             })
             .collect();
-    let environment = materialize_shared_environment(b, &captures);
+    let environment = materialize_shared_environment(b, &captures, worksharing_chunk);
+    let worksharing_chunk_slot = environment.worksharing_chunk_slot;
 
     let callback_name = ctx.next_openmp_region_name();
     let local_modules = b.local_modules();
@@ -471,6 +484,14 @@ fn lower_parallel_region(
             outlined.set_local_modules(local_modules);
             let cleanup_descriptors =
                 install_shared_captures(&mut outlined, &mut outlined_ctx, &captures);
+            let outlined_worksharing_chunk = worksharing_chunk_slot.map(|slot_index| {
+                let raw_environment = outlined.ptr_to_int(ValueId(0));
+                let environment_slots =
+                    outlined.int_to_ptr(raw_environment, IrType::Int(IntWidth::I64));
+                let index = outlined.const_i64(slot_index);
+                let slot = outlined.gep(environment_slots, vec![index], IrType::Int(IntWidth::I64));
+                outlined.load_typed(slot, IrType::Int(IntWidth::I64))
+            });
             collect_label_blocks(&mut outlined, capture_body, &mut outlined_ctx.label_blocks);
             collect_format_labels(capture_body, &mut outlined_ctx.format_labels);
             let _scope = ProcScopeGuard::enter(outlined_ctx.proc_scope_id);
@@ -488,6 +509,7 @@ fn lower_parallel_region(
                         clauses,
                         loop_stmt,
                         true,
+                        outlined_worksharing_chunk,
                     );
                 }
             }
@@ -537,6 +559,7 @@ fn lower_worksharing_loop(
     clauses: &[OpenMpClause],
     loop_stmt: &SpannedStmt,
     suppress_barrier: bool,
+    precomputed_chunk: Option<ValueId>,
 ) {
     let Stmt::DoLoop {
         name,
@@ -557,6 +580,19 @@ fn lower_worksharing_loop(
         .iter()
         .any(|clause| matches!(clause, OpenMpClause::Nowait));
     let i64_ty = IrType::Int(IntWidth::I64);
+    let chunk_expr = clauses.iter().find_map(|clause| match clause {
+        OpenMpClause::Schedule {
+            kind: OpenMpScheduleKind::Static,
+            chunk_size,
+        } => chunk_size.as_ref(),
+        _ => None,
+    });
+    let chunk_size = precomputed_chunk.or_else(|| {
+        chunk_expr.map(|chunk_size| {
+            let raw = super::expr::lower_expr_ctx(b, ctx, chunk_size);
+            coerce_to_type(b, raw, &i64_ty)
+        })
+    });
 
     // Every implicit task computes the same logical iteration space before
     // replacing the associated iteration variable with its private binding.
@@ -573,39 +609,18 @@ fn lower_worksharing_loop(
 
     let first_addr = b.alloca(i64_ty.clone());
     let last_addr = b.alloca(i64_ty.clone());
-    let status = b.call(
-        FuncRef::External("afs_omp_static_bounds".into()),
-        vec![
-            lower, upper, step, thread_num, team_size, first_addr, last_addr,
-        ],
-        IrType::Int(IntWidth::I32),
-    );
-    let zero = b.const_i32(0);
-    let invalid = b.icmp(CmpOp::Lt, status, zero);
-    let error_bb = b.create_block("omp_do_invalid");
-    let dispatch_bb = b.create_block("omp_do_dispatch");
-    let work_bb = b.create_block("omp_do_work");
-    let done_bb = b.create_block("omp_do_done");
-    b.cond_branch(invalid, error_bb, vec![], dispatch_bb, vec![]);
+    let step_addr = b.alloca(i64_ty.clone());
+    b.store(step, step_addr);
+    let chunk_index_addr = chunk_size.map(|_| {
+        let address = b.alloca(i64_ty.clone());
+        let zero = b.const_i64(0);
+        b.store(zero, address);
+        address
+    });
 
-    b.set_block(error_bb);
-    b.runtime_call(
-        crate::ir::inst::RuntimeFunc::ErrorStop,
-        vec![],
-        IrType::Void,
-    );
-    b.branch(done_bb, vec![]);
-
-    b.set_block(dispatch_bb);
-    let has_work = b.icmp(CmpOp::Gt, status, zero);
-    b.cond_branch(has_work, work_bb, vec![], done_bb, vec![]);
-
-    b.set_block(work_bb);
     let first_name = "$afs_omp_first".to_string();
     let last_name = "$afs_omp_last".to_string();
     let step_name = "$afs_omp_step".to_string();
-    let step_addr = b.alloca(i64_ty.clone());
-    b.store(step, step_addr);
     let saved_first = ctx.locals.remove(&first_name);
     let saved_last = ctx.locals.remove(&last_name);
     let saved_step = ctx.locals.remove(&step_name);
@@ -625,6 +640,59 @@ fn lower_worksharing_loop(
     private_var.inline_const = None;
     ctx.locals.insert(key.clone(), private_var);
 
+    let error_bb = b.create_block("omp_do_invalid");
+    let dispatch_bb = b.create_block("omp_do_dispatch");
+    let status_ok_bb = b.create_block("omp_do_status_ok");
+    let work_bb = b.create_block("omp_do_work");
+    let advance_bb = chunk_size.map(|_| b.create_block("omp_do_next_chunk"));
+    let done_bb = b.create_block("omp_do_done");
+    b.branch(dispatch_bb, vec![]);
+
+    b.set_block(dispatch_bb);
+    let status = if let (Some(chunk_size), Some(chunk_index_addr)) = (chunk_size, chunk_index_addr)
+    {
+        let chunk_index = b.load_typed(chunk_index_addr, IrType::Int(IntWidth::I64));
+        b.call(
+            FuncRef::External("afs_omp_static_chunk_bounds".into()),
+            vec![
+                lower,
+                upper,
+                step,
+                chunk_size,
+                thread_num,
+                team_size,
+                chunk_index,
+                first_addr,
+                last_addr,
+            ],
+            IrType::Int(IntWidth::I32),
+        )
+    } else {
+        b.call(
+            FuncRef::External("afs_omp_static_bounds".into()),
+            vec![
+                lower, upper, step, thread_num, team_size, first_addr, last_addr,
+            ],
+            IrType::Int(IntWidth::I32),
+        )
+    };
+    let zero = b.const_i32(0);
+    let invalid = b.icmp(CmpOp::Lt, status, zero);
+    b.cond_branch(invalid, error_bb, vec![], status_ok_bb, vec![]);
+
+    b.set_block(error_bb);
+    b.runtime_call(
+        crate::ir::inst::RuntimeFunc::ErrorStop,
+        vec![],
+        IrType::Void,
+    );
+    b.branch(done_bb, vec![]);
+
+    b.set_block(status_ok_bb);
+    let has_work = b.icmp(CmpOp::Gt, status, zero);
+    b.cond_branch(has_work, work_bb, vec![], done_bb, vec![]);
+
+    b.set_block(work_bb);
     let first_expr = Some(Spanned::new(
         Expr::Name {
             name: first_name.clone(),
@@ -665,7 +733,16 @@ fn lower_worksharing_loop(
     restore_temp_binding(ctx, last_name, saved_last);
     restore_temp_binding(ctx, step_name, saved_step);
     if b.func().block(b.current_block()).terminator.is_none() {
-        b.branch(done_bb, vec![]);
+        b.branch(advance_bb.unwrap_or(done_bb), vec![]);
+    }
+
+    if let (Some(advance_bb), Some(chunk_index_addr)) = (advance_bb, chunk_index_addr) {
+        b.set_block(advance_bb);
+        let chunk_index = b.load_typed(chunk_index_addr, IrType::Int(IntWidth::I64));
+        let one = b.const_i64(1);
+        let next_chunk = b.iadd(chunk_index, one);
+        b.store(next_chunk, chunk_index_addr);
+        b.branch(dispatch_bb, vec![]);
     }
 
     b.set_block(done_bb);
@@ -688,22 +765,25 @@ fn restore_temp_binding(ctx: &mut LowerCtx<'_>, name: String, saved: Option<Loca
 fn materialize_shared_environment(
     b: &mut FuncBuilder<'_>,
     captures: &[Capture],
+    worksharing_chunk: Option<ValueId>,
 ) -> MaterializedEnvironment {
     let addressed_count = captures
         .iter()
         .filter(|capture| capture_needs_environment(capture))
         .count();
-    if addressed_count == 0 {
+    let environment_slots = addressed_count + usize::from(worksharing_chunk.is_some());
+    if environment_slots == 0 {
         let null = b.const_i64(0);
         return MaterializedEnvironment {
             address: b.int_to_ptr(null, IrType::Int(IntWidth::I8)),
             cleanup_descriptors: Vec::new(),
+            worksharing_chunk_slot: None,
         };
     }
 
     let environment = b.alloca(IrType::Array(
         Box::new(IrType::Int(IntWidth::I64)),
-        addressed_count as u64,
+        environment_slots as u64,
     ));
     let mut cleanup_descriptors = Vec::new();
     let mut slot_index = 0i64;
@@ -782,10 +862,17 @@ fn materialize_shared_environment(
         b.store(raw_address, slot);
         slot_index += 1;
     }
+    let worksharing_chunk_slot = worksharing_chunk.map(|chunk_size| {
+        let index = b.const_i64(slot_index);
+        let slot = b.gep(environment, vec![index], IrType::Int(IntWidth::I64));
+        b.store(chunk_size, slot);
+        slot_index
+    });
     let raw_environment = b.ptr_to_int(environment);
     MaterializedEnvironment {
         address: b.int_to_ptr(raw_environment, IrType::Int(IntWidth::I8)),
         cleanup_descriptors,
+        worksharing_chunk_slot,
     }
 }
 

@@ -20995,8 +20995,8 @@ fn fopenmp_parallel_do_static_runs() {
         "program p
   use omp_lib, only: omp_get_thread_num
   implicit none
-  integer :: i, tid, seed
-  integer :: values(17), owners(10), sparse(3)
+  integer :: i, tid, seed, chunk
+  integer :: values(17), owners(10), sparse(3), cyclic(10)
   integer(kind=8) :: k
   i = -77
   seed = 100
@@ -21028,6 +21028,16 @@ fn fopenmp_parallel_do_static_runs() {
   end do
 !$omp end parallel do
   if (any(sparse /= [1,2,3])) error stop 4
+
+  chunk = 2
+  cyclic = -1
+!$omp parallel do default(none) num_threads(3) schedule(static,chunk) &
+!$omp& private(i) firstprivate(chunk) shared(cyclic)
+  do i = 1, 10
+    cyclic(i) = omp_get_thread_num()
+  end do
+!$omp end parallel do
+  if (any(cyclic /= [0,0,1,1,2,2,0,0,1,1])) error stop 5
   print *, 'ok'
 end program
 ",
@@ -21079,13 +21089,15 @@ fn fopenmp_standalone_do_static_barrier_and_nowait_run() {
         "program p
   use omp_lib, only: omp_get_thread_num
   implicit none
-  integer :: i, tid
-  integer :: values(19), more(8), passed(0:3)
+  integer :: i, tid, chunk
+  integer :: values(19), more(8), owners(10), passed(0:3)
   i = -91
   values = 0
   more = 0
+  owners = -1
   passed = 0
-!$omp parallel default(none) num_threads(4) private(tid) shared(values,more,passed)
+  chunk = 2
+!$omp parallel default(none) num_threads(4) private(tid) shared(values,more,owners,passed,chunk)
   tid = omp_get_thread_num()
 !$omp do schedule(static)
   do i = 19, 1, -2
@@ -21098,10 +21110,16 @@ fn fopenmp_standalone_do_static_barrier_and_nowait_run() {
     more(i) = i
   end do
 !$omp end do nowait
+!$omp do schedule(static,chunk)
+  do i = 10, 1, -1
+    owners(11-i) = tid
+  end do
+!$omp end do
 !$omp end parallel
   if (i /= -91) error stop 1
   if (any(passed /= 1)) error stop 2
   if (any(more /= [1,2,3,4,5,6,7,8])) error stop 3
+  if (any(owners /= [0,0,1,1,2,2,3,3,0,0])) error stop 4
   print *, 'ok'
 end program
 ",
@@ -21152,8 +21170,12 @@ fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
             "OpenMP SCHEDULE(DYNAMIC) is recognized but not yet implemented",
         ),
         (
-            "program p\ninteger :: i\n!$omp parallel do schedule(static,2)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
-            "OpenMP SCHEDULE(STATIC, chunk_size) is recognized but not yet implemented",
+            "program p\ninteger :: i\n!$omp parallel do schedule(static,0)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP SCHEDULE chunk size must be positive",
+        ),
+        (
+            "program p\ninteger :: i\n!$omp parallel do schedule(static,1.5)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP SCHEDULE chunk size must be a scalar INTEGER expression",
         ),
         (
             "program p\ninteger :: i\n!$omp parallel do\ndo i=1,4\nend do\n!$omp end parallel do nowait\nend program\n",
@@ -21189,7 +21211,7 @@ fn fopenmp_worksharing_emits_x86_64_elf_object() {
   implicit none
   integer :: i, values(9)
   values = 0
-!$omp parallel do num_threads(3) schedule(static)
+!$omp parallel do num_threads(3) schedule(static,2)
   do i = 9, 1, -1
     values(i) = i
   end do

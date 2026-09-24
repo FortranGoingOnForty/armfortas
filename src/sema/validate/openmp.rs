@@ -2,7 +2,8 @@
 //!
 //! The executable slice is intentionally narrow: `PARALLEL` data environments
 //! support selected numeric/logical storage, while canonical worksharing `DO`
-//! and combined `PARALLEL DO` support the initial contiguous static schedule.
+//! and combined `PARALLEL DO` support contiguous and explicit-chunk static
+//! schedules.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
 //! regions without pretending later schedules, loop clauses, characters, or
 //! derived objects are already implemented.
@@ -16,8 +17,8 @@ use crate::sema::symtab::{Intent, SymbolKind, SymbolTable, TypeInfo};
 
 use super::core::{
     collect_default_none_nested_block_references, collect_reference_stmts,
-    validation_explicit_dim_bounds, validation_expr_rank, validation_expr_type_info, Ctx,
-    ProcedureReferenceFacts,
+    validation_const_int_value, validation_explicit_dim_bounds, validation_expr_rank,
+    validation_expr_type_info, Ctx, ProcedureReferenceFacts,
 };
 
 pub(crate) use super::core::ReferenceRole;
@@ -236,16 +237,30 @@ fn validate_worksharing_loop(
         match clause {
             OpenMpClause::Schedule {
                 kind: OpenMpScheduleKind::Static,
-                chunk_size: None,
+                chunk_size,
+            } => {
+                if let Some(chunk_size) = chunk_size {
+                    if validation_expr_rank(ctx, chunk_size) != Some(0)
+                        || !matches!(
+                            validation_expr_type_info(ctx, chunk_size),
+                            Some(TypeInfo::Integer { .. })
+                        )
+                    {
+                        ctx.error(
+                            chunk_size.span,
+                            "OpenMP SCHEDULE chunk size must be a scalar INTEGER expression",
+                        );
+                    }
+                    if validation_const_int_value(ctx, chunk_size).is_some_and(|value| value <= 0)
+                    {
+                        ctx.error(
+                            chunk_size.span,
+                            "OpenMP SCHEDULE chunk size must be positive",
+                        );
+                    }
+                }
             }
-            | OpenMpClause::Nowait => {}
-            OpenMpClause::Schedule {
-                kind: OpenMpScheduleKind::Static,
-                chunk_size: Some(_),
-            } => ctx.error(
-                span,
-                "OpenMP SCHEDULE(STATIC, chunk_size) is recognized but not yet implemented",
-            ),
+            OpenMpClause::Nowait => {}
             OpenMpClause::Schedule { kind, .. } => ctx.error(
                 span,
                 format!(

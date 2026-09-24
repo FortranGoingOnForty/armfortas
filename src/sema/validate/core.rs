@@ -6917,7 +6917,7 @@ fn intrinsic_assignment_types_compatible(
     }
 }
 
-fn validation_const_int_value(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<i128> {
+pub(super) fn validation_const_int_value(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<i128> {
     eval_const_int_expr_checked(ctx, expr)
         .ok()
         .flatten()
