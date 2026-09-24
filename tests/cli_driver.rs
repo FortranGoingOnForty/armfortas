@@ -22583,6 +22583,91 @@ end program
 }
 
 #[test]
+fn fopenmp_shared_derived_arrays_preserve_component_ownership() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_shared_derived_arrays_preserve_component_ownership count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  type :: slot_t
+    integer :: stamp = -1
+    character(len=:), allocatable :: text
+  end type
+  type(slot_t), save :: fixed(0:3)
+  type(slot_t), allocatable :: dynamic(:)
+  integer :: tid
+  allocate(dynamic(-1:2))
+  fixed%stamp = -1
+  dynamic%stamp = -1
+!$omp parallel default(none) num_threads(4) private(tid) shared(fixed, dynamic)
+  tid = omp_get_thread_num()
+  fixed(tid)%stamp = 100 + tid
+  dynamic(tid-1)%stamp = 200 + tid
+  if (tid == 0) then
+    fixed(0)%text = 'fixed-zero'
+    dynamic(-1)%text = 'dynamic-zero'
+  else if (tid == 1) then
+    fixed(1)%text = 'fixed-one'
+    dynamic(0)%text = 'dynamic-one'
+  else if (tid == 2) then
+    fixed(2)%text = 'fixed-two'
+    dynamic(1)%text = 'dynamic-two'
+  else
+    fixed(3)%text = 'fixed-three'
+    dynamic(2)%text = 'dynamic-three'
+  end if
+!$omp end parallel
+  if (lbound(dynamic, 1) /= -1 .or. ubound(dynamic, 1) /= 2) error stop 1
+  if (any(fixed%stamp /= [100,101,102,103])) error stop 2
+  if (any(dynamic%stamp /= [200,201,202,203])) error stop 3
+  if (fixed(0)%text /= 'fixed-zero' .or. fixed(3)%text /= 'fixed-three') error stop 4
+  if (dynamic(-1)%text /= 'dynamic-zero' .or. dynamic(2)%text /= 'dynamic-three') error stop 5
+  if (.not. allocated(fixed(1)%text) .or. .not. allocated(dynamic(1)%text)) error stop 6
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_shared_derived_arrays", "bin");
+        let runtime_cache = unique_dir("openmp_shared_derived_arrays_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP shared derived arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP shared derived arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_shared_descriptor_backed_dummy_arrays_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -22983,8 +23068,8 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
         stderr.contains("shared variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")
             && stderr.contains("shared scalar allocatable or pointer 'scalar' is recognized but not yet implemented")
             && stderr.contains("shared scalar allocatable or pointer 'scalar_pointer' is recognized but not yet implemented")
-            && stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER elements")
-            && stderr.contains("shared array 'assumed_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER elements")
+            && stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
+            && stderr.contains("shared array 'assumed_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
             && stderr.contains("shared array 'assumed_rank' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy")
             && stderr.contains("shared OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")

@@ -917,11 +917,12 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
                 kind,
             }) if kind.unwrap_or(1) == 1
         );
-        if !supported_numeric_or_logical && !supported_character {
+        let supported_derived = matches!(symbol.type_info.as_ref(), Some(TypeInfo::Derived(_)));
+        if !supported_numeric_or_logical && !supported_character && !supported_derived {
             ctx.error(
                 span,
                 format!(
-                    "OpenMP PARALLEL shared array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER elements",
+                    "OpenMP PARALLEL shared array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements",
                     name
                 ),
             );
