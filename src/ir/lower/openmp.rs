@@ -50,6 +50,7 @@ struct Capture {
 struct MaterializedEnvironment {
     address: ValueId,
     cleanup_descriptors: Vec<ValueId>,
+    derived_snapshots: std::collections::HashMap<String, LocalInfo>,
     worksharing_chunk_slot: Option<i64>,
 }
 
@@ -646,6 +647,20 @@ fn lower_parallel_region(
         ],
         IrType::Int(IntWidth::I32),
     );
+    if !environment.derived_snapshots.is_empty() {
+        let closure_locals = ctx.locals.clone();
+        insert_implicit_dealloc(
+            b,
+            &environment.derived_snapshots,
+            &closure_locals,
+            ctx.type_layouts,
+            ctx.st,
+            ctx.internal_funcs,
+            Some(ctx.contained_host_refs),
+            None,
+            false,
+        );
+    }
     for descriptor in environment.cleanup_descriptors {
         deallocate_array_descriptor(b, descriptor);
     }
@@ -1244,6 +1259,7 @@ fn materialize_shared_environment(
         return MaterializedEnvironment {
             address: b.int_to_ptr(null, IrType::Int(IntWidth::I8)),
             cleanup_descriptors: Vec::new(),
+            derived_snapshots: std::collections::HashMap::new(),
             worksharing_chunk_slot: None,
         };
     }
@@ -1253,6 +1269,7 @@ fn materialize_shared_environment(
         environment_slots as u64,
     ));
     let mut cleanup_descriptors = Vec::new();
+    let mut derived_snapshots = std::collections::HashMap::new();
     let mut slot_index = 0i64;
     for capture in captures {
         if !capture_needs_environment(capture) {
@@ -1311,7 +1328,16 @@ fn materialize_shared_environment(
             let storage_ty = derived_storage_ir_type(type_name, type_layouts)
                 .expect("validated OpenMP firstprivate derived scalar has no storage layout");
             let snapshot = b.alloca(storage_ty);
+            let layout = type_layouts
+                .get(type_name)
+                .expect("validated OpenMP firstprivate derived scalar has no type layout");
+            initialize_derived_storage(b, snapshot, layout, type_layouts);
             emit_derived_value_copy(b, type_layouts, type_name, snapshot, outside_address);
+            let mut snapshot_info = capture.info.clone();
+            snapshot_info.addr = snapshot;
+            snapshot_info.by_ref = false;
+            snapshot_info.inline_const = None;
+            derived_snapshots.insert(capture.name.clone(), snapshot_info);
             snapshot
         } else if capture.kind == CaptureKind::FirstPrivate {
             let outside_address = if capture.info.by_ref {
@@ -1355,6 +1381,7 @@ fn materialize_shared_environment(
     MaterializedEnvironment {
         address: b.int_to_ptr(raw_environment, IrType::Int(IntWidth::I8)),
         cleanup_descriptors,
+        derived_snapshots,
         worksharing_chunk_slot,
     }
 }
