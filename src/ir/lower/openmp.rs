@@ -759,6 +759,7 @@ fn restore_scalar_reductions(ctx: &mut LowerCtx<'_>, bindings: &[ScalarReduction
 }
 
 struct CollapsedLoopSource<'a> {
+    inner_name: Option<&'a str>,
     inner_var: &'a str,
     inner_body: &'a [SpannedStmt],
     outer_lower: ValueId,
@@ -882,6 +883,7 @@ fn lower_worksharing_loop(
             unreachable!("non-perfect COLLAPSE(2) nest passed semantic validation")
         };
         let Stmt::DoLoop {
+            name: inner_name,
             var: Some(inner_var),
             start: Some(inner_start),
             end: Some(inner_end),
@@ -929,6 +931,7 @@ fn lower_worksharing_loop(
         upper = b.isub(total_count, one);
         schedule_step = one;
         CollapsedLoopSource {
+            inner_name: inner_name.as_deref(),
             inner_var,
             inner_body,
             outer_lower,
@@ -1086,6 +1089,9 @@ fn lower_worksharing_loop(
         var.clone()
     });
     let unnamed_loop = None;
+    let collapsed_cycle_name = collapsed
+        .as_ref()
+        .and_then(|collapsed| collapsed.inner_name.map(str::to_string));
     let lowered_body = if let (
         Some(collapsed),
         Some((flat_addr, _)),
@@ -1121,7 +1127,7 @@ fn lower_worksharing_loop(
         ctx,
         DoLoopFields {
             cycle_name: if collapsed.is_some() {
-                &unnamed_loop
+                &collapsed_cycle_name
             } else {
                 name
             },
