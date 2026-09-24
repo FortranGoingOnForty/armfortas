@@ -21369,6 +21369,97 @@ end program
 }
 
 #[test]
+fn fopenmp_parallel_do_dynamic_reductions_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_parallel_do_dynamic_reductions_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: i, j, chunk, total
+  integer :: values(23), reverse(10), matrix(2,3)
+  logical :: any_match
+  values = 0
+  any_match = .false.
+!$omp parallel do default(none) num_threads(4) schedule(dynamic) &
+!$omp& private(i) shared(values) reduction(.or.:any_match)
+  do i = 1, 23
+    values(i) = 2*i
+    any_match = any_match .or. (i == 17)
+  end do
+!$omp end parallel do
+  if (.not. any_match) error stop 1
+  do i = 1, 23
+    if (values(i) /= 2*i) error stop 2
+  end do
+
+  chunk = 3
+  total = 5
+  reverse = 0
+!$omp parallel do default(none) num_threads(3) schedule(dynamic,chunk) &
+!$omp& private(i) firstprivate(chunk) shared(reverse) reduction(+:total)
+  do i = 10, 1, -1
+    reverse(11-i) = i
+    total = total + i
+  end do
+!$omp end parallel do
+  if (total /= 60) error stop 3
+  if (any(reverse /= [10,9,8,7,6,5,4,3,2,1])) error stop 4
+
+  matrix = 0
+!$omp parallel do collapse(2) default(none) num_threads(3) schedule(dynamic,2) &
+!$omp& private(i,j) shared(matrix)
+  do i = 1, 2
+    do j = 3, 1, -1
+      matrix(i,4-j) = 10*i+j
+    end do
+  end do
+!$omp end parallel do
+  if (any(matrix(1,:) /= [13,12,11])) error stop 5
+  if (any(matrix(2,:) /= [23,22,21])) error stop 6
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_parallel_do_dynamic", "bin");
+        let runtime_cache = unique_dir("openmp_parallel_do_dynamic_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "dynamic OpenMP PARALLEL DO should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "dynamic OpenMP PARALLEL DO failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
     let cases = [
         (
@@ -21376,7 +21467,7 @@ fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
             "OpenMP DO must be closely nested inside an OpenMP PARALLEL region",
         ),
         (
-            "program p\ninteger :: i\n!$omp parallel do schedule(dynamic)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
+            "program p\ninteger :: i\n!$omp parallel\n!$omp do schedule(dynamic)\ndo i=1,4\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
             "OpenMP SCHEDULE(DYNAMIC) is recognized but not yet implemented",
         ),
         (
@@ -21466,7 +21557,7 @@ fn fopenmp_worksharing_emits_x86_64_elf_object() {
   integer :: i, j, values(3,3), total
   values = 0
   total = 7
-!$omp parallel do collapse(2) num_threads(3) schedule(static,2) reduction(+:total)
+!$omp parallel do collapse(2) num_threads(3) schedule(dynamic,2) reduction(+:total)
   do i = 3, 1, -1
     do j = 1, 3
       values(i,j) = i + j

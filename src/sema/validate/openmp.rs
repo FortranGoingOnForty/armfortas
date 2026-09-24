@@ -377,9 +377,12 @@ fn validate_worksharing_loop(
     for clause in clauses {
         match clause {
             OpenMpClause::Schedule {
-                kind: OpenMpScheduleKind::Static,
+                kind,
                 chunk_size,
-            } => {
+            }
+                if *kind == OpenMpScheduleKind::Static
+                    || (*kind == OpenMpScheduleKind::Dynamic && combined_do) =>
+            {
                 if let Some(chunk_size) = chunk_size {
                     if validation_expr_rank(ctx, chunk_size) != Some(0)
                         || !matches!(

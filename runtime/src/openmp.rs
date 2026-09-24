@@ -1,7 +1,7 @@
 //! ARMFORTAS-owned OpenMP host runtime ABI.
 //!
 //! ABI version 1 uses a synchronous, fixed-signature parallel-region call and
-//! compiler-private barrier/static-worksharing entry points:
+//! compiler-private barrier/worksharing entry points:
 //!
 //! ```text
 //! i32 afs_omp_parallel_region(entry, environment, if_value,
@@ -264,12 +264,18 @@ struct TeamContext {
     contention_group: Arc<ContentionGroup>,
     barrier: Arc<Barrier>,
     reduction: Arc<Mutex<ReductionWorkspace>>,
+    dynamic: Arc<Mutex<DynamicWorkspace>>,
 }
 
 #[derive(Debug, Default)]
 struct ReductionWorkspace {
     slots: Vec<i64>,
     result: i64,
+}
+
+#[derive(Debug, Default)]
+struct DynamicWorkspace {
+    next_index: i128,
 }
 
 #[derive(Debug, Default)]
@@ -390,6 +396,7 @@ fn run_implicit_task(
     contention_group: Arc<ContentionGroup>,
     barrier: Arc<Barrier>,
     reduction: Arc<Mutex<ReductionWorkspace>>,
+    dynamic: Arc<Mutex<DynamicWorkspace>>,
 ) {
     let _guard = enter_team(
         TeamContext {
@@ -399,6 +406,7 @@ fn run_implicit_task(
             contention_group,
             barrier,
             reduction,
+            dynamic,
         },
         inherited_requested_threads,
     );
@@ -447,6 +455,7 @@ pub extern "C" fn afs_omp_parallel_region(
     let environment = environment as usize;
     let barrier = Arc::new(Barrier::new(team_size as usize));
     let reduction = Arc::new(Mutex::new(ReductionWorkspace::default()));
+    let dynamic = Arc::new(Mutex::new(DynamicWorkspace::default()));
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         std::thread::scope(|scope| {
@@ -454,6 +463,7 @@ pub extern "C" fn afs_omp_parallel_region(
                 let contention_group = Arc::clone(&contention_group);
                 let barrier = Arc::clone(&barrier);
                 let reduction = Arc::clone(&reduction);
+                let dynamic = Arc::clone(&dynamic);
                 scope.spawn(move || {
                     run_implicit_task(
                         entry,
@@ -464,6 +474,7 @@ pub extern "C" fn afs_omp_parallel_region(
                         contention_group,
                         barrier,
                         reduction,
+                        dynamic,
                     );
                 });
             }
@@ -476,6 +487,7 @@ pub extern "C" fn afs_omp_parallel_region(
                 Arc::clone(&contention_group),
                 Arc::clone(&barrier),
                 Arc::clone(&reduction),
+                Arc::clone(&dynamic),
             );
         });
     }));
@@ -690,6 +702,65 @@ pub extern "C" fn afs_omp_static_chunk_bounds(
     }
     let first_index = global_chunk * chunk_size;
     let local_iterations = chunk_size.min(iterations - first_index);
+    let local_first = lower + first_index * step;
+    let local_last = local_first + (local_iterations - 1) * step;
+    debug_assert!(i64::try_from(local_first).is_ok());
+    debug_assert!(i64::try_from(local_last).is_ok());
+    unsafe {
+        *first = local_first as i64;
+        *last = local_last as i64;
+    }
+    1
+}
+
+/// Claim the next interval for `schedule(dynamic, chunk_size)`.
+///
+/// The logical iteration cursor belongs to the current team and is advanced
+/// while holding a short-lived mutex. Combined `parallel do` currently owns
+/// one such cursor for its entire synchronous region. i128 cursor arithmetic
+/// preserves every iteration of an i64-bounded Fortran loop, including ranges
+/// whose logical trip count is larger than `i64::MAX`.
+#[no_mangle]
+pub extern "C" fn afs_omp_dynamic_bounds(
+    lower: i64,
+    upper: i64,
+    step: i64,
+    chunk_size: i64,
+    first: *mut i64,
+    last: *mut i64,
+) -> i32 {
+    if step == 0 || chunk_size <= 0 || first.is_null() || last.is_null() {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+    let dynamic = THREAD_STATE.with(|state| {
+        state
+            .borrow()
+            .teams
+            .last()
+            .map(|team| Arc::clone(&team.dynamic))
+    });
+    let Some(dynamic) = dynamic else {
+        return -AFS_OMP_ERROR_NO_TEAM;
+    };
+
+    let lower = i128::from(lower);
+    let upper = i128::from(upper);
+    let step = i128::from(step);
+    let iterations = loop_iteration_count(lower, upper, step);
+    let chunk_size = i128::from(chunk_size);
+    let (first_index, local_iterations) = {
+        let mut workspace = dynamic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first_index = workspace.next_index;
+        if first_index >= iterations {
+            return 0;
+        }
+        let local_iterations = chunk_size.min(iterations - first_index);
+        workspace.next_index = first_index + local_iterations;
+        (first_index, local_iterations)
+    };
+
     let local_first = lower + first_index * step;
     let local_last = local_first + (local_iterations - 1) * step;
     debug_assert!(i64::try_from(local_first).is_ok());
@@ -1198,6 +1269,71 @@ mod tests {
                 -AFS_OMP_ERROR_INVALID_LOOP
             );
         }
+    }
+
+    #[derive(Default)]
+    struct DynamicObservations {
+        chunks: Mutex<Vec<(i64, i64)>>,
+    }
+
+    unsafe extern "C" fn claim_dynamic_chunks(
+        environment: *mut c_void,
+        _thread_num: i32,
+        _team_size: i32,
+    ) {
+        let observations = unsafe { &*(environment as *const DynamicObservations) };
+        loop {
+            let mut first = 0;
+            let mut last = 0;
+            let status = afs_omp_dynamic_bounds(10, -2, -3, 2, &mut first, &mut last);
+            assert!(status >= 0, "unexpected dynamic-bounds error {status}");
+            if status == 0 {
+                break;
+            }
+            observations.chunks.lock().unwrap().push((first, last));
+        }
+    }
+
+    #[test]
+    fn dynamic_bounds_claim_each_chunk_once_across_the_team() {
+        reset_thread_state();
+        let observations = DynamicObservations::default();
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(claim_dynamic_chunks),
+                &observations as *const DynamicObservations as *mut c_void,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        let mut chunks = observations.chunks.into_inner().unwrap();
+        chunks.sort_unstable();
+        assert_eq!(chunks, vec![(-2, -2), (4, 1), (10, 7)]);
+    }
+
+    #[test]
+    fn dynamic_bounds_reject_invalid_context_and_arguments() {
+        reset_thread_state();
+        let mut first = 0;
+        let mut last = 0;
+        assert_eq!(
+            afs_omp_dynamic_bounds(1, 10, 1, 1, &mut first, &mut last),
+            -AFS_OMP_ERROR_NO_TEAM
+        );
+        assert_eq!(
+            afs_omp_dynamic_bounds(1, 10, 0, 1, &mut first, &mut last),
+            -AFS_OMP_ERROR_INVALID_LOOP
+        );
+        assert_eq!(
+            afs_omp_dynamic_bounds(1, 10, 1, 0, &mut first, &mut last),
+            -AFS_OMP_ERROR_INVALID_LOOP
+        );
+        assert_eq!(
+            afs_omp_dynamic_bounds(1, 10, 1, 1, std::ptr::null_mut(), &mut last),
+            -AFS_OMP_ERROR_INVALID_LOOP
+        );
     }
 
     fn collapse2_shape(

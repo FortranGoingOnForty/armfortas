@@ -1,14 +1,15 @@
 //! Lowering for executable OpenMP constructs.
 //!
 //! Semantic validation admits `PARALLEL`, canonical static worksharing `DO`,
-//! and combined `PARALLEL DO` regions over the supported numeric/logical data
-//! environment. Parallel regions are outlined into the fixed callback shape
-//! owned by the ARMFORTAS OpenMP ABI and synchronously invoked through the
-//! runtime. Shared addresses, shared owning/non-owning array descriptors, and
-//! firstprivate snapshots live in a compiler-private environment whose
-//! lifetime is bounded by the synchronous join. Private objects live in each
-//! callback invocation, using inline storage below the compiler's stack
-//! threshold and owned descriptors above it.
+//! and combined `PARALLEL DO` regions with static or dynamic scheduling over
+//! the supported numeric/logical data environment. Parallel regions are
+//! outlined into the fixed callback shape owned by the ARMFORTAS OpenMP ABI
+//! and synchronously invoked through the runtime. Shared addresses, shared
+//! owning/non-owning array descriptors, and firstprivate snapshots live in a
+//! compiler-private environment whose lifetime is bounded by the synchronous
+//! join. Private objects live in each callback invocation, using inline
+//! storage below the compiler's stack threshold and owned descriptors above
+//! it.
 
 use crate::ast::expr::Expr;
 use crate::ast::openmp::{
@@ -351,7 +352,7 @@ fn lower_parallel_region(
                 requested_threads = coerce_to_type(b, raw, &IrType::Int(IntWidth::I32));
             }
             OpenMpClause::Schedule {
-                kind: OpenMpScheduleKind::Static,
+                kind: OpenMpScheduleKind::Static | OpenMpScheduleKind::Dynamic,
                 chunk_size: Some(chunk_size),
             } => {
                 // A combined construct evaluates the schedule expression in
@@ -808,9 +809,17 @@ fn lower_worksharing_loop(
         .iter()
         .any(|clause| matches!(clause, OpenMpClause::Nowait));
     let i64_ty = IrType::Int(IntWidth::I64);
+    let schedule_kind = clauses
+        .iter()
+        .find_map(|clause| match clause {
+            OpenMpClause::Schedule { kind, .. } => Some(*kind),
+            _ => None,
+        })
+        .unwrap_or(OpenMpScheduleKind::Static);
+    let dynamic_schedule = schedule_kind == OpenMpScheduleKind::Dynamic;
     let chunk_expr = clauses.iter().find_map(|clause| match clause {
         OpenMpClause::Schedule {
-            kind: OpenMpScheduleKind::Static,
+            kind: OpenMpScheduleKind::Static | OpenMpScheduleKind::Dynamic,
             chunk_size,
         } => chunk_size.as_ref(),
         _ => None,
@@ -821,6 +830,11 @@ fn lower_worksharing_loop(
             coerce_to_type(b, raw, &i64_ty)
         })
     });
+    let chunk_size = if dynamic_schedule && chunk_size.is_none() {
+        Some(b.const_i64(1))
+    } else {
+        chunk_size
+    };
 
     // Every implicit task computes the same source iteration space before
     // replacing either associated iteration variable with private storage.
@@ -908,12 +922,16 @@ fn lower_worksharing_loop(
     let last_addr = b.alloca(i64_ty.clone());
     let step_addr = b.alloca(i64_ty.clone());
     b.store(schedule_step, step_addr);
-    let chunk_index_addr = chunk_size.map(|_| {
-        let address = b.alloca(i64_ty.clone());
-        let zero = b.const_i64(0);
-        b.store(zero, address);
-        address
-    });
+    let chunk_index_addr = if dynamic_schedule {
+        None
+    } else {
+        chunk_size.map(|_| {
+            let address = b.alloca(i64_ty.clone());
+            let zero = b.const_i64(0);
+            b.store(zero, address);
+            address
+        })
+    };
 
     let first_name = "$afs_omp_first".to_string();
     let last_name = "$afs_omp_last".to_string();
@@ -947,7 +965,8 @@ fn lower_worksharing_loop(
     let dispatch_bb = b.create_block("omp_do_dispatch");
     let status_ok_bb = b.create_block("omp_do_status_ok");
     let work_bb = b.create_block("omp_do_work");
-    let advance_bb = chunk_size.map(|_| b.create_block("omp_do_next_chunk"));
+    let advance_bb =
+        (dynamic_schedule || chunk_size.is_some()).then(|| b.create_block("omp_do_next_chunk"));
     let done_bb = b.create_block("omp_do_done");
     if let Some(shape_status) = shape_status {
         let zero = b.const_i32(0);
@@ -958,8 +977,20 @@ fn lower_worksharing_loop(
     }
 
     b.set_block(dispatch_bb);
-    let status = if let (Some(chunk_size), Some(chunk_index_addr)) = (chunk_size, chunk_index_addr)
-    {
+    let status = if dynamic_schedule {
+        b.call(
+            FuncRef::External("afs_omp_dynamic_bounds".into()),
+            vec![
+                lower,
+                upper,
+                schedule_step,
+                chunk_size.expect("dynamic schedule is missing its default chunk size"),
+                first_addr,
+                last_addr,
+            ],
+            IrType::Int(IntWidth::I32),
+        )
+    } else if let (Some(chunk_size), Some(chunk_index_addr)) = (chunk_size, chunk_index_addr) {
         let chunk_index = b.load_typed(chunk_index_addr, IrType::Int(IntWidth::I64));
         b.call(
             FuncRef::External("afs_omp_static_chunk_bounds".into()),
@@ -1107,6 +1138,9 @@ fn lower_worksharing_loop(
         let one = b.const_i64(1);
         let next_chunk = b.iadd(chunk_index, one);
         b.store(next_chunk, chunk_index_addr);
+        b.branch(dispatch_bb, vec![]);
+    } else if let Some(advance_bb) = advance_bb {
+        b.set_block(advance_bb);
         b.branch(dispatch_bb, vec![]);
     }
 
