@@ -21003,14 +21003,19 @@ fn fopenmp_parallel_do_static_runs() {
   values = 0
 !$omp parallel do default(none) num_threads(4) schedule(static) &
 !$omp& private(i,tid) firstprivate(seed) shared(values)
-  do i = 1, 17
+  outer_work: do i = 1, 17
+    if (mod(i,5) == 0) cycle outer_work
     tid = omp_get_thread_num()
     values(i) = seed + i
-  end do
+  end do outer_work
 !$omp end parallel do
   if (i /= -77 .or. seed /= 100) error stop 1
   do i = 1, 17
-    if (values(i) /= 100 + i) error stop 2
+    if (mod(i,5) == 0) then
+      if (values(i) /= 0) error stop 2
+    else
+      if (values(i) /= 100 + i) error stop 2
+    end if
   end do
 
   owners = -1
@@ -21182,18 +21187,21 @@ fn fopenmp_collapse_two_static_runs() {
 !$omp parallel do collapse(depth) default(none) num_threads(3) schedule(static) &
 !$omp& private(i,j,tid) shared(values,owners)
   do i = 1_8, 3_8
-    do j = 8, 2, -2
+    inner_work: do j = 8, 2, -2
+      if (j == 6) cycle inner_work
       tid = omp_get_thread_num()
       values(int(i),(10-j)/2) = int(100_8*i) + j
       owners(int(i),(10-j)/2) = tid
-    end do
+    end do inner_work
   end do
 !$omp end parallel do
   if (i /= -91_8 .or. j /= -92) error stop 1
-  if (values(1,1) /= 108 .or. values(1,2) /= 106 .or. values(1,3) /= 104 .or. values(1,4) /= 102) error stop 2
-  if (values(2,1) /= 208 .or. values(2,2) /= 206 .or. values(2,3) /= 204 .or. values(2,4) /= 202) error stop 3
-  if (values(3,1) /= 308 .or. values(3,2) /= 306 .or. values(3,3) /= 304 .or. values(3,4) /= 302) error stop 4
-  if (any(owners(1,:) /= 0) .or. any(owners(2,:) /= 1) .or. any(owners(3,:) /= 2)) error stop 5
+  if (values(1,1) /= 108 .or. values(1,2) /= 0 .or. values(1,3) /= 104 .or. values(1,4) /= 102) error stop 2
+  if (values(2,1) /= 208 .or. values(2,2) /= 0 .or. values(2,3) /= 204 .or. values(2,4) /= 202) error stop 3
+  if (values(3,1) /= 308 .or. values(3,2) /= 0 .or. values(3,3) /= 304 .or. values(3,4) /= 302) error stop 4
+  if (owners(1,1) /= 0 .or. owners(1,2) /= -1 .or. owners(1,3) /= 0 .or. owners(1,4) /= 0) error stop 5
+  if (owners(2,1) /= 1 .or. owners(2,2) /= -1 .or. owners(2,3) /= 1 .or. owners(2,4) /= 1) error stop 5
+  if (owners(3,1) /= 2 .or. owners(3,2) /= -1 .or. owners(3,3) /= 2 .or. owners(3,4) /= 2) error stop 5
 
   values = 0
 !$omp parallel do collapse(1) num_threads(3) schedule(static) shared(values) private(i)
@@ -21269,6 +21277,420 @@ end program
 }
 
 #[test]
+fn fopenmp_scalar_integer_and_logical_reductions_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_scalar_integer_and_logical_reductions_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer(kind=1) :: isum
+  integer(kind=2) :: iprod
+  integer :: i, j, imax, count, untouched
+  integer(kind=8) :: imin, total
+  logical(kind=1) :: all_positive, saw_three
+  logical :: equivalence, inequivalence
+  isum = 5_1
+  iprod = 2_2
+  imax = -100
+  imin = 100_8
+  all_positive = .true.
+  saw_three = .false.
+  equivalence = .false.
+  inequivalence = .true.
+!$omp parallel do default(none) num_threads(2) schedule(static) private(i) &
+!$omp& reduction(+:isum) reduction(*:iprod) reduction(max:imax) reduction(min:imin) &
+!$omp& reduction(.and.:all_positive) reduction(.or.:saw_three) &
+!$omp& reduction(.eqv.:equivalence) reduction(.neqv.:inequivalence)
+  do i = 1, 4
+    isum = isum + int(i, kind=1)
+    iprod = iprod * int(i, kind=2)
+    imax = max(imax, i-3)
+    imin = min(imin, int(8-i, kind=8))
+    all_positive = all_positive .and. (i > 0)
+    saw_three = saw_three .or. (i == 3)
+    equivalence = equivalence .eqv. (mod(i,2) == 1)
+    inequivalence = inequivalence .neqv. (mod(i,2) == 1)
+  end do
+!$omp end parallel do
+  if (isum /= 15_1 .or. iprod /= 48_2) error stop 1
+  if (imax /= 1 .or. imin /= 4_8) error stop 2
+  if (.not. all_positive .or. .not. saw_three) error stop 3
+  if (equivalence .or. .not. inequivalence) error stop 4
+
+  count = 7
+  untouched = 13
+!$omp parallel default(none) num_threads(4) reduction(+:count,untouched)
+  count = count + 1
+!$omp end parallel
+  if (count /= 11 .or. untouched /= 13) error stop 5
+
+  total = 10_8
+!$omp parallel do collapse(2) default(none) num_threads(3) private(i,j) reduction(+:total)
+  do i = 1, 2
+    do j = 1, 3
+      total = total + int(10*i+j, kind=8)
+    end do
+  end do
+!$omp end parallel do
+  if (total /= 112_8) error stop 6
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_scalar_reductions", "bin");
+        let runtime_cache = unique_dir("openmp_scalar_reductions_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP scalar reductions should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP scalar reductions failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_parallel_do_dynamic_reductions_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_parallel_do_dynamic_reductions_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: i, j, chunk, total
+  integer :: values(23), reverse(10), matrix(2,3)
+  logical :: any_match
+  values = 0
+  any_match = .false.
+!$omp parallel do default(none) num_threads(4) schedule(dynamic) &
+!$omp& private(i) shared(values) reduction(.or.:any_match)
+  do i = 1, 23
+    if (mod(i,2) == 0) cycle
+    values(i) = 2*i
+    any_match = any_match .or. (i == 17)
+  end do
+!$omp end parallel do
+  if (.not. any_match) error stop 1
+  do i = 1, 23
+    if (mod(i,2) == 0) then
+      if (values(i) /= 0) error stop 2
+    else
+      if (values(i) /= 2*i) error stop 2
+    end if
+  end do
+
+  chunk = 3
+  total = 5
+  reverse = 0
+!$omp parallel do default(none) num_threads(3) schedule(dynamic,chunk) &
+!$omp& private(i) firstprivate(chunk) shared(reverse) reduction(+:total)
+  do i = 10, 1, -1
+    reverse(11-i) = i
+    total = total + i
+  end do
+!$omp end parallel do
+  if (total /= 60) error stop 3
+  if (any(reverse /= [10,9,8,7,6,5,4,3,2,1])) error stop 4
+
+  matrix = 0
+!$omp parallel do collapse(2) default(none) num_threads(3) schedule(dynamic,2) &
+!$omp& private(i,j) shared(matrix)
+  do i = 1, 2
+    do j = 3, 1, -1
+      matrix(i,4-j) = 10*i+j
+    end do
+  end do
+!$omp end parallel do
+  if (any(matrix(1,:) /= [13,12,11])) error stop 5
+  if (any(matrix(2,:) /= [23,22,21])) error stop 6
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_parallel_do_dynamic", "bin");
+        let runtime_cache = unique_dir("openmp_parallel_do_dynamic_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "dynamic OpenMP PARALLEL DO should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "dynamic OpenMP PARALLEL DO failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_named_and_unnamed_critical_regions_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_named_and_unnamed_critical_regions_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: i, named_count, unnamed_count
+  named_count = 0
+  unnamed_count = 0
+!$omp critical(serial_entry)
+  do i = 1, 4
+    if (mod(i,2) == 0) cycle
+    named_count = named_count + 1
+  end do
+!$omp end critical(serial_entry)
+!$omp parallel default(none) num_threads(4) private(i) shared(named_count,unnamed_count)
+  do i = 1, 500
+!$omp critical(Update_Count)
+    named_count = named_count + 1
+!$omp end critical(update_count)
+!$omp critical
+    unnamed_count = unnamed_count + 1
+!$omp end critical
+  end do
+!$omp end parallel
+  if (named_count /= 2002) error stop 1
+  if (unnamed_count /= 2000) error stop 2
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_critical", "bin");
+        let runtime_cache = unique_dir("openmp_critical_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP CRITICAL regions should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+            .expect("OpenMP CRITICAL binary timed out");
+        assert!(
+            run.status.success(),
+            "OpenMP CRITICAL regions failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_named_critical_identity_crosses_translation_units() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_named_critical_identity_crosses_translation_units count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("openmp_critical_cross_tu");
+    let state_src = write_program_in(
+        &dir,
+        "critical_state.f90",
+        "module critical_state
+  implicit none
+  integer :: count = 0
+  integer :: inside = 0
+  logical :: overlapped = .false.
+end module
+",
+    );
+    let left_src = write_program_in(
+        &dir,
+        "bump_left.f90",
+        "subroutine bump_left()
+  use iso_fortran_env, only: real64
+  use omp_lib, only: omp_get_wtime
+  use critical_state
+  implicit none
+  real(real64) :: deadline
+!$omp critical(Output_Lock)
+  inside = inside + 1
+  if (inside /= 1) overlapped = .true.
+  deadline = omp_get_wtime() + 0.00005_real64
+  do while (omp_get_wtime() < deadline)
+  end do
+  count = count + 1
+  inside = inside - 1
+!$omp end critical(Output_Lock)
+end subroutine
+",
+    );
+    let right_src = write_program_in(
+        &dir,
+        "bump_right.f90",
+        "subroutine bump_right()
+  use iso_fortran_env, only: real64
+  use omp_lib, only: omp_get_wtime
+  use critical_state
+  implicit none
+  real(real64) :: deadline
+!$omp critical(output_lock)
+  inside = inside + 1
+  if (inside /= 1) overlapped = .true.
+  deadline = omp_get_wtime() + 0.00005_real64
+  do while (omp_get_wtime() < deadline)
+  end do
+  count = count + 1
+  inside = inside - 1
+!$omp end critical(output_lock)
+end subroutine
+",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  use critical_state
+  implicit none
+  integer :: i
+!$omp parallel default(none) num_threads(4) private(i)
+  do i = 1, 25
+    if (mod(omp_get_thread_num(), 2) == 0) then
+      call bump_left()
+    else
+      call bump_right()
+    end if
+  end do
+!$omp end parallel
+  if (count /= 100) error stop 1
+  if (inside /= 0 .or. overlapped) error stop 2
+  print *, 'ok'
+end program
+",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let state_obj = dir.join(format!("critical_state_{opt}.o"));
+        let left_obj = dir.join(format!("bump_left_{opt}.o"));
+        let right_obj = dir.join(format!("bump_right_{opt}.o"));
+        let main_obj = dir.join(format!("main_{opt}.o"));
+        for (source, object) in [
+            (&state_src, &state_obj),
+            (&left_src, &left_obj),
+            (&right_src, &right_obj),
+            (&main_src, &main_obj),
+        ] {
+            let compile = Command::new(compiler("armfortas"))
+                .current_dir(&dir)
+                .args(["-fopenmp", opt, "-c", "-I"])
+                .arg(&dir)
+                .arg("-J")
+                .arg(&dir)
+                .arg(source)
+                .arg("-o")
+                .arg(object)
+                .output()
+                .expect("cross-TU OpenMP CRITICAL compile failed to spawn");
+            assert!(
+                compile.status.success(),
+                "{} should compile at {opt}: {}",
+                source.display(),
+                String::from_utf8_lossy(&compile.stderr)
+            );
+        }
+
+        let out = dir.join(format!("critical_cross_tu_{opt}.bin"));
+        let runtime_cache = dir.join(format!("runtime_cache_{opt}"));
+        let link = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .arg("-fopenmp")
+            .args([&state_obj, &left_obj, &right_obj, &main_obj])
+            .arg("-o")
+            .arg(&out)
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("cross-TU OpenMP CRITICAL link failed to spawn");
+        assert!(
+            link.status.success(),
+            "cross-TU OpenMP CRITICAL objects should link at {opt}: {}",
+            String::from_utf8_lossy(&link.stderr)
+        );
+        let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+            .expect("cross-TU OpenMP CRITICAL binary timed out");
+        assert!(
+            run.status.success(),
+            "cross-TU OpenMP CRITICAL failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
     let cases = [
         (
@@ -21276,8 +21698,24 @@ fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
             "OpenMP DO must be closely nested inside an OpenMP PARALLEL region",
         ),
         (
-            "program p\ninteger :: i\n!$omp parallel do schedule(dynamic)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
+            "program p\ninteger :: i\n!$omp parallel\n!$omp do schedule(dynamic)\ndo i=1,4\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
             "OpenMP SCHEDULE(DYNAMIC) is recognized but not yet implemented",
+        ),
+        (
+            "subroutine s\n!$omp critical\nreturn\n!$omp end critical\nend subroutine\n",
+            "RETURN is not yet supported inside an OpenMP structured block",
+        ),
+        (
+            "pure subroutine s\n!$omp critical\ncontinue\n!$omp end critical\nend subroutine\n",
+            "OpenMP CRITICAL is not allowed in a PURE procedure",
+        ),
+        (
+            "program p\ninteger :: i\nouter: do i=1,2\n!$omp critical\ncycle outer\n!$omp end critical\nend do outer\nend program\n",
+            "CYCLE is not yet supported inside an OpenMP structured block",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do collapse(2)\nouter: do i=1,2\ninner: do j=1,2\ncycle outer\nend do inner\nend do outer\n!$omp end parallel do\nend program\n",
+            "CYCLE is not yet supported inside an OpenMP structured block",
         ),
         (
             "program p\ninteger :: i\n!$omp parallel do schedule(static,0)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
@@ -21312,6 +21750,26 @@ fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
             "OpenMP PARALLEL DO associated iteration variables may not appear in SHARED",
         ),
         (
+            "program p\ninteger :: i\n!$omp parallel do reduction(+:i)\ndo i=1,4\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP PARALLEL DO associated iteration variables may not appear in REDUCTION",
+        ),
+        (
+            "program p\ninteger :: i,total\n!$omp parallel\n!$omp do reduction(+:total)\ndo i=1,4\ntotal=total+i\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
+            "OpenMP REDUCTION clause on standalone DO is recognized but not yet implemented",
+        ),
+        (
+            "program p\ninteger :: i\nreal :: total\n!$omp parallel do reduction(+:total)\ndo i=1,4\ntotal=total+real(i)\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP + REDUCTION currently requires a scalar INTEGER of kind 1, 2, 4, or 8",
+        ),
+        (
+            "program p\ninteger :: i,total(2)\n!$omp parallel do reduction(+:total)\ndo i=1,4\ntotal(1)=total(1)+i\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP REDUCTION variable 'total' must currently be a nonallocatable, nonpointer scalar",
+        ),
+        (
+            "program p\ninteger :: i,total\n!$omp parallel do shared(total) reduction(+:total)\ndo i=1,4\ntotal=total+i\nend do\n!$omp end parallel do\nend program\n",
+            "appears in both SHARED and REDUCTION data-sharing clauses",
+        ),
+        (
             "program p\ninteger :: i\n!$omp parallel do\ndo i=1,4\nend do\n!$omp end parallel do nowait\nend program\n",
             "OpenMP PARALLEL DO may not specify NOWAIT",
         ),
@@ -21343,12 +21801,16 @@ fn fopenmp_worksharing_emits_x86_64_elf_object() {
     let src = write_program(
         "program p
   implicit none
-  integer :: i, j, values(3,3)
+  integer :: i, j, values(3,3), total
   values = 0
-!$omp parallel do collapse(2) num_threads(3) schedule(static,2)
+  total = 7
+!$omp parallel do collapse(2) num_threads(3) schedule(dynamic,2) reduction(+:total)
   do i = 3, 1, -1
     do j = 1, 3
+!$omp critical(x86_worksharing)
       values(i,j) = i + j
+!$omp end critical(x86_worksharing)
+      total = total + values(i,j)
     end do
   end do
 !$omp end parallel do
@@ -22039,6 +22501,173 @@ fn fopenmp_shared_fixed_shape_arrays_run() {
 }
 
 #[test]
+fn fopenmp_shared_fixed_character_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_shared_fixed_character_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_shared_character_state
+  implicit none
+  character(len=8), save :: labels(0:3)
+end module
+program p
+  use omp_shared_character_state, only: labels
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  character(len=12), allocatable :: paths(:)
+  integer :: tid
+  allocate(paths(-1:2))
+  labels = 'missing'
+  paths = 'missing'
+!$omp parallel default(none) num_threads(4) private(tid) shared(labels, paths)
+  tid = omp_get_thread_num()
+  if (tid == 0) then
+    labels(0) = 'zero'
+    paths(-1) = 'path-zero'
+  else if (tid == 1) then
+    labels(1) = 'one'
+    paths(0) = 'path-one'
+  else if (tid == 2) then
+    labels(2) = 'two'
+    paths(1) = 'path-two'
+  else
+    labels(3) = 'three'
+    paths(2) = 'path-three'
+  end if
+!$omp end parallel
+  if (lbound(paths, 1) /= -1 .or. ubound(paths, 1) /= 2) error stop 1
+  if (labels(0) /= 'zero' .or. labels(1) /= 'one') error stop 2
+  if (labels(2) /= 'two' .or. labels(3) /= 'three') error stop 3
+  if (paths(-1) /= 'path-zero' .or. paths(0) /= 'path-one') error stop 4
+  if (paths(1) /= 'path-two' .or. paths(2) /= 'path-three') error stop 5
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_shared_fixed_character_arrays", "bin");
+        let runtime_cache = unique_dir("openmp_shared_fixed_character_arrays_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP shared fixed CHARACTER arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP shared fixed CHARACTER arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_shared_derived_arrays_preserve_component_ownership() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_shared_derived_arrays_preserve_component_ownership count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  type :: slot_t
+    integer :: stamp = -1
+    character(len=:), allocatable :: text
+  end type
+  type(slot_t), save :: fixed(0:3)
+  type(slot_t), allocatable :: dynamic(:)
+  integer :: tid
+  allocate(dynamic(-1:2))
+  fixed%stamp = -1
+  dynamic%stamp = -1
+!$omp parallel default(none) num_threads(4) private(tid) shared(fixed, dynamic)
+  tid = omp_get_thread_num()
+  fixed(tid)%stamp = 100 + tid
+  dynamic(tid-1)%stamp = 200 + tid
+  if (tid == 0) then
+    fixed(0)%text = 'fixed-zero'
+    dynamic(-1)%text = 'dynamic-zero'
+  else if (tid == 1) then
+    fixed(1)%text = 'fixed-one'
+    dynamic(0)%text = 'dynamic-one'
+  else if (tid == 2) then
+    fixed(2)%text = 'fixed-two'
+    dynamic(1)%text = 'dynamic-two'
+  else
+    fixed(3)%text = 'fixed-three'
+    dynamic(2)%text = 'dynamic-three'
+  end if
+!$omp end parallel
+  if (lbound(dynamic, 1) /= -1 .or. ubound(dynamic, 1) /= 2) error stop 1
+  if (any(fixed%stamp /= [100,101,102,103])) error stop 2
+  if (any(dynamic%stamp /= [200,201,202,203])) error stop 3
+  if (fixed(0)%text /= 'fixed-zero' .or. fixed(3)%text /= 'fixed-three') error stop 4
+  if (dynamic(-1)%text /= 'dynamic-zero' .or. dynamic(2)%text /= 'dynamic-three') error stop 5
+  if (.not. allocated(fixed(1)%text) .or. .not. allocated(dynamic(1)%text)) error stop 6
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_shared_derived_arrays", "bin");
+        let runtime_cache = unique_dir("openmp_shared_derived_arrays_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP shared derived arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP shared derived arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_shared_descriptor_backed_dummy_arrays_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -22175,9 +22804,360 @@ fn fopenmp_capture_free_parallel_regions_run() {
 }
 
 #[test]
+fn fopenmp_private_derived_scalars_initialize_and_finalize() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_derived_scalars_initialize_and_finalize count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_private_derived_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: finalized(0:3) = -1
+  type :: nested_state
+    integer :: stamp = 6
+  end type
+  type :: worker_state
+    type(nested_state) :: nested
+    integer :: value = 11
+    integer :: guard = 5
+  contains
+    final :: finish_worker
+  end type
+contains
+  subroutine finish_worker(state)
+    type(worker_state) :: state
+    finalized(omp_get_thread_num()) = state%value + state%nested%stamp + state%guard
+  end subroutine
+end module
+
+program p
+  use omp_private_derived_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  type(worker_state) :: state
+  integer :: i, tid, observed(0:3)
+  state%value = 900
+  state%nested%stamp = 100
+  state%guard = 700
+  observed = -1
+!$omp parallel do default(none) num_threads(4) schedule(static) &
+!$omp& private(state,tid) shared(observed)
+  do i = 1, 4
+    tid = omp_get_thread_num()
+    observed(tid) = state%value + state%nested%stamp + state%guard
+    state%value = 20 + tid
+    state%nested%stamp = 3
+  end do
+!$omp end parallel do
+  if (state%value /= 900 .or. state%nested%stamp /= 100 .or. state%guard /= 700) error stop 1
+  if (any(observed /= [22,22,22,22])) error stop 2
+  if (any(finalized /= [28,29,30,31])) error stop 3
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_derived", "bin");
+        let runtime_cache = unique_dir("openmp_private_derived_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PRIVATE derived scalars should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PRIVATE derived scalars failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_firstprivate_derived_scalars_copy_and_finalize() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_firstprivate_derived_scalars_copy_and_finalize count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_firstprivate_shadow
+  implicit none
+  type :: worker_state
+    integer :: unrelated = -99
+  end type
+end module
+
+module omp_firstprivate_derived_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: finalized(0:3) = -1
+  integer, target :: shared_target = 50
+  type :: nested_state
+    integer :: stamp = 6
+  end type
+  type :: worker_state
+    type(nested_state) :: nested
+    integer :: value = 11
+    integer, pointer :: reference => null()
+  contains
+    final :: finish_worker
+  end type
+contains
+  subroutine finish_worker(state)
+    type(worker_state) :: state
+    integer :: pointed
+    pointed = 0
+    if (associated(state%reference)) pointed = state%reference
+    finalized(omp_get_thread_num()) = state%value + state%nested%stamp + pointed
+  end subroutine
+end module
+
+program p
+  use omp_firstprivate_derived_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  type(worker_state) :: state
+  integer :: i, tid, observed(0:3)
+  state%value = 100
+  state%nested%stamp = 7
+  state%reference => shared_target
+  observed = -1
+!$omp parallel do default(none) num_threads(4) schedule(static) &
+!$omp& firstprivate(state) private(tid) shared(observed,shared_target)
+  do i = 1, 4
+    tid = omp_get_thread_num()
+    if (.not. associated(state%reference, shared_target)) error stop 1
+    observed(tid) = state%value + state%nested%stamp + state%reference
+    state%value = 20 + tid
+    state%nested%stamp = 3
+  end do
+!$omp end parallel do
+  if (state%value /= 100 .or. state%nested%stamp /= 7) error stop 2
+  if (.not. associated(state%reference, shared_target)) error stop 3
+  if (any(observed /= [157,157,157,157])) error stop 4
+  if (any(finalized /= [73,74,75,76])) error stop 5
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_firstprivate_derived", "bin");
+        let runtime_cache = unique_dir("openmp_firstprivate_derived_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP FIRSTPRIVATE derived scalars should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP FIRSTPRIVATE derived scalars failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_firstprivate_derived_scalars_deep_copy_allocatable_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_firstprivate_derived_scalars_deep_copy_allocatable_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_firstprivate_owning_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: finalized(0:3) = -1
+  type :: item_t
+    integer :: code = -1
+    character(len=:), allocatable :: payload
+  end type
+  type :: owning_state
+    type(item_t), allocatable :: items(:)
+    integer, allocatable :: values(:)
+    character(len=:), allocatable :: label
+  contains
+    final :: finish_state
+  end type
+contains
+  subroutine finish_state(state)
+    type(owning_state) :: state
+    integer :: tid
+    tid = omp_get_thread_num()
+    finalized(tid) = state%values(-1) + state%items(0)%code + &
+      len(state%items(0)%payload) + len(state%label)
+  end subroutine
+end module
+
+program p
+  use omp_firstprivate_owning_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  type(owning_state) :: state
+  integer :: i, tid, observed(0:3)
+  allocate(state%items(0:1), state%values(-1:0))
+  state%items(0)%code = 7
+  state%items(0)%payload = 'alpha'
+  state%items(1)%code = 8
+  state%items(1)%payload = 'beta'
+  state%values = [30, 40]
+  state%label = 'parent'
+  observed = -1
+!$omp parallel do default(none) num_threads(4) schedule(static) &
+!$omp& firstprivate(state) private(tid) shared(observed)
+  do i = 1, 4
+    tid = omp_get_thread_num()
+    if (lbound(state%items, 1) /= 0 .or. ubound(state%items, 1) /= 1) error stop 1
+    if (lbound(state%values, 1) /= -1 .or. ubound(state%values, 1) /= 0) error stop 2
+    observed(tid) = state%values(-1) + state%items(0)%code + &
+      len(state%items(0)%payload) + len(state%label)
+    state%values(-1) = 100 + tid
+    state%items(0)%code = 200 + tid
+    state%items(0)%payload = 'task'
+    state%label = 'copy'
+  end do
+!$omp end parallel do
+  if (any(observed /= [48,48,48,48])) error stop 3
+  if (any(finalized /= [308,310,312,314])) error stop 4
+  if (any(state%values /= [30,40])) error stop 5
+  if (state%items(0)%code /= 7 .or. state%items(1)%code /= 8) error stop 6
+  if (state%items(0)%payload /= 'alpha' .or. state%items(1)%payload /= 'beta') error stop 7
+  if (state%label /= 'parent') error stop 8
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_firstprivate_owning_derived", "bin");
+        let runtime_cache = unique_dir("openmp_firstprivate_owning_derived_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP FIRSTPRIVATE owning derived scalar should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP FIRSTPRIVATE owning derived scalar failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_rejects_unimplemented_derived_private_ownership() {
+    let src = write_program(
+        "program p
+  implicit none
+  type :: owning_state
+    integer, allocatable :: values(:)
+  end type
+  type :: assigned_state
+    integer :: value = 1
+  contains
+    procedure :: assign_state
+    generic :: assignment(=) => assign_state
+  end type
+  type(owning_state) :: owning
+  type(assigned_state) :: assigned
+!$omp parallel private(owning)
+  continue
+!$omp end parallel
+!$omp parallel firstprivate(assigned)
+  continue
+!$omp end parallel
+contains
+  subroutine assign_state(lhs, rhs)
+    class(assigned_state), intent(out) :: lhs
+    type(assigned_state), intent(in) :: rhs
+    lhs%value = rhs%value
+  end subroutine
+end program
+",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-fopenmp"]);
+    assert!(
+        !result.status.success(),
+        "unsupported derived private ownership compiled silently"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(
+            "OpenMP PRIVATE derived-type variable 'owning' with allocatable components is recognized but not yet implemented"
+        ) && stderr.contains(
+            "OpenMP FIRSTPRIVATE derived-type variable 'assigned' with type-bound defined assignment is recognized but not yet implemented"
+        ),
+        "unexpected diagnostic: {stderr}"
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let src = write_program(
-        "program p\n  implicit none\n  character(len=3) :: text, words(2)\n  character(len=3), allocatable :: dynamic_words(:)\n  integer, allocatable :: scalar, values(:)\n  integer, pointer :: scalar_pointer\n  integer, target :: target_values(2)\n  integer, volatile :: volatile_values(2)\n  text = 'abc'\n  allocate(scalar, values(2))\n  allocate(dynamic_words(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(scalar, scalar_pointer)\n  scalar = 1\n!$omp end parallel\n!$omp parallel shared(dynamic_words)\n  dynamic_words(1) = 'abc'\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\n!$omp parallel firstprivate(words)\n  continue\n!$omp end parallel\n!$omp parallel private(values)\n  continue\n!$omp end parallel\n!$omp parallel private(target_values)\n  continue\n!$omp end parallel\n!$omp parallel private(volatile_values)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_private_dummy(dummy_values)\n    integer, intent(inout) :: dummy_values(2)\n!$omp parallel private(dummy_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_automatic(n)\n    integer, intent(in) :: n\n    integer :: automatic_values(n)\n!$omp parallel firstprivate(automatic_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
+        "program p\n  implicit none\n  character(len=3) :: text, words(2)\n  character(len=:), allocatable :: dynamic_words(:)\n  integer, allocatable :: scalar, values(:)\n  integer, pointer :: scalar_pointer\n  integer, target :: target_values(2)\n  integer, volatile :: volatile_values(2)\n  text = 'abc'\n  allocate(scalar, values(2))\n  allocate(character(len=3) :: dynamic_words(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(scalar, scalar_pointer)\n  scalar = 1\n!$omp end parallel\n!$omp parallel shared(dynamic_words)\n  dynamic_words(1) = 'abc'\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\n!$omp parallel firstprivate(words)\n  continue\n!$omp end parallel\n!$omp parallel private(values)\n  continue\n!$omp end parallel\n!$omp parallel private(target_values)\n  continue\n!$omp end parallel\n!$omp parallel private(volatile_values)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_character(assumed_words)\n    character(len=*), intent(inout) :: assumed_words(:)\n!$omp parallel shared(assumed_words)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_private_dummy(dummy_values)\n    integer, intent(inout) :: dummy_values(2)\n!$omp parallel private(dummy_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_automatic(n)\n    integer, intent(in) :: n\n    integer :: automatic_values(n)\n!$omp parallel firstprivate(automatic_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
         "f90",
     );
     let result = diagnostic_output(&src, &["-fopenmp"]);
@@ -22190,7 +23170,8 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
         stderr.contains("shared variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")
             && stderr.contains("shared scalar allocatable or pointer 'scalar' is recognized but not yet implemented")
             && stderr.contains("shared scalar allocatable or pointer 'scalar_pointer' is recognized but not yet implemented")
-            && stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
+            && stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
+            && stderr.contains("shared array 'assumed_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
             && stderr.contains("shared array 'assumed_rank' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy")
             && stderr.contains("shared OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")

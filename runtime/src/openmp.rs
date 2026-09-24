@@ -1,7 +1,7 @@
 //! ARMFORTAS-owned OpenMP host runtime ABI.
 //!
 //! ABI version 1 uses a synchronous, fixed-signature parallel-region call and
-//! compiler-private barrier/static-worksharing entry points:
+//! compiler-private barrier/worksharing entry points:
 //!
 //! ```text
 //! i32 afs_omp_parallel_region(entry, environment, if_value,
@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, OnceLock};
+use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 pub const AFS_OMP_ABI_VERSION: u32 = 1;
@@ -29,6 +29,17 @@ pub const AFS_OMP_ERROR_UNSUPPORTED_FLAGS: i32 = 2;
 pub const AFS_OMP_ERROR_TEAM_PANIC: i32 = 3;
 pub const AFS_OMP_ERROR_NO_TEAM: i32 = 4;
 pub const AFS_OMP_ERROR_INVALID_LOOP: i32 = 5;
+pub const AFS_OMP_ERROR_INVALID_REDUCTION: i32 = 6;
+pub const AFS_OMP_ERROR_INVALID_CRITICAL: i32 = 7;
+
+pub const AFS_OMP_REDUCTION_ADD: i32 = 1;
+pub const AFS_OMP_REDUCTION_MULTIPLY: i32 = 2;
+pub const AFS_OMP_REDUCTION_MAX: i32 = 3;
+pub const AFS_OMP_REDUCTION_MIN: i32 = 4;
+pub const AFS_OMP_REDUCTION_AND: i32 = 5;
+pub const AFS_OMP_REDUCTION_OR: i32 = 6;
+pub const AFS_OMP_REDUCTION_EQV: i32 = 7;
+pub const AFS_OMP_REDUCTION_NEQV: i32 = 8;
 
 pub type AfsOmpRegionEntry = unsafe extern "C" fn(*mut c_void, i32, i32);
 
@@ -253,6 +264,19 @@ struct TeamContext {
     active: bool,
     contention_group: Arc<ContentionGroup>,
     barrier: Arc<Barrier>,
+    reduction: Arc<Mutex<ReductionWorkspace>>,
+    dynamic: Arc<Mutex<DynamicWorkspace>>,
+}
+
+#[derive(Debug, Default)]
+struct ReductionWorkspace {
+    slots: Vec<i64>,
+    result: i64,
+}
+
+#[derive(Debug, Default)]
+struct DynamicWorkspace {
+    next_index: i128,
 }
 
 #[derive(Debug, Default)]
@@ -372,6 +396,8 @@ fn run_implicit_task(
     inherited_requested_threads: i32,
     contention_group: Arc<ContentionGroup>,
     barrier: Arc<Barrier>,
+    reduction: Arc<Mutex<ReductionWorkspace>>,
+    dynamic: Arc<Mutex<DynamicWorkspace>>,
 ) {
     let _guard = enter_team(
         TeamContext {
@@ -380,6 +406,8 @@ fn run_implicit_task(
             active: team_size > 1,
             contention_group,
             barrier,
+            reduction,
+            dynamic,
         },
         inherited_requested_threads,
     );
@@ -427,12 +455,16 @@ pub extern "C" fn afs_omp_parallel_region(
     let team_size = i32::try_from(reserved_threads.saturating_add(1)).unwrap_or(i32::MAX);
     let environment = environment as usize;
     let barrier = Arc::new(Barrier::new(team_size as usize));
+    let reduction = Arc::new(Mutex::new(ReductionWorkspace::default()));
+    let dynamic = Arc::new(Mutex::new(DynamicWorkspace::default()));
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         std::thread::scope(|scope| {
             for thread_num in 1..team_size {
                 let contention_group = Arc::clone(&contention_group);
                 let barrier = Arc::clone(&barrier);
+                let reduction = Arc::clone(&reduction);
+                let dynamic = Arc::clone(&dynamic);
                 scope.spawn(move || {
                     run_implicit_task(
                         entry,
@@ -442,6 +474,8 @@ pub extern "C" fn afs_omp_parallel_region(
                         inherited_requested_threads,
                         contention_group,
                         barrier,
+                        reduction,
+                        dynamic,
                     );
                 });
             }
@@ -453,6 +487,8 @@ pub extern "C" fn afs_omp_parallel_region(
                 inherited_requested_threads,
                 Arc::clone(&contention_group),
                 Arc::clone(&barrier),
+                Arc::clone(&reduction),
+                Arc::clone(&dynamic),
             );
         });
     }));
@@ -482,6 +518,163 @@ pub extern "C" fn afs_omp_barrier() -> i32 {
         return AFS_OMP_ERROR_NO_TEAM;
     };
     barrier.wait();
+    AFS_OMP_SUCCESS
+}
+
+#[derive(Debug, Default)]
+struct CriticalLock {
+    held: Mutex<bool>,
+    available: Condvar,
+}
+
+fn critical_lock(name: *const u8, name_len: i64) -> Result<Arc<CriticalLock>, i32> {
+    let Ok(name_len) = usize::try_from(name_len) else {
+        return Err(AFS_OMP_ERROR_INVALID_CRITICAL);
+    };
+    if name_len > 0 && name.is_null() {
+        return Err(AFS_OMP_ERROR_INVALID_CRITICAL);
+    }
+    let mut key = if name_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(name, name_len) }.to_vec()
+    };
+    key.make_ascii_lowercase();
+
+    static LOCKS: OnceLock<Mutex<std::collections::HashMap<Vec<u8>, Arc<CriticalLock>>>> =
+        OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(Arc::clone(locks.entry(key).or_default()))
+}
+
+/// Enter a named or unnamed OpenMP critical region.
+///
+/// Lock identity is process-wide and based on the case-insensitive Fortran
+/// name bytes. A zero-length name denotes the single global unnamed critical
+/// region. The registry lives in the runtime rather than generated objects so
+/// separately compiled procedures resolve the same name to the same lock.
+#[no_mangle]
+pub extern "C" fn afs_omp_critical_enter(name: *const u8, name_len: i64) -> i32 {
+    let Ok(lock) = critical_lock(name, name_len) else {
+        return AFS_OMP_ERROR_INVALID_CRITICAL;
+    };
+    let mut held = lock
+        .held
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *held {
+        held = lock
+            .available
+            .wait(held)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    *held = true;
+    AFS_OMP_SUCCESS
+}
+
+/// Leave the matching OpenMP critical region.
+#[no_mangle]
+pub extern "C" fn afs_omp_critical_exit(name: *const u8, name_len: i64) -> i32 {
+    let Ok(lock) = critical_lock(name, name_len) else {
+        return AFS_OMP_ERROR_INVALID_CRITICAL;
+    };
+    let mut held = lock
+        .held
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !*held {
+        return AFS_OMP_ERROR_INVALID_CRITICAL;
+    }
+    *held = false;
+    drop(held);
+    lock.available.notify_one();
+    AFS_OMP_SUCCESS
+}
+
+fn combine_i64_reduction(operator: i32, left: i64, right: i64) -> Option<i64> {
+    match operator {
+        AFS_OMP_REDUCTION_ADD => Some(left.wrapping_add(right)),
+        AFS_OMP_REDUCTION_MULTIPLY => Some(left.wrapping_mul(right)),
+        AFS_OMP_REDUCTION_MAX => Some(left.max(right)),
+        AFS_OMP_REDUCTION_MIN => Some(left.min(right)),
+        AFS_OMP_REDUCTION_AND => Some(i64::from(left != 0 && right != 0)),
+        AFS_OMP_REDUCTION_OR => Some(i64::from(left != 0 || right != 0)),
+        AFS_OMP_REDUCTION_EQV => Some(i64::from((left != 0) == (right != 0))),
+        AFS_OMP_REDUCTION_NEQV => Some(i64::from((left != 0) != (right != 0))),
+        _ => None,
+    }
+}
+
+/// Combine one signed-integer or logical private value across the current team.
+///
+/// Every implicit task must call this entry point in the same order. Values are
+/// stored by thread number and thread zero combines the original value followed
+/// by private values in ascending thread-number order. The two team barriers
+/// make the result available to every caller before the workspace is reused by
+/// a later reduction.
+#[no_mangle]
+pub extern "C" fn afs_omp_reduce_i64(
+    operator: i32,
+    private_value: i64,
+    original_value: i64,
+    result: *mut i64,
+) -> i32 {
+    if result.is_null() || combine_i64_reduction(operator, 0, 0).is_none() {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    }
+    let context = THREAD_STATE.with(|state| {
+        let state = state.borrow();
+        state.teams.last().map(|team| {
+            (
+                team.thread_num,
+                team.team_size,
+                Arc::clone(&team.barrier),
+                Arc::clone(&team.reduction),
+            )
+        })
+    });
+    let Some((thread_num, team_size, barrier, reduction)) = context else {
+        return AFS_OMP_ERROR_NO_TEAM;
+    };
+
+    {
+        let mut workspace = reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let team_size = usize::try_from(team_size).unwrap_or(0);
+        if workspace.slots.len() != team_size {
+            workspace.slots.resize(team_size, 0);
+        }
+        workspace.slots[thread_num as usize] = private_value;
+    }
+    barrier.wait();
+
+    if thread_num == 0 {
+        let mut workspace = reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        workspace.result =
+            workspace
+                .slots
+                .iter()
+                .copied()
+                .fold(original_value, |combined, value| {
+                    combine_i64_reduction(operator, combined, value)
+                        .expect("validated OpenMP reduction operator became invalid")
+                });
+    }
+    barrier.wait();
+
+    let combined = reduction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .result;
+    unsafe {
+        *result = combined;
+    }
     AFS_OMP_SUCCESS
 }
 
@@ -583,6 +776,65 @@ pub extern "C" fn afs_omp_static_chunk_bounds(
     }
     let first_index = global_chunk * chunk_size;
     let local_iterations = chunk_size.min(iterations - first_index);
+    let local_first = lower + first_index * step;
+    let local_last = local_first + (local_iterations - 1) * step;
+    debug_assert!(i64::try_from(local_first).is_ok());
+    debug_assert!(i64::try_from(local_last).is_ok());
+    unsafe {
+        *first = local_first as i64;
+        *last = local_last as i64;
+    }
+    1
+}
+
+/// Claim the next interval for `schedule(dynamic, chunk_size)`.
+///
+/// The logical iteration cursor belongs to the current team and is advanced
+/// while holding a short-lived mutex. Combined `parallel do` currently owns
+/// one such cursor for its entire synchronous region. i128 cursor arithmetic
+/// preserves every iteration of an i64-bounded Fortran loop, including ranges
+/// whose logical trip count is larger than `i64::MAX`.
+#[no_mangle]
+pub extern "C" fn afs_omp_dynamic_bounds(
+    lower: i64,
+    upper: i64,
+    step: i64,
+    chunk_size: i64,
+    first: *mut i64,
+    last: *mut i64,
+) -> i32 {
+    if step == 0 || chunk_size <= 0 || first.is_null() || last.is_null() {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+    let dynamic = THREAD_STATE.with(|state| {
+        state
+            .borrow()
+            .teams
+            .last()
+            .map(|team| Arc::clone(&team.dynamic))
+    });
+    let Some(dynamic) = dynamic else {
+        return -AFS_OMP_ERROR_NO_TEAM;
+    };
+
+    let lower = i128::from(lower);
+    let upper = i128::from(upper);
+    let step = i128::from(step);
+    let iterations = loop_iteration_count(lower, upper, step);
+    let chunk_size = i128::from(chunk_size);
+    let (first_index, local_iterations) = {
+        let mut workspace = dynamic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first_index = workspace.next_index;
+        if first_index >= iterations {
+            return 0;
+        }
+        let local_iterations = chunk_size.min(iterations - first_index);
+        workspace.next_index = first_index + local_iterations;
+        (first_index, local_iterations)
+    };
+
     let local_first = lower + first_index * step;
     let local_last = local_first + (local_iterations - 1) * step;
     debug_assert!(i64::try_from(local_first).is_ok());
@@ -793,7 +1045,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
-    use std::sync::Mutex;
 
     fn reset_thread_state() {
         THREAD_STATE.with(|state| *state.borrow_mut() = ThreadState::default());
@@ -898,6 +1149,141 @@ mod tests {
         assert!(observations
             .all_arrived_after_barrier
             .load(Ordering::SeqCst));
+    }
+
+    struct CriticalObservations {
+        counter: AtomicUsize,
+    }
+
+    unsafe extern "C" fn critical_task(
+        environment: *mut c_void,
+        _thread_num: i32,
+        _team_size: i32,
+    ) {
+        let observations = unsafe { &*(environment as *const CriticalObservations) };
+        for _ in 0..500 {
+            assert_eq!(
+                afs_omp_critical_enter(b"OUTPUT_LOCK".as_ptr(), 11),
+                AFS_OMP_SUCCESS
+            );
+            let value = observations.counter.load(Ordering::Relaxed);
+            std::thread::yield_now();
+            observations.counter.store(value + 1, Ordering::Relaxed);
+            assert_eq!(
+                afs_omp_critical_exit(b"output_lock".as_ptr(), 11),
+                AFS_OMP_SUCCESS
+            );
+        }
+    }
+
+    #[test]
+    fn named_critical_serializes_a_team_with_process_wide_identity() {
+        reset_thread_state();
+        let observations = CriticalObservations {
+            counter: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(critical_task),
+                &observations as *const CriticalObservations as *mut c_void,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(observations.counter.load(Ordering::Relaxed), 2_000);
+    }
+
+    #[test]
+    fn critical_runtime_supports_unnamed_regions_and_rejects_invalid_calls() {
+        assert_eq!(afs_omp_critical_enter(std::ptr::null(), 0), AFS_OMP_SUCCESS);
+        assert_eq!(afs_omp_critical_exit(b"".as_ptr(), 0), AFS_OMP_SUCCESS);
+        assert_eq!(
+            afs_omp_critical_enter(std::ptr::null(), 1),
+            AFS_OMP_ERROR_INVALID_CRITICAL
+        );
+        assert_eq!(
+            afs_omp_critical_enter(b"invalid".as_ptr(), -1),
+            AFS_OMP_ERROR_INVALID_CRITICAL
+        );
+        assert_eq!(
+            afs_omp_critical_exit(b"not_held".as_ptr(), 8),
+            AFS_OMP_ERROR_INVALID_CRITICAL
+        );
+    }
+
+    #[derive(Default)]
+    struct ReductionObservations {
+        values: Mutex<Vec<(i32, [i64; 8])>>,
+    }
+
+    unsafe extern "C" fn reduce_task(environment: *mut c_void, thread_num: i32, _team_size: i32) {
+        let observations = unsafe { &*(environment as *const ReductionObservations) };
+        let mut values = [0; 8];
+        let private = i64::from(thread_num) + 1;
+        let inputs = [
+            (AFS_OMP_REDUCTION_ADD, private, 10),
+            (AFS_OMP_REDUCTION_MULTIPLY, private, 2),
+            (AFS_OMP_REDUCTION_MAX, i64::from(thread_num) - 2, -9),
+            (AFS_OMP_REDUCTION_MIN, i64::from(thread_num) - 2, 9),
+            (AFS_OMP_REDUCTION_AND, i64::from(thread_num != 3), 1),
+            (AFS_OMP_REDUCTION_OR, i64::from(thread_num == 2), 0),
+            (AFS_OMP_REDUCTION_EQV, i64::from(thread_num % 2 == 0), 1),
+            (AFS_OMP_REDUCTION_NEQV, i64::from(thread_num % 2 == 0), 0),
+        ];
+        for (index, (operator, private, original)) in inputs.into_iter().enumerate() {
+            assert_eq!(
+                afs_omp_reduce_i64(operator, private, original, &mut values[index]),
+                AFS_OMP_SUCCESS
+            );
+        }
+        observations
+            .values
+            .lock()
+            .unwrap()
+            .push((thread_num, values));
+    }
+
+    #[test]
+    fn integer_and_logical_reductions_combine_in_thread_order() {
+        reset_thread_state();
+        let observations = ReductionObservations::default();
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(reduce_task),
+                &observations as *const ReductionObservations as *mut c_void,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        let mut values = observations.values.into_inner().unwrap();
+        values.sort_unstable_by_key(|(thread_num, _)| *thread_num);
+        assert_eq!(values.len(), 4);
+        for (_, values) in values {
+            assert_eq!(values, [20, 48, 1, -2, 0, 1, 1, 0]);
+        }
+    }
+
+    #[test]
+    fn reduction_runtime_rejects_invalid_context_or_arguments() {
+        reset_thread_state();
+        let mut result = -1;
+        assert_eq!(
+            afs_omp_reduce_i64(AFS_OMP_REDUCTION_ADD, 1, 2, &mut result),
+            AFS_OMP_ERROR_NO_TEAM
+        );
+        assert_eq!(
+            afs_omp_reduce_i64(99, 1, 2, &mut result),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(
+            afs_omp_reduce_i64(AFS_OMP_REDUCTION_ADD, 1, 2, std::ptr::null_mut()),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(result, -1);
     }
 
     fn static_bounds(
@@ -1019,6 +1405,71 @@ mod tests {
                 -AFS_OMP_ERROR_INVALID_LOOP
             );
         }
+    }
+
+    #[derive(Default)]
+    struct DynamicObservations {
+        chunks: Mutex<Vec<(i64, i64)>>,
+    }
+
+    unsafe extern "C" fn claim_dynamic_chunks(
+        environment: *mut c_void,
+        _thread_num: i32,
+        _team_size: i32,
+    ) {
+        let observations = unsafe { &*(environment as *const DynamicObservations) };
+        loop {
+            let mut first = 0;
+            let mut last = 0;
+            let status = afs_omp_dynamic_bounds(10, -2, -3, 2, &mut first, &mut last);
+            assert!(status >= 0, "unexpected dynamic-bounds error {status}");
+            if status == 0 {
+                break;
+            }
+            observations.chunks.lock().unwrap().push((first, last));
+        }
+    }
+
+    #[test]
+    fn dynamic_bounds_claim_each_chunk_once_across_the_team() {
+        reset_thread_state();
+        let observations = DynamicObservations::default();
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(claim_dynamic_chunks),
+                &observations as *const DynamicObservations as *mut c_void,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        let mut chunks = observations.chunks.into_inner().unwrap();
+        chunks.sort_unstable();
+        assert_eq!(chunks, vec![(-2, -2), (4, 1), (10, 7)]);
+    }
+
+    #[test]
+    fn dynamic_bounds_reject_invalid_context_and_arguments() {
+        reset_thread_state();
+        let mut first = 0;
+        let mut last = 0;
+        assert_eq!(
+            afs_omp_dynamic_bounds(1, 10, 1, 1, &mut first, &mut last),
+            -AFS_OMP_ERROR_NO_TEAM
+        );
+        assert_eq!(
+            afs_omp_dynamic_bounds(1, 10, 0, 1, &mut first, &mut last),
+            -AFS_OMP_ERROR_INVALID_LOOP
+        );
+        assert_eq!(
+            afs_omp_dynamic_bounds(1, 10, 1, 0, &mut first, &mut last),
+            -AFS_OMP_ERROR_INVALID_LOOP
+        );
+        assert_eq!(
+            afs_omp_dynamic_bounds(1, 10, 1, 1, std::ptr::null_mut(), &mut last),
+            -AFS_OMP_ERROR_INVALID_LOOP
+        );
     }
 
     fn collapse2_shape(

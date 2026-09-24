@@ -1,17 +1,20 @@
 //! Lowering for executable OpenMP constructs.
 //!
 //! Semantic validation admits `PARALLEL`, canonical static worksharing `DO`,
-//! and combined `PARALLEL DO` regions over the supported numeric/logical data
-//! environment. Parallel regions are outlined into the fixed callback shape
-//! owned by the ARMFORTAS OpenMP ABI and synchronously invoked through the
-//! runtime. Shared addresses, shared owning/non-owning array descriptors, and
-//! firstprivate snapshots live in a compiler-private environment whose
-//! lifetime is bounded by the synchronous join. Private objects live in each
-//! callback invocation, using inline storage below the compiler's stack
-//! threshold and owned descriptors above it.
+//! and combined `PARALLEL DO` regions with static or dynamic scheduling over
+//! the supported numeric/logical data environment. Parallel regions are
+//! outlined into the fixed callback shape owned by the ARMFORTAS OpenMP ABI
+//! and synchronously invoked through the runtime. Shared addresses, shared
+//! owning/non-owning array descriptors, and firstprivate snapshots live in a
+//! compiler-private environment whose lifetime is bounded by the synchronous
+//! join. Private objects live in each callback invocation, using inline
+//! storage below the compiler's stack threshold and owned descriptors above
+//! it.
 
 use crate::ast::expr::Expr;
-use crate::ast::openmp::{OpenMpClause, OpenMpConstruct, OpenMpScheduleKind};
+use crate::ast::openmp::{
+    OpenMpClause, OpenMpConstruct, OpenMpReductionOperator, OpenMpScheduleKind,
+};
 use crate::ast::stmt::{SpannedStmt, Stmt};
 use crate::ast::Spanned;
 use crate::ir::builder::FuncBuilder;
@@ -21,7 +24,8 @@ use crate::ir::types::{IntWidth, IrType};
 use super::alloc::rewrite_heap_promoted_declared_bounds;
 use super::core::{
     array_base_addr, array_descriptor_addr, collect_format_labels, collect_label_blocks,
-    emit_memcpy_bytes, ensure_termination, ir_scalar_byte_size, local_declared_rank,
+    derived_storage_ir_type, emit_derived_value_copy, emit_memcpy_bytes, ensure_termination,
+    initialize_derived_storage, insert_implicit_dealloc, ir_scalar_byte_size, local_declared_rank,
     local_uses_array_descriptor, lower_do_loop, materialize_array_descriptor_for_info,
     materialize_array_section_source_descriptor, DoLoopBody, DoLoopFields,
 };
@@ -46,7 +50,21 @@ struct Capture {
 struct MaterializedEnvironment {
     address: ValueId,
     cleanup_descriptors: Vec<ValueId>,
+    derived_snapshots: std::collections::HashMap<String, LocalInfo>,
     worksharing_chunk_slot: Option<i64>,
+}
+
+#[derive(Default)]
+struct InstalledCaptureCleanup {
+    array_descriptors: Vec<ValueId>,
+    private_derived_scalars: std::collections::HashMap<String, LocalInfo>,
+}
+
+struct ScalarReductionBinding {
+    name: String,
+    operator: OpenMpReductionOperator,
+    shared: LocalInfo,
+    private: LocalInfo,
 }
 
 const PRIVATE_ARRAY_STACK_THRESHOLD: i64 = 64 * 1024;
@@ -304,10 +322,33 @@ pub(super) fn lower_construct(
                 ParallelRegionBody::WorksharingDo { clauses, loop_stmt },
             );
         }
-        OpenMpConstruct::Critical { .. } => unreachable!(
-            "unsupported OpenMP {} construct passed semantic validation",
-            construct.name()
-        ),
+        OpenMpConstruct::Critical { name, body } => {
+            lower_critical_region(b, ctx, name.as_deref(), body)
+        }
+    }
+}
+
+fn lower_critical_region(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    name: Option<&str>,
+    body: &[SpannedStmt],
+) {
+    let name = name.unwrap_or_default().to_ascii_lowercase();
+    let name_ptr = b.const_string(name.as_bytes());
+    let name_len = b.const_i64(name.len() as i64);
+    b.call(
+        FuncRef::External("afs_omp_critical_enter".into()),
+        vec![name_ptr, name_len],
+        IrType::Int(IntWidth::I32),
+    );
+    super::stmt::lower_stmts(b, ctx, body);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.call(
+            FuncRef::External("afs_omp_critical_exit".into()),
+            vec![name_ptr, name_len],
+            IrType::Int(IntWidth::I32),
+        );
     }
 }
 
@@ -342,7 +383,7 @@ fn lower_parallel_region(
                 requested_threads = coerce_to_type(b, raw, &IrType::Int(IntWidth::I32));
             }
             OpenMpClause::Schedule {
-                kind: OpenMpScheduleKind::Static,
+                kind: OpenMpScheduleKind::Static | OpenMpScheduleKind::Dynamic,
                 chunk_size: Some(chunk_size),
             } => {
                 // A combined construct evaluates the schedule expression in
@@ -356,7 +397,8 @@ fn lower_parallel_region(
             | OpenMpClause::FirstPrivate(_)
             | OpenMpClause::Default(_)
             | OpenMpClause::Schedule { .. }
-            | OpenMpClause::Collapse(_) => {}
+            | OpenMpClause::Collapse(_)
+            | OpenMpClause::Reduction { .. } => {}
             _ => unreachable!("unsupported OpenMP PARALLEL clause passed semantic validation"),
         }
     }
@@ -391,7 +433,7 @@ fn lower_parallel_region(
     let predetermined_private =
         crate::sema::validate::openmp::predetermined_private_names(ctx.st, capture_body);
     let mut seen_captures = std::collections::HashSet::new();
-    let captures: Vec<Capture> =
+    let mut captures: Vec<Capture> =
         crate::sema::validate::openmp::capture_references(ctx.st, capture_body)
             .into_iter()
             .filter(|(name, _, role)| {
@@ -430,7 +472,43 @@ fn lower_parallel_region(
                 Capture { name, info, kind }
             })
             .collect();
-    let environment = materialize_shared_environment(b, &captures, worksharing_chunk);
+    for clause in clauses {
+        let OpenMpClause::Reduction { variables, .. } = clause else {
+            continue;
+        };
+        for name in variables {
+            let key = name.to_ascii_lowercase();
+            if !seen_captures.insert(key.clone()) {
+                continue;
+            }
+            let info = ctx.locals.get(&key).cloned().unwrap_or_else(|| {
+                panic!("validated OpenMP reduction capture '{key}' has no lowering binding")
+            });
+            captures.push(Capture {
+                name: key,
+                info,
+                kind: CaptureKind::Shared,
+            });
+        }
+    }
+    for capture in &mut captures {
+        let Some(type_name) = capture.info.derived_type.as_deref() else {
+            continue;
+        };
+        let canonical = ctx
+            .proc_scope_id
+            .and_then(|scope| ctx.type_layouts.canonical_name_for_scope(scope, type_name))
+            .or_else(|| {
+                ctx.type_layouts
+                    .get(type_name)
+                    .map(|layout| ctx.type_layouts.canonical_key_for_layout(layout))
+            });
+        if let Some(canonical) = canonical {
+            capture.info.derived_type = Some(canonical);
+        }
+    }
+    let environment =
+        materialize_shared_environment(b, &captures, worksharing_chunk, ctx.type_layouts);
     let worksharing_chunk_slot = environment.worksharing_chunk_slot;
 
     let callback_name = ctx.next_openmp_region_name();
@@ -483,8 +561,13 @@ fn lower_parallel_region(
         {
             let mut outlined = FuncBuilder::new(&mut callback, ctx.layout);
             outlined.set_local_modules(local_modules);
-            let cleanup_descriptors =
-                install_shared_captures(&mut outlined, &mut outlined_ctx, &captures);
+            let cleanup = install_shared_captures(&mut outlined, &mut outlined_ctx, &captures);
+            let parallel_reductions = match region_body {
+                ParallelRegionBody::Statements(_) => {
+                    prepare_scalar_reductions(&mut outlined, &mut outlined_ctx, clauses)
+                }
+                ParallelRegionBody::WorksharingDo { .. } => Vec::new(),
+            };
             let outlined_worksharing_chunk = worksharing_chunk_slot.map(|slot_index| {
                 let raw_environment = outlined.ptr_to_int(ValueId(0));
                 let environment_slots =
@@ -520,7 +603,22 @@ fn lower_parallel_region(
                 .terminator
                 .is_none()
             {
-                for descriptor in cleanup_descriptors {
+                finish_scalar_reductions(&mut outlined, &parallel_reductions, ValueId(1));
+                if !cleanup.private_derived_scalars.is_empty() {
+                    let closure_locals = outlined_ctx.locals.clone();
+                    insert_implicit_dealloc(
+                        &mut outlined,
+                        &cleanup.private_derived_scalars,
+                        &closure_locals,
+                        outlined_ctx.type_layouts,
+                        outlined_ctx.st,
+                        outlined_ctx.internal_funcs,
+                        Some(outlined_ctx.contained_host_refs),
+                        None,
+                        true,
+                    );
+                }
+                for descriptor in cleanup.array_descriptors {
                     deallocate_array_descriptor(&mut outlined, descriptor);
                 }
             }
@@ -549,12 +647,171 @@ fn lower_parallel_region(
         ],
         IrType::Int(IntWidth::I32),
     );
+    if !environment.derived_snapshots.is_empty() {
+        let closure_locals = ctx.locals.clone();
+        insert_implicit_dealloc(
+            b,
+            &environment.derived_snapshots,
+            &closure_locals,
+            ctx.type_layouts,
+            ctx.st,
+            ctx.internal_funcs,
+            Some(ctx.contained_host_refs),
+            None,
+            false,
+        );
+    }
     for descriptor in environment.cleanup_descriptors {
         deallocate_array_descriptor(b, descriptor);
     }
 }
 
+fn reduction_runtime_operator(operator: OpenMpReductionOperator) -> i32 {
+    match operator {
+        OpenMpReductionOperator::Add => 1,
+        OpenMpReductionOperator::Multiply => 2,
+        OpenMpReductionOperator::Max => 3,
+        OpenMpReductionOperator::Min => 4,
+        OpenMpReductionOperator::And => 5,
+        OpenMpReductionOperator::Or => 6,
+        OpenMpReductionOperator::Eqv => 7,
+        OpenMpReductionOperator::Neqv => 8,
+    }
+}
+
+fn scalar_reduction_identity(
+    b: &mut FuncBuilder<'_>,
+    operator: OpenMpReductionOperator,
+    info: &LocalInfo,
+) -> ValueId {
+    if info.logical_kind.is_some() || info.ty == IrType::Bool {
+        let identity = matches!(
+            operator,
+            OpenMpReductionOperator::And | OpenMpReductionOperator::Eqv
+        );
+        let value = b.const_bool(identity);
+        return coerce_to_type(b, value, &info.ty);
+    }
+
+    let IrType::Int(width) = &info.ty else {
+        unreachable!("non-integer OpenMP scalar reduction passed semantic validation")
+    };
+    let bits = width.bits();
+    let (least, greatest) = if bits == 128 {
+        (i128::MIN, i128::MAX)
+    } else {
+        let magnitude = 1_i128 << (bits - 1);
+        (-magnitude, magnitude - 1)
+    };
+    let value = match operator {
+        OpenMpReductionOperator::Multiply => 1,
+        OpenMpReductionOperator::Max => least,
+        OpenMpReductionOperator::Min => greatest,
+        OpenMpReductionOperator::Add => 0,
+        _ => unreachable!("logical OpenMP reduction applied to INTEGER"),
+    };
+    b.const_int(value, *width)
+}
+
+fn prepare_scalar_reductions(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    clauses: &[OpenMpClause],
+) -> Vec<ScalarReductionBinding> {
+    let mut bindings = Vec::new();
+    for clause in clauses {
+        let OpenMpClause::Reduction {
+            operator,
+            variables,
+        } = clause
+        else {
+            continue;
+        };
+        for name in variables {
+            let key = name.to_ascii_lowercase();
+            let shared = ctx.locals.get(&key).cloned().unwrap_or_else(|| {
+                panic!("validated OpenMP reduction variable '{key}' has no lowering binding")
+            });
+            let mut private = shared.clone();
+            private.addr = b.alloca(private.ty.clone());
+            private.by_ref = false;
+            private.inline_const = None;
+            let identity = scalar_reduction_identity(b, *operator, &private);
+            b.store(identity, private.addr);
+            ctx.locals.insert(key.clone(), private.clone());
+            bindings.push(ScalarReductionBinding {
+                name: key,
+                operator: *operator,
+                shared,
+                private,
+            });
+        }
+    }
+    bindings
+}
+
+fn scalar_storage_address(b: &mut FuncBuilder<'_>, info: &LocalInfo) -> ValueId {
+    if info.by_ref {
+        b.load(info.addr)
+    } else {
+        info.addr
+    }
+}
+
+fn finish_scalar_reductions(
+    b: &mut FuncBuilder<'_>,
+    bindings: &[ScalarReductionBinding],
+    thread_num: ValueId,
+) {
+    for binding in bindings {
+        let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
+        let private = coerce_to_type(b, private, &IrType::Int(IntWidth::I64));
+        let shared_address = scalar_storage_address(b, &binding.shared);
+        let original = b.load_typed(shared_address, binding.shared.ty.clone());
+        let original = coerce_to_type(b, original, &IrType::Int(IntWidth::I64));
+        let result_address = b.alloca(IrType::Int(IntWidth::I64));
+        let operator = b.const_i32(reduction_runtime_operator(binding.operator));
+        let status = b.call(
+            FuncRef::External("afs_omp_reduce_i64".into()),
+            vec![operator, private, original, result_address],
+            IrType::Int(IntWidth::I32),
+        );
+        let zero = b.const_i32(0);
+        let invalid = b.icmp(CmpOp::Ne, status, zero);
+        let error_bb = b.create_block("omp_reduction_invalid");
+        let ready_bb = b.create_block("omp_reduction_ready");
+        b.cond_branch(invalid, error_bb, vec![], ready_bb, vec![]);
+        b.set_block(error_bb);
+        b.runtime_call(
+            crate::ir::inst::RuntimeFunc::ErrorStop,
+            vec![],
+            IrType::Void,
+        );
+        b.branch(ready_bb, vec![]);
+
+        b.set_block(ready_bb);
+        let thread_zero = b.icmp(CmpOp::Eq, thread_num, zero);
+        let store_bb = b.create_block("omp_reduction_store");
+        let done_bb = b.create_block("omp_reduction_done");
+        b.cond_branch(thread_zero, store_bb, vec![], done_bb, vec![]);
+        b.set_block(store_bb);
+        let result = b.load_typed(result_address, IrType::Int(IntWidth::I64));
+        let result = coerce_to_type(b, result, &binding.shared.ty);
+        b.store(result, shared_address);
+        b.branch(done_bb, vec![]);
+        b.set_block(done_bb);
+    }
+}
+
+fn restore_scalar_reductions(ctx: &mut LowerCtx<'_>, bindings: &[ScalarReductionBinding]) {
+    for binding in bindings {
+        ctx.locals
+            .insert(binding.name.clone(), binding.shared.clone());
+    }
+}
+
 struct CollapsedLoopSource<'a> {
+    inner_name: Option<&'a str>,
     inner_var: &'a str,
     inner_body: &'a [SpannedStmt],
     outer_lower: ValueId,
@@ -628,9 +885,17 @@ fn lower_worksharing_loop(
         .iter()
         .any(|clause| matches!(clause, OpenMpClause::Nowait));
     let i64_ty = IrType::Int(IntWidth::I64);
+    let schedule_kind = clauses
+        .iter()
+        .find_map(|clause| match clause {
+            OpenMpClause::Schedule { kind, .. } => Some(*kind),
+            _ => None,
+        })
+        .unwrap_or(OpenMpScheduleKind::Static);
+    let dynamic_schedule = schedule_kind == OpenMpScheduleKind::Dynamic;
     let chunk_expr = clauses.iter().find_map(|clause| match clause {
         OpenMpClause::Schedule {
-            kind: OpenMpScheduleKind::Static,
+            kind: OpenMpScheduleKind::Static | OpenMpScheduleKind::Dynamic,
             chunk_size,
         } => chunk_size.as_ref(),
         _ => None,
@@ -641,6 +906,11 @@ fn lower_worksharing_loop(
             coerce_to_type(b, raw, &i64_ty)
         })
     });
+    let chunk_size = if dynamic_schedule && chunk_size.is_none() {
+        Some(b.const_i64(1))
+    } else {
+        chunk_size
+    };
 
     // Every implicit task computes the same source iteration space before
     // replacing either associated iteration variable with private storage.
@@ -665,6 +935,7 @@ fn lower_worksharing_loop(
             unreachable!("non-perfect COLLAPSE(2) nest passed semantic validation")
         };
         let Stmt::DoLoop {
+            name: inner_name,
             var: Some(inner_var),
             start: Some(inner_start),
             end: Some(inner_end),
@@ -712,6 +983,7 @@ fn lower_worksharing_loop(
         upper = b.isub(total_count, one);
         schedule_step = one;
         CollapsedLoopSource {
+            inner_name: inner_name.as_deref(),
             inner_var,
             inner_body,
             outer_lower,
@@ -722,17 +994,22 @@ fn lower_worksharing_loop(
             inner_count,
         }
     });
+    let reductions = prepare_scalar_reductions(b, ctx, clauses);
 
     let first_addr = b.alloca(i64_ty.clone());
     let last_addr = b.alloca(i64_ty.clone());
     let step_addr = b.alloca(i64_ty.clone());
     b.store(schedule_step, step_addr);
-    let chunk_index_addr = chunk_size.map(|_| {
-        let address = b.alloca(i64_ty.clone());
-        let zero = b.const_i64(0);
-        b.store(zero, address);
-        address
-    });
+    let chunk_index_addr = if dynamic_schedule {
+        None
+    } else {
+        chunk_size.map(|_| {
+            let address = b.alloca(i64_ty.clone());
+            let zero = b.const_i64(0);
+            b.store(zero, address);
+            address
+        })
+    };
 
     let first_name = "$afs_omp_first".to_string();
     let last_name = "$afs_omp_last".to_string();
@@ -766,7 +1043,8 @@ fn lower_worksharing_loop(
     let dispatch_bb = b.create_block("omp_do_dispatch");
     let status_ok_bb = b.create_block("omp_do_status_ok");
     let work_bb = b.create_block("omp_do_work");
-    let advance_bb = chunk_size.map(|_| b.create_block("omp_do_next_chunk"));
+    let advance_bb =
+        (dynamic_schedule || chunk_size.is_some()).then(|| b.create_block("omp_do_next_chunk"));
     let done_bb = b.create_block("omp_do_done");
     if let Some(shape_status) = shape_status {
         let zero = b.const_i32(0);
@@ -777,8 +1055,20 @@ fn lower_worksharing_loop(
     }
 
     b.set_block(dispatch_bb);
-    let status = if let (Some(chunk_size), Some(chunk_index_addr)) = (chunk_size, chunk_index_addr)
-    {
+    let status = if dynamic_schedule {
+        b.call(
+            FuncRef::External("afs_omp_dynamic_bounds".into()),
+            vec![
+                lower,
+                upper,
+                schedule_step,
+                chunk_size.expect("dynamic schedule is missing its default chunk size"),
+                first_addr,
+                last_addr,
+            ],
+            IrType::Int(IntWidth::I32),
+        )
+    } else if let (Some(chunk_size), Some(chunk_index_addr)) = (chunk_size, chunk_index_addr) {
         let chunk_index = b.load_typed(chunk_index_addr, IrType::Int(IntWidth::I64));
         b.call(
             FuncRef::External("afs_omp_static_chunk_bounds".into()),
@@ -851,6 +1141,9 @@ fn lower_worksharing_loop(
         var.clone()
     });
     let unnamed_loop = None;
+    let collapsed_cycle_name = collapsed
+        .as_ref()
+        .and_then(|collapsed| collapsed.inner_name.map(str::to_string));
     let lowered_body = if let (
         Some(collapsed),
         Some((flat_addr, _)),
@@ -886,7 +1179,7 @@ fn lower_worksharing_loop(
         ctx,
         DoLoopFields {
             cycle_name: if collapsed.is_some() {
-                &unnamed_loop
+                &collapsed_cycle_name
             } else {
                 name
             },
@@ -915,6 +1208,7 @@ fn lower_worksharing_loop(
     restore_temp_binding(ctx, first_name, saved_first);
     restore_temp_binding(ctx, last_name, saved_last);
     restore_temp_binding(ctx, step_name, saved_step);
+    restore_scalar_reductions(ctx, &reductions);
     if b.func().block(b.current_block()).terminator.is_none() {
         b.branch(advance_bb.unwrap_or(done_bb), vec![]);
     }
@@ -926,9 +1220,13 @@ fn lower_worksharing_loop(
         let next_chunk = b.iadd(chunk_index, one);
         b.store(next_chunk, chunk_index_addr);
         b.branch(dispatch_bb, vec![]);
+    } else if let Some(advance_bb) = advance_bb {
+        b.set_block(advance_bb);
+        b.branch(dispatch_bb, vec![]);
     }
 
     b.set_block(done_bb);
+    finish_scalar_reductions(b, &reductions, thread_num);
     if !suppress_barrier && !nowait {
         b.call(
             FuncRef::External("afs_omp_barrier".into()),
@@ -949,6 +1247,7 @@ fn materialize_shared_environment(
     b: &mut FuncBuilder<'_>,
     captures: &[Capture],
     worksharing_chunk: Option<ValueId>,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> MaterializedEnvironment {
     let addressed_count = captures
         .iter()
@@ -960,6 +1259,7 @@ fn materialize_shared_environment(
         return MaterializedEnvironment {
             address: b.int_to_ptr(null, IrType::Int(IntWidth::I8)),
             cleanup_descriptors: Vec::new(),
+            derived_snapshots: std::collections::HashMap::new(),
             worksharing_chunk_slot: None,
         };
     }
@@ -969,6 +1269,7 @@ fn materialize_shared_environment(
         environment_slots as u64,
     ));
     let mut cleanup_descriptors = Vec::new();
+    let mut derived_snapshots = std::collections::HashMap::new();
     let mut slot_index = 0i64;
     for capture in captures {
         if !capture_needs_environment(capture) {
@@ -1013,6 +1314,31 @@ fn materialize_shared_environment(
             copy_array_data(b, &snapshot, source, descriptor_copy);
             cleanup_descriptors.extend(cleanup);
             snapshot.addr
+        } else if capture.kind == CaptureKind::FirstPrivate && capture.info.derived_type.is_some() {
+            let outside_address = if capture.info.by_ref {
+                b.load(capture.info.addr)
+            } else {
+                capture.info.addr
+            };
+            let type_name = capture
+                .info
+                .derived_type
+                .as_deref()
+                .expect("derived FIRSTPRIVATE capture lost its type name");
+            let storage_ty = derived_storage_ir_type(type_name, type_layouts)
+                .expect("validated OpenMP firstprivate derived scalar has no storage layout");
+            let snapshot = b.alloca(storage_ty);
+            let layout = type_layouts
+                .get(type_name)
+                .expect("validated OpenMP firstprivate derived scalar has no type layout");
+            initialize_derived_storage(b, snapshot, layout, type_layouts);
+            emit_derived_value_copy(b, type_layouts, type_name, snapshot, outside_address);
+            let mut snapshot_info = capture.info.clone();
+            snapshot_info.addr = snapshot;
+            snapshot_info.by_ref = false;
+            snapshot_info.inline_const = None;
+            derived_snapshots.insert(capture.name.clone(), snapshot_info);
+            snapshot
         } else if capture.kind == CaptureKind::FirstPrivate {
             let outside_address = if capture.info.by_ref {
                 b.load(capture.info.addr)
@@ -1055,6 +1381,7 @@ fn materialize_shared_environment(
     MaterializedEnvironment {
         address: b.int_to_ptr(raw_environment, IrType::Int(IntWidth::I8)),
         cleanup_descriptors,
+        derived_snapshots,
         worksharing_chunk_slot,
     }
 }
@@ -1063,9 +1390,9 @@ fn install_shared_captures(
     b: &mut FuncBuilder<'_>,
     ctx: &mut LowerCtx<'_>,
     captures: &[Capture],
-) -> Vec<ValueId> {
+) -> InstalledCaptureCleanup {
     let mut slot_index = 0i64;
-    let mut cleanup_descriptors = Vec::new();
+    let mut cleanup = InstalledCaptureCleanup::default();
     let environment_slots = if captures.iter().any(capture_needs_environment) {
         let raw_environment = b.ptr_to_int(ValueId(0));
         Some(b.int_to_ptr(raw_environment, IrType::Int(IntWidth::I64)))
@@ -1101,19 +1428,32 @@ fn install_shared_captures(
                         raw_address,
                         IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392),
                     );
-                    let (private, cleanup) =
+                    let (private, cleanup_descriptor) =
                         allocate_allocatable_private(b, &capture.info, shape_snapshot, false);
                     local = private;
-                    cleanup_descriptors.push(cleanup);
+                    cleanup.array_descriptors.push(cleanup_descriptor);
                     slot_index += 1;
                 } else if !is_array(&capture.info) {
-                    local.addr = b.alloca(capture.info.ty.clone());
+                    let storage_ty = local
+                        .derived_type
+                        .as_deref()
+                        .and_then(|name| derived_storage_ir_type(name, ctx.type_layouts))
+                        .unwrap_or_else(|| capture.info.ty.clone());
+                    local.addr = b.alloca(storage_ty);
                     local.by_ref = false;
                     local.inline_const = None;
+                    if let Some(type_name) = local.derived_type.as_deref() {
+                        let layout = ctx
+                            .type_layouts
+                            .get(type_name)
+                            .expect("validated OpenMP private derived scalar has no type layout");
+                        initialize_derived_storage(b, local.addr, layout, ctx.type_layouts);
+                    }
                 } else {
-                    let (private, cleanup) = allocate_private_array(b, &capture.info, None);
+                    let (private, cleanup_descriptor) =
+                        allocate_private_array(b, &capture.info, None);
                     local = private;
-                    cleanup_descriptors.extend(cleanup);
+                    cleanup.array_descriptors.extend(cleanup_descriptor);
                 }
             }
             CaptureKind::Shared | CaptureKind::FirstPrivate => {
@@ -1139,6 +1479,13 @@ fn install_shared_captures(
                     IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392)
                 } else if firstprivate_array {
                     fixed_array_storage_type(&capture.info, b.layout)
+                } else if capture.kind == CaptureKind::FirstPrivate {
+                    capture
+                        .info
+                        .derived_type
+                        .as_deref()
+                        .and_then(|name| derived_storage_ir_type(name, ctx.type_layouts))
+                        .unwrap_or_else(|| capture.info.ty.clone())
                 } else {
                     capture.info.ty.clone()
                 };
@@ -1146,21 +1493,41 @@ fn install_shared_captures(
                 if firstprivate_pointer {
                     local = allocate_pointer_private(b, &capture.info, Some(environment_address));
                 } else if firstprivate_allocatable {
-                    let (private, cleanup) =
+                    let (private, cleanup_descriptor) =
                         allocate_allocatable_private(b, &capture.info, environment_address, true);
                     local = private;
-                    cleanup_descriptors.push(cleanup);
+                    cleanup.array_descriptors.push(cleanup_descriptor);
                 } else if firstprivate_array {
                     let shape_descriptor = firstprivate_descriptor.then_some(environment_address);
-                    let (private, cleanup) =
+                    let (private, cleanup_descriptor) =
                         allocate_private_array(b, &capture.info, shape_descriptor);
                     copy_array_data(b, &private, environment_address, firstprivate_descriptor);
                     local = private;
-                    cleanup_descriptors.extend(cleanup);
+                    cleanup.array_descriptors.extend(cleanup_descriptor);
                 } else if capture.kind == CaptureKind::FirstPrivate {
-                    let private = b.alloca(capture.info.ty.clone());
-                    let value = b.load_typed(environment_address, capture.info.ty.clone());
-                    b.store(value, private);
+                    let storage_ty = capture
+                        .info
+                        .derived_type
+                        .as_deref()
+                        .and_then(|name| derived_storage_ir_type(name, ctx.type_layouts))
+                        .unwrap_or_else(|| capture.info.ty.clone());
+                    let private = b.alloca(storage_ty);
+                    if let Some(type_name) = capture.info.derived_type.as_deref() {
+                        let layout = ctx.type_layouts.get(type_name).expect(
+                            "validated OpenMP firstprivate derived scalar has no type layout",
+                        );
+                        initialize_derived_storage(b, private, layout, ctx.type_layouts);
+                        emit_derived_value_copy(
+                            b,
+                            ctx.type_layouts,
+                            type_name,
+                            private,
+                            environment_address,
+                        );
+                    } else {
+                        let value = b.load_typed(environment_address, capture.info.ty.clone());
+                        b.store(value, private);
+                    }
                     local.addr = private;
                     local.inline_const = None;
                 } else {
@@ -1181,7 +1548,19 @@ fn install_shared_captures(
                 slot_index += 1;
             }
         }
+        if matches!(
+            capture.kind,
+            CaptureKind::Private | CaptureKind::FirstPrivate
+        ) && !is_array(&local)
+            && !local.allocatable
+            && !local.is_pointer
+            && local.derived_type.is_some()
+        {
+            cleanup
+                .private_derived_scalars
+                .insert(capture.name.clone(), local.clone());
+        }
         ctx.locals.insert(capture.name.clone(), local);
     }
-    cleanup_descriptors
+    cleanup
 }

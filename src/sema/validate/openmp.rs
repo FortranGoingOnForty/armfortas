@@ -1,16 +1,18 @@
 //! Semantic validation for executable OpenMP constructs.
 //!
 //! The executable slice is intentionally narrow: `PARALLEL` data environments
-//! support selected numeric/logical storage, while canonical worksharing `DO`
-//! and combined `PARALLEL DO` support contiguous and explicit-chunk static
-//! schedules.
+//! support selected numeric/logical storage and private derived scalars, while canonical worksharing `DO`
+//! and combined `PARALLEL DO` support the implemented static/dynamic schedules.
+//! Named and unnamed `CRITICAL` regions retain process-wide lock identity.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
 //! regions without pretending later schedules, loop clauses, characters, or
 //! derived objects are already implemented.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::openmp::{OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpScheduleKind};
+use crate::ast::openmp::{
+    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionOperator, OpenMpScheduleKind,
+};
 use crate::ast::stmt::{IoControl, RankGuard, SpannedStmt, Stmt, TypeGuard};
 use crate::lexer::Span;
 use crate::sema::symtab::{Intent, SymbolKind, SymbolTable, TypeInfo};
@@ -50,10 +52,10 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             validate_data_environment(ctx, loop_body, &clause_info, &predetermined_private);
             validate_worksharing_loop(ctx, span, clauses, loop_stmt, true);
         }
-        OpenMpConstruct::Critical { .. } => ctx.error(
-            span,
-            "OpenMP CRITICAL execution is recognized but not yet implemented",
-        ),
+        OpenMpConstruct::Critical { body, .. } => {
+            reject_in_pure(ctx, span, "CRITICAL");
+            validate_structured_block(ctx, body);
+        }
     }
 }
 
@@ -152,6 +154,16 @@ fn validate_parallel_clauses(
                     validate_private_object(ctx, name, span, "FIRSTPRIVATE");
                 }
             }
+            OpenMpClause::Reduction {
+                operator,
+                variables,
+            } => {
+                for name in variables {
+                    let key = name.to_ascii_lowercase();
+                    register_data_attribute(ctx, span, &mut data_attributes, &key, "REDUCTION");
+                    validate_reduction_object(ctx, name, span, *operator);
+                }
+            }
             OpenMpClause::Default(OpenMpDefault::Shared) => {}
             OpenMpClause::Default(OpenMpDefault::None) => {}
             OpenMpClause::Schedule { .. } if combined_do => {}
@@ -177,6 +189,7 @@ fn validate_parallel_clauses(
 }
 
 struct AssociatedLoop<'a> {
+    name: Option<&'a str>,
     var: &'a str,
     start: &'a crate::ast::expr::SpannedExpr,
     end: &'a crate::ast::expr::SpannedExpr,
@@ -191,6 +204,7 @@ fn validate_associated_loop<'a>(
     description: &str,
 ) -> Option<AssociatedLoop<'a>> {
     let Stmt::DoLoop {
+        name,
         var,
         start,
         end,
@@ -247,6 +261,7 @@ fn validate_associated_loop<'a>(
     }
 
     Some(AssociatedLoop {
+        name: name.as_deref(),
         var,
         start,
         end,
@@ -365,9 +380,12 @@ fn validate_worksharing_loop(
     for clause in clauses {
         match clause {
             OpenMpClause::Schedule {
-                kind: OpenMpScheduleKind::Static,
+                kind,
                 chunk_size,
-            } => {
+            }
+                if *kind == OpenMpScheduleKind::Static
+                    || (*kind == OpenMpScheduleKind::Dynamic && combined_do) =>
+            {
                 if let Some(chunk_size) = chunk_size {
                     if validation_expr_rank(ctx, chunk_size) != Some(0)
                         || !matches!(
@@ -435,13 +453,21 @@ fn validate_worksharing_loop(
             | OpenMpClause::NumThreads(_)
                 if combined_do => {}
             OpenMpClause::Collapse(_) => {}
+            OpenMpClause::Reduction { variables, .. }
+                if combined_do
+                    && variables
+                        .iter()
+                        .any(|name| associated_loop_keys.contains(&name.to_ascii_lowercase())) =>
+            {
+                ctx.error(
+                    span,
+                    "OpenMP PARALLEL DO associated iteration variables may not appear in REDUCTION",
+                )
+            }
+            OpenMpClause::Reduction { .. } if combined_do => {}
             OpenMpClause::Reduction { .. } => ctx.error(
                 span,
-                format!(
-                    "OpenMP {} clause on {} is recognized but not yet implemented",
-                    clause_name(clause),
-                    if combined_do { "PARALLEL DO" } else { "DO" }
-                ),
+                "OpenMP REDUCTION clause on standalone DO is recognized but not yet implemented",
             ),
             OpenMpClause::Shared(_)
             | OpenMpClause::Default(_)
@@ -454,7 +480,106 @@ fn validate_worksharing_loop(
             }
         }
     }
-    validate_structured_block(ctx, outer_loop.body);
+    let mut cycle_targets = Vec::new();
+    if collapse_depth == 1 {
+        cycle_targets.push(outer_loop.name.map(str::to_ascii_lowercase));
+    }
+    validate_structured_block_with_cycle_targets(ctx, outer_loop.body, &mut cycle_targets);
+}
+
+fn validate_reduction_object(
+    ctx: &mut Ctx<'_>,
+    name: &str,
+    span: Span,
+    operator: OpenMpReductionOperator,
+) {
+    let Some(symbol) = ctx.lookup_lexical(name) else {
+        ctx.error(
+            span,
+            format!("OpenMP REDUCTION variable '{name}' does not resolve to a visible data object"),
+        );
+        return;
+    };
+    if symbol.kind != SymbolKind::Variable {
+        ctx.error(
+            span,
+            format!("OpenMP REDUCTION list item '{name}' must be a variable"),
+        );
+        return;
+    }
+    if !symbol.attrs.array_spec.is_empty() || symbol.attrs.allocatable || symbol.attrs.pointer {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP REDUCTION variable '{name}' must currently be a nonallocatable, nonpointer scalar"
+            ),
+        );
+        return;
+    }
+    if symbol.attrs.optional
+        || symbol.attrs.volatile
+        || symbol.attrs.asynchronous
+        || symbol.attrs.intent == Some(Intent::In)
+    {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP REDUCTION variable '{name}' may not currently be OPTIONAL, VOLATILE, ASYNCHRONOUS, or INTENT(IN)"
+            ),
+        );
+        return;
+    }
+
+    let valid = match (operator, symbol.type_info.as_ref()) {
+        (
+            OpenMpReductionOperator::Add
+            | OpenMpReductionOperator::Multiply
+            | OpenMpReductionOperator::Max
+            | OpenMpReductionOperator::Min,
+            Some(TypeInfo::Integer { kind }),
+        ) => matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8),
+        (
+            OpenMpReductionOperator::And
+            | OpenMpReductionOperator::Or
+            | OpenMpReductionOperator::Eqv
+            | OpenMpReductionOperator::Neqv,
+            Some(TypeInfo::Logical { kind }),
+        ) => matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8),
+        _ => false,
+    };
+    if !valid {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP {} REDUCTION currently requires a scalar {} of kind 1, 2, 4, or 8",
+                reduction_operator_name(operator),
+                if matches!(
+                    operator,
+                    OpenMpReductionOperator::And
+                        | OpenMpReductionOperator::Or
+                        | OpenMpReductionOperator::Eqv
+                        | OpenMpReductionOperator::Neqv
+                ) {
+                    "LOGICAL"
+                } else {
+                    "INTEGER"
+                }
+            ),
+        );
+    }
+}
+
+fn reduction_operator_name(operator: OpenMpReductionOperator) -> &'static str {
+    match operator {
+        OpenMpReductionOperator::Add => "+",
+        OpenMpReductionOperator::Multiply => "*",
+        OpenMpReductionOperator::Max => "MAX",
+        OpenMpReductionOperator::Min => "MIN",
+        OpenMpReductionOperator::And => ".AND.",
+        OpenMpReductionOperator::Or => ".OR.",
+        OpenMpReductionOperator::Eqv => ".EQV.",
+        OpenMpReductionOperator::Neqv => ".NEQV.",
+    }
 }
 
 fn schedule_kind_name(kind: OpenMpScheduleKind) -> &'static str {
@@ -778,17 +903,26 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
             );
             return;
         }
-        if !matches!(
+        let supported_numeric_or_logical = matches!(
             symbol.type_info.as_ref(),
             Some(TypeInfo::Integer { .. })
                 | Some(TypeInfo::Real { .. })
                 | Some(TypeInfo::DoublePrecision)
                 | Some(TypeInfo::Logical { .. })
-        ) {
+        );
+        let supported_character = matches!(
+            symbol.type_info.as_ref(),
+            Some(TypeInfo::Character {
+                len: Some(_),
+                kind,
+            }) if kind.unwrap_or(1) == 1
+        );
+        let supported_derived = matches!(symbol.type_info.as_ref(), Some(TypeInfo::Derived(_)));
+        if !supported_numeric_or_logical && !supported_character && !supported_derived {
             ctx.error(
                 span,
                 format!(
-                    "OpenMP PARALLEL shared array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements",
+                    "OpenMP PARALLEL shared array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements",
                     name
                 ),
             );
@@ -994,6 +1128,58 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         }
         return;
     }
+    if let Some(TypeInfo::Derived(type_name)) = symbol.type_info.as_ref() {
+        if clause != "PRIVATE" && clause != "FIRSTPRIVATE" {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} derived-type variable '{}' is recognized but not yet implemented",
+                    clause, name
+                ),
+            );
+            return;
+        }
+        let layout = ctx.type_layouts.and_then(|layouts| {
+            layouts
+                .get_for_scope(ctx.scope_id, type_name)
+                .or_else(|| layouts.get_for_scope(symbol.scope, type_name))
+                .or_else(|| layouts.get(type_name))
+        });
+        let Some(layout) = layout else {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} derived-type variable '{}' has no available type layout",
+                    clause, name
+                ),
+            );
+            return;
+        };
+        if clause == "PRIVATE"
+            && ctx.type_layouts.is_some_and(|layouts| {
+                derived_layout_has_allocatable_components(layouts, layout, &mut HashSet::new())
+            })
+        {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} derived-type variable '{}' with allocatable components is recognized but not yet implemented",
+                    clause, name
+                ),
+            );
+            return;
+        }
+        if clause == "FIRSTPRIVATE" && !layout.bound_proc_candidates("assignment(=)").is_empty() {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP FIRSTPRIVATE derived-type variable '{}' with type-bound defined assignment is recognized but not yet implemented",
+                    name
+                ),
+            );
+        }
+        return;
+    }
     if !matches!(
         symbol.type_info.as_ref(),
         Some(TypeInfo::Integer { .. })
@@ -1011,7 +1197,44 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
     }
 }
 
+fn derived_layout_has_allocatable_components(
+    layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    layout: &crate::sema::type_layout::TypeLayout,
+    active: &mut HashSet<String>,
+) -> bool {
+    let key = layouts.canonical_key_for_layout(layout);
+    if !active.insert(key.clone()) {
+        return false;
+    }
+    let has_allocatable = layout.fields.iter().any(|field| {
+        if field.allocatable {
+            return true;
+        }
+        if field.pointer {
+            return false;
+        }
+        let TypeInfo::Derived(type_name) = &field.type_info else {
+            return false;
+        };
+        layouts
+            .get_related(layout, type_name)
+            .is_some_and(|nested| {
+                derived_layout_has_allocatable_components(layouts, nested, active)
+            })
+    });
+    active.remove(&key);
+    has_allocatable
+}
+
 fn validate_structured_block(ctx: &mut Ctx<'_>, stmts: &[SpannedStmt]) {
+    validate_structured_block_with_cycle_targets(ctx, stmts, &mut Vec::new());
+}
+
+fn validate_structured_block_with_cycle_targets(
+    ctx: &mut Ctx<'_>,
+    stmts: &[SpannedStmt],
+    cycle_targets: &mut Vec<Option<String>>,
+) {
     for stmt in stmts {
         match &stmt.node {
             Stmt::Return { .. } => reject_transfer(ctx, stmt.span, "RETURN"),
@@ -1019,7 +1242,19 @@ fn validate_structured_block(ctx: &mut Ctx<'_>, stmts: &[SpannedStmt]) {
             Stmt::ComputedGoto { .. } => reject_transfer(ctx, stmt.span, "computed GOTO"),
             Stmt::ArithmeticIf { .. } => reject_transfer(ctx, stmt.span, "arithmetic IF"),
             Stmt::Exit { .. } => reject_transfer(ctx, stmt.span, "EXIT"),
-            Stmt::Cycle { .. } => reject_transfer(ctx, stmt.span, "CYCLE"),
+            Stmt::Cycle { name } => {
+                let target_is_internal = match name {
+                    Some(name) => cycle_targets.iter().rev().any(|target| {
+                        target
+                            .as_deref()
+                            .is_some_and(|target| target.eq_ignore_ascii_case(name))
+                    }),
+                    None => !cycle_targets.is_empty(),
+                };
+                if !target_is_internal {
+                    reject_transfer(ctx, stmt.span, "CYCLE");
+                }
+            }
             Stmt::Write { controls, .. } | Stmt::Read { controls, .. } => {
                 reject_io_branches(ctx, stmt.span, controls)
             }
@@ -1037,29 +1272,39 @@ fn validate_structured_block(ctx: &mut Ctx<'_>, stmts: &[SpannedStmt]) {
                 else_body,
                 ..
             } => {
-                validate_structured_block(ctx, then_body);
+                validate_structured_block_with_cycle_targets(ctx, then_body, cycle_targets);
                 for (_, body) in else_ifs {
-                    validate_structured_block(ctx, body);
+                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
                 }
                 if let Some(body) = else_body {
-                    validate_structured_block(ctx, body);
+                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
                 }
             }
             Stmt::IfStmt { action, .. }
             | Stmt::WhereStmt { stmt: action, .. }
             | Stmt::ForallStmt { stmt: action, .. }
             | Stmt::Labeled { stmt: action, .. } => {
-                validate_structured_block(ctx, std::slice::from_ref(action.as_ref()));
+                validate_structured_block_with_cycle_targets(
+                    ctx,
+                    std::slice::from_ref(action.as_ref()),
+                    cycle_targets,
+                );
             }
-            Stmt::DoLoop { body, .. }
-            | Stmt::DoWhile { body, .. }
-            | Stmt::DoConcurrent { body, .. }
-            | Stmt::Block { body, .. }
+            Stmt::DoLoop { name, body, .. }
+            | Stmt::DoWhile { name, body, .. }
+            | Stmt::DoConcurrent { name, body, .. } => {
+                cycle_targets.push(name.as_deref().map(str::to_ascii_lowercase));
+                validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                cycle_targets.pop();
+            }
+            Stmt::Block { body, .. }
             | Stmt::Associate { body, .. }
-            | Stmt::ForallConstruct { body, .. } => validate_structured_block(ctx, body),
+            | Stmt::ForallConstruct { body, .. } => {
+                validate_structured_block_with_cycle_targets(ctx, body, cycle_targets)
+            }
             Stmt::SelectCase { cases, .. } => {
                 for case in cases {
-                    validate_structured_block(ctx, &case.body);
+                    validate_structured_block_with_cycle_targets(ctx, &case.body, cycle_targets);
                 }
             }
             Stmt::SelectType { guards, .. } => {
@@ -1069,7 +1314,7 @@ fn validate_structured_block(ctx: &mut Ctx<'_>, stmts: &[SpannedStmt]) {
                         | TypeGuard::ClassIs { body, .. }
                         | TypeGuard::ClassDefault { body } => body,
                     };
-                    validate_structured_block(ctx, body);
+                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
                 }
             }
             Stmt::SelectRank { guards, .. } => {
@@ -1079,15 +1324,15 @@ fn validate_structured_block(ctx: &mut Ctx<'_>, stmts: &[SpannedStmt]) {
                         | RankGuard::RankStar { body }
                         | RankGuard::RankDefault { body } => body,
                     };
-                    validate_structured_block(ctx, body);
+                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
                 }
             }
             Stmt::WhereConstruct {
                 body, elsewhere, ..
             } => {
-                validate_structured_block(ctx, body);
+                validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
                 for (_, body) in elsewhere {
-                    validate_structured_block(ctx, body);
+                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
                 }
             }
             // A nested OpenMP region is a distinct structured block. It is
@@ -1103,7 +1348,7 @@ fn reject_transfer(ctx: &mut Ctx<'_>, span: Span, statement: &str) {
     ctx.error(
         span,
         format!(
-            "{} is not yet supported inside an outlined OpenMP PARALLEL region",
+            "{} is not yet supported inside an OpenMP structured block",
             statement
         ),
     );
@@ -1117,7 +1362,7 @@ fn reject_io_branches(ctx: &mut Ctx<'_>, span: Span, controls: &[IoControl]) {
     }) {
         ctx.error(
             span,
-            "I/O ERR=/END=/EOR= transfer is not yet supported inside an outlined OpenMP PARALLEL region",
+            "I/O ERR=/END=/EOR= transfer is not yet supported inside an OpenMP structured block",
         );
     }
 }

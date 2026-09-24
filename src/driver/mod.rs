@@ -1246,7 +1246,7 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     }
     if opts.openmp {
         opts.cli_warnings.push(
-            "-fopenmp enables preview OpenMP support; numeric/logical PARALLEL data environments and initial static DO worksharing are implemented and unsupported constructs or clauses are errors"
+            "-fopenmp enables preview OpenMP support; PARALLEL data environments, static and combined dynamic DO worksharing, COLLAPSE(2), scalar INTEGER/LOGICAL reductions, and named/unnamed CRITICAL regions are implemented and unsupported constructs or clauses are errors"
                 .into(),
         );
     } else if opts.openmp_simd {
@@ -1357,7 +1357,7 @@ LANGUAGE:
   -fdefault-real-8            Make default real kind 8 bytes
   -fimplicit-none             Force implicit none in all scopes
   -frecursive                 Make all procedures recursive by default
-  -fopenmp                    Enable preview OpenMP PARALLEL and static DO support
+  -fopenmp                    Enable preview OpenMP PARALLEL and DO support
   -fno-openmp                 Disable full OpenMP compilation
   -fopenmp-simd               Enable OpenMP SIMD syntax without the thread runtime
   -fbackslash                 Interpret backslash in strings as escape
