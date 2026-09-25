@@ -11155,8 +11155,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     Some(IrType::Int(IntWidth::I64)) => idx,
                                     _ => b.int_extend(idx, IntWidth::I64, true),
                                 };
-                                let one = b.const_i64(1);
-                                let idx0 = b.isub(idx64, one);
+                                let lower = if local_uses_array_descriptor(&arr_info) {
+                                    let descriptor = array_descriptor_addr(b, &arr_info);
+                                    load_array_desc_i64_field(b, descriptor, 24)
+                                } else {
+                                    b.const_i64(
+                                        arr_info.dims.first().map_or(1, |(lower, _)| *lower),
+                                    )
+                                };
+                                let idx0 = b.isub(idx64, lower);
                                 let elem_ptr = b.gep(base, vec![idx0], arr_info.ty.clone());
                                 store_scalar_pointer_slot_value(b, &tgt_info, elem_ptr);
                                 return;
