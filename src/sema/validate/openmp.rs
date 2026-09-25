@@ -15,7 +15,7 @@ use crate::ast::openmp::{
 };
 use crate::ast::stmt::{IoControl, RankGuard, SpannedStmt, Stmt, TypeGuard};
 use crate::lexer::Span;
-use crate::sema::symtab::{Intent, ScopeKind, SymbolKind, SymbolTable, TypeInfo};
+use crate::sema::symtab::{Intent, SymbolKind, SymbolTable, TypeInfo};
 
 use super::core::{
     collect_default_none_nested_block_references, collect_reference_expr, collect_reference_stmts,
@@ -1009,21 +1009,6 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
     }
     if symbol.attrs.pointer {
         let scalar = symbol.attrs.array_spec.is_empty();
-        if scalar
-            && matches!(
-                ctx.st.scope(symbol.scope).kind,
-                ScopeKind::Module(_) | ScopeKind::Submodule(_)
-            )
-        {
-            ctx.error(
-                span,
-                format!(
-                    "OpenMP {} module scalar pointer '{}' is recognized but not yet implemented",
-                    clause, name
-                ),
-            );
-            return;
-        }
         let deferred_shape_array = !scalar
             && symbol
                 .attrs
@@ -1072,21 +1057,6 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
     }
     if symbol.attrs.allocatable {
         let scalar = symbol.attrs.array_spec.is_empty();
-        if scalar
-            && matches!(
-                ctx.st.scope(symbol.scope).kind,
-                ScopeKind::Module(_) | ScopeKind::Submodule(_)
-            )
-        {
-            ctx.error(
-                span,
-                format!(
-                    "OpenMP {} module scalar allocatable '{}' is recognized but not yet implemented",
-                    clause, name
-                ),
-            );
-            return;
-        }
         let deferred_shape_array = !scalar
             && symbol
                 .attrs

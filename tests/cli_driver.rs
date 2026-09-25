@@ -22318,6 +22318,111 @@ end program
 }
 
 #[test]
+fn fopenmp_private_and_firstprivate_module_scalar_descriptors_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_and_firstprivate_module_scalar_descriptors_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_module_scalar_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer, allocatable :: private_value, first_value, empty_private, empty_first
+  integer, target :: original = 70, rebound(0:3)
+  integer, pointer :: private_view, first_view, empty_view
+contains
+  subroutine exercise(alloc_results, pointer_results)
+    integer, intent(out) :: alloc_results(0:3), pointer_results(0:3)
+    integer :: tid
+    allocate(private_value, first_value)
+    private_value = -9
+    first_value = 40
+    private_view => original
+    first_view => original
+    nullify(empty_view)
+    rebound = -1
+    alloc_results = -1
+    pointer_results = -1
+!$omp parallel default(none) num_threads(4) &
+!$omp& private(tid, private_value, empty_private, private_view) &
+!$omp& firstprivate(first_value, empty_first, first_view, empty_view) &
+!$omp& shared(alloc_results, pointer_results, rebound)
+    tid = omp_get_thread_num()
+    if (.not. allocated(private_value) .or. .not. allocated(first_value)) error stop 1
+    if (allocated(empty_private) .or. allocated(empty_first)) error stop 2
+    if (first_value /= 40) error stop 3
+    if (.not. associated(first_view) .or. first_view /= 70) error stop 4
+    if (associated(empty_view)) error stop 5
+    private_value = 100 + tid
+    first_value = first_value + tid
+    allocate(empty_private, empty_first)
+    empty_private = 10 + tid
+    empty_first = 20 + tid
+    alloc_results(tid) = private_value + first_value + empty_private + empty_first
+    private_view => rebound(tid)
+    private_view = 200 + tid
+    pointer_results(tid) = first_view
+    nullify(private_view, first_view)
+!$omp end parallel
+    if (private_value /= -9 .or. first_value /= 40) error stop 6
+    if (allocated(empty_private) .or. allocated(empty_first)) error stop 7
+    if (any(alloc_results /= [170, 174, 178, 182])) error stop 8
+    if (any(pointer_results /= 70)) error stop 9
+    if (any(rebound /= [200, 201, 202, 203])) error stop 10
+    if (.not. associated(private_view, original)) error stop 11
+    if (.not. associated(first_view, original) .or. associated(empty_view)) error stop 12
+    deallocate(private_value, first_value)
+    nullify(private_view, first_view)
+  end subroutine exercise
+end module omp_module_scalar_state
+
+program p
+  use omp_module_scalar_state, only: exercise
+  implicit none
+  integer :: alloc_results(0:3), pointer_results(0:3)
+  call exercise(alloc_results, pointer_results)
+  print *, 'ok'
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_module_scalar_descriptors", "bin");
+        let runtime_cache = unique_dir("openmp_private_module_scalar_descriptors_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP module scalar allocatables and pointers should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP module scalar allocatables and pointers failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_private_and_firstprivate_pointer_arrays_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -23496,9 +23601,7 @@ end program
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("PRIVATE module scalar allocatable 'module_alloc' is recognized but not yet implemented")
-            && stderr.contains("FIRSTPRIVATE module scalar pointer 'module_view' is recognized but not yet implemented")
-            && stderr.contains("PRIVATE allocatable 'scalar_text' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL type")
+        stderr.contains("PRIVATE allocatable 'scalar_text' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL type")
             && stderr.contains("FIRSTPRIVATE allocatable array 'words' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
             && stderr.contains("FIRSTPRIVATE pointer 'scalar_character_view' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL type")
             && stderr.contains("FIRSTPRIVATE pointer array 'character_view' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
@@ -23506,6 +23609,10 @@ end program
             && stderr.contains("PRIVATE OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE pointer 'intent_view' may not have INTENT(IN)"),
         "unexpected diagnostic: {stderr}"
+    );
+    assert!(
+        !stderr.contains("module scalar"),
+        "supported module scalar descriptors were still rejected: {stderr}"
     );
     let _ = std::fs::remove_file(&src);
 }
