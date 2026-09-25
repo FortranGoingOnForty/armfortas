@@ -5044,6 +5044,55 @@ pub(super) fn collect_module_globals(
                     continue;
                 }
 
+                // Rank-0 allocatables use the same 392-byte descriptor slot
+                // as local scalar allocatables.  In particular, the first
+                // machine word is the allocated payload pointer consumed by
+                // scalar value access, while the full descriptor-sized
+                // reservation keeps the module ABI consistent with .amod
+                // consumers and allocation/inquiry helpers. Treating this as
+                // an ordinary scalar global made
+                // same-TU ALLOCATED calls fall through to an external symbol
+                // and let cross-TU allocation overwrite adjacent globals.
+                if is_allocatable && array_spec.is_none() {
+                    let storage_ty = if let Some(type_name) = &derived_type_name {
+                        derived_storage_ir_type(type_name, type_layouts)
+                            .unwrap_or_else(|| ir_ty.clone())
+                    } else if matches!(type_spec, TypeSpec::Character(_)) {
+                        char_len
+                            .map(fixed_char_storage_ir_type)
+                            .unwrap_or_else(|| ir_ty.clone())
+                    } else {
+                        ir_ty.clone()
+                    };
+                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
+                    module.add_global(Global {
+                        name: symbol.clone(),
+                        ty: desc_ty,
+                        initializer: Some(GlobalInit::Zero),
+                    });
+                    globals.insert(
+                        (mod_name.to_lowercase(), entity.name.to_lowercase()),
+                        ModuleGlobalInfo {
+                            symbol,
+                            ty: storage_ty,
+                            dims: vec![],
+                            declared_rank: 0,
+                            allocatable: true,
+                            is_pointer: false,
+                            volatile: entity_is_volatile,
+                            deferred_char: false,
+                            derived_type: derived_type_name.clone(),
+                            char_kind: global_char_kind.clone(),
+                            logical_kind: global_logical_kind,
+                            const_value: None,
+                            const_real_value: None,
+                            external: false,
+                            private: false,
+                        },
+                    );
+                    continue;
+                }
+
                 if let Some(specs) = array_spec {
                     // Array module variable. Compute dims and
                     // build an array-typed global with a matching

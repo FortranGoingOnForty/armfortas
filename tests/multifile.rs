@@ -726,6 +726,25 @@ fn module_with_allocatable_array() {
     );
 }
 
+#[test]
+fn module_scalar_allocatable_and_pointer_preserve_cross_tu_state() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=module_scalar_allocatable_and_pointer_preserve_cross_tu_state count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    for opt in ["-O0", "-O3"] {
+        multifile_test_flags(
+            "module scalar_state_m\n  implicit none\n  integer, allocatable :: owned\n  integer, target :: backing = 7\n  integer, pointer :: alias\ncontains\n  subroutine initialize()\n    allocate(owned, source=41)\n    alias => backing\n  end subroutine initialize\n  subroutine release()\n    deallocate(owned)\n    nullify(alias)\n  end subroutine release\nend module scalar_state_m\n",
+            "program p\n  use scalar_state_m\n  implicit none\n  if (allocated(owned)) error stop 1\n  if (associated(alias)) error stop 2\n  call initialize()\n  if (.not. allocated(owned)) error stop 3\n  if (owned /= 41) error stop 4\n  if (.not. associated(alias, backing)) error stop 5\n  alias = alias + 1\n  if (backing /= 8) error stop 6\n  call release()\n  if (allocated(owned)) error stop 7\n  if (associated(alias)) error stop 8\n  print *, 41, backing\nend program p\n",
+            "41 8",
+            &[opt],
+        );
+    }
+}
+
 // Regression: gfortran/flang accept Fortran sources and prebuilt objects
 // mixed on one command line, e.g. `fc main.f90 mod.o -o prog`. fortsh's
 // unit-test rules use exactly this shape (`fc test.f90 build/foo.o -o test`).
