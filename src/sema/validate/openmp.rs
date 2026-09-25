@@ -15,7 +15,7 @@ use crate::ast::openmp::{
 };
 use crate::ast::stmt::{IoControl, RankGuard, SpannedStmt, Stmt, TypeGuard};
 use crate::lexer::Span;
-use crate::sema::symtab::{Intent, SymbolKind, SymbolTable, TypeInfo};
+use crate::sema::symtab::{Intent, ScopeKind, SymbolKind, SymbolTable, TypeInfo};
 
 use super::core::{
     collect_default_none_nested_block_references, collect_reference_expr, collect_reference_stmts,
@@ -1008,17 +1008,33 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         return;
     }
     if symbol.attrs.pointer {
-        let deferred_shape_array = !symbol.attrs.array_spec.is_empty()
+        let scalar = symbol.attrs.array_spec.is_empty();
+        if scalar
+            && matches!(
+                ctx.st.scope(symbol.scope).kind,
+                ScopeKind::Module(_) | ScopeKind::Submodule(_)
+            )
+        {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} module scalar pointer '{}' is recognized but not yet implemented",
+                    clause, name
+                ),
+            );
+            return;
+        }
+        let deferred_shape_array = !scalar
             && symbol
                 .attrs
                 .array_spec
                 .iter()
                 .all(|spec| matches!(spec, crate::ast::decl::ArraySpec::Deferred));
-        if !deferred_shape_array {
+        if !scalar && !deferred_shape_array {
             ctx.error(
                 span,
                 format!(
-                    "OpenMP {} scalar or non-deferred-shape pointer '{}' is recognized but not yet implemented",
+                    "OpenMP {} non-deferred-shape pointer array '{}' is recognized but not yet implemented",
                     clause, name
                 ),
             );
@@ -1044,25 +1060,44 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
             ctx.error(
                 span,
                 format!(
-                    "OpenMP {} pointer array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements",
-                    clause, name
+                    "OpenMP {} {} '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL {}",
+                    clause,
+                    if scalar { "pointer" } else { "pointer array" },
+                    name,
+                    if scalar { "type" } else { "elements" },
                 ),
             );
         }
         return;
     }
     if symbol.attrs.allocatable {
-        let deferred_shape_array = !symbol.attrs.array_spec.is_empty()
+        let scalar = symbol.attrs.array_spec.is_empty();
+        if scalar
+            && matches!(
+                ctx.st.scope(symbol.scope).kind,
+                ScopeKind::Module(_) | ScopeKind::Submodule(_)
+            )
+        {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} module scalar allocatable '{}' is recognized but not yet implemented",
+                    clause, name
+                ),
+            );
+            return;
+        }
+        let deferred_shape_array = !scalar
             && symbol
                 .attrs
                 .array_spec
                 .iter()
                 .all(|spec| matches!(spec, crate::ast::decl::ArraySpec::Deferred));
-        if !deferred_shape_array {
+        if !scalar && !deferred_shape_array {
             ctx.error(
                 span,
                 format!(
-                    "OpenMP {} scalar allocatable '{}' is recognized but not yet implemented",
+                    "OpenMP {} non-deferred-shape allocatable array '{}' is recognized but not yet implemented",
                     clause, name
                 ),
             );
@@ -1078,8 +1113,11 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
             ctx.error(
                 span,
                 format!(
-                    "OpenMP {} allocatable array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements",
-                    clause, name
+                    "OpenMP {} {} '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL {}",
+                    clause,
+                    if scalar { "allocatable" } else { "allocatable array" },
+                    name,
+                    if scalar { "type" } else { "elements" },
                 ),
             );
         }
