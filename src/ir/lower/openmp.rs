@@ -109,12 +109,16 @@ fn zero_array_descriptor(b: &mut FuncBuilder<'_>) -> ValueId {
     descriptor
 }
 
-fn is_allocatable_array(info: &LocalInfo) -> bool {
-    info.allocatable && !info.is_pointer && local_declared_rank(info) > 0
+fn is_allocatable_entity(info: &LocalInfo) -> bool {
+    info.allocatable && !info.is_pointer
 }
 
 fn is_pointer_array(info: &LocalInfo) -> bool {
     info.is_pointer && local_declared_rank(info) > 0
+}
+
+fn is_scalar_pointer(info: &LocalInfo) -> bool {
+    info.is_pointer && local_declared_rank(info) == 0 && !local_uses_array_descriptor(info)
 }
 
 fn is_array(info: &LocalInfo) -> bool {
@@ -128,7 +132,7 @@ fn capture_needs_environment(
     matches!(
         capture.kind,
         CaptureKind::Shared | CaptureKind::FirstPrivate
-    ) || (capture.kind == CaptureKind::Private && is_allocatable_array(&capture.info))
+    ) || (capture.kind == CaptureKind::Private && is_allocatable_entity(&capture.info))
         || (capture.kind == CaptureKind::Private
             && capture
                 .info
@@ -170,13 +174,63 @@ fn allocate_pointer_private(
     private
 }
 
+fn scalar_pointer_slot(b: &mut FuncBuilder<'_>, info: &LocalInfo) -> ValueId {
+    debug_assert!(is_scalar_pointer(info));
+    if info.by_ref {
+        b.load(info.addr)
+    } else {
+        info.addr
+    }
+}
+
+fn snapshot_scalar_pointer(b: &mut FuncBuilder<'_>, source: &LocalInfo) -> ValueId {
+    let pointer_ty = IrType::Ptr(Box::new(source.ty.clone()));
+    let snapshot = b.alloca(pointer_ty.clone());
+    let source_slot = scalar_pointer_slot(b, source);
+    let target = b.load_typed(source_slot, pointer_ty);
+    b.store(target, snapshot);
+    snapshot
+}
+
+fn allocate_scalar_pointer_private(
+    b: &mut FuncBuilder<'_>,
+    outside: &LocalInfo,
+    source: Option<ValueId>,
+) -> LocalInfo {
+    debug_assert!(is_scalar_pointer(outside));
+    let pointer_ty = IrType::Ptr(Box::new(outside.ty.clone()));
+    let slot = b.alloca(pointer_ty.clone());
+    let target = if let Some(source) = source {
+        // FIRSTPRIVATE pointer initialization has pointer-assignment
+        // semantics: copy the association, never the target value.
+        b.load_typed(source, pointer_ty)
+    } else {
+        // OpenMP leaves a PRIVATE pointer's initial association undefined.
+        // Null is a deterministic safe implementation value.
+        let zero = b.const_i64(0);
+        b.int_to_ptr(zero, outside.ty.clone())
+    };
+    b.store(target, slot);
+
+    let mut private = outside.clone();
+    private.addr = slot;
+    private.by_ref = false;
+    private.allocatable = false;
+    private.descriptor_arg = false;
+    private.inline_const = None;
+    private.is_pointer = true;
+    private.runtime_dim_upper.clear();
+    private.last_dim_assumed_size = false;
+    private
+}
+
 fn allocate_allocatable_private(
     b: &mut FuncBuilder<'_>,
     outside: &LocalInfo,
     source: ValueId,
     copy_values: bool,
 ) -> (LocalInfo, ValueId) {
-    debug_assert!(is_allocatable_array(outside));
+    debug_assert!(is_allocatable_entity(outside));
     let descriptor = zero_array_descriptor(b);
     let allocated = b.call(
         FuncRef::External("afs_array_allocated".into()),
@@ -1290,7 +1344,7 @@ fn materialize_shared_environment(
             continue;
         }
         let environment_address = if capture.kind == CaptureKind::Private
-            && is_allocatable_array(&capture.info)
+            && is_allocatable_entity(&capture.info)
         {
             let source = array_descriptor_addr(b, &capture.info);
             // PRIVATE inherits only the encounter-time allocation status
@@ -1304,7 +1358,10 @@ fn materialize_shared_environment(
             // environment nor an implicit task may free the target.
             let source = array_descriptor_addr(b, &capture.info);
             snapshot_array_descriptor(b, source)
-        } else if capture.kind == CaptureKind::FirstPrivate && is_allocatable_array(&capture.info) {
+        } else if capture.kind == CaptureKind::FirstPrivate && is_scalar_pointer(&capture.info) {
+            snapshot_scalar_pointer(b, &capture.info)
+        } else if capture.kind == CaptureKind::FirstPrivate && is_allocatable_entity(&capture.info)
+        {
             let source = array_descriptor_addr(b, &capture.info);
             // FIRSTPRIVATE values are fixed before any implicit task can
             // run, so the environment owns a stable deep copy until the
@@ -1431,13 +1488,15 @@ fn install_shared_captures(
                 local.addr = b.alloca(capture.info.ty.clone());
             }
             CaptureKind::Private => {
-                if is_pointer_array(&capture.info) {
+                if is_scalar_pointer(&capture.info) {
+                    local = allocate_scalar_pointer_private(b, &capture.info, None);
+                } else if is_pointer_array(&capture.info) {
                     // OpenMP leaves a PRIVATE Fortran pointer's initial
                     // association undefined. A zero descriptor is a safe
                     // implementation value; the task owns only this
                     // association slot and never owns a target.
                     local = allocate_pointer_private(b, &capture.info, None);
-                } else if is_allocatable_array(&capture.info) {
+                } else if is_allocatable_entity(&capture.info) {
                     let index = b.const_i64(slot_index);
                     let slot = b.gep(
                         environment_slots.expect("missing OpenMP environment slots"),
@@ -1519,15 +1578,19 @@ fn install_shared_captures(
                     && shared_capture_uses_descriptor(&capture.info);
                 let firstprivate_array =
                     capture.kind == CaptureKind::FirstPrivate && is_array(&capture.info);
-                let firstprivate_allocatable =
-                    firstprivate_array && is_allocatable_array(&capture.info);
+                let firstprivate_allocatable = capture.kind == CaptureKind::FirstPrivate
+                    && is_allocatable_entity(&capture.info);
                 let firstprivate_pointer = firstprivate_array && is_pointer_array(&capture.info);
+                let firstprivate_scalar_pointer =
+                    capture.kind == CaptureKind::FirstPrivate && is_scalar_pointer(&capture.info);
                 let firstprivate_descriptor = firstprivate_array
                     && (firstprivate_pointer
                         || firstprivate_allocatable
                         || fixed_array_uses_heap(&capture.info, b.layout));
                 let captured_pointee = if captures_descriptor || firstprivate_descriptor {
                     IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392)
+                } else if firstprivate_scalar_pointer {
+                    IrType::Ptr(Box::new(capture.info.ty.clone()))
                 } else if firstprivate_array {
                     fixed_array_storage_type(&capture.info, b.layout)
                 } else if capture.kind == CaptureKind::FirstPrivate {
@@ -1543,6 +1606,12 @@ fn install_shared_captures(
                 let environment_address = b.int_to_ptr(raw_address, captured_pointee);
                 if firstprivate_pointer {
                     local = allocate_pointer_private(b, &capture.info, Some(environment_address));
+                } else if firstprivate_scalar_pointer {
+                    local = allocate_scalar_pointer_private(
+                        b,
+                        &capture.info,
+                        Some(environment_address),
+                    );
                 } else if firstprivate_allocatable {
                     let (private, cleanup_descriptor) =
                         allocate_allocatable_private(b, &capture.info, environment_address, true);
