@@ -1583,13 +1583,15 @@ fn install_shared_captures(
                 let firstprivate_pointer = firstprivate_array && is_pointer_array(&capture.info);
                 let firstprivate_scalar_pointer =
                     capture.kind == CaptureKind::FirstPrivate && is_scalar_pointer(&capture.info);
+                let shared_scalar_pointer =
+                    capture.kind == CaptureKind::Shared && is_scalar_pointer(&capture.info);
                 let firstprivate_descriptor = firstprivate_array
                     && (firstprivate_pointer
                         || firstprivate_allocatable
                         || fixed_array_uses_heap(&capture.info, b.layout));
                 let captured_pointee = if captures_descriptor || firstprivate_descriptor {
                     IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392)
-                } else if firstprivate_scalar_pointer {
+                } else if firstprivate_scalar_pointer || shared_scalar_pointer {
                     IrType::Ptr(Box::new(capture.info.ty.clone()))
                 } else if firstprivate_array {
                     fixed_array_storage_type(&capture.info, b.layout)

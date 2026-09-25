@@ -819,16 +819,6 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
         );
         return;
     }
-    if (symbol.attrs.allocatable || symbol.attrs.pointer) && symbol.attrs.array_spec.is_empty() {
-        ctx.error(
-            span,
-            format!(
-                "OpenMP PARALLEL shared scalar allocatable or pointer '{}' is recognized but not yet implemented",
-                name
-            ),
-        );
-        return;
-    }
     if symbol.attrs.optional {
         ctx.error(
             span,

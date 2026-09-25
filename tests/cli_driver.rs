@@ -22423,6 +22423,110 @@ end program p
 }
 
 #[test]
+fn fopenmp_shared_scalar_allocatables_and_pointers_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_shared_scalar_allocatables_and_pointers_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_shared_scalar_descriptor_state
+  implicit none
+  integer, allocatable :: module_value
+  integer, target :: module_target = 10, module_new_target = 20
+  integer, pointer :: module_view
+contains
+  subroutine exercise_module()
+    allocate(module_value, source=1)
+    module_view => module_target
+!$omp parallel if(.false.) default(none) shared(module_value, module_view, module_new_target)
+    module_value = module_value + 1
+    module_view => module_new_target
+    module_view = 21
+!$omp end parallel
+    if (module_value /= 2) error stop 1
+    if (.not. associated(module_view, module_new_target)) error stop 2
+    if (module_new_target /= 21) error stop 3
+    deallocate(module_value)
+    nullify(module_view)
+  end subroutine exercise_module
+end module omp_shared_scalar_descriptor_state
+
+program p
+  use omp_shared_scalar_descriptor_state, only: exercise_module
+  implicit none
+  integer, allocatable :: local_value
+  integer, target :: local_target, local_new_target
+  integer, pointer :: local_view
+  call exercise_module()
+  allocate(local_value, source=3)
+  local_target = 30
+  local_new_target = 40
+  local_view => local_target
+!$omp parallel if(.false.) default(none) shared(local_value, local_view, local_new_target)
+  local_value = local_value + 1
+  local_view => local_new_target
+  local_view = 41
+!$omp end parallel
+  if (local_value /= 4) error stop 4
+  if (.not. associated(local_view, local_new_target)) error stop 5
+  if (local_new_target /= 41) error stop 6
+  call exercise_dummy(local_value, local_view, local_new_target)
+  if (local_value /= 5) error stop 7
+  if (.not. associated(local_view, local_new_target)) error stop 8
+  if (local_new_target /= 42) error stop 9
+  print *, 'ok'
+contains
+  subroutine exercise_dummy(value, view, new_target)
+    integer, allocatable, intent(inout) :: value
+    integer, pointer, intent(inout) :: view
+    integer, target, intent(inout) :: new_target
+!$omp parallel if(.false.) default(none) shared(value, view, new_target)
+    value = value + 1
+    view => new_target
+    view = 42
+!$omp end parallel
+  end subroutine exercise_dummy
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_shared_scalar_descriptors", "bin");
+        let runtime_cache = unique_dir("openmp_shared_scalar_descriptors_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP shared scalar allocatables and pointers should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP shared scalar allocatables and pointers failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_private_and_firstprivate_pointer_arrays_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -23525,8 +23629,6 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains("shared variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")
-            && stderr.contains("shared scalar allocatable or pointer 'scalar' is recognized but not yet implemented")
-            && stderr.contains("shared scalar allocatable or pointer 'scalar_pointer' is recognized but not yet implemented")
             && stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
             && stderr.contains("shared array 'assumed_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
             && stderr.contains("shared array 'assumed_rank' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy")
@@ -23538,6 +23640,10 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
             && stderr.contains("PRIVATE dummy argument 'dummy_values' is recognized but not yet implemented")
             && stderr.contains("FIRSTPRIVATE array 'automatic_values' must currently have constant explicit shape"),
         "unexpected diagnostic: {stderr}"
+    );
+    assert!(
+        !stderr.contains("shared scalar allocatable or pointer"),
+        "supported shared scalar descriptors were still rejected: {stderr}"
     );
     let _ = std::fs::remove_file(&src);
 }
