@@ -27,11 +27,11 @@ use super::core::{
     derived_layout_needs_component_deallocation, derived_storage_ir_type,
     emit_derived_private_allocation_copy, emit_derived_value_copy, emit_memcpy_bytes,
     ensure_termination, initialize_derived_storage, insert_implicit_dealloc, ir_scalar_byte_size,
-    local_declared_rank, local_uses_array_descriptor, lower_do_loop,
-    materialize_array_descriptor_for_info, materialize_array_section_source_descriptor, DoLoopBody,
-    DoLoopFields,
+    load_string_descriptor_view, local_char_ptr_and_len, local_declared_rank,
+    local_uses_array_descriptor, lower_do_loop, materialize_array_descriptor_for_info,
+    materialize_array_section_source_descriptor, string_descriptor_addr, DoLoopBody, DoLoopFields,
 };
-use super::ctx::{LocalInfo, LowerCtx, ProcScopeGuard};
+use super::ctx::{CharKind, LocalInfo, LowerCtx, ProcScopeGuard};
 use super::helpers::coerce_to_type;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +52,7 @@ struct Capture {
 struct MaterializedEnvironment {
     address: ValueId,
     cleanup_descriptors: Vec<ValueId>,
+    cleanup_string_descriptors: Vec<ValueId>,
     derived_snapshots: std::collections::HashMap<String, LocalInfo>,
     worksharing_chunk_slot: Option<i64>,
 }
@@ -59,6 +60,7 @@ struct MaterializedEnvironment {
 #[derive(Default)]
 struct InstalledCaptureCleanup {
     array_descriptors: Vec<ValueId>,
+    string_descriptors: Vec<ValueId>,
     private_derived_scalars: std::collections::HashMap<String, LocalInfo>,
 }
 
@@ -113,6 +115,19 @@ fn is_allocatable_entity(info: &LocalInfo) -> bool {
     info.allocatable && !info.is_pointer
 }
 
+fn fixed_character_scalar_len(info: &LocalInfo) -> Option<i64> {
+    (!is_array(info) && !info.allocatable && !info.is_pointer)
+        .then_some(())
+        .and_then(|()| match info.char_kind {
+            CharKind::Fixed(len) => Some(len.max(0)),
+            _ => None,
+        })
+}
+
+fn is_deferred_character_allocatable_scalar(info: &LocalInfo) -> bool {
+    !is_array(info) && !info.is_pointer && matches!(info.char_kind, CharKind::Deferred)
+}
+
 fn is_pointer_array(info: &LocalInfo) -> bool {
     info.is_pointer && local_declared_rank(info) > 0
 }
@@ -132,7 +147,9 @@ fn capture_needs_environment(
     matches!(
         capture.kind,
         CaptureKind::Shared | CaptureKind::FirstPrivate
-    ) || (capture.kind == CaptureKind::Private && is_allocatable_entity(&capture.info))
+    ) || (capture.kind == CaptureKind::Private
+        && (is_allocatable_entity(&capture.info)
+            || is_deferred_character_allocatable_scalar(&capture.info)))
         || (capture.kind == CaptureKind::Private
             && capture
                 .info
@@ -148,6 +165,114 @@ fn snapshot_array_descriptor(b: &mut FuncBuilder<'_>, source: ValueId) -> ValueI
     let snapshot = zero_array_descriptor(b);
     emit_memcpy_bytes(b, snapshot, source, 392);
     snapshot
+}
+
+fn zero_string_descriptor(b: &mut FuncBuilder<'_>) -> ValueId {
+    let descriptor = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32));
+    let zero = b.const_i32(0);
+    let bytes = b.const_i64(32);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![descriptor, zero, bytes],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    descriptor
+}
+
+fn snapshot_string_descriptor(b: &mut FuncBuilder<'_>, source: ValueId) -> ValueId {
+    let snapshot = zero_string_descriptor(b);
+    emit_memcpy_bytes(b, snapshot, source, 32);
+    snapshot
+}
+
+fn allocate_deferred_character_private(
+    b: &mut FuncBuilder<'_>,
+    outside: &LocalInfo,
+    source: ValueId,
+    copy_value: bool,
+) -> (LocalInfo, ValueId) {
+    debug_assert!(is_deferred_character_allocatable_scalar(outside));
+    let descriptor = zero_string_descriptor(b);
+    let allocated = b.call(
+        FuncRef::External("afs_string_allocated".into()),
+        vec![source],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero = b.const_i32(0);
+    let is_allocated = b.icmp(CmpOp::Ne, allocated, zero);
+    let allocate_bb = b.create_block("omp_string_private_allocate");
+    let ready_bb = b.create_block("omp_string_private_ready");
+    b.cond_branch(is_allocated, allocate_bb, vec![], ready_bb, vec![]);
+
+    b.set_block(allocate_bb);
+    let (source_ptr, source_len) = load_string_descriptor_view(b, source);
+    if copy_value {
+        b.call(
+            FuncRef::External("afs_assign_char_deferred".into()),
+            vec![descriptor, source_ptr, source_len],
+            IrType::Void,
+        );
+    } else {
+        let null_stat = b.const_i64(0);
+        b.call(
+            FuncRef::External("afs_allocate_string".into()),
+            vec![descriptor, source_len, null_stat],
+            IrType::Void,
+        );
+    }
+    b.branch(ready_bb, vec![]);
+    b.set_block(ready_bb);
+
+    let mut private = outside.clone();
+    private.addr = descriptor;
+    private.allocatable = true;
+    private.descriptor_arg = false;
+    private.by_ref = false;
+    private.inline_const = None;
+    private.is_pointer = false;
+    private.runtime_dim_upper.clear();
+    private.last_dim_assumed_size = false;
+    (private, descriptor)
+}
+
+fn allocate_fixed_character_private(
+    b: &mut FuncBuilder<'_>,
+    outside: &LocalInfo,
+    source: Option<ValueId>,
+) -> LocalInfo {
+    let len = fixed_character_scalar_len(outside)
+        .expect("OpenMP fixed character private requested for a non-character scalar");
+    let storage = b.alloca(IrType::Array(
+        Box::new(IrType::Int(IntWidth::I8)),
+        len.saturating_add(1).max(1) as u64,
+    ));
+    let zero = b.const_i32(0);
+    let total = b.const_i64(len.saturating_add(1));
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![storage, zero, total],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    if let Some(source) = source {
+        emit_memcpy_bytes(b, storage, source, len);
+    } else if len > 0 {
+        // PRIVATE values are undefined on entry. Blank initialization is a
+        // deterministic safe representation that also preserves the trailing
+        // NUL expected by character call lowering.
+        let space = b.const_i32(b' ' as i32);
+        let bytes = b.const_i64(len);
+        b.call(
+            FuncRef::External("memset".into()),
+            vec![storage, space, bytes],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+    }
+
+    let mut private = outside.clone();
+    private.addr = storage;
+    private.by_ref = false;
+    private.inline_const = None;
+    private
 }
 
 fn allocate_pointer_private(
@@ -360,6 +485,14 @@ fn deallocate_array_descriptor(b: &mut FuncBuilder<'_>, descriptor: ValueId) {
     );
     b.branch(done_bb, vec![]);
     b.set_block(done_bb);
+}
+
+fn deallocate_string_descriptor(b: &mut FuncBuilder<'_>, descriptor: ValueId) {
+    b.call(
+        FuncRef::External("afs_dealloc_string".into()),
+        vec![descriptor],
+        IrType::Void,
+    );
 }
 
 fn shared_capture_uses_descriptor(info: &LocalInfo) -> bool {
@@ -686,6 +819,9 @@ fn lower_parallel_region(
                         true,
                     );
                 }
+                for descriptor in cleanup.string_descriptors {
+                    deallocate_string_descriptor(&mut outlined, descriptor);
+                }
                 for descriptor in cleanup.array_descriptors {
                     deallocate_array_descriptor(&mut outlined, descriptor);
                 }
@@ -731,6 +867,9 @@ fn lower_parallel_region(
     }
     for descriptor in environment.cleanup_descriptors {
         deallocate_array_descriptor(b, descriptor);
+    }
+    for descriptor in environment.cleanup_string_descriptors {
+        deallocate_string_descriptor(b, descriptor);
     }
 }
 
@@ -1327,6 +1466,7 @@ fn materialize_shared_environment(
         return MaterializedEnvironment {
             address: b.int_to_ptr(null, IrType::Int(IntWidth::I8)),
             cleanup_descriptors: Vec::new(),
+            cleanup_string_descriptors: Vec::new(),
             derived_snapshots: std::collections::HashMap::new(),
             worksharing_chunk_slot: None,
         };
@@ -1337,6 +1477,7 @@ fn materialize_shared_environment(
         environment_slots as u64,
     ));
     let mut cleanup_descriptors = Vec::new();
+    let mut cleanup_string_descriptors = Vec::new();
     let mut derived_snapshots = std::collections::HashMap::new();
     let mut slot_index = 0i64;
     for capture in captures {
@@ -1344,14 +1485,27 @@ fn materialize_shared_environment(
             continue;
         }
         let environment_address = if capture.kind == CaptureKind::Private
-            && is_allocatable_entity(&capture.info)
+            && is_deferred_character_allocatable_scalar(&capture.info)
         {
+            let source = string_descriptor_addr(b, &capture.info);
+            // Freeze allocation status and length before the team starts.
+            // This byte snapshot is non-owning and its payload is never read.
+            snapshot_string_descriptor(b, source)
+        } else if capture.kind == CaptureKind::Private && is_allocatable_entity(&capture.info) {
             let source = array_descriptor_addr(b, &capture.info);
             // PRIVATE inherits only the encounter-time allocation status
             // and bounds. This byte snapshot is deliberately non-owning:
             // callbacks inspect its metadata but never read or free its
             // payload pointer.
             snapshot_array_descriptor(b, source)
+        } else if capture.kind == CaptureKind::FirstPrivate
+            && is_deferred_character_allocatable_scalar(&capture.info)
+        {
+            let source = string_descriptor_addr(b, &capture.info);
+            let (snapshot, cleanup) =
+                allocate_deferred_character_private(b, &capture.info, source, true);
+            cleanup_string_descriptors.push(cleanup);
+            snapshot.addr
         } else if capture.kind == CaptureKind::FirstPrivate && is_pointer_array(&capture.info) {
             // The environment freezes association status before the team is
             // launched. It is a non-owning descriptor snapshot: neither the
@@ -1414,6 +1568,19 @@ fn materialize_shared_environment(
             snapshot_info.inline_const = None;
             derived_snapshots.insert(capture.name.clone(), snapshot_info);
             snapshot
+        } else if capture.kind == CaptureKind::FirstPrivate
+            && fixed_character_scalar_len(&capture.info).is_some()
+        {
+            let (source, _) = local_char_ptr_and_len(b, &capture.info)
+                .expect("validated OpenMP fixed character capture should lower");
+            let len = fixed_character_scalar_len(&capture.info)
+                .expect("validated OpenMP fixed character capture lost its length");
+            let snapshot = b.alloca(IrType::Array(
+                Box::new(IrType::Int(IntWidth::I8)),
+                len.max(1) as u64,
+            ));
+            emit_memcpy_bytes(b, snapshot, source, len);
+            snapshot
         } else if capture.kind == CaptureKind::FirstPrivate {
             let outside_address = if capture.info.by_ref {
                 b.load(capture.info.addr)
@@ -1427,6 +1594,16 @@ fn materialize_shared_environment(
             let value = b.load_typed(outside_address, capture.info.ty.clone());
             b.store(value, snapshot);
             snapshot
+        } else if capture.kind == CaptureKind::Shared
+            && is_deferred_character_allocatable_scalar(&capture.info)
+        {
+            string_descriptor_addr(b, &capture.info)
+        } else if capture.kind == CaptureKind::Shared
+            && fixed_character_scalar_len(&capture.info).is_some()
+        {
+            local_char_ptr_and_len(b, &capture.info)
+                .expect("validated OpenMP fixed character capture should lower")
+                .0
         } else if shared_capture_uses_descriptor(&capture.info) {
             if local_uses_array_descriptor(&capture.info) {
                 array_descriptor_addr(b, &capture.info)
@@ -1456,6 +1633,7 @@ fn materialize_shared_environment(
     MaterializedEnvironment {
         address: b.int_to_ptr(raw_environment, IrType::Int(IntWidth::I8)),
         cleanup_descriptors,
+        cleanup_string_descriptors,
         derived_snapshots,
         worksharing_chunk_slot,
     }
@@ -1488,7 +1666,24 @@ fn install_shared_captures(
                 local.addr = b.alloca(capture.info.ty.clone());
             }
             CaptureKind::Private => {
-                if is_scalar_pointer(&capture.info) {
+                if is_deferred_character_allocatable_scalar(&capture.info) {
+                    let index = b.const_i64(slot_index);
+                    let slot = b.gep(
+                        environment_slots.expect("missing OpenMP environment slots"),
+                        vec![index],
+                        IrType::Int(IntWidth::I64),
+                    );
+                    let raw_address = b.load_typed(slot, IrType::Int(IntWidth::I64));
+                    let snapshot = b.int_to_ptr(
+                        raw_address,
+                        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32),
+                    );
+                    let (private, cleanup_descriptor) =
+                        allocate_deferred_character_private(b, &capture.info, snapshot, false);
+                    local = private;
+                    cleanup.string_descriptors.push(cleanup_descriptor);
+                    slot_index += 1;
+                } else if is_scalar_pointer(&capture.info) {
                     local = allocate_scalar_pointer_private(b, &capture.info, None);
                 } else if is_pointer_array(&capture.info) {
                     // OpenMP leaves a PRIVATE Fortran pointer's initial
@@ -1513,6 +1708,8 @@ fn install_shared_captures(
                     local = private;
                     cleanup.array_descriptors.push(cleanup_descriptor);
                     slot_index += 1;
+                } else if fixed_character_scalar_len(&capture.info).is_some() {
+                    local = allocate_fixed_character_private(b, &capture.info, None);
                 } else if !is_array(&capture.info) {
                     let owning_type = local.derived_type.as_deref().and_then(|name| {
                         ctx.type_layouts.get(name).and_then(|layout| {
@@ -1575,6 +1772,7 @@ fn install_shared_captures(
                 );
                 let raw_address = b.load_typed(slot, IrType::Int(IntWidth::I64));
                 let captures_descriptor = capture.kind == CaptureKind::Shared
+                    && !is_deferred_character_allocatable_scalar(&capture.info)
                     && shared_capture_uses_descriptor(&capture.info);
                 let firstprivate_array =
                     capture.kind == CaptureKind::FirstPrivate && is_array(&capture.info);
@@ -1583,30 +1781,50 @@ fn install_shared_captures(
                 let firstprivate_pointer = firstprivate_array && is_pointer_array(&capture.info);
                 let firstprivate_scalar_pointer =
                     capture.kind == CaptureKind::FirstPrivate && is_scalar_pointer(&capture.info);
+                let firstprivate_deferred_character = capture.kind == CaptureKind::FirstPrivate
+                    && is_deferred_character_allocatable_scalar(&capture.info);
+                let firstprivate_fixed_character = capture.kind == CaptureKind::FirstPrivate
+                    && fixed_character_scalar_len(&capture.info).is_some();
+                let shared_deferred_character = capture.kind == CaptureKind::Shared
+                    && is_deferred_character_allocatable_scalar(&capture.info);
                 let shared_scalar_pointer =
                     capture.kind == CaptureKind::Shared && is_scalar_pointer(&capture.info);
                 let firstprivate_descriptor = firstprivate_array
                     && (firstprivate_pointer
                         || firstprivate_allocatable
                         || fixed_array_uses_heap(&capture.info, b.layout));
-                let captured_pointee = if captures_descriptor || firstprivate_descriptor {
-                    IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392)
-                } else if firstprivate_scalar_pointer || shared_scalar_pointer {
-                    IrType::Ptr(Box::new(capture.info.ty.clone()))
-                } else if firstprivate_array {
-                    fixed_array_storage_type(&capture.info, b.layout)
-                } else if capture.kind == CaptureKind::FirstPrivate {
-                    capture
-                        .info
-                        .derived_type
-                        .as_deref()
-                        .and_then(|name| derived_storage_ir_type(name, ctx.type_layouts))
-                        .unwrap_or_else(|| capture.info.ty.clone())
-                } else {
-                    capture.info.ty.clone()
-                };
+                let captured_pointee =
+                    if firstprivate_deferred_character || shared_deferred_character {
+                        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32)
+                    } else if captures_descriptor || firstprivate_descriptor {
+                        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392)
+                    } else if firstprivate_scalar_pointer || shared_scalar_pointer {
+                        IrType::Ptr(Box::new(capture.info.ty.clone()))
+                    } else if firstprivate_array {
+                        fixed_array_storage_type(&capture.info, b.layout)
+                    } else if firstprivate_fixed_character {
+                        IrType::Int(IntWidth::I8)
+                    } else if capture.kind == CaptureKind::FirstPrivate {
+                        capture
+                            .info
+                            .derived_type
+                            .as_deref()
+                            .and_then(|name| derived_storage_ir_type(name, ctx.type_layouts))
+                            .unwrap_or_else(|| capture.info.ty.clone())
+                    } else {
+                        capture.info.ty.clone()
+                    };
                 let environment_address = b.int_to_ptr(raw_address, captured_pointee);
-                if firstprivate_pointer {
+                if firstprivate_deferred_character {
+                    let (private, cleanup_descriptor) = allocate_deferred_character_private(
+                        b,
+                        &capture.info,
+                        environment_address,
+                        true,
+                    );
+                    local = private;
+                    cleanup.string_descriptors.push(cleanup_descriptor);
+                } else if firstprivate_pointer {
                     local = allocate_pointer_private(b, &capture.info, Some(environment_address));
                 } else if firstprivate_scalar_pointer {
                     local = allocate_scalar_pointer_private(
@@ -1626,6 +1844,12 @@ fn install_shared_captures(
                     copy_array_data(b, &private, environment_address, firstprivate_descriptor);
                     local = private;
                     cleanup.array_descriptors.extend(cleanup_descriptor);
+                } else if firstprivate_fixed_character {
+                    local = allocate_fixed_character_private(
+                        b,
+                        &capture.info,
+                        Some(environment_address),
+                    );
                 } else if capture.kind == CaptureKind::FirstPrivate {
                     let storage_ty = capture
                         .info
