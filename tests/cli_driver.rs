@@ -22527,6 +22527,266 @@ end program p
 }
 
 #[test]
+fn fopenmp_fixed_character_scalars_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_fixed_character_scalars_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_fixed_character_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  character(len=5) :: module_shared = 'alpha'
+  character(len=5) :: module_private = 'outer'
+  character(len=5) :: module_first = 'prior'
+contains
+  subroutine exercise_module(results)
+    integer, intent(out) :: results(0:3)
+    integer :: tid
+!$omp parallel default(none) num_threads(4) private(tid, module_private) &
+!$omp& firstprivate(module_first) shared(module_shared, results)
+    tid = omp_get_thread_num()
+    if (module_shared /= 'alpha') error stop 1
+    module_private = 'task0'
+    module_private(5:5) = achar(iachar('0') + tid)
+    if (module_first /= 'prior') error stop 2
+    module_first(5:5) = achar(iachar('0') + tid)
+    results(tid) = iachar(module_private(5:5)) + iachar(module_first(5:5))
+!$omp end parallel
+    if (module_private /= 'outer' .or. module_first /= 'prior') error stop 3
+    if (any(results /= [96, 98, 100, 102])) error stop 4
+  end subroutine exercise_module
+end module omp_fixed_character_state
+
+program p
+  use omp_lib, only: omp_get_thread_num
+  use omp_fixed_character_state, only: exercise_module
+  implicit none
+  character(len=5) :: shared_text, private_text, first_text
+  character(len=5), allocatable :: private_alloc, first_alloc
+  character(len=5), allocatable :: empty_private_alloc, empty_first_alloc
+  character(len=5), target :: pointer_target, thread_targets(0:3)
+  character(len=5), pointer :: private_view, first_view
+  integer :: tid, results(0:3), pointer_results(0:3), module_results(0:3)
+  shared_text = 'alpha'
+  private_text = 'outer'
+  first_text = 'prior'
+  pointer_target = 'point'
+  thread_targets = 'empty'
+  allocate(private_alloc, first_alloc)
+  private_alloc = 'outer'
+  first_alloc = 'prior'
+  nullify(private_view)
+  first_view => pointer_target
+!$omp parallel default(none) num_threads(4) &
+!$omp& private(tid, private_text, private_view, private_alloc, empty_private_alloc) &
+!$omp& firstprivate(first_text, first_view, first_alloc, empty_first_alloc) &
+!$omp& shared(shared_text, results, pointer_results, pointer_target, thread_targets)
+  tid = omp_get_thread_num()
+  if (shared_text /= 'alpha') error stop 5
+  private_text = 'task0'
+  private_text(5:5) = achar(iachar('0') + tid)
+  if (first_text /= 'prior') error stop 6
+  first_text(5:5) = achar(iachar('0') + tid)
+  if (.not. associated(first_view, pointer_target)) error stop 7
+  if (first_view /= 'point') error stop 8
+  if (.not. allocated(private_alloc) .or. len(private_alloc) /= 5) error stop 9
+  if (allocated(empty_private_alloc)) error stop 10
+  if (.not. allocated(first_alloc) .or. first_alloc /= 'prior') error stop 11
+  if (allocated(empty_first_alloc)) error stop 12
+  private_alloc = 'alloc'
+  first_alloc(1:1) = 'f'
+  allocate(empty_private_alloc, empty_first_alloc)
+  empty_private_alloc = 'empty'
+  empty_first_alloc = 'empty'
+  private_view => thread_targets(tid)
+  private_view = 'slot0'
+  private_view(5:5) = achar(iachar('0') + tid)
+  results(tid) = iachar(private_text(5:5)) + iachar(first_text(5:5))
+  pointer_results(tid) = iachar(private_view(5:5)) + iachar(first_view(1:1))
+  nullify(private_view, first_view)
+!$omp end parallel
+  if (private_text /= 'outer' .or. first_text /= 'prior') error stop 13
+  if (private_alloc /= 'outer' .or. first_alloc /= 'prior') error stop 14
+  if (allocated(empty_private_alloc) .or. allocated(empty_first_alloc)) error stop 15
+  if (.not. associated(first_view, pointer_target)) error stop 16
+  if (any(results /= [96, 98, 100, 102])) error stop 17
+  if (any(pointer_results /= [160, 161, 162, 163])) error stop 18
+  if (any(thread_targets /= ['slot0', 'slot1', 'slot2', 'slot3'])) error stop 19
+  deallocate(private_alloc, first_alloc)
+  call exercise_shared_dummy(shared_text)
+  if (shared_text /= 'after') error stop 20
+  call exercise_module(module_results)
+  print *, 'ok'
+contains
+  subroutine exercise_shared_dummy(text)
+    character(len=5), intent(inout) :: text
+!$omp parallel if(.false.) default(none) shared(text)
+    text = 'after'
+!$omp end parallel
+  end subroutine exercise_shared_dummy
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_fixed_character_scalars", "bin");
+        let runtime_cache = unique_dir("openmp_fixed_character_scalars_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP fixed character scalars should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP fixed character scalars failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_deferred_character_allocatable_scalars_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_deferred_character_allocatable_scalars_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_deferred_character_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  character(len=:), allocatable :: module_shared
+  character(len=:), allocatable :: module_private, module_first
+  character(len=:), allocatable :: module_empty_private, module_empty_first
+contains
+  subroutine exercise_module(results)
+    integer, intent(out) :: results(0:3)
+    integer :: tid
+    module_shared = 'shared'
+    module_private = 'outer'
+    module_first = 'prior'
+!$omp parallel default(none) num_threads(4) private(tid, module_private, module_empty_private) &
+!$omp& firstprivate(module_first, module_empty_first) shared(module_shared, results)
+    tid = omp_get_thread_num()
+    if (module_shared /= 'shared') error stop 1
+    if (.not. allocated(module_private) .or. len(module_private) /= 5) error stop 2
+    if (allocated(module_empty_private)) error stop 3
+    if (.not. allocated(module_first) .or. module_first /= 'prior') error stop 4
+    if (allocated(module_empty_first)) error stop 5
+    module_private = 'task' // achar(iachar('0') + tid)
+    module_first = module_first // achar(iachar('0') + tid)
+    module_empty_private = 'x'
+    module_empty_first = 'yy'
+    results(tid) = len(module_private) + len(module_first) + &
+                   len(module_empty_private) + len(module_empty_first)
+!$omp end parallel
+    if (module_private /= 'outer' .or. module_first /= 'prior') error stop 6
+    if (allocated(module_empty_private) .or. allocated(module_empty_first)) error stop 7
+    if (any(results /= 14)) error stop 8
+    deallocate(module_shared, module_private, module_first)
+  end subroutine exercise_module
+end module omp_deferred_character_state
+
+program p
+  use omp_lib, only: omp_get_thread_num
+  use omp_deferred_character_state, only: exercise_module
+  implicit none
+  character(len=:), allocatable :: shared_text
+  character(len=:), allocatable :: private_text, first_text
+  character(len=:), allocatable :: empty_private, empty_first
+  integer :: tid, results(0:3), module_results(0:3)
+  shared_text = 'shared'
+  private_text = 'outer'
+  first_text = 'prior'
+!$omp parallel default(none) num_threads(4) private(tid, private_text, empty_private) &
+!$omp& firstprivate(first_text, empty_first) shared(shared_text, results)
+  tid = omp_get_thread_num()
+  if (shared_text /= 'shared') error stop 9
+  if (.not. allocated(private_text) .or. len(private_text) /= 5) error stop 10
+  if (allocated(empty_private)) error stop 11
+  if (.not. allocated(first_text) .or. first_text /= 'prior') error stop 12
+  if (allocated(empty_first)) error stop 13
+  private_text = 'task' // achar(iachar('0') + tid)
+  first_text = first_text // achar(iachar('0') + tid)
+  empty_private = 'x'
+  empty_first = 'yy'
+  results(tid) = len(private_text) + len(first_text) + len(empty_private) + len(empty_first)
+!$omp end parallel
+  if (private_text /= 'outer' .or. first_text /= 'prior') error stop 14
+  if (allocated(empty_private) .or. allocated(empty_first)) error stop 15
+  if (any(results /= 14)) error stop 16
+  call exercise_shared_dummy(shared_text)
+  if (shared_text /= 'after') error stop 17
+  call exercise_module(module_results)
+  print *, 'ok'
+contains
+  subroutine exercise_shared_dummy(text)
+    character(len=:), allocatable, intent(inout) :: text
+!$omp parallel if(.false.) default(none) shared(text)
+    text = 'after'
+!$omp end parallel
+  end subroutine exercise_shared_dummy
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_deferred_character_scalars", "bin");
+        let runtime_cache = unique_dir("openmp_deferred_character_scalars_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP deferred character allocatable scalars should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP deferred character allocatable scalars failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_private_and_firstprivate_pointer_arrays_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -23618,7 +23878,7 @@ end program
 #[test]
 fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let src = write_program(
-        "program p\n  implicit none\n  character(len=3) :: text, words(2)\n  character(len=:), allocatable :: dynamic_words(:)\n  integer, allocatable :: scalar, values(:)\n  integer, pointer :: scalar_pointer\n  integer, target :: target_values(2)\n  integer, volatile :: volatile_values(2)\n  text = 'abc'\n  allocate(scalar, values(2))\n  allocate(character(len=3) :: dynamic_words(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(scalar, scalar_pointer)\n  scalar = 1\n!$omp end parallel\n!$omp parallel shared(dynamic_words)\n  dynamic_words(1) = 'abc'\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\n!$omp parallel firstprivate(words)\n  continue\n!$omp end parallel\n!$omp parallel private(values)\n  continue\n!$omp end parallel\n!$omp parallel private(target_values)\n  continue\n!$omp end parallel\n!$omp parallel private(volatile_values)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_character(assumed_words)\n    character(len=*), intent(inout) :: assumed_words(:)\n!$omp parallel shared(assumed_words)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_private_dummy(dummy_values)\n    integer, intent(inout) :: dummy_values(2)\n!$omp parallel private(dummy_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_automatic(n)\n    integer, intent(in) :: n\n    integer :: automatic_values(n)\n!$omp parallel firstprivate(automatic_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
+        "program p\n  implicit none\n  character(len=3) :: text, words(2)\n  character(len=:), allocatable :: dynamic_words(:)\n  integer, allocatable :: scalar, values(:)\n  integer, pointer :: scalar_pointer\n  integer, target :: target_values(2)\n  integer, volatile :: volatile_values(2)\n  text = 'abc'\n  allocate(scalar, values(2))\n  allocate(character(len=3) :: dynamic_words(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(scalar, scalar_pointer)\n  scalar = 1\n!$omp end parallel\n!$omp parallel shared(dynamic_words)\n  dynamic_words(1) = 'abc'\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\n!$omp parallel firstprivate(words)\n  continue\n!$omp end parallel\n!$omp parallel private(values)\n  continue\n!$omp end parallel\n!$omp parallel private(target_values)\n  continue\n!$omp end parallel\n!$omp parallel private(volatile_values)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_character(assumed_words)\n    character(len=*), intent(inout) :: assumed_words(:)\n!$omp parallel shared(assumed_words)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_assumed_character_scalar(assumed_text)\n    character(len=*), intent(inout) :: assumed_text\n!$omp parallel shared(assumed_text)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_private_dummy(dummy_values)\n    integer, intent(inout) :: dummy_values(2)\n!$omp parallel private(dummy_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_automatic(n)\n    integer, intent(in) :: n\n    integer :: automatic_values(n)\n!$omp parallel firstprivate(automatic_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
         "f90",
     );
     let result = diagnostic_output(&src, &["-fopenmp"]);
@@ -23628,12 +23888,11 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("shared variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")
-            && stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
+        stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
             && stderr.contains("shared array 'assumed_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
+            && stderr.contains("shared variable 'assumed_text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or default-kind CHARACTER allocatable")
             && stderr.contains("shared array 'assumed_rank' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy")
             && stderr.contains("shared OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
-            && stderr.contains("PRIVATE variable 'text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, or LOGICAL")
             && stderr.contains("FIRSTPRIVATE array 'words' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
             && stderr.contains("PRIVATE pointer or target variable 'target_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE VOLATILE or ASYNCHRONOUS variable 'volatile_values' requires memory-model support that is not yet implemented")
@@ -23642,8 +23901,8 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
         "unexpected diagnostic: {stderr}"
     );
     assert!(
-        !stderr.contains("shared scalar allocatable or pointer"),
-        "supported shared scalar descriptors were still rejected: {stderr}"
+        !stderr.contains("shared variable 'text'") && !stderr.contains("PRIVATE variable 'text'"),
+        "supported fixed character scalars were still rejected: {stderr}"
     );
     let _ = std::fs::remove_file(&src);
 }
@@ -23668,6 +23927,7 @@ program p
   character(len=3), allocatable :: words(:)
   character(len=3), allocatable :: scalar_text
   character(len=3), pointer :: scalar_character_view
+  character(len=:), pointer :: deferred_character_view
   character(len=3), pointer :: character_view(:)
   integer, target :: target_values(2)
   allocate(words(2))
@@ -23678,6 +23938,9 @@ program p
   words(1) = 'abc'
 !$omp end parallel
 !$omp parallel firstprivate(scalar_character_view) private(target_values)
+  continue
+!$omp end parallel
+!$omp parallel firstprivate(deferred_character_view)
   continue
 !$omp end parallel
 !$omp parallel firstprivate(character_view)
@@ -23707,9 +23970,8 @@ end program
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("PRIVATE allocatable 'scalar_text' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL type")
-            && stderr.contains("FIRSTPRIVATE allocatable array 'words' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
-            && stderr.contains("FIRSTPRIVATE pointer 'scalar_character_view' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL type")
+        stderr.contains("FIRSTPRIVATE allocatable array 'words' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
+            && stderr.contains("FIRSTPRIVATE pointer 'deferred_character_view' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER type")
             && stderr.contains("FIRSTPRIVATE pointer array 'character_view' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
             && stderr.contains("PRIVATE pointer or target variable 'target_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
@@ -23717,8 +23979,9 @@ end program
         "unexpected diagnostic: {stderr}"
     );
     assert!(
-        !stderr.contains("module scalar"),
-        "supported module scalar descriptors were still rejected: {stderr}"
+        !stderr.contains("PRIVATE allocatable 'scalar_text'")
+            && !stderr.contains("FIRSTPRIVATE pointer 'scalar_character_view'"),
+        "supported character scalar descriptors were still rejected: {stderr}"
     );
     let _ = std::fs::remove_file(&src);
 }
