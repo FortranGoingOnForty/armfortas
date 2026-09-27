@@ -1096,16 +1096,16 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
                 | Some(TypeInfo::DoublePrecision)
                 | Some(TypeInfo::Logical { .. })
         );
-        let supported_character_allocatable = scalar
-            && matches!(
-                symbol.type_info.as_ref(),
-                Some(TypeInfo::Character { kind, .. }) if kind.unwrap_or(1) == 1
-            );
+        let supported_character_allocatable = matches!(
+            symbol.type_info.as_ref(),
+            Some(TypeInfo::Character { len, kind })
+                if kind.unwrap_or(1) == 1 && (scalar || len.is_some())
+        );
         if !supported_numeric_or_logical && !supported_character_allocatable {
             let supported_types = if scalar {
                 "INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or default-kind CHARACTER type"
             } else {
-                "INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements"
+                "INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER elements"
             };
             ctx.error(
                 span,
