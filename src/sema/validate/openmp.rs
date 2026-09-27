@@ -1044,19 +1044,18 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
                 | Some(TypeInfo::DoublePrecision)
                 | Some(TypeInfo::Logical { .. })
         );
-        let supported_character_pointer = scalar
-            && matches!(
-                symbol.type_info.as_ref(),
-                Some(TypeInfo::Character {
-                    len: Some(_),
-                    kind,
-                }) if kind.unwrap_or(1) == 1
-            );
+        let supported_character_pointer = matches!(
+            symbol.type_info.as_ref(),
+            Some(TypeInfo::Character {
+                len: Some(_),
+                kind,
+            }) if kind.unwrap_or(1) == 1
+        );
         if !supported_numeric_or_logical && !supported_character_pointer {
             let supported_types = if scalar {
                 "INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER type"
             } else {
-                "INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements"
+                "INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER elements"
             };
             ctx.error(
                 span,

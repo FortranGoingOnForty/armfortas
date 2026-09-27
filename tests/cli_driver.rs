@@ -23209,6 +23209,163 @@ end program
 }
 
 #[test]
+fn fopenmp_private_and_firstprivate_fixed_character_pointer_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_and_firstprivate_fixed_character_pointer_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_character_pointer_private_state
+  implicit none
+  character(len=6), target :: module_target(-1:1)
+  character(len=6), pointer :: module_view(:)
+contains
+  subroutine check_module(result)
+    integer, intent(out) :: result
+    module_target(-1) = 'alpha'
+    module_target(0) = 'beta'
+    module_target(1) = 'gamma'
+    module_view => module_target
+!$omp parallel if(.false.) default(none) firstprivate(module_view) shared(result)
+    if (.not. associated(module_view)) error stop 21
+    if (lbound(module_view, 1) /= -1 .or. ubound(module_view, 1) /= 1) error stop 22
+    if (module_view(-1) /= 'alpha' .or. module_view(1) /= 'gamma') error stop 23
+    module_view(-1) = 'change'
+    result = len_trim(module_view(-1)) + len_trim(module_view(0)) &
+         + len_trim(module_view(1))
+    nullify(module_view)
+!$omp end parallel
+    if (.not. associated(module_view, module_target)) error stop 24
+    if (module_target(-1) /= 'change') error stop 25
+  end subroutine
+
+  subroutine check_dummy_first(view, result)
+    character(len=6), pointer, intent(in) :: view(:)
+    integer, intent(out) :: result
+!$omp parallel if(.false.) default(none) firstprivate(view) shared(result)
+    if (.not. associated(view)) error stop 31
+    if (lbound(view, 1) /= -2 .or. ubound(view, 1) /= 1) error stop 32
+    result = iachar(view(-2)) + iachar(view(-1)) + iachar(view(0)) + iachar(view(1))
+    nullify(view)
+!$omp end parallel
+  end subroutine
+
+  subroutine check_dummy_private(view, target_values, result)
+    character(len=6), pointer, intent(inout) :: view(:)
+    character(len=6), target, intent(inout) :: target_values(:)
+    integer, intent(out) :: result
+!$omp parallel if(.false.) default(none) private(view) shared(target_values, result)
+    view => target_values
+    view = 'dummy'
+    result = len_trim(view(1))
+    nullify(view)
+!$omp end parallel
+  end subroutine
+end module
+
+program p
+  use omp_character_pointer_private_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  character(len=6), target :: original(-2:1), rebound(0:3), strided_target(0:7)
+  character(len=6), pointer :: view(:), strided_view(:), empty_view(:)
+  integer :: tid, private_seen(0:3), first_seen(0:3)
+  integer :: module_result, dummy_first_result, dummy_private_result
+
+  original(-2) = 'zero'
+  original(-1) = 'one'
+  original(0) = 'two'
+  original(1) = 'three'
+  rebound = 'outer'
+  strided_target = 'outer'
+  private_seen = -1
+  first_seen = -1
+  view => original
+  strided_view => strided_target(0:6:2)
+  nullify(empty_view)
+
+!$omp parallel default(none) num_threads(4) private(view, tid) shared(rebound, private_seen)
+  tid = omp_get_thread_num()
+  view => rebound(tid:tid)
+  if (lbound(view, 1) /= 1 .or. ubound(view, 1) /= 1) error stop 1
+  view(1) = achar(iachar('a') + tid)
+  private_seen(tid) = iachar(view(1))
+  nullify(view)
+!$omp end parallel
+  if (.not. associated(view, original)) error stop 2
+  if (any(private_seen /= [97, 98, 99, 100])) error stop 3
+  if (iachar(rebound(0)) /= 97 .or. iachar(rebound(3)) /= 100) error stop 4
+
+!$omp parallel default(none) num_threads(4) private(tid) &
+!$omp& firstprivate(view, strided_view, empty_view) shared(first_seen)
+  tid = omp_get_thread_num()
+  if (.not. associated(view) .or. .not. associated(strided_view)) error stop 5
+  if (associated(empty_view)) error stop 6
+  if (lbound(view, 1) /= -2 .or. ubound(view, 1) /= 1) error stop 7
+  if (lbound(strided_view, 1) /= 1 .or. ubound(strided_view, 1) /= 4) error stop 8
+  view(tid-2) = achar(iachar('A') + tid)
+  strided_view(tid+1) = achar(iachar('K') + tid)
+  first_seen(tid) = iachar(view(tid-2))
+  nullify(view)
+  nullify(strided_view)
+!$omp end parallel
+  if (.not. associated(view, original) .or. .not. associated(strided_view)) error stop 9
+  if (associated(empty_view)) error stop 10
+  if (any(first_seen /= [65, 66, 67, 68])) error stop 11
+  if (iachar(original(-2)) /= 65 .or. iachar(original(1)) /= 68) error stop 12
+  if (iachar(strided_target(0)) /= 75 .or. iachar(strided_target(2)) /= 76) error stop 13
+  if (iachar(strided_target(4)) /= 77 .or. iachar(strided_target(6)) /= 78) error stop 14
+
+  call check_module(module_result)
+  if (module_result /= 15) error stop 15
+  call check_dummy_first(view, dummy_first_result)
+  if (dummy_first_result /= 266) error stop 16
+  call check_dummy_private(view, rebound, dummy_private_result)
+  if (dummy_private_result /= 5) error stop 17
+  if (.not. associated(view, original)) error stop 18
+  if (rebound(0) /= 'dummy' .or. rebound(3) /= 'dummy') error stop 19
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_fixed_character_pointers", "bin");
+        let runtime_cache = unique_dir("openmp_private_fixed_character_pointers_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE fixed CHARACTER pointer arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE fixed CHARACTER pointer arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_default_none_and_predetermined_scalars_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -24196,6 +24353,7 @@ program p
   character(len=3), pointer :: scalar_character_view
   character(len=:), pointer :: deferred_character_view
   character(len=3), pointer :: character_view(:)
+  character(len=:), pointer :: deferred_character_array_view(:)
   integer, target :: target_values(2)
   allocate(words(2))
 !$omp parallel private(scalar_text)
@@ -24214,6 +24372,9 @@ program p
   continue
 !$omp end parallel
 !$omp parallel firstprivate(character_view)
+  continue
+!$omp end parallel
+!$omp parallel firstprivate(deferred_character_array_view)
   continue
 !$omp end parallel
 contains
@@ -24242,7 +24403,7 @@ end program
     assert!(
         stderr.contains("FIRSTPRIVATE allocatable array 'deferred_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER elements")
             && stderr.contains("FIRSTPRIVATE pointer 'deferred_character_view' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER type")
-            && stderr.contains("FIRSTPRIVATE pointer array 'character_view' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
+            && stderr.contains("FIRSTPRIVATE pointer array 'deferred_character_array_view' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER elements")
             && stderr.contains("PRIVATE pointer or target variable 'target_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE pointer 'intent_view' may not have INTENT(IN)"),
@@ -24251,7 +24412,8 @@ end program
     assert!(
         !stderr.contains("FIRSTPRIVATE allocatable array 'words'")
             && !stderr.contains("PRIVATE allocatable 'scalar_text'")
-            && !stderr.contains("FIRSTPRIVATE pointer 'scalar_character_view'"),
+            && !stderr.contains("FIRSTPRIVATE pointer 'scalar_character_view'")
+            && !stderr.contains("FIRSTPRIVATE pointer array 'character_view'"),
         "supported character descriptors were still rejected: {stderr}"
     );
     let _ = std::fs::remove_file(&src);
