@@ -22028,6 +22028,116 @@ fn fopenmp_private_and_firstprivate_fixed_shape_arrays_run() {
 }
 
 #[test]
+fn fopenmp_private_and_firstprivate_fixed_character_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_and_firstprivate_fixed_character_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_fixed_character_private_state
+  implicit none
+  character(len=5), save :: module_private(0:1), module_first(0:1)
+contains
+  subroutine check_module(result)
+    integer, intent(out) :: result
+!$omp parallel if(.false.) default(none) private(module_private) &
+!$omp& firstprivate(module_first) shared(result)
+    if (module_first(0) /= 'alpha' .or. module_first(1) /= 'beta') error stop 21
+    module_private = 'priv'
+    module_first = 'copy'
+    result = len_trim(module_private(0)) + len_trim(module_first(1))
+!$omp end parallel
+  end subroutine
+end module
+
+program p
+  use omp_fixed_character_private_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  character(len=8) :: private_values(-1:0,2:3), first_values(-1:0,2:3)
+  character(len=80) :: large_private(0:1023), large_first(0:1023)
+  integer :: tid, observed(0:3), module_result
+
+  private_values = 'outside'
+  first_values = 'seed'
+  first_values(-1,2) = 'left'
+  first_values(0,3) = 'right'
+  large_private = 'outside'
+  large_first = 'bulk'
+  large_first(0) = 'head'
+  large_first(1023) = 'tail'
+  observed = -1
+
+!$omp parallel default(none) num_threads(4) private(tid, private_values, large_private) &
+!$omp& firstprivate(first_values, large_first) shared(observed)
+  tid = omp_get_thread_num()
+  if (lbound(first_values, 1) /= -1 .or. ubound(first_values, 1) /= 0) error stop 1
+  if (lbound(first_values, 2) /= 2 .or. ubound(first_values, 2) /= 3) error stop 2
+  if (first_values(-1,2) /= 'left' .or. first_values(0,3) /= 'right') error stop 3
+  if (large_first(0) /= 'head' .or. large_first(1023) /= 'tail') error stop 4
+  private_values = 'private'
+  first_values(-1,2) = 'changed'
+  large_private = 'local'
+  large_first(0) = 'changed'
+  observed(tid) = len_trim(private_values(0,3)) + len_trim(first_values(-1,2)) &
+       + len_trim(large_private(1023)) + len_trim(large_first(0))
+!$omp end parallel
+
+  if (private_values(-1,2) /= 'outside' .or. private_values(0,3) /= 'outside') error stop 5
+  if (first_values(-1,2) /= 'left' .or. first_values(0,3) /= 'right') error stop 6
+  if (large_private(0) /= 'outside' .or. large_private(1023) /= 'outside') error stop 7
+  if (large_first(0) /= 'head' .or. large_first(1023) /= 'tail') error stop 8
+  if (any(observed /= 26)) error stop 9
+
+  module_private = 'outer'
+  module_first(0) = 'alpha'
+  module_first(1) = 'beta'
+  call check_module(module_result)
+  if (module_result /= 8) error stop 10
+  if (module_private(0) /= 'outer' .or. module_private(1) /= 'outer') error stop 11
+  if (module_first(0) /= 'alpha' .or. module_first(1) /= 'beta') error stop 12
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_fixed_character_arrays", "bin");
+        let runtime_cache = unique_dir("openmp_private_fixed_character_arrays_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE fixed CHARACTER arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE fixed CHARACTER arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_private_and_firstprivate_allocatable_arrays_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -23893,7 +24003,6 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
             && stderr.contains("shared variable 'assumed_text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or default-kind CHARACTER allocatable")
             && stderr.contains("shared array 'assumed_rank' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy")
             && stderr.contains("shared OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
-            && stderr.contains("FIRSTPRIVATE array 'words' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
             && stderr.contains("PRIVATE pointer or target variable 'target_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE VOLATILE or ASYNCHRONOUS variable 'volatile_values' requires memory-model support that is not yet implemented")
             && stderr.contains("PRIVATE dummy argument 'dummy_values' is recognized but not yet implemented")
@@ -23901,8 +24010,10 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
         "unexpected diagnostic: {stderr}"
     );
     assert!(
-        !stderr.contains("shared variable 'text'") && !stderr.contains("PRIVATE variable 'text'"),
-        "supported fixed character scalars were still rejected: {stderr}"
+        !stderr.contains("shared variable 'text'")
+            && !stderr.contains("PRIVATE variable 'text'")
+            && !stderr.contains("FIRSTPRIVATE array 'words'"),
+        "supported fixed character entities were still rejected: {stderr}"
     );
     let _ = std::fs::remove_file(&src);
 }

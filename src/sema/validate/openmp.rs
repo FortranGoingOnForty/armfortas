@@ -1150,17 +1150,25 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
             );
             return;
         }
-        if !matches!(
+        let supported_numeric_or_logical = matches!(
             symbol.type_info.as_ref(),
             Some(TypeInfo::Integer { .. })
                 | Some(TypeInfo::Real { .. })
                 | Some(TypeInfo::DoublePrecision)
                 | Some(TypeInfo::Logical { .. })
-        ) {
+        );
+        let supported_character = matches!(
+            symbol.type_info.as_ref(),
+            Some(TypeInfo::Character {
+                len: Some(_),
+                kind,
+            }) if kind.unwrap_or(1) == 1
+        );
+        if !supported_numeric_or_logical && !supported_character {
             ctx.error(
                 span,
                 format!(
-                    "OpenMP {} array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements",
+                    "OpenMP {} array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER elements",
                     clause, name
                 ),
             );
