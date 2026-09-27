@@ -22028,6 +22028,116 @@ fn fopenmp_private_and_firstprivate_fixed_shape_arrays_run() {
 }
 
 #[test]
+fn fopenmp_private_and_firstprivate_fixed_character_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_and_firstprivate_fixed_character_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_fixed_character_private_state
+  implicit none
+  character(len=5), save :: module_private(0:1), module_first(0:1)
+contains
+  subroutine check_module(result)
+    integer, intent(out) :: result
+!$omp parallel if(.false.) default(none) private(module_private) &
+!$omp& firstprivate(module_first) shared(result)
+    if (module_first(0) /= 'alpha' .or. module_first(1) /= 'beta') error stop 21
+    module_private = 'priv'
+    module_first = 'copy'
+    result = len_trim(module_private(0)) + len_trim(module_first(1))
+!$omp end parallel
+  end subroutine
+end module
+
+program p
+  use omp_fixed_character_private_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  character(len=8) :: private_values(-1:0,2:3), first_values(-1:0,2:3)
+  character(len=80) :: large_private(0:1023), large_first(0:1023)
+  integer :: tid, observed(0:3), module_result
+
+  private_values = 'outside'
+  first_values = 'seed'
+  first_values(-1,2) = 'left'
+  first_values(0,3) = 'right'
+  large_private = 'outside'
+  large_first = 'bulk'
+  large_first(0) = 'head'
+  large_first(1023) = 'tail'
+  observed = -1
+
+!$omp parallel default(none) num_threads(4) private(tid, private_values, large_private) &
+!$omp& firstprivate(first_values, large_first) shared(observed)
+  tid = omp_get_thread_num()
+  if (lbound(first_values, 1) /= -1 .or. ubound(first_values, 1) /= 0) error stop 1
+  if (lbound(first_values, 2) /= 2 .or. ubound(first_values, 2) /= 3) error stop 2
+  if (first_values(-1,2) /= 'left' .or. first_values(0,3) /= 'right') error stop 3
+  if (large_first(0) /= 'head' .or. large_first(1023) /= 'tail') error stop 4
+  private_values = 'private'
+  first_values(-1,2) = 'changed'
+  large_private = 'local'
+  large_first(0) = 'changed'
+  observed(tid) = len_trim(private_values(0,3)) + len_trim(first_values(-1,2)) &
+       + len_trim(large_private(1023)) + len_trim(large_first(0))
+!$omp end parallel
+
+  if (private_values(-1,2) /= 'outside' .or. private_values(0,3) /= 'outside') error stop 5
+  if (first_values(-1,2) /= 'left' .or. first_values(0,3) /= 'right') error stop 6
+  if (large_private(0) /= 'outside' .or. large_private(1023) /= 'outside') error stop 7
+  if (large_first(0) /= 'head' .or. large_first(1023) /= 'tail') error stop 8
+  if (any(observed /= 26)) error stop 9
+
+  module_private = 'outer'
+  module_first(0) = 'alpha'
+  module_first(1) = 'beta'
+  call check_module(module_result)
+  if (module_result /= 8) error stop 10
+  if (module_private(0) /= 'outer' .or. module_private(1) /= 'outer') error stop 11
+  if (module_first(0) /= 'alpha' .or. module_first(1) /= 'beta') error stop 12
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_fixed_character_arrays", "bin");
+        let runtime_cache = unique_dir("openmp_private_fixed_character_arrays_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE fixed CHARACTER arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE fixed CHARACTER arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_private_and_firstprivate_allocatable_arrays_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -22170,6 +22280,161 @@ end program
         assert!(
             run.status.success(),
             "OpenMP PRIVATE/FIRSTPRIVATE allocatable arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_private_and_firstprivate_fixed_character_allocatable_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_and_firstprivate_fixed_character_allocatable_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_character_allocatable_private_state
+  implicit none
+  character(len=7), allocatable :: module_private(:), module_first(:), module_empty(:)
+contains
+  subroutine check_module(result)
+    integer, intent(out) :: result
+    allocate(module_private(-2:-1), module_first(3:4))
+    module_private = 'outside'
+    module_first = 'prior'
+!$omp parallel if(.false.) default(none) private(module_private, module_empty) &
+!$omp& firstprivate(module_first) shared(result)
+    if (.not. allocated(module_private) .or. .not. allocated(module_first)) error stop 21
+    if (allocated(module_empty)) error stop 22
+    if (lbound(module_private, 1) /= -2 .or. ubound(module_private, 1) /= -1) error stop 23
+    if (lbound(module_first, 1) /= 3 .or. ubound(module_first, 1) /= 4) error stop 24
+    if (len(module_private) /= 7 .or. len(module_first) /= 7) error stop 25
+    if (module_first(3) /= 'prior' .or. module_first(4) /= 'prior') error stop 26
+    module_private = 'priv'
+    module_first = 'copy'
+    allocate(module_empty(0:1))
+    module_empty = 'new'
+    result = len_trim(module_private(-2)) + len_trim(module_first(4)) &
+         + len_trim(module_empty(0))
+!$omp end parallel
+    if (module_private(-2) /= 'outside' .or. module_private(-1) /= 'outside') error stop 27
+    if (module_first(3) /= 'prior' .or. module_first(4) /= 'prior') error stop 28
+    if (allocated(module_empty)) error stop 29
+    deallocate(module_private, module_first)
+  end subroutine
+
+  subroutine check_dummies(private_values, first_values, private_empty, first_empty, result)
+    character(len=8), allocatable, intent(inout) :: private_values(:), first_values(:)
+    character(len=8), allocatable, intent(inout) :: private_empty(:), first_empty(:)
+    integer, intent(out) :: result
+!$omp parallel if(.false.) default(none) private(private_values, private_empty) &
+!$omp& firstprivate(first_values, first_empty) shared(result)
+    if (.not. allocated(private_values) .or. .not. allocated(first_values)) error stop 31
+    if (allocated(private_empty) .or. allocated(first_empty)) error stop 32
+    if (lbound(private_values, 1) /= -3 .or. ubound(private_values, 1) /= -1) error stop 33
+    if (lbound(first_values, 1) /= 4 .or. ubound(first_values, 1) /= 6) error stop 34
+    if (first_values(4) /= 'dummy' .or. first_values(6) /= 'dummy') error stop 35
+    private_values = 'private'
+    first_values = 'copy'
+    allocate(private_empty(-1:1), first_empty(2:4))
+    private_empty = 'x'
+    first_empty = 'yy'
+    result = len_trim(private_values(-3)) + len_trim(first_values(6)) &
+         + len_trim(private_empty(0)) + len_trim(first_empty(3))
+!$omp end parallel
+  end subroutine
+end module
+
+program p
+  use omp_character_allocatable_private_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  character(len=8), allocatable :: private_values(:,:), first_values(:,:)
+  character(len=8), allocatable :: empty_private(:), empty_first(:)
+  character(len=8), allocatable :: zero_private(:), zero_first(:)
+  character(len=8), allocatable :: dummy_private(:), dummy_first(:)
+  character(len=8), allocatable :: dummy_empty_private(:), dummy_empty_first(:)
+  integer :: tid, observed(0:3), module_result, dummy_result
+
+  allocate(private_values(-1:0,3:4), first_values(-1:0,3:4))
+  allocate(zero_private(1:0), zero_first(1:0))
+  private_values = 'outside'
+  first_values = 'seed'
+  observed = -1
+!$omp parallel default(none) num_threads(4) &
+!$omp& private(tid, private_values, empty_private, zero_private) &
+!$omp& firstprivate(first_values, empty_first, zero_first) shared(observed)
+  tid = omp_get_thread_num()
+  if (.not. allocated(private_values) .or. .not. allocated(first_values)) error stop 1
+  if (allocated(empty_private) .or. allocated(empty_first)) error stop 2
+  if (.not. allocated(zero_private) .or. .not. allocated(zero_first)) error stop 3
+  if (size(zero_private) /= 0 .or. size(zero_first) /= 0) error stop 4
+  if (lbound(private_values, 1) /= -1 .or. ubound(private_values, 1) /= 0) error stop 5
+  if (lbound(first_values, 2) /= 3 .or. ubound(first_values, 2) /= 4) error stop 6
+  if (len(private_values) /= 8 .or. len(first_values) /= 8) error stop 7
+  if (first_values(-1,3) /= 'seed' .or. first_values(0,4) /= 'seed') error stop 8
+  private_values = 'private'
+  first_values = 'copy'
+  allocate(empty_private(-2:1), empty_first(-2:1))
+  empty_private = 'x'
+  empty_first = 'yy'
+  observed(tid) = len_trim(private_values(0,4)) + len_trim(first_values(-1,3)) &
+       + len_trim(empty_private(-2)) + len_trim(empty_first(1))
+!$omp end parallel
+
+  if (private_values(-1,3) /= 'outside' .or. private_values(0,4) /= 'outside') error stop 9
+  if (first_values(-1,3) /= 'seed' .or. first_values(0,4) /= 'seed') error stop 10
+  if (allocated(empty_private) .or. allocated(empty_first)) error stop 11
+  if (.not. allocated(zero_private) .or. .not. allocated(zero_first)) error stop 12
+  if (size(zero_private) /= 0 .or. size(zero_first) /= 0) error stop 13
+  if (any(observed /= 14)) error stop 14
+
+  call check_module(module_result)
+  if (module_result /= 11) error stop 15
+  allocate(dummy_private(-3:-1), dummy_first(4:6))
+  dummy_private = 'outside'
+  dummy_first = 'dummy'
+  call check_dummies(dummy_private, dummy_first, dummy_empty_private, &
+       dummy_empty_first, dummy_result)
+  if (dummy_result /= 14) error stop 16
+  if (dummy_private(-3) /= 'outside' .or. dummy_private(-1) /= 'outside') error stop 17
+  if (dummy_first(4) /= 'dummy' .or. dummy_first(6) /= 'dummy') error stop 18
+  if (allocated(dummy_empty_private) .or. allocated(dummy_empty_first)) error stop 19
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_fixed_character_allocatables", "bin");
+        let runtime_cache = unique_dir("openmp_private_fixed_character_allocatables_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE fixed CHARACTER allocatable arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE fixed CHARACTER allocatable arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
         );
@@ -22933,6 +23198,163 @@ end program
         assert!(
             run.status.success(),
             "OpenMP PRIVATE/FIRSTPRIVATE pointer arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_private_and_firstprivate_fixed_character_pointer_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_and_firstprivate_fixed_character_pointer_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_character_pointer_private_state
+  implicit none
+  character(len=6), target :: module_target(-1:1)
+  character(len=6), pointer :: module_view(:)
+contains
+  subroutine check_module(result)
+    integer, intent(out) :: result
+    module_target(-1) = 'alpha'
+    module_target(0) = 'beta'
+    module_target(1) = 'gamma'
+    module_view => module_target
+!$omp parallel if(.false.) default(none) firstprivate(module_view) shared(result)
+    if (.not. associated(module_view)) error stop 21
+    if (lbound(module_view, 1) /= -1 .or. ubound(module_view, 1) /= 1) error stop 22
+    if (module_view(-1) /= 'alpha' .or. module_view(1) /= 'gamma') error stop 23
+    module_view(-1) = 'change'
+    result = len_trim(module_view(-1)) + len_trim(module_view(0)) &
+         + len_trim(module_view(1))
+    nullify(module_view)
+!$omp end parallel
+    if (.not. associated(module_view, module_target)) error stop 24
+    if (module_target(-1) /= 'change') error stop 25
+  end subroutine
+
+  subroutine check_dummy_first(view, result)
+    character(len=6), pointer, intent(in) :: view(:)
+    integer, intent(out) :: result
+!$omp parallel if(.false.) default(none) firstprivate(view) shared(result)
+    if (.not. associated(view)) error stop 31
+    if (lbound(view, 1) /= -2 .or. ubound(view, 1) /= 1) error stop 32
+    result = iachar(view(-2)) + iachar(view(-1)) + iachar(view(0)) + iachar(view(1))
+    nullify(view)
+!$omp end parallel
+  end subroutine
+
+  subroutine check_dummy_private(view, target_values, result)
+    character(len=6), pointer, intent(inout) :: view(:)
+    character(len=6), target, intent(inout) :: target_values(:)
+    integer, intent(out) :: result
+!$omp parallel if(.false.) default(none) private(view) shared(target_values, result)
+    view => target_values
+    view = 'dummy'
+    result = len_trim(view(1))
+    nullify(view)
+!$omp end parallel
+  end subroutine
+end module
+
+program p
+  use omp_character_pointer_private_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  character(len=6), target :: original(-2:1), rebound(0:3), strided_target(0:7)
+  character(len=6), pointer :: view(:), strided_view(:), empty_view(:)
+  integer :: tid, private_seen(0:3), first_seen(0:3)
+  integer :: module_result, dummy_first_result, dummy_private_result
+
+  original(-2) = 'zero'
+  original(-1) = 'one'
+  original(0) = 'two'
+  original(1) = 'three'
+  rebound = 'outer'
+  strided_target = 'outer'
+  private_seen = -1
+  first_seen = -1
+  view => original
+  strided_view => strided_target(0:6:2)
+  nullify(empty_view)
+
+!$omp parallel default(none) num_threads(4) private(view, tid) shared(rebound, private_seen)
+  tid = omp_get_thread_num()
+  view => rebound(tid:tid)
+  if (lbound(view, 1) /= 1 .or. ubound(view, 1) /= 1) error stop 1
+  view(1) = achar(iachar('a') + tid)
+  private_seen(tid) = iachar(view(1))
+  nullify(view)
+!$omp end parallel
+  if (.not. associated(view, original)) error stop 2
+  if (any(private_seen /= [97, 98, 99, 100])) error stop 3
+  if (iachar(rebound(0)) /= 97 .or. iachar(rebound(3)) /= 100) error stop 4
+
+!$omp parallel default(none) num_threads(4) private(tid) &
+!$omp& firstprivate(view, strided_view, empty_view) shared(first_seen)
+  tid = omp_get_thread_num()
+  if (.not. associated(view) .or. .not. associated(strided_view)) error stop 5
+  if (associated(empty_view)) error stop 6
+  if (lbound(view, 1) /= -2 .or. ubound(view, 1) /= 1) error stop 7
+  if (lbound(strided_view, 1) /= 1 .or. ubound(strided_view, 1) /= 4) error stop 8
+  view(tid-2) = achar(iachar('A') + tid)
+  strided_view(tid+1) = achar(iachar('K') + tid)
+  first_seen(tid) = iachar(view(tid-2))
+  nullify(view)
+  nullify(strided_view)
+!$omp end parallel
+  if (.not. associated(view, original) .or. .not. associated(strided_view)) error stop 9
+  if (associated(empty_view)) error stop 10
+  if (any(first_seen /= [65, 66, 67, 68])) error stop 11
+  if (iachar(original(-2)) /= 65 .or. iachar(original(1)) /= 68) error stop 12
+  if (iachar(strided_target(0)) /= 75 .or. iachar(strided_target(2)) /= 76) error stop 13
+  if (iachar(strided_target(4)) /= 77 .or. iachar(strided_target(6)) /= 78) error stop 14
+
+  call check_module(module_result)
+  if (module_result /= 15) error stop 15
+  call check_dummy_first(view, dummy_first_result)
+  if (dummy_first_result /= 266) error stop 16
+  call check_dummy_private(view, rebound, dummy_private_result)
+  if (dummy_private_result /= 5) error stop 17
+  if (.not. associated(view, original)) error stop 18
+  if (rebound(0) /= 'dummy' .or. rebound(3) /= 'dummy') error stop 19
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_fixed_character_pointers", "bin");
+        let runtime_cache = unique_dir("openmp_private_fixed_character_pointers_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE fixed CHARACTER pointer arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE fixed CHARACTER pointer arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
         );
@@ -23893,7 +24315,6 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
             && stderr.contains("shared variable 'assumed_text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or default-kind CHARACTER allocatable")
             && stderr.contains("shared array 'assumed_rank' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy")
             && stderr.contains("shared OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
-            && stderr.contains("FIRSTPRIVATE array 'words' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
             && stderr.contains("PRIVATE pointer or target variable 'target_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE VOLATILE or ASYNCHRONOUS variable 'volatile_values' requires memory-model support that is not yet implemented")
             && stderr.contains("PRIVATE dummy argument 'dummy_values' is recognized but not yet implemented")
@@ -23901,8 +24322,10 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
         "unexpected diagnostic: {stderr}"
     );
     assert!(
-        !stderr.contains("shared variable 'text'") && !stderr.contains("PRIVATE variable 'text'"),
-        "supported fixed character scalars were still rejected: {stderr}"
+        !stderr.contains("shared variable 'text'")
+            && !stderr.contains("PRIVATE variable 'text'")
+            && !stderr.contains("FIRSTPRIVATE array 'words'"),
+        "supported fixed character entities were still rejected: {stderr}"
     );
     let _ = std::fs::remove_file(&src);
 }
@@ -23925,10 +24348,12 @@ program p
   use unsupported_module_scalars
   implicit none
   character(len=3), allocatable :: words(:)
+  character(len=:), allocatable :: deferred_words(:)
   character(len=3), allocatable :: scalar_text
   character(len=3), pointer :: scalar_character_view
   character(len=:), pointer :: deferred_character_view
   character(len=3), pointer :: character_view(:)
+  character(len=:), pointer :: deferred_character_array_view(:)
   integer, target :: target_values(2)
   allocate(words(2))
 !$omp parallel private(scalar_text)
@@ -23937,6 +24362,9 @@ program p
 !$omp parallel firstprivate(words)
   words(1) = 'abc'
 !$omp end parallel
+!$omp parallel firstprivate(deferred_words)
+  continue
+!$omp end parallel
 !$omp parallel firstprivate(scalar_character_view) private(target_values)
   continue
 !$omp end parallel
@@ -23944,6 +24372,9 @@ program p
   continue
 !$omp end parallel
 !$omp parallel firstprivate(character_view)
+  continue
+!$omp end parallel
+!$omp parallel firstprivate(deferred_character_array_view)
   continue
 !$omp end parallel
 contains
@@ -23970,18 +24401,20 @@ end program
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("FIRSTPRIVATE allocatable array 'words' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
+        stderr.contains("FIRSTPRIVATE allocatable array 'deferred_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER elements")
             && stderr.contains("FIRSTPRIVATE pointer 'deferred_character_view' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER type")
-            && stderr.contains("FIRSTPRIVATE pointer array 'character_view' must currently have INTEGER, REAL, DOUBLE PRECISION, or LOGICAL elements")
+            && stderr.contains("FIRSTPRIVATE pointer array 'deferred_character_array_view' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER elements")
             && stderr.contains("PRIVATE pointer or target variable 'target_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE pointer 'intent_view' may not have INTENT(IN)"),
         "unexpected diagnostic: {stderr}"
     );
     assert!(
-        !stderr.contains("PRIVATE allocatable 'scalar_text'")
-            && !stderr.contains("FIRSTPRIVATE pointer 'scalar_character_view'"),
-        "supported character scalar descriptors were still rejected: {stderr}"
+        !stderr.contains("FIRSTPRIVATE allocatable array 'words'")
+            && !stderr.contains("PRIVATE allocatable 'scalar_text'")
+            && !stderr.contains("FIRSTPRIVATE pointer 'scalar_character_view'")
+            && !stderr.contains("FIRSTPRIVATE pointer array 'character_view'"),
+        "supported character descriptors were still rejected: {stderr}"
     );
     let _ = std::fs::remove_file(&src);
 }
