@@ -65,6 +65,10 @@ impl OpenMpConstruct {
 pub enum OpenMpClause {
     Private(Vec<String>),
     FirstPrivate(Vec<String>),
+    LastPrivate {
+        conditional: bool,
+        variables: Vec<String>,
+    },
     Shared(Vec<String>),
     Default(OpenMpDefault),
     If {
@@ -93,6 +97,7 @@ impl OpenMpClause {
             Self::Schedule { chunk_size, .. } => chunk_size.as_ref(),
             Self::Private(_)
             | Self::FirstPrivate(_)
+            | Self::LastPrivate { .. }
             | Self::Shared(_)
             | Self::Default(_)
             | Self::Nowait
@@ -103,6 +108,7 @@ impl OpenMpClause {
     pub fn listed_variables(&self) -> Option<&[String]> {
         match self {
             Self::Private(names) | Self::FirstPrivate(names) | Self::Shared(names) => Some(names),
+            Self::LastPrivate { variables, .. } => Some(variables),
             Self::Reduction { variables, .. } => Some(variables),
             Self::Default(_)
             | Self::If { .. }

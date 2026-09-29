@@ -154,6 +154,10 @@ pub(super) struct Ctx<'a> {
     /// Number of lexically enclosing OpenMP parallel regions. Worksharing DO
     /// constructs bind to the innermost such team and are invalid without it.
     pub(super) openmp_parallel_depth: usize,
+    /// Explicitly private data-sharing attributes on each enclosing OpenMP
+    /// PARALLEL region. LASTPRIVATE on a bound worksharing loop may not name
+    /// an object that is private in that parallel region.
+    pub(super) openmp_parallel_private_frames: Vec<HashSet<String>>,
     /// Host scopes whose storage must not be captured by the procedure
     /// currently being validated because it is reachable from a local
     /// FINAL binding and may be invoked after those scopes return.
@@ -247,6 +251,7 @@ impl<'a> Ctx<'a> {
             in_bind_c_unit: false,
             openmp_full: false,
             openmp_parallel_depth: 0,
+            openmp_parallel_private_frames: Vec::new(),
             finalizer_capture_host_scopes: HashSet::new(),
             reported_finalizer_captures: HashSet::new(),
             reported_use_ambiguities: HashSet::new(),
@@ -6053,15 +6058,20 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 );
             }
             if let Some(body) = construct.region_body() {
-                let enters_parallel = matches!(
-                    construct,
-                    crate::ast::openmp::OpenMpConstruct::Parallel { .. }
-                );
-                if enters_parallel {
+                let parallel_private_frame = match construct {
+                    crate::ast::openmp::OpenMpConstruct::Parallel { clauses, .. } => {
+                        Some(super::openmp::parallel_private_names(clauses))
+                    }
+                    _ => None,
+                };
+                let enters_parallel = parallel_private_frame.is_some();
+                if let Some(frame) = parallel_private_frame {
                     ctx.openmp_parallel_depth += 1;
+                    ctx.openmp_parallel_private_frames.push(frame);
                 }
                 validate_stmts(ctx, body);
                 if enters_parallel {
+                    ctx.openmp_parallel_private_frames.pop();
                     ctx.openmp_parallel_depth -= 1;
                 }
             }

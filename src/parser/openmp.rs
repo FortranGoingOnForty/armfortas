@@ -340,6 +340,25 @@ fn parse_clauses(
                 span,
                 "FIRSTPRIVATE list",
             )?),
+            "lastprivate" => {
+                let value = cursor.parenthesized("LASTPRIVATE list")?;
+                let (conditional, variables) =
+                    if let Some((modifier, variables)) = split_top_level_once(value, ':') {
+                        if !modifier.trim().eq_ignore_ascii_case("conditional") {
+                            return Err(cursor.error(format!(
+                                "unsupported OpenMP LASTPRIVATE modifier '{}'",
+                                modifier.trim()
+                            )));
+                        }
+                        (true, variables)
+                    } else {
+                        (false, value)
+                    };
+                OpenMpClause::LastPrivate {
+                    conditional,
+                    variables: parse_name_list(variables, span, "LASTPRIVATE list")?,
+                }
+            }
             "shared" => OpenMpClause::Shared(parse_name_list(
                 cursor.parenthesized("SHARED list")?,
                 span,
@@ -448,6 +467,7 @@ fn validate_clause_for_construct(
             clause,
             OpenMpClause::Private(_)
                 | OpenMpClause::FirstPrivate(_)
+                | OpenMpClause::LastPrivate { .. }
                 | OpenMpClause::Schedule { .. }
                 | OpenMpClause::Collapse(_)
                 | OpenMpClause::Reduction { .. }
@@ -849,6 +869,49 @@ mod tests {
         assert!(clauses
             .iter()
             .any(|clause| matches!(clause, OpenMpClause::Nowait)));
+    }
+
+    #[test]
+    fn parses_lastprivate_and_conditional_modifier() {
+        let stmt = parse(
+            "!$omp parallel do lastprivate(i,value)\n\
+             do i = 1, n\n\
+               value = i\n\
+             end do\n\
+             !$omp end parallel do\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::ParallelDo { clauses, .. }) = stmt.node else {
+            panic!("expected parallel-do construct");
+        };
+        assert!(clauses.iter().any(|clause| matches!(
+            clause,
+            OpenMpClause::LastPrivate {
+                conditional: false,
+                variables,
+            } if variables == &["i", "value"]
+        )));
+
+        let stmt = parse(
+            "!$omp do lastprivate(conditional: value)\n\
+             do i = 1, n\n\
+               value = i\n\
+             end do\n\
+             !$omp end do\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::Do { clauses, .. }) = stmt.node else {
+            panic!("expected worksharing-do construct");
+        };
+        assert!(matches!(
+            clauses.as_slice(),
+            [OpenMpClause::LastPrivate {
+                conditional: true,
+                variables,
+            }] if variables == &["value"]
+        ));
     }
 
     #[test]

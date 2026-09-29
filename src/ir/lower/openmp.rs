@@ -9,7 +9,8 @@
 //! compiler-private environment whose lifetime is bounded by the synchronous
 //! join. Private objects live in each callback invocation, using inline
 //! storage below the compiler's stack threshold and owned descriptors above
-//! it.
+//! it. Scalar LASTPRIVATE copy-out is selected by the sequentially last
+//! logical iteration rather than by whichever implicit task finishes last.
 
 use crate::ast::expr::Expr;
 use crate::ast::openmp::{
@@ -47,6 +48,7 @@ struct Capture {
     name: String,
     info: LocalInfo,
     kind: CaptureKind,
+    lastprivate: bool,
 }
 
 struct MaterializedEnvironment {
@@ -62,6 +64,7 @@ struct InstalledCaptureCleanup {
     array_descriptors: Vec<ValueId>,
     string_descriptors: Vec<ValueId>,
     private_derived_scalars: std::collections::HashMap<String, LocalInfo>,
+    lastprivate_originals: std::collections::HashMap<String, LocalInfo>,
 }
 
 struct ScalarReductionBinding {
@@ -69,6 +72,13 @@ struct ScalarReductionBinding {
     operator: OpenMpReductionOperator,
     shared: LocalInfo,
     private: LocalInfo,
+}
+
+struct LastPrivateBinding {
+    name: String,
+    original: LocalInfo,
+    private: LocalInfo,
+    restore: Option<LocalInfo>,
 }
 
 const PRIVATE_ARRAY_STACK_THRESHOLD: i64 = 64 * 1024;
@@ -140,7 +150,7 @@ fn is_array(info: &LocalInfo) -> bool {
     local_declared_rank(info) > 0
 }
 
-fn capture_needs_environment(
+fn capture_base_needs_environment(
     capture: &Capture,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> bool {
@@ -159,6 +169,14 @@ fn capture_needs_environment(
                 .is_some_and(|layout| {
                     derived_layout_needs_component_deallocation(layout, type_layouts)
                 }))
+}
+
+fn capture_environment_slot_count(
+    capture: &Capture,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> usize {
+    usize::from(capture.lastprivate)
+        + usize::from(capture_base_needs_environment(capture, type_layouts))
 }
 
 fn snapshot_array_descriptor(b: &mut FuncBuilder<'_>, source: ValueId) -> ValueId {
@@ -511,7 +529,7 @@ pub(super) fn lower_construct(
             lower_parallel_region(b, ctx, clauses, body, ParallelRegionBody::Statements(body));
         }
         OpenMpConstruct::Do { clauses, loop_stmt } => {
-            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, None);
+            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, None, None);
         }
         OpenMpConstruct::ParallelDo { clauses, loop_stmt } => {
             let capture_body = std::slice::from_ref(loop_stmt.as_ref());
@@ -596,6 +614,7 @@ fn lower_parallel_region(
             OpenMpClause::Shared(_)
             | OpenMpClause::Private(_)
             | OpenMpClause::FirstPrivate(_)
+            | OpenMpClause::LastPrivate { .. }
             | OpenMpClause::Default(_)
             | OpenMpClause::Schedule { .. }
             | OpenMpClause::Collapse(_)
@@ -631,8 +650,19 @@ fn lower_parallel_region(
         .flatten()
         .map(|name| name.to_ascii_lowercase())
         .collect();
+    let lastprivate_names: std::collections::HashSet<_> = clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            OpenMpClause::LastPrivate { variables, .. } => Some(variables.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
     let predetermined_private =
         crate::sema::validate::openmp::predetermined_private_names(ctx.st, capture_body);
+    let standalone_lastprivate =
+        crate::sema::validate::openmp::standalone_worksharing_lastprivate_names(capture_body);
     let mut seen_captures = std::collections::HashSet::new();
     let mut captures: Vec<Capture> =
         crate::sema::validate::openmp::capture_references(ctx.st, capture_body)
@@ -657,22 +687,60 @@ fn lower_parallel_region(
                 let info = ctx.locals.get(&name).cloned().unwrap_or_else(|| {
                     panic!("validated OpenMP shared capture '{name}' has no lowering binding")
                 });
-                let kind = if private_names.contains(&name) {
-                    CaptureKind::Private
-                } else if firstprivate_names.contains(&name) {
+                let kind = if firstprivate_names.contains(&name) {
                     CaptureKind::FirstPrivate
+                } else if private_names.contains(&name) || lastprivate_names.contains(&name) {
+                    CaptureKind::Private
                 } else if info.inline_const.is_some() {
                     CaptureKind::InlineConstant
-                } else if shared_names.contains(&name) {
+                } else if shared_names.contains(&name) || standalone_lastprivate.contains(&name) {
                     CaptureKind::Shared
                 } else if predetermined_private.contains(&name) {
                     CaptureKind::Private
                 } else {
                     CaptureKind::Shared
                 };
-                Capture { name, info, kind }
+                let lastprivate = lastprivate_names.contains(&name);
+                Capture {
+                    name,
+                    info,
+                    kind,
+                    lastprivate,
+                }
             })
             .collect();
+    for name in &lastprivate_names {
+        if !seen_captures.insert(name.clone()) {
+            continue;
+        }
+        let info = ctx.locals.get(name).cloned().unwrap_or_else(|| {
+            panic!("validated OpenMP LASTPRIVATE capture '{name}' has no lowering binding")
+        });
+        captures.push(Capture {
+            name: name.clone(),
+            info,
+            kind: if firstprivate_names.contains(name) {
+                CaptureKind::FirstPrivate
+            } else {
+                CaptureKind::Private
+            },
+            lastprivate: true,
+        });
+    }
+    for name in &standalone_lastprivate {
+        if !seen_captures.insert(name.clone()) {
+            continue;
+        }
+        let info = ctx.locals.get(name).cloned().unwrap_or_else(|| {
+            panic!("validated OpenMP DO LASTPRIVATE capture '{name}' has no lowering binding")
+        });
+        captures.push(Capture {
+            name: name.clone(),
+            info,
+            kind: CaptureKind::Shared,
+            lastprivate: false,
+        });
+    }
     for clause in clauses {
         let OpenMpClause::Reduction { variables, .. } = clause else {
             continue;
@@ -689,6 +757,7 @@ fn lower_parallel_region(
                 name: key,
                 info,
                 kind: CaptureKind::Shared,
+                lastprivate: false,
             });
         }
     }
@@ -795,6 +864,7 @@ fn lower_parallel_region(
                         loop_stmt,
                         true,
                         outlined_worksharing_chunk,
+                        Some(&cleanup.lastprivate_originals),
                     );
                 }
             }
@@ -1065,6 +1135,104 @@ fn privatize_worksharing_variable(
     (key, saved, private)
 }
 
+fn prepare_lastprivate_bindings(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    clauses: &[OpenMpClause],
+    captured_originals: Option<&std::collections::HashMap<String, LocalInfo>>,
+) -> Vec<LastPrivateBinding> {
+    let firstprivate_names: std::collections::HashSet<_> = clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            OpenMpClause::FirstPrivate(names) => Some(names.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut bindings = Vec::new();
+    for clause in clauses {
+        let OpenMpClause::LastPrivate { variables, .. } = clause else {
+            continue;
+        };
+        for name in variables {
+            let key = name.to_ascii_lowercase();
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let current = ctx.locals.get(&key).cloned().unwrap_or_else(|| {
+                panic!("validated OpenMP LASTPRIVATE variable '{key}' has no lowering binding")
+            });
+            if let Some(original) = captured_originals
+                .and_then(|items| items.get(&key))
+                .cloned()
+            {
+                bindings.push(LastPrivateBinding {
+                    name: key,
+                    original,
+                    private: current,
+                    restore: None,
+                });
+                continue;
+            }
+
+            let original = current.clone();
+            let copy_in = firstprivate_names.contains(&key);
+            let private = if fixed_character_scalar_len(&current).is_some() {
+                let source = copy_in.then(|| {
+                    local_char_ptr_and_len(b, &current)
+                        .expect("validated OpenMP FIRSTPRIVATE character should lower")
+                        .0
+                });
+                allocate_fixed_character_private(b, &current, source)
+            } else {
+                let mut private = current.clone();
+                private.addr = b.alloca(private.ty.clone());
+                private.by_ref = false;
+                private.inline_const = None;
+                if copy_in {
+                    let source = scalar_storage_address(b, &current);
+                    let value = b.load_typed(source, current.ty.clone());
+                    b.store(value, private.addr);
+                }
+                private
+            };
+            ctx.locals.insert(key.clone(), private.clone());
+            bindings.push(LastPrivateBinding {
+                name: key,
+                original: original.clone(),
+                private,
+                restore: Some(original),
+            });
+        }
+    }
+    bindings
+}
+
+fn restore_lastprivate_bindings(ctx: &mut LowerCtx<'_>, bindings: &[LastPrivateBinding]) {
+    for binding in bindings {
+        if let Some(original) = &binding.restore {
+            ctx.locals.insert(binding.name.clone(), original.clone());
+        }
+    }
+}
+
+fn emit_lastprivate_copy(b: &mut FuncBuilder<'_>, binding: &LastPrivateBinding) {
+    if let Some(len) = fixed_character_scalar_len(&binding.private) {
+        let (source, _) = local_char_ptr_and_len(b, &binding.private)
+            .expect("validated OpenMP LASTPRIVATE character source should lower");
+        let (destination, _) = local_char_ptr_and_len(b, &binding.original)
+            .expect("validated OpenMP LASTPRIVATE character destination should lower");
+        emit_memcpy_bytes(b, destination, source, len);
+    } else {
+        let source = scalar_storage_address(b, &binding.private);
+        let destination = scalar_storage_address(b, &binding.original);
+        let value = b.load_typed(source, binding.private.ty.clone());
+        b.store(value, destination);
+    }
+}
+
 fn lower_worksharing_loop(
     b: &mut FuncBuilder<'_>,
     ctx: &mut LowerCtx<'_>,
@@ -1072,6 +1240,7 @@ fn lower_worksharing_loop(
     loop_stmt: &SpannedStmt,
     suppress_barrier: bool,
     precomputed_chunk: Option<ValueId>,
+    captured_lastprivate_originals: Option<&std::collections::HashMap<String, LocalInfo>>,
 ) {
     let Stmt::DoLoop {
         name,
@@ -1202,11 +1371,33 @@ fn lower_worksharing_loop(
         }
     });
     let reductions = prepare_scalar_reductions(b, ctx, clauses);
+    let mut lastprivate_bindings =
+        prepare_lastprivate_bindings(b, ctx, clauses, captured_lastprivate_originals);
 
     let first_addr = b.alloca(i64_ty.clone());
     let last_addr = b.alloca(i64_ty.clone());
     let step_addr = b.alloca(i64_ty.clone());
     b.store(schedule_step, step_addr);
+    let sequential_last_addr = (!lastprivate_bindings.is_empty()).then(|| {
+        let sequential_first_addr = b.alloca(IrType::Int(IntWidth::I64));
+        let sequential_last_addr = b.alloca(IrType::Int(IntWidth::I64));
+        let zero_thread = b.const_i32(0);
+        let one_thread = b.const_i32(1);
+        b.call(
+            FuncRef::External("afs_omp_static_bounds".into()),
+            vec![
+                lower,
+                upper,
+                schedule_step,
+                zero_thread,
+                one_thread,
+                sequential_first_addr,
+                sequential_last_addr,
+            ],
+            IrType::Int(IntWidth::I32),
+        );
+        sequential_last_addr
+    });
     let chunk_index_addr = if dynamic_schedule {
         None
     } else {
@@ -1245,6 +1436,16 @@ fn lower_worksharing_loop(
         ctx.insert_scalar(flat_name.clone(), address, IrType::Int(IntWidth::I64));
         (address, saved)
     });
+    for binding in &mut lastprivate_bindings {
+        if binding.name == outer_key {
+            binding.private = private_outer.clone();
+        }
+        if let Some((inner_key, _, private)) = private_inner.as_ref() {
+            if binding.name == *inner_key {
+                binding.private = private.clone();
+            }
+        }
+    }
 
     let error_bb = b.create_block("omp_do_invalid");
     let dispatch_bb = b.create_block("omp_do_dispatch");
@@ -1405,7 +1606,7 @@ fn lower_worksharing_loop(
             span: loop_stmt.span,
         },
     );
-    ctx.locals.insert(outer_key, saved_outer);
+    ctx.locals.insert(outer_key.clone(), saved_outer);
     if let Some((inner_key, saved_inner, _)) = private_inner {
         ctx.locals.insert(inner_key, saved_inner);
     }
@@ -1416,7 +1617,39 @@ fn lower_worksharing_loop(
     restore_temp_binding(ctx, last_name, saved_last);
     restore_temp_binding(ctx, step_name, saved_step);
     restore_scalar_reductions(ctx, &reductions);
+    restore_lastprivate_bindings(ctx, &lastprivate_bindings);
     if b.func().block(b.current_block()).terminator.is_none() {
+        if let Some(sequential_last_addr) = sequential_last_addr {
+            let chunk_last = b.load_typed(last_addr, IrType::Int(IntWidth::I64));
+            let sequential_last = b.load_typed(sequential_last_addr, IrType::Int(IntWidth::I64));
+            let owns_last_iteration = b.icmp(CmpOp::Eq, chunk_last, sequential_last);
+            let copy_bb = b.create_block("omp_do_lastprivate_copy");
+            let copy_done_bb = b.create_block("omp_do_lastprivate_done");
+            b.cond_branch(owns_last_iteration, copy_bb, vec![], copy_done_bb, vec![]);
+            b.set_block(copy_bb);
+            if let Some(collapsed) = collapsed.as_ref() {
+                for binding in &lastprivate_bindings {
+                    let sequential_value = if binding.name == outer_key {
+                        let span = b.imul(collapsed.outer_count, collapsed.outer_step);
+                        Some(b.iadd(collapsed.outer_lower, span))
+                    } else if binding.name.eq_ignore_ascii_case(collapsed.inner_var) {
+                        let span = b.imul(collapsed.inner_count, collapsed.inner_step);
+                        Some(b.iadd(collapsed.inner_lower, span))
+                    } else {
+                        None
+                    };
+                    if let Some(value) = sequential_value {
+                        let value = coerce_to_type(b, value, &binding.private.ty);
+                        b.store(value, binding.private.addr);
+                    }
+                }
+            }
+            for binding in &lastprivate_bindings {
+                emit_lastprivate_copy(b, binding);
+            }
+            b.branch(copy_done_bb, vec![]);
+            b.set_block(copy_done_bb);
+        }
         b.branch(advance_bb.unwrap_or(done_bb), vec![]);
     }
 
@@ -1458,8 +1691,8 @@ fn materialize_shared_environment(
 ) -> MaterializedEnvironment {
     let addressed_count = captures
         .iter()
-        .filter(|capture| capture_needs_environment(capture, type_layouts))
-        .count();
+        .map(|capture| capture_environment_slot_count(capture, type_layouts))
+        .sum::<usize>();
     let environment_slots = addressed_count + usize::from(worksharing_chunk.is_some());
     if environment_slots == 0 {
         let null = b.const_i64(0);
@@ -1481,7 +1714,21 @@ fn materialize_shared_environment(
     let mut derived_snapshots = std::collections::HashMap::new();
     let mut slot_index = 0i64;
     for capture in captures {
-        if !capture_needs_environment(capture, type_layouts) {
+        if capture.lastprivate {
+            let original_address = if fixed_character_scalar_len(&capture.info).is_some() {
+                local_char_ptr_and_len(b, &capture.info)
+                    .expect("validated OpenMP LASTPRIVATE character should lower")
+                    .0
+            } else {
+                scalar_storage_address(b, &capture.info)
+            };
+            let raw_address = b.ptr_to_int(original_address);
+            let index = b.const_i64(slot_index);
+            let slot = b.gep(environment, vec![index], IrType::Int(IntWidth::I64));
+            b.store(raw_address, slot);
+            slot_index += 1;
+        }
+        if !capture_base_needs_environment(capture, type_layouts) {
             continue;
         }
         let environment_address = if capture.kind == CaptureKind::Private
@@ -1648,7 +1895,7 @@ fn install_shared_captures(
     let mut cleanup = InstalledCaptureCleanup::default();
     let environment_slots = if captures
         .iter()
-        .any(|capture| capture_needs_environment(capture, ctx.type_layouts))
+        .any(|capture| capture_environment_slot_count(capture, ctx.type_layouts) > 0)
     {
         let raw_environment = b.ptr_to_int(ValueId(0));
         Some(b.int_to_ptr(raw_environment, IrType::Int(IntWidth::I64)))
@@ -1657,6 +1904,28 @@ fn install_shared_captures(
     };
 
     for capture in captures {
+        if capture.lastprivate {
+            let index = b.const_i64(slot_index);
+            let slot = b.gep(
+                environment_slots.expect("missing OpenMP environment slots"),
+                vec![index],
+                IrType::Int(IntWidth::I64),
+            );
+            let raw_address = b.load_typed(slot, IrType::Int(IntWidth::I64));
+            let pointee = if fixed_character_scalar_len(&capture.info).is_some() {
+                IrType::Int(IntWidth::I8)
+            } else {
+                capture.info.ty.clone()
+            };
+            let mut original = capture.info.clone();
+            original.addr = b.int_to_ptr(raw_address, pointee);
+            original.by_ref = false;
+            original.inline_const = None;
+            cleanup
+                .lastprivate_originals
+                .insert(capture.name.clone(), original);
+            slot_index += 1;
+        }
         let mut local = capture.info.clone();
         match capture.kind {
             CaptureKind::InlineConstant => {
