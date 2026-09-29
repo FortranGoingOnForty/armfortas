@@ -1,12 +1,13 @@
 //! Semantic validation for executable OpenMP constructs.
 //!
 //! The executable slice is intentionally narrow: `PARALLEL` data environments
-//! support selected numeric/logical storage and private derived scalars, while canonical worksharing `DO`
-//! and combined `PARALLEL DO` support the implemented static/dynamic schedules.
+//! support selected intrinsic/derived storage, while canonical worksharing
+//! `DO` and combined `PARALLEL DO` support the implemented schedules and
+//! scalar LASTPRIVATE copy-out.
 //! Named and unnamed `CRITICAL` regions retain process-wide lock identity.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
-//! regions without pretending later schedules, loop clauses, characters, or
-//! derived objects are already implemented.
+//! regions without pretending later schedules, loop clauses, or wider object
+//! ownership cases are already implemented.
 
 use std::collections::{HashMap, HashSet};
 
@@ -72,6 +73,21 @@ fn reject_in_pure(ctx: &mut Ctx<'_>, span: Span, construct: &str) {
 struct ParallelClauseInfo {
     explicitly_scoped: HashSet<String>,
     default_none: bool,
+}
+
+pub(crate) fn parallel_private_names(clauses: &[OpenMpClause]) -> HashSet<String> {
+    clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            OpenMpClause::Private(names) | OpenMpClause::FirstPrivate(names) => {
+                Some(names.as_slice())
+            }
+            OpenMpClause::Reduction { variables, .. } => Some(variables.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .map(|name| name.to_ascii_lowercase())
+        .collect()
 }
 
 fn validate_parallel_clauses(
@@ -152,6 +168,22 @@ fn validate_parallel_clauses(
                     let key = name.to_ascii_lowercase();
                     register_data_attribute(ctx, span, &mut data_attributes, &key, "FIRSTPRIVATE");
                     validate_private_object(ctx, name, span, "FIRSTPRIVATE");
+                }
+            }
+            OpenMpClause::LastPrivate {
+                conditional,
+                variables,
+            } if combined_do => {
+                if *conditional {
+                    ctx.error(
+                        span,
+                        "OpenMP LASTPRIVATE(CONDITIONAL:) is recognized but not yet implemented",
+                    );
+                }
+                for name in variables {
+                    let key = name.to_ascii_lowercase();
+                    register_data_attribute(ctx, span, &mut data_attributes, &key, "LASTPRIVATE");
+                    validate_lastprivate_object(ctx, name, span);
                 }
             }
             OpenMpClause::Reduction {
@@ -377,6 +409,41 @@ fn validate_worksharing_loop(
         associated_loop_keys.insert(inner_loop.var.to_ascii_lowercase());
     }
 
+    let lastprivate_names: HashSet<_> = clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            OpenMpClause::LastPrivate { variables, .. } => Some(variables.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    if !combined_do {
+        let mut data_attributes = HashMap::new();
+        for clause in clauses {
+            let (names, attribute) = match clause {
+                OpenMpClause::Private(names) => (Some(names.as_slice()), "PRIVATE"),
+                OpenMpClause::FirstPrivate(names) => (Some(names.as_slice()), "FIRSTPRIVATE"),
+                OpenMpClause::LastPrivate { variables, .. } => {
+                    (Some(variables.as_slice()), "LASTPRIVATE")
+                }
+                OpenMpClause::Reduction { variables, .. } => {
+                    (Some(variables.as_slice()), "REDUCTION")
+                }
+                _ => (None, ""),
+            };
+            for name in names.into_iter().flatten() {
+                register_data_attribute(
+                    ctx,
+                    span,
+                    &mut data_attributes,
+                    &name.to_ascii_lowercase(),
+                    attribute,
+                );
+            }
+        }
+    }
+
     for clause in clauses {
         match clause {
             OpenMpClause::Schedule {
@@ -420,6 +487,19 @@ fn validate_worksharing_loop(
                     && names
                         .iter()
                         .all(|name| associated_loop_keys.contains(&name.to_ascii_lowercase())) => {}
+            OpenMpClause::FirstPrivate(names)
+                if !combined_do
+                    && names
+                        .iter()
+                        .any(|name| associated_loop_keys.contains(&name.to_ascii_lowercase())) => ctx.error(
+                            span,
+                            "OpenMP DO associated iteration variables may not appear in FIRSTPRIVATE",
+                        ),
+            OpenMpClause::FirstPrivate(names)
+                if !combined_do
+                    && names
+                        .iter()
+                        .all(|name| lastprivate_names.contains(&name.to_ascii_lowercase())) => {}
             OpenMpClause::Private(_)
             | OpenMpClause::FirstPrivate(_)
                 if !combined_do => ctx.error(
@@ -447,11 +527,39 @@ fn validate_worksharing_loop(
                         ),
             OpenMpClause::Private(_)
             | OpenMpClause::FirstPrivate(_)
+            | OpenMpClause::LastPrivate { .. }
             | OpenMpClause::Shared(_)
             | OpenMpClause::Default(_)
             | OpenMpClause::If { .. }
             | OpenMpClause::NumThreads(_)
                 if combined_do => {}
+            OpenMpClause::LastPrivate {
+                conditional,
+                variables,
+            } => {
+                if *conditional {
+                    ctx.error(
+                        span,
+                        "OpenMP LASTPRIVATE(CONDITIONAL:) is recognized but not yet implemented",
+                    );
+                }
+                for name in variables {
+                    let key = name.to_ascii_lowercase();
+                    if ctx
+                        .openmp_parallel_private_frames
+                        .last()
+                        .is_some_and(|frame| frame.contains(&key))
+                    {
+                        ctx.error(
+                            span,
+                            format!(
+                                "OpenMP DO LASTPRIVATE variable '{name}' may not be private in the binding PARALLEL region"
+                            ),
+                        );
+                    }
+                    validate_lastprivate_object(ctx, name, span);
+                }
+            }
             OpenMpClause::Collapse(_) => {}
             OpenMpClause::Reduction { variables, .. }
                 if combined_do
@@ -485,6 +593,46 @@ fn validate_worksharing_loop(
         cycle_targets.push(outer_loop.name.map(str::to_ascii_lowercase));
     }
     validate_structured_block_with_cycle_targets(ctx, outer_loop.body, &mut cycle_targets);
+}
+
+fn validate_lastprivate_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
+    validate_private_object(ctx, name, span, "LASTPRIVATE");
+    let Some(symbol) = ctx.lookup_lexical(name) else {
+        return;
+    };
+    if symbol.kind != SymbolKind::Variable {
+        return;
+    }
+    if !symbol.attrs.array_spec.is_empty() || symbol.attrs.allocatable || symbol.attrs.pointer {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP LASTPRIVATE variable '{name}' must currently be a nonallocatable, nonpointer scalar"
+            ),
+        );
+        return;
+    }
+    let supported = matches!(
+        symbol.type_info.as_ref(),
+        Some(TypeInfo::Integer { .. })
+            | Some(TypeInfo::Real { .. })
+            | Some(TypeInfo::DoublePrecision)
+            | Some(TypeInfo::Logical { .. })
+    ) || matches!(
+        symbol.type_info.as_ref(),
+        Some(TypeInfo::Character {
+            len: Some(_),
+            kind,
+        }) if kind.unwrap_or(1) == 1
+    );
+    if !supported {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP LASTPRIVATE variable '{name}' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER"
+            ),
+        );
+    }
 }
 
 fn validate_reduction_object(
@@ -595,25 +743,32 @@ fn schedule_kind_name(kind: OpenMpScheduleKind) -> &'static str {
 fn register_data_attribute(
     ctx: &mut Ctx<'_>,
     span: Span,
-    attributes: &mut HashMap<String, &'static str>,
+    attributes: &mut HashMap<String, Vec<&'static str>>,
     name: &str,
     attribute: &'static str,
 ) {
-    if let Some(previous) = attributes.insert(name.to_string(), attribute) {
+    let existing = attributes.entry(name.to_string()).or_default();
+    let compatible_first_last = (attribute == "FIRSTPRIVATE"
+        && existing.as_slice() == ["LASTPRIVATE"])
+        || (attribute == "LASTPRIVATE" && existing.as_slice() == ["FIRSTPRIVATE"]);
+    if !existing.is_empty() && !compatible_first_last {
+        let previous = existing.join(" and ");
         ctx.error(
             span,
             format!(
-                "OpenMP PARALLEL variable '{}' appears in both {} and {} data-sharing clauses",
+                "OpenMP variable '{}' appears in both {} and {} data-sharing clauses",
                 name, previous, attribute
             ),
         );
     }
+    existing.push(attribute);
 }
 
 fn clause_name(clause: &OpenMpClause) -> &'static str {
     match clause {
         OpenMpClause::Private(_) => "PRIVATE",
         OpenMpClause::FirstPrivate(_) => "FIRSTPRIVATE",
+        OpenMpClause::LastPrivate { .. } => "LASTPRIVATE",
         OpenMpClause::Shared(_) => "SHARED",
         OpenMpClause::Default(_) => "DEFAULT",
         OpenMpClause::If { .. } => "IF",
@@ -662,6 +817,98 @@ pub(crate) fn predetermined_private_names(
                 .then_some(name)
         })
         .collect()
+}
+
+pub(crate) fn standalone_worksharing_lastprivate_names(body: &[SpannedStmt]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    collect_standalone_worksharing_lastprivate_names(body, &mut names);
+    names
+}
+
+fn collect_standalone_worksharing_lastprivate_names(
+    stmts: &[SpannedStmt],
+    names: &mut HashSet<String>,
+) {
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::OpenMp(OpenMpConstruct::Do { clauses, .. }) => {
+                for clause in clauses {
+                    if let OpenMpClause::LastPrivate { variables, .. } = clause {
+                        names.extend(variables.iter().map(|name| name.to_ascii_lowercase()));
+                    }
+                }
+            }
+            // Nested parallel and combined constructs own distinct data
+            // environments; their LASTPRIVATE clauses do not affect this
+            // enclosing callback's captures.
+            Stmt::OpenMp(_) => {}
+            Stmt::DoLoop { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::DoConcurrent { body, .. }
+            | Stmt::Block { body, .. }
+            | Stmt::Associate { body, .. }
+            | Stmt::ForallConstruct { body, .. } => {
+                collect_standalone_worksharing_lastprivate_names(body, names)
+            }
+            Stmt::IfConstruct {
+                then_body,
+                else_ifs,
+                else_body,
+                ..
+            } => {
+                collect_standalone_worksharing_lastprivate_names(then_body, names);
+                for (_, body) in else_ifs {
+                    collect_standalone_worksharing_lastprivate_names(body, names);
+                }
+                if let Some(body) = else_body {
+                    collect_standalone_worksharing_lastprivate_names(body, names);
+                }
+            }
+            Stmt::IfStmt { action, .. }
+            | Stmt::WhereStmt { stmt: action, .. }
+            | Stmt::ForallStmt { stmt: action, .. }
+            | Stmt::Labeled { stmt: action, .. } => {
+                collect_standalone_worksharing_lastprivate_names(
+                    std::slice::from_ref(action.as_ref()),
+                    names,
+                )
+            }
+            Stmt::SelectCase { cases, .. } => {
+                for case in cases {
+                    collect_standalone_worksharing_lastprivate_names(&case.body, names);
+                }
+            }
+            Stmt::SelectType { guards, .. } => {
+                for guard in guards {
+                    let body = match guard {
+                        TypeGuard::TypeIs { body, .. }
+                        | TypeGuard::ClassIs { body, .. }
+                        | TypeGuard::ClassDefault { body } => body,
+                    };
+                    collect_standalone_worksharing_lastprivate_names(body, names);
+                }
+            }
+            Stmt::SelectRank { guards, .. } => {
+                for guard in guards {
+                    let body = match guard {
+                        RankGuard::Rank { body, .. }
+                        | RankGuard::RankStar { body }
+                        | RankGuard::RankDefault { body } => body,
+                    };
+                    collect_standalone_worksharing_lastprivate_names(body, names);
+                }
+            }
+            Stmt::WhereConstruct {
+                body, elsewhere, ..
+            } => {
+                collect_standalone_worksharing_lastprivate_names(body, names);
+                for (_, body) in elsewhere {
+                    collect_standalone_worksharing_lastprivate_names(body, names);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn collect_predetermined_private_names(stmts: &[SpannedStmt], names: &mut Vec<(String, Span)>) {
