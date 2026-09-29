@@ -69,7 +69,8 @@ end module
 program p
   use m_c, only : run
   implicit none
-  call run('/tmp/x12_use_only_call_out.txt')
+  ! Keep filesystem effects inside the per-optimization-level harness sandbox.
+  call run('x12_use_only_call_out.txt')
   print '(a)', 'DONE'
 end program p
 ! CHECK: WROTE=hello-from-manifest

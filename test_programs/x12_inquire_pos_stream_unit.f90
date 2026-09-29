@@ -9,7 +9,8 @@
 ! user read an empty chunk.
 program x12_inquire_pos_stream_unit
   implicit none
-  character(len=*), parameter :: path = '/tmp/x12_inquire_pos_stream.dat'
+  ! Keep filesystem effects inside the per-optimization-level harness sandbox.
+  character(len=*), parameter :: path = 'x12_inquire_pos_stream.dat'
   character(len=:), allocatable :: s
   integer :: io, stat, length
   ! write a 26-byte payload
