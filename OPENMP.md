@@ -32,8 +32,8 @@ toward [OpenMP 6.0][omp-60] without silently changing existing behavior.
 | Data sharing | Partial | `shared`, `private`, `firstprivate`, `lastprivate`, `default(shared)`, and `default(none)` for the scalar and array forms accepted by semantic validation. `lastprivate` is currently limited to supported intrinsic scalars on worksharing loops. |
 | Scalar data | Partial | INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, selected allocatable/pointer forms, and nonpolymorphic derived-type privatization. Unsupported ownership, dynamic-length, optional, volatile, and asynchronous cases are diagnosed. |
 | Array data | Partial | Numeric, logical, and fixed-length default-kind CHARACTER constant-shape storage plus selected descriptor-backed dummy, allocatable, pointer, section, and shared derived-type views. Unsupported ownership or lifetime cases are diagnosed. |
-| Worksharing loops | Preview | Canonical `do` and combined `parallel do`, positive/negative strides, static contiguous and chunked schedules, combined dynamic schedules, `collapse(2)`, implicit barriers, standalone `nowait`, and scalar `lastprivate`. Standalone dynamic scheduling remains rejected. |
-| Reductions and synchronization | Partial | Scalar INTEGER `+`, `*`, `max`, and `min`; scalar LOGICAL `.and.`, `.or.`, `.eqv.`, and `.neqv.`; worksharing barriers; and process-wide named/unnamed `critical`. Atomics, flush, locks, ordered regions, single, masked, sections, and the wider reduction type/operator surface remain unimplemented. |
+| Worksharing loops | Preview | Canonical `do` and combined `parallel do`, positive/negative strides, static contiguous and chunked schedules, combined dynamic schedules, `collapse(2)`, implicit barriers, standalone `nowait`, scalar `lastprivate`, and scalar reductions. Standalone dynamic scheduling remains rejected. |
+| Reductions and synchronization | Partial | Scalar INTEGER `+`, `*`, `max`, and `min` plus scalar LOGICAL `.and.`, `.or.`, `.eqv.`, and `.neqv.` on `parallel`, combined `parallel do`, and standalone worksharing `do`. Standalone `do reduction` supports both its implicit barrier and barrier-free `nowait` completion. Atomics, flush, locks, ordered regions, single, masked, sections, and the wider reduction type/operator surface remain unimplemented. |
 | Runtime library | Partial | Initial `omp_lib` queries, setters, timing routines, team execution, barriers, work dispatch, reductions, and critical locks. Unsupported API names are not published as implemented procedures. |
 | Environment variables | Partial | Initial handling for `OMP_NUM_THREADS`, `OMP_DYNAMIC`, `OMP_THREAD_LIMIT`, `OMP_MAX_ACTIVE_LEVELS`, and `OMP_SCHEDULE`. |
 | SIMD semantics | Not implemented | `-fopenmp-simd` does not yet change loop vectorization or accept a SIMD construct as executable support. |
@@ -67,8 +67,7 @@ rather than treated as an opaque pass/fail corpus.
    OpenMP Validation and Verification cases.
 2. Run NPB EP Class S through the owned runtime and preserve minimized compiler
    edges as focused regressions.
-3. Add standalone worksharing reductions, then widen reduction types and
-   operators in bounded slices.
+3. Widen reduction types and operators in bounded slices.
 4. Add guided/runtime scheduling only after each worksharing construct owns an
    explicit dispatch-generation protocol.
 5. Build the durable memory-model primitives needed for barriers, atomics,

@@ -678,6 +678,74 @@ pub extern "C" fn afs_omp_reduce_i64(
     AFS_OMP_SUCCESS
 }
 
+fn valid_i64_reduction_storage_bytes(storage_bytes: i32) -> bool {
+    matches!(storage_bytes, 1 | 2 | 4 | 8)
+}
+
+unsafe fn read_i64_reduction_storage(storage: *const c_void, storage_bytes: i32) -> i64 {
+    match storage_bytes {
+        1 => i64::from(unsafe { (storage.cast::<i8>()).read_unaligned() }),
+        2 => i64::from(unsafe { (storage.cast::<i16>()).read_unaligned() }),
+        4 => i64::from(unsafe { (storage.cast::<i32>()).read_unaligned() }),
+        8 => unsafe { (storage.cast::<i64>()).read_unaligned() },
+        _ => unreachable!("validated OpenMP reduction storage width became invalid"),
+    }
+}
+
+unsafe fn write_i64_reduction_storage(storage: *mut c_void, storage_bytes: i32, value: i64) {
+    match storage_bytes {
+        1 => unsafe { storage.cast::<i8>().write_unaligned(value as i8) },
+        2 => unsafe { storage.cast::<i16>().write_unaligned(value as i16) },
+        4 => unsafe { storage.cast::<i32>().write_unaligned(value as i32) },
+        8 => unsafe { storage.cast::<i64>().write_unaligned(value) },
+        _ => unreachable!("validated OpenMP reduction storage width became invalid"),
+    }
+}
+
+/// Atomically combine one signed-integer or logical private value into the
+/// original object without a team barrier.
+///
+/// This entry point implements the end of a worksharing reduction carrying a
+/// `NOWAIT` clause. The team reduction mutex serializes the read/modify/write,
+/// but each implicit task returns as soon as its own private value has been
+/// combined. A later program synchronization point is therefore still needed
+/// before another task may safely consume the final value.
+#[no_mangle]
+pub extern "C" fn afs_omp_reduce_i64_nowait(
+    operator: i32,
+    private_value: i64,
+    original_storage: *mut c_void,
+    storage_bytes: i32,
+) -> i32 {
+    if original_storage.is_null()
+        || !valid_i64_reduction_storage_bytes(storage_bytes)
+        || combine_i64_reduction(operator, 0, 0).is_none()
+    {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    }
+    let reduction = THREAD_STATE.with(|state| {
+        state
+            .borrow()
+            .teams
+            .last()
+            .map(|team| Arc::clone(&team.reduction))
+    });
+    let Some(reduction) = reduction else {
+        return AFS_OMP_ERROR_NO_TEAM;
+    };
+
+    let _workspace = reduction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let original = unsafe { read_i64_reduction_storage(original_storage, storage_bytes) };
+    let combined = combine_i64_reduction(operator, original, private_value)
+        .expect("validated OpenMP reduction operator became invalid");
+    unsafe {
+        write_i64_reduction_storage(original_storage, storage_bytes, combined);
+    }
+    AFS_OMP_SUCCESS
+}
+
 /// Compute one thread's contiguous `schedule(static)` iteration interval.
 ///
 /// A positive result means `first` and `last` were written. Zero means this
@@ -1267,6 +1335,98 @@ mod tests {
         }
     }
 
+    #[repr(C)]
+    struct NowaitReductionObservations {
+        add_i8: i8,
+        multiply_i16: i16,
+        maximum_i32: i32,
+        minimum_i64: i64,
+        logical_and: i8,
+        logical_or: i8,
+    }
+
+    unsafe extern "C" fn reduce_nowait_task(
+        environment: *mut c_void,
+        thread_num: i32,
+        _team_size: i32,
+    ) {
+        let values = environment.cast::<NowaitReductionObservations>();
+        let private = i64::from(thread_num) + 1;
+        let calls = [
+            (
+                AFS_OMP_REDUCTION_ADD,
+                private,
+                std::ptr::addr_of_mut!((*values).add_i8).cast(),
+                1,
+            ),
+            (
+                AFS_OMP_REDUCTION_MULTIPLY,
+                private,
+                std::ptr::addr_of_mut!((*values).multiply_i16).cast(),
+                2,
+            ),
+            (
+                AFS_OMP_REDUCTION_MAX,
+                i64::from(thread_num) - 3,
+                std::ptr::addr_of_mut!((*values).maximum_i32).cast(),
+                4,
+            ),
+            (
+                AFS_OMP_REDUCTION_MIN,
+                8 - private,
+                std::ptr::addr_of_mut!((*values).minimum_i64).cast(),
+                8,
+            ),
+            (
+                AFS_OMP_REDUCTION_AND,
+                i64::from(thread_num != 3),
+                std::ptr::addr_of_mut!((*values).logical_and).cast(),
+                1,
+            ),
+            (
+                AFS_OMP_REDUCTION_OR,
+                i64::from(thread_num == 2),
+                std::ptr::addr_of_mut!((*values).logical_or).cast(),
+                1,
+            ),
+        ];
+        for (operator, private, storage, storage_bytes) in calls {
+            assert_eq!(
+                afs_omp_reduce_i64_nowait(operator, private, storage, storage_bytes),
+                AFS_OMP_SUCCESS
+            );
+        }
+    }
+
+    #[test]
+    fn nowait_reductions_update_typed_shared_storage_without_a_barrier() {
+        reset_thread_state();
+        let mut values = NowaitReductionObservations {
+            add_i8: 5,
+            multiply_i16: 2,
+            maximum_i32: -100,
+            minimum_i64: 100,
+            logical_and: 1,
+            logical_or: 0,
+        };
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(reduce_nowait_task),
+                std::ptr::addr_of_mut!(values).cast(),
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(values.add_i8, 15);
+        assert_eq!(values.multiply_i16, 48);
+        assert_eq!(values.maximum_i32, 0);
+        assert_eq!(values.minimum_i64, 4);
+        assert_eq!(values.logical_and, 0);
+        assert_eq!(values.logical_or, 1);
+    }
+
     #[test]
     fn reduction_runtime_rejects_invalid_context_or_arguments() {
         reset_thread_state();
@@ -1281,6 +1441,32 @@ mod tests {
         );
         assert_eq!(
             afs_omp_reduce_i64(AFS_OMP_REDUCTION_ADD, 1, 2, std::ptr::null_mut()),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(
+            afs_omp_reduce_i64_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                1,
+                std::ptr::addr_of_mut!(result).cast(),
+                4,
+            ),
+            AFS_OMP_ERROR_NO_TEAM
+        );
+        assert_eq!(
+            afs_omp_reduce_i64_nowait(99, 1, std::ptr::addr_of_mut!(result).cast(), 4,),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(
+            afs_omp_reduce_i64_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                1,
+                std::ptr::addr_of_mut!(result).cast(),
+                3,
+            ),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(
+            afs_omp_reduce_i64_nowait(AFS_OMP_REDUCTION_ADD, 1, std::ptr::null_mut(), 4,),
             AFS_OMP_ERROR_INVALID_REDUCTION
         );
         assert_eq!(result, -1);

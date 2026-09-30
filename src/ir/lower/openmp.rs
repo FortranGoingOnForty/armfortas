@@ -11,6 +11,8 @@
 //! storage below the compiler's stack threshold and owned descriptors above
 //! it. Scalar LASTPRIVATE copy-out is selected by the sequentially last
 //! logical iteration rather than by whichever implicit task finishes last.
+//! Standalone worksharing reductions use either the synchronized team
+//! combiner or a lock-protected, barrier-free `NOWAIT` combiner.
 
 use crate::ast::expr::Expr;
 use crate::ast::openmp::{
@@ -1053,20 +1055,8 @@ fn finish_scalar_reductions(
             vec![operator, private, original, result_address],
             IrType::Int(IntWidth::I32),
         );
+        require_scalar_reduction_success(b, status);
         let zero = b.const_i32(0);
-        let invalid = b.icmp(CmpOp::Ne, status, zero);
-        let error_bb = b.create_block("omp_reduction_invalid");
-        let ready_bb = b.create_block("omp_reduction_ready");
-        b.cond_branch(invalid, error_bb, vec![], ready_bb, vec![]);
-        b.set_block(error_bb);
-        b.runtime_call(
-            crate::ir::inst::RuntimeFunc::ErrorStop,
-            vec![],
-            IrType::Void,
-        );
-        b.branch(ready_bb, vec![]);
-
-        b.set_block(ready_bb);
         let thread_zero = b.icmp(CmpOp::Eq, thread_num, zero);
         let store_bb = b.create_block("omp_reduction_store");
         let done_bb = b.create_block("omp_reduction_done");
@@ -1078,6 +1068,41 @@ fn finish_scalar_reductions(
         b.branch(done_bb, vec![]);
         b.set_block(done_bb);
     }
+}
+
+fn finish_scalar_reductions_nowait(b: &mut FuncBuilder<'_>, bindings: &[ScalarReductionBinding]) {
+    for binding in bindings {
+        let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
+        let private = coerce_to_type(b, private, &IrType::Int(IntWidth::I64));
+        let shared_address = scalar_storage_address(b, &binding.shared);
+        let operator = b.const_i32(reduction_runtime_operator(binding.operator));
+        let storage_bytes = b.const_i32(
+            i32::try_from(ir_scalar_byte_size(&binding.shared.ty, b.layout))
+                .expect("validated OpenMP reduction scalar storage exceeds i32"),
+        );
+        let status = b.call(
+            FuncRef::External("afs_omp_reduce_i64_nowait".into()),
+            vec![operator, private, shared_address, storage_bytes],
+            IrType::Int(IntWidth::I32),
+        );
+        require_scalar_reduction_success(b, status);
+    }
+}
+
+fn require_scalar_reduction_success(b: &mut FuncBuilder<'_>, status: ValueId) {
+    let zero = b.const_i32(0);
+    let invalid = b.icmp(CmpOp::Ne, status, zero);
+    let error_bb = b.create_block("omp_reduction_invalid");
+    let ready_bb = b.create_block("omp_reduction_ready");
+    b.cond_branch(invalid, error_bb, vec![], ready_bb, vec![]);
+    b.set_block(error_bb);
+    b.runtime_call(
+        crate::ir::inst::RuntimeFunc::ErrorStop,
+        vec![],
+        IrType::Void,
+    );
+    b.branch(ready_bb, vec![]);
+    b.set_block(ready_bb);
 }
 
 fn restore_scalar_reductions(ctx: &mut LowerCtx<'_>, bindings: &[ScalarReductionBinding]) {
@@ -1666,8 +1691,12 @@ fn lower_worksharing_loop(
     }
 
     b.set_block(done_bb);
-    finish_scalar_reductions(b, &reductions, thread_num);
-    if !suppress_barrier && !nowait {
+    if nowait {
+        finish_scalar_reductions_nowait(b, &reductions);
+    } else {
+        finish_scalar_reductions(b, &reductions, thread_num);
+    }
+    if !suppress_barrier && !nowait && reductions.is_empty() {
         b.call(
             FuncRef::External("afs_omp_barrier".into()),
             vec![],

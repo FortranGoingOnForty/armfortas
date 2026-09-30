@@ -3,7 +3,7 @@
 //! The executable slice is intentionally narrow: `PARALLEL` data environments
 //! support selected intrinsic/derived storage, while canonical worksharing
 //! `DO` and combined `PARALLEL DO` support the implemented schedules and
-//! scalar LASTPRIVATE copy-out.
+//! scalar LASTPRIVATE copy-out and scalar INTEGER/LOGICAL reductions.
 //! Named and unnamed `CRITICAL` regions retain process-wide lock identity.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
 //! regions without pretending later schedules, loop clauses, or wider object
@@ -561,22 +561,40 @@ fn validate_worksharing_loop(
                 }
             }
             OpenMpClause::Collapse(_) => {}
-            OpenMpClause::Reduction { variables, .. }
-                if combined_do
-                    && variables
-                        .iter()
-                        .any(|name| associated_loop_keys.contains(&name.to_ascii_lowercase())) =>
+            OpenMpClause::Reduction { variables, .. } if variables
+                .iter()
+                .any(|name| associated_loop_keys.contains(&name.to_ascii_lowercase())) =>
             {
                 ctx.error(
                     span,
-                    "OpenMP PARALLEL DO associated iteration variables may not appear in REDUCTION",
+                    format!(
+                        "OpenMP {} associated iteration variables may not appear in REDUCTION",
+                        if combined_do { "PARALLEL DO" } else { "DO" }
+                    ),
                 )
             }
             OpenMpClause::Reduction { .. } if combined_do => {}
-            OpenMpClause::Reduction { .. } => ctx.error(
-                span,
-                "OpenMP REDUCTION clause on standalone DO is recognized but not yet implemented",
-            ),
+            OpenMpClause::Reduction {
+                operator,
+                variables,
+            } => {
+                for name in variables {
+                    let key = name.to_ascii_lowercase();
+                    if ctx
+                        .openmp_parallel_private_frames
+                        .last()
+                        .is_some_and(|frame| frame.contains(&key))
+                    {
+                        ctx.error(
+                            span,
+                            format!(
+                                "OpenMP DO REDUCTION variable '{name}' must be shared in the binding PARALLEL region"
+                            ),
+                        );
+                    }
+                    validate_reduction_object(ctx, name, span, *operator);
+                }
+            }
             OpenMpClause::Shared(_)
             | OpenMpClause::Default(_)
             | OpenMpClause::If { .. }
