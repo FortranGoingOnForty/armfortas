@@ -42464,7 +42464,36 @@ fn fdefault_real_8_changes_default_kind() {
         return;
     }
     let src = write_program(
-        "program p\n  implicit none\n  type :: box_t\n    real :: value = 0.0\n  end type\n  interface assignment(=)\n    procedure :: assign_real\n  end interface\n  real :: y\n  type(box_t) :: box\n  y = 2.5\n  box = y\n  if (box%value /= 2.5) error stop 1\n  print *, kind(y)\ncontains\n  subroutine assign_real(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    real, intent(in) :: rhs\n    lhs%value = rhs\n  end subroutine\nend program\n",
+        "program p
+  implicit none
+  type :: box_t
+    real :: value = 0.0
+  end type
+  interface assignment(=)
+    procedure :: assign_real
+  end interface
+  real :: y
+  complex :: z
+  type(box_t) :: box
+  y = 2.5
+  box = y
+  z = make_complex()
+  if (box%value /= 2.5) error stop 1
+  if (kind(z) /= 8) error stop 2
+  if (real(z, kind=8) /= 1.0000000000000002_8) error stop 3
+  if (aimag(z) /= -1.0000000000000002_8) error stop 4
+  print *, kind(y), kind(z)
+contains
+  complex function make_complex()
+    make_complex = cmplx(1.0000000000000002_8, -1.0000000000000002_8, kind=8)
+  end function
+  subroutine assign_real(lhs, rhs)
+    type(box_t), intent(out) :: lhs
+    real, intent(in) :: rhs
+    lhs%value = rhs
+  end subroutine
+end program
+",
         "f90",
     );
     let out = unique_path("defreal", "bin");
@@ -42479,6 +42508,12 @@ fn fdefault_real_8_changes_default_kind() {
         .expect("spawn failed");
     assert!(result.status.success());
     let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "default REAL/COMPLEX kind executable failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
         stdout.trim().ends_with('8'),
