@@ -3,7 +3,7 @@
 //! The executable slice is intentionally narrow: `PARALLEL` data environments
 //! support selected intrinsic/derived storage, while canonical worksharing
 //! `DO` and combined `PARALLEL DO` support the implemented schedules and
-//! scalar LASTPRIVATE copy-out and scalar INTEGER/LOGICAL reductions.
+//! scalar LASTPRIVATE copy-out and scalar INTEGER/REAL/LOGICAL reductions.
 //! Named and unnamed `CRITICAL` regions retain process-wide lock identity.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
 //! regions without pretending later schedules, loop clauses, or wider object
@@ -705,6 +705,23 @@ fn validate_reduction_object(
             Some(TypeInfo::Integer { kind }),
         ) => matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8),
         (
+            OpenMpReductionOperator::Add
+            | OpenMpReductionOperator::Multiply
+            | OpenMpReductionOperator::Max
+            | OpenMpReductionOperator::Min,
+            Some(TypeInfo::Real { kind }),
+        ) => matches!(
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
+            4 | 8
+        ),
+        (
+            OpenMpReductionOperator::Add
+            | OpenMpReductionOperator::Multiply
+            | OpenMpReductionOperator::Max
+            | OpenMpReductionOperator::Min,
+            Some(TypeInfo::DoublePrecision),
+        ) => true,
+        (
             OpenMpReductionOperator::And
             | OpenMpReductionOperator::Or
             | OpenMpReductionOperator::Eqv
@@ -714,22 +731,22 @@ fn validate_reduction_object(
         _ => false,
     };
     if !valid {
+        let requirement = if matches!(
+            operator,
+            OpenMpReductionOperator::And
+                | OpenMpReductionOperator::Or
+                | OpenMpReductionOperator::Eqv
+                | OpenMpReductionOperator::Neqv
+        ) {
+            "a scalar LOGICAL of kind 1, 2, 4, or 8"
+        } else {
+            "a scalar INTEGER of kind 1, 2, 4, or 8, or REAL of kind 4 or 8"
+        };
         ctx.error(
             span,
             format!(
-                "OpenMP {} REDUCTION currently requires a scalar {} of kind 1, 2, 4, or 8",
+                "OpenMP {} REDUCTION currently requires {requirement}",
                 reduction_operator_name(operator),
-                if matches!(
-                    operator,
-                    OpenMpReductionOperator::And
-                        | OpenMpReductionOperator::Or
-                        | OpenMpReductionOperator::Eqv
-                        | OpenMpReductionOperator::Neqv
-                ) {
-                    "LOGICAL"
-                } else {
-                    "INTEGER"
-                }
             ),
         );
     }

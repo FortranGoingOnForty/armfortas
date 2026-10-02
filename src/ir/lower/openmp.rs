@@ -22,7 +22,7 @@ use crate::ast::stmt::{SpannedStmt, Stmt};
 use crate::ast::Spanned;
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::{CmpOp, FuncRef, Function, Param, ValueId};
-use crate::ir::types::{IntWidth, IrType};
+use crate::ir::types::{FloatWidth, IntWidth, IrType};
 
 use super::alloc::rewrite_heap_promoted_declared_bounds;
 use super::core::{
@@ -972,8 +972,25 @@ fn scalar_reduction_identity(
         return coerce_to_type(b, value, &info.ty);
     }
 
+    if let IrType::Float(width) = &info.ty {
+        let value = match operator {
+            OpenMpReductionOperator::Multiply => 1.0,
+            OpenMpReductionOperator::Max => match width {
+                FloatWidth::F32 => f32::MIN as f64,
+                FloatWidth::F64 => f64::MIN,
+            },
+            OpenMpReductionOperator::Min => match width {
+                FloatWidth::F32 => f32::MAX as f64,
+                FloatWidth::F64 => f64::MAX,
+            },
+            OpenMpReductionOperator::Add => 0.0,
+            _ => unreachable!("logical OpenMP reduction applied to REAL"),
+        };
+        return b.const_float(value, *width);
+    }
+
     let IrType::Int(width) = &info.ty else {
-        unreachable!("non-integer OpenMP scalar reduction passed semantic validation")
+        unreachable!("unsupported OpenMP scalar reduction passed semantic validation")
     };
     let bits = width.bits();
     let (least, greatest) = if bits == 128 {
@@ -1044,17 +1061,38 @@ fn finish_scalar_reductions(
 ) {
     for binding in bindings {
         let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
-        let private = coerce_to_type(b, private, &IrType::Int(IntWidth::I64));
         let shared_address = scalar_storage_address(b, &binding.shared);
-        let original = b.load_typed(shared_address, binding.shared.ty.clone());
-        let original = coerce_to_type(b, original, &IrType::Int(IntWidth::I64));
-        let result_address = b.alloca(IrType::Int(IntWidth::I64));
         let operator = b.const_i32(reduction_runtime_operator(binding.operator));
-        let status = b.call(
-            FuncRef::External("afs_omp_reduce_i64".into()),
-            vec![operator, private, original, result_address],
-            IrType::Int(IntWidth::I32),
-        );
+        let (status, result_address, result_ty) = match &binding.shared.ty {
+            IrType::Float(width) => {
+                let result_ty = IrType::Float(*width);
+                let original = b.load_typed(shared_address, result_ty.clone());
+                let result_address = b.alloca(result_ty.clone());
+                let function = match width {
+                    FloatWidth::F32 => "afs_omp_reduce_f32",
+                    FloatWidth::F64 => "afs_omp_reduce_f64",
+                };
+                let status = b.call(
+                    FuncRef::External(function.into()),
+                    vec![operator, private, original, result_address],
+                    IrType::Int(IntWidth::I32),
+                );
+                (status, result_address, result_ty)
+            }
+            _ => {
+                let abi_ty = IrType::Int(IntWidth::I64);
+                let private = coerce_to_type(b, private, &abi_ty);
+                let original = b.load_typed(shared_address, binding.shared.ty.clone());
+                let original = coerce_to_type(b, original, &abi_ty);
+                let result_address = b.alloca(abi_ty.clone());
+                let status = b.call(
+                    FuncRef::External("afs_omp_reduce_i64".into()),
+                    vec![operator, private, original, result_address],
+                    IrType::Int(IntWidth::I32),
+                );
+                (status, result_address, abi_ty)
+            }
+        };
         require_scalar_reduction_success(b, status);
         let zero = b.const_i32(0);
         let thread_zero = b.icmp(CmpOp::Eq, thread_num, zero);
@@ -1062,29 +1100,57 @@ fn finish_scalar_reductions(
         let done_bb = b.create_block("omp_reduction_done");
         b.cond_branch(thread_zero, store_bb, vec![], done_bb, vec![]);
         b.set_block(store_bb);
-        let result = b.load_typed(result_address, IrType::Int(IntWidth::I64));
+        let result = b.load_typed(result_address, result_ty);
         let result = coerce_to_type(b, result, &binding.shared.ty);
         b.store(result, shared_address);
         b.branch(done_bb, vec![]);
         b.set_block(done_bb);
+    }
+    if !bindings.is_empty() {
+        // The synchronized runtime combiner's second barrier makes its result
+        // available to every implicit task, but thread zero still has to
+        // publish that result to the original shared object. One barrier after
+        // all stores makes the reduction result visible before a standalone
+        // worksharing construct's implicit barrier completes.
+        let status = b.call(
+            FuncRef::External("afs_omp_barrier".into()),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        );
+        require_scalar_reduction_success(b, status);
     }
 }
 
 fn finish_scalar_reductions_nowait(b: &mut FuncBuilder<'_>, bindings: &[ScalarReductionBinding]) {
     for binding in bindings {
         let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
-        let private = coerce_to_type(b, private, &IrType::Int(IntWidth::I64));
         let shared_address = scalar_storage_address(b, &binding.shared);
         let operator = b.const_i32(reduction_runtime_operator(binding.operator));
-        let storage_bytes = b.const_i32(
-            i32::try_from(ir_scalar_byte_size(&binding.shared.ty, b.layout))
-                .expect("validated OpenMP reduction scalar storage exceeds i32"),
-        );
-        let status = b.call(
-            FuncRef::External("afs_omp_reduce_i64_nowait".into()),
-            vec![operator, private, shared_address, storage_bytes],
-            IrType::Int(IntWidth::I32),
-        );
+        let status = match &binding.shared.ty {
+            IrType::Float(width) => {
+                let function = match width {
+                    FloatWidth::F32 => "afs_omp_reduce_f32_nowait",
+                    FloatWidth::F64 => "afs_omp_reduce_f64_nowait",
+                };
+                b.call(
+                    FuncRef::External(function.into()),
+                    vec![operator, private, shared_address],
+                    IrType::Int(IntWidth::I32),
+                )
+            }
+            _ => {
+                let private = coerce_to_type(b, private, &IrType::Int(IntWidth::I64));
+                let storage_bytes = b.const_i32(
+                    i32::try_from(ir_scalar_byte_size(&binding.shared.ty, b.layout))
+                        .expect("validated OpenMP reduction scalar storage exceeds i32"),
+                );
+                b.call(
+                    FuncRef::External("afs_omp_reduce_i64_nowait".into()),
+                    vec![operator, private, shared_address, storage_bytes],
+                    IrType::Int(IntWidth::I32),
+                )
+            }
+        };
         require_scalar_reduction_success(b, status);
     }
 }
