@@ -5589,9 +5589,13 @@ pub extern "C" fn afs_fmt_begin_internal_ex(
     });
 }
 
+// These are imports from libc, not replacement definitions of Rust runtime symbols.
+#[allow(suspicious_runtime_symbol_definitions)]
 extern "C" {
-    fn malloc(size: usize) -> *mut u8;
-    fn free(ptr: *mut u8);
+    #[link_name = "malloc"]
+    fn system_malloc(size: usize) -> *mut u8;
+    #[link_name = "free"]
+    fn system_free(ptr: *mut u8);
 }
 
 /// Store formatted internal-write bytes into a deferred-length
@@ -5621,14 +5625,14 @@ fn store_internal_alloc_record(
         return true;
     }
     if n > d.capacity || d.data.is_null() {
-        let newp = unsafe { malloc(n as usize) };
+        let newp = unsafe { system_malloc(n as usize) };
         if newp.is_null() {
             return false;
         }
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), newp, n as usize);
             if d.is_allocated() && !d.data.is_null() {
-                free(d.data);
+                system_free(d.data);
             }
         }
         d.data = newp;

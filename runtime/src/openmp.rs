@@ -272,6 +272,8 @@ struct TeamContext {
 struct ReductionWorkspace {
     slots: Vec<i64>,
     result: i64,
+    real_slots: Vec<u64>,
+    real_result: u64,
 }
 
 #[derive(Debug, Default)]
@@ -608,6 +610,167 @@ fn combine_i64_reduction(operator: i32, left: i64, right: i64) -> Option<i64> {
     }
 }
 
+trait RealReductionValue: Copy {
+    fn zero() -> Self;
+    fn encode(self) -> u64;
+    fn decode(bits: u64) -> Self;
+    fn combine(operator: i32, left: Self, right: Self) -> Option<Self>;
+}
+
+impl RealReductionValue for f32 {
+    fn zero() -> Self {
+        0.0
+    }
+
+    fn encode(self) -> u64 {
+        u64::from(self.to_bits())
+    }
+
+    fn decode(bits: u64) -> Self {
+        Self::from_bits(bits as u32)
+    }
+
+    fn combine(operator: i32, left: Self, right: Self) -> Option<Self> {
+        match operator {
+            AFS_OMP_REDUCTION_ADD => Some(left + right),
+            AFS_OMP_REDUCTION_MULTIPLY => Some(left * right),
+            AFS_OMP_REDUCTION_MAX => Some(left.max(right)),
+            AFS_OMP_REDUCTION_MIN => Some(left.min(right)),
+            _ => None,
+        }
+    }
+}
+
+impl RealReductionValue for f64 {
+    fn zero() -> Self {
+        0.0
+    }
+
+    fn encode(self) -> u64 {
+        self.to_bits()
+    }
+
+    fn decode(bits: u64) -> Self {
+        Self::from_bits(bits)
+    }
+
+    fn combine(operator: i32, left: Self, right: Self) -> Option<Self> {
+        match operator {
+            AFS_OMP_REDUCTION_ADD => Some(left + right),
+            AFS_OMP_REDUCTION_MULTIPLY => Some(left * right),
+            AFS_OMP_REDUCTION_MAX => Some(left.max(right)),
+            AFS_OMP_REDUCTION_MIN => Some(left.min(right)),
+            _ => None,
+        }
+    }
+}
+
+fn reduce_real<T: RealReductionValue>(
+    operator: i32,
+    private_value: T,
+    original_value: T,
+) -> Result<T, i32> {
+    if T::combine(operator, T::zero(), T::zero()).is_none() {
+        return Err(AFS_OMP_ERROR_INVALID_REDUCTION);
+    }
+    let context = THREAD_STATE.with(|state| {
+        let state = state.borrow();
+        state.teams.last().map(|team| {
+            (
+                team.thread_num,
+                team.team_size,
+                Arc::clone(&team.barrier),
+                Arc::clone(&team.reduction),
+            )
+        })
+    });
+    let Some((thread_num, team_size, barrier, reduction)) = context else {
+        return Err(AFS_OMP_ERROR_NO_TEAM);
+    };
+
+    {
+        let mut workspace = reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let team_size = usize::try_from(team_size).unwrap_or(0);
+        if workspace.real_slots.len() != team_size {
+            workspace.real_slots.resize(team_size, T::zero().encode());
+        }
+        workspace.real_slots[thread_num as usize] = private_value.encode();
+    }
+    barrier.wait();
+
+    if thread_num == 0 {
+        let mut workspace = reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let combined =
+            workspace
+                .real_slots
+                .iter()
+                .copied()
+                .fold(original_value, |combined, value| {
+                    T::combine(operator, combined, T::decode(value))
+                        .expect("validated OpenMP REAL reduction operator became invalid")
+                });
+        workspace.real_result = combined.encode();
+    }
+    barrier.wait();
+
+    let combined = reduction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .real_result;
+    Ok(T::decode(combined))
+}
+
+/// Combine one REAL(4) private value across the current team.
+///
+/// The runtime performs every combiner operation at binary32 precision and in
+/// ascending thread-number order. The latter is deterministic but not exposed
+/// as a language guarantee: OpenMP leaves the reduction order unspecified.
+#[no_mangle]
+pub extern "C" fn afs_omp_reduce_f32(
+    operator: i32,
+    private_value: f32,
+    original_value: f32,
+    result: *mut f32,
+) -> i32 {
+    if result.is_null() {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    }
+    let combined = match reduce_real(operator, private_value, original_value) {
+        Ok(combined) => combined,
+        Err(error) => return error,
+    };
+    unsafe {
+        result.write_unaligned(combined);
+    }
+    AFS_OMP_SUCCESS
+}
+
+/// Combine one REAL(8) or DOUBLE PRECISION private value across the current
+/// team using binary64 operations.
+#[no_mangle]
+pub extern "C" fn afs_omp_reduce_f64(
+    operator: i32,
+    private_value: f64,
+    original_value: f64,
+    result: *mut f64,
+) -> i32 {
+    if result.is_null() {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    }
+    let combined = match reduce_real(operator, private_value, original_value) {
+        Ok(combined) => combined,
+        Err(error) => return error,
+    };
+    unsafe {
+        result.write_unaligned(combined);
+    }
+    AFS_OMP_SUCCESS
+}
+
 /// Combine one signed-integer or logical private value across the current team.
 ///
 /// Every implicit task must call this entry point in the same order. Values are
@@ -744,6 +907,60 @@ pub extern "C" fn afs_omp_reduce_i64_nowait(
         write_i64_reduction_storage(original_storage, storage_bytes, combined);
     }
     AFS_OMP_SUCCESS
+}
+
+fn reduce_real_nowait<T: RealReductionValue>(
+    operator: i32,
+    private_value: T,
+    original_storage: *mut T,
+) -> i32 {
+    if original_storage.is_null() || T::combine(operator, T::zero(), T::zero()).is_none() {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    }
+    let reduction = THREAD_STATE.with(|state| {
+        state
+            .borrow()
+            .teams
+            .last()
+            .map(|team| Arc::clone(&team.reduction))
+    });
+    let Some(reduction) = reduction else {
+        return AFS_OMP_ERROR_NO_TEAM;
+    };
+
+    let _workspace = reduction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let original = unsafe { original_storage.read_unaligned() };
+    let combined = T::combine(operator, original, private_value)
+        .expect("validated OpenMP REAL reduction operator became invalid");
+    unsafe {
+        original_storage.write_unaligned(combined);
+    }
+    AFS_OMP_SUCCESS
+}
+
+/// Combine one REAL(4) private value directly into the shared object without
+/// a team barrier. This is the `NOWAIT` counterpart of
+/// [`afs_omp_reduce_f32`].
+#[no_mangle]
+pub extern "C" fn afs_omp_reduce_f32_nowait(
+    operator: i32,
+    private_value: f32,
+    original_storage: *mut f32,
+) -> i32 {
+    reduce_real_nowait(operator, private_value, original_storage)
+}
+
+/// Combine one REAL(8) or DOUBLE PRECISION private value directly into the
+/// shared object without a team barrier.
+#[no_mangle]
+pub extern "C" fn afs_omp_reduce_f64_nowait(
+    operator: i32,
+    private_value: f64,
+    original_storage: *mut f64,
+) -> i32 {
+    reduce_real_nowait(operator, private_value, original_storage)
 }
 
 /// Compute one thread's contiguous `schedule(static)` iteration interval.
@@ -1335,6 +1552,87 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RealReductionObservations {
+        values: Mutex<Vec<RealReductionObservation>>,
+    }
+
+    struct RealReductionObservation {
+        thread_num: i32,
+        values_f32: [f32; 4],
+        values_f64: [f64; 4],
+    }
+
+    unsafe extern "C" fn reduce_real_task(
+        environment: *mut c_void,
+        thread_num: i32,
+        _team_size: i32,
+    ) {
+        let observations = unsafe { &*(environment as *const RealReductionObservations) };
+        let private_f32 = thread_num as f32 + 1.0;
+        let private_f64 = f64::from(thread_num) + 1.0;
+        let extrema_f32 = thread_num as f32 - 2.0;
+        let extrema_f64 = f64::from(thread_num) - 2.0;
+        let mut values_f32 = [0.0; 4];
+        let mut values_f64 = [0.0; 4];
+        let inputs_f32 = [
+            (AFS_OMP_REDUCTION_ADD, private_f32, 10.0),
+            (AFS_OMP_REDUCTION_MULTIPLY, private_f32, 2.0),
+            (AFS_OMP_REDUCTION_MAX, extrema_f32, -9.0),
+            (AFS_OMP_REDUCTION_MIN, extrema_f32, 9.0),
+        ];
+        for (index, (operator, private, original)) in inputs_f32.into_iter().enumerate() {
+            assert_eq!(
+                afs_omp_reduce_f32(operator, private, original, &mut values_f32[index]),
+                AFS_OMP_SUCCESS
+            );
+        }
+        let inputs_f64 = [
+            (AFS_OMP_REDUCTION_ADD, private_f64, 10.0),
+            (AFS_OMP_REDUCTION_MULTIPLY, private_f64, 2.0),
+            (AFS_OMP_REDUCTION_MAX, extrema_f64, -9.0),
+            (AFS_OMP_REDUCTION_MIN, extrema_f64, 9.0),
+        ];
+        for (index, (operator, private, original)) in inputs_f64.into_iter().enumerate() {
+            assert_eq!(
+                afs_omp_reduce_f64(operator, private, original, &mut values_f64[index]),
+                AFS_OMP_SUCCESS
+            );
+        }
+        observations
+            .values
+            .lock()
+            .unwrap()
+            .push(RealReductionObservation {
+                thread_num,
+                values_f32,
+                values_f64,
+            });
+    }
+
+    #[test]
+    fn real_reductions_preserve_kind_precision_and_thread_order() {
+        reset_thread_state();
+        let observations = RealReductionObservations::default();
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(reduce_real_task),
+                &observations as *const RealReductionObservations as *mut c_void,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        let mut values = observations.values.into_inner().unwrap();
+        values.sort_unstable_by_key(|observation| observation.thread_num);
+        assert_eq!(values.len(), 4);
+        for observation in values {
+            assert_eq!(observation.values_f32, [20.0, 48.0, 1.0, -2.0]);
+            assert_eq!(observation.values_f64, [20.0, 48.0, 1.0, -2.0]);
+        }
+    }
+
     #[repr(C)]
     struct NowaitReductionObservations {
         add_i8: i8,
@@ -1343,6 +1641,10 @@ mod tests {
         minimum_i64: i64,
         logical_and: i8,
         logical_or: i8,
+        real_add_f32: f32,
+        real_multiply_f32: f32,
+        real_maximum_f64: f64,
+        real_minimum_f64: f64,
     }
 
     unsafe extern "C" fn reduce_nowait_task(
@@ -1396,6 +1698,38 @@ mod tests {
                 AFS_OMP_SUCCESS
             );
         }
+        assert_eq!(
+            afs_omp_reduce_f32_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                private as f32,
+                std::ptr::addr_of_mut!((*values).real_add_f32),
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_f32_nowait(
+                AFS_OMP_REDUCTION_MULTIPLY,
+                private as f32,
+                std::ptr::addr_of_mut!((*values).real_multiply_f32),
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_f64_nowait(
+                AFS_OMP_REDUCTION_MAX,
+                f64::from(thread_num) - 3.0,
+                std::ptr::addr_of_mut!((*values).real_maximum_f64),
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_f64_nowait(
+                AFS_OMP_REDUCTION_MIN,
+                8.0 - private as f64,
+                std::ptr::addr_of_mut!((*values).real_minimum_f64),
+            ),
+            AFS_OMP_SUCCESS
+        );
     }
 
     #[test]
@@ -1408,6 +1742,10 @@ mod tests {
             minimum_i64: 100,
             logical_and: 1,
             logical_or: 0,
+            real_add_f32: 5.0,
+            real_multiply_f32: 2.0,
+            real_maximum_f64: -100.0,
+            real_minimum_f64: 100.0,
         };
         assert_eq!(
             afs_omp_parallel_region(
@@ -1425,12 +1763,18 @@ mod tests {
         assert_eq!(values.minimum_i64, 4);
         assert_eq!(values.logical_and, 0);
         assert_eq!(values.logical_or, 1);
+        assert_eq!(values.real_add_f32, 15.0);
+        assert_eq!(values.real_multiply_f32, 48.0);
+        assert_eq!(values.real_maximum_f64, 0.0);
+        assert_eq!(values.real_minimum_f64, 4.0);
     }
 
     #[test]
     fn reduction_runtime_rejects_invalid_context_or_arguments() {
         reset_thread_state();
         let mut result = -1;
+        let mut real32_result = -1.0;
+        let mut real64_result = -1.0;
         assert_eq!(
             afs_omp_reduce_i64(AFS_OMP_REDUCTION_ADD, 1, 2, &mut result),
             AFS_OMP_ERROR_NO_TEAM
@@ -1469,7 +1813,37 @@ mod tests {
             afs_omp_reduce_i64_nowait(AFS_OMP_REDUCTION_ADD, 1, std::ptr::null_mut(), 4,),
             AFS_OMP_ERROR_INVALID_REDUCTION
         );
+        assert_eq!(
+            afs_omp_reduce_f32(AFS_OMP_REDUCTION_ADD, 1.0, 2.0, &mut real32_result),
+            AFS_OMP_ERROR_NO_TEAM
+        );
+        assert_eq!(
+            afs_omp_reduce_f64(99, 1.0, 2.0, &mut real64_result),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(
+            afs_omp_reduce_f32(AFS_OMP_REDUCTION_ADD, 1.0, 2.0, std::ptr::null_mut()),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(
+            afs_omp_reduce_f32_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                1.0,
+                std::ptr::addr_of_mut!(real32_result),
+            ),
+            AFS_OMP_ERROR_NO_TEAM
+        );
+        assert_eq!(
+            afs_omp_reduce_f64_nowait(99, 1.0, std::ptr::addr_of_mut!(real64_result),),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(
+            afs_omp_reduce_f64_nowait(AFS_OMP_REDUCTION_ADD, 1.0, std::ptr::null_mut()),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
         assert_eq!(result, -1);
+        assert_eq!(real32_result, -1.0);
+        assert_eq!(real64_result, -1.0);
     }
 
     fn static_bounds(

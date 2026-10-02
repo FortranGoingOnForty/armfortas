@@ -2374,17 +2374,21 @@ pub extern "C" fn afs_create_section(
 
 // ---- libc interop ----
 
+// These are imports from libc, not replacement definitions of Rust runtime symbols.
+#[allow(suspicious_runtime_symbol_definitions)]
 extern "C" {
-    fn malloc(size: usize) -> *mut u8;
-    fn free(ptr: *mut u8);
+    #[link_name = "malloc"]
+    fn system_malloc(size: usize) -> *mut u8;
+    #[link_name = "free"]
+    fn system_free(ptr: *mut u8);
 }
 
 unsafe fn libc_malloc(size: usize) -> *mut u8 {
-    malloc(size)
+    system_malloc(size)
 }
 
 unsafe fn libc_free(ptr: *mut u8) {
-    free(ptr)
+    system_free(ptr)
 }
 
 fn set_rank2_contiguous_shape(desc: &mut ArrayDescriptor, dim0: usize, dim1: usize) {

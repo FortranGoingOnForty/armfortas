@@ -9,9 +9,13 @@ use std::ptr;
 // Use libc malloc/free directly so allocate/deallocate are paired correctly
 // without needing to track Rust Layout. The system allocator on macOS returns
 // 16-byte aligned pointers from malloc, satisfying our alignment requirement.
+// These are imports from libc, not replacement definitions of Rust runtime symbols.
+#[allow(suspicious_runtime_symbol_definitions)]
 extern "C" {
-    fn malloc(size: usize) -> *mut u8;
-    fn free(ptr: *mut u8);
+    #[link_name = "malloc"]
+    fn system_malloc(size: usize) -> *mut u8;
+    #[link_name = "free"]
+    fn system_free(ptr: *mut u8);
 }
 
 /// Allocate `size` bytes on the heap. Returns a pointer.
@@ -21,7 +25,7 @@ pub extern "C" fn afs_allocate(size: i64) -> *mut u8 {
     if size <= 0 {
         return ptr::null_mut();
     }
-    let ptr = unsafe { malloc(size as usize) };
+    let ptr = unsafe { system_malloc(size as usize) };
     if ptr.is_null() {
         eprintln!("ALLOCATE: out of memory ({} bytes)", size);
         std::process::exit(1);
@@ -62,7 +66,7 @@ pub extern "C" fn afs_allocate_scalar(slot: *mut *mut u8, size: i64, stat: *mut 
     // can represent successful pointer allocation.
     let allocation_size = size.max(1);
 
-    let allocation = unsafe { malloc(allocation_size) };
+    let allocation = unsafe { system_malloc(allocation_size) };
     if allocation.is_null() {
         fail(3, "out of memory");
         return;
@@ -102,7 +106,7 @@ pub extern "C" fn afs_allocate_pointer(slot: *mut *mut u8, size: i64, stat: *mut
         return;
     };
     let allocation_size = size.max(1);
-    let allocation = unsafe { malloc(allocation_size) };
+    let allocation = unsafe { system_malloc(allocation_size) };
     if allocation.is_null() {
         fail(3, "out of memory");
         return;
@@ -121,7 +125,7 @@ pub extern "C" fn afs_deallocate(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
-    unsafe { free(ptr) };
+    unsafe { system_free(ptr) };
 }
 
 /// Deallocate the target of an explicit scalar pointer DEALLOCATE statement.
@@ -154,7 +158,7 @@ pub extern "C" fn afs_deallocate_pointer(slot: *mut *mut u8, stat: *mut i32) {
     }
 
     unsafe {
-        free(target);
+        system_free(target);
         *slot = ptr::null_mut();
         if !stat.is_null() {
             *stat = 0;

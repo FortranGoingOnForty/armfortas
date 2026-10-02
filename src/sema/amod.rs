@@ -1949,8 +1949,8 @@ fn parse_use_binding(rest: &str, directive: &str, path: &Path) -> Result<UseRena
             directive
         )
     };
-    let (lhs, source_module) = rest.split_once(" from ").ok_or_else(&malformed)?;
-    let (local, original) = lhs.split_once(" = ").ok_or_else(&malformed)?;
+    let (lhs, source_module) = rest.split_once(" from ").ok_or_else(malformed)?;
+    let (local, original) = lhs.split_once(" = ").ok_or_else(malformed)?;
     let local = local.trim();
     let original = original.trim();
     let source = parse_module_reference(source_module.trim(), directive, path)?;
