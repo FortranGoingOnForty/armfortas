@@ -22,8 +22,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
-// These are imports from libc, not replacement definitions of Rust runtime symbols.
-#[allow(suspicious_runtime_symbol_definitions)]
 extern "C" {
     #[link_name = "read"]
     fn libc_read(fd: i32, buf: *mut c_void, count: usize) -> isize;
@@ -5591,6 +5589,8 @@ pub extern "C" fn afs_fmt_begin_internal_ex(
     });
 }
 
+// These are imports from libc, not replacement definitions of Rust runtime symbols.
+#[allow(suspicious_runtime_symbol_definitions)]
 extern "C" {
     #[link_name = "malloc"]
     fn system_malloc(size: usize) -> *mut u8;
