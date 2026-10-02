@@ -13,8 +13,10 @@ use std::ffi::c_void;
 use std::ptr;
 
 extern "C" {
-    fn malloc(size: usize) -> *mut u8;
-    fn free(ptr: *mut u8);
+    #[link_name = "malloc"]
+    fn system_malloc(size: usize) -> *mut u8;
+    #[link_name = "free"]
+    fn system_free(ptr: *mut u8);
     fn memcmp(a: *const c_void, b: *const c_void, len: usize) -> i32;
 }
 
@@ -88,7 +90,7 @@ pub extern "C" fn afs_allocate_string(
     let data = if len == 0 {
         ptr::null_mut()
     } else {
-        let data = unsafe { malloc(len as usize) };
+        let data = unsafe { system_malloc(len as usize) };
         if data.is_null() {
             if !stat.is_null() {
                 unsafe {
@@ -146,7 +148,7 @@ pub extern "C" fn afs_assign_char_deferred(
     let needs_realloc = src_len > desc.capacity || desc.data.is_null();
 
     if needs_realloc {
-        let new_data = unsafe { malloc(src_len as usize) };
+        let new_data = unsafe { system_malloc(src_len as usize) };
         if new_data.is_null() {
             eprintln!("character assignment: out of memory ({} bytes)", src_len);
             std::process::exit(1);
@@ -166,7 +168,7 @@ pub extern "C" fn afs_assign_char_deferred(
         // NOW free old buffer (after copy is complete).
         if desc.is_allocated() && !desc.data.is_null() {
             unsafe {
-                free(desc.data);
+                system_free(desc.data);
             }
         }
 
@@ -195,7 +197,7 @@ pub extern "C" fn afs_dealloc_string(desc: *mut StringDescriptor) {
     let desc = unsafe { &mut *desc };
     if desc.is_allocated() && !desc.data.is_null() {
         unsafe {
-            free(desc.data);
+            system_free(desc.data);
         }
     }
     desc.data = ptr::null_mut();
@@ -299,7 +301,7 @@ pub extern "C" fn afs_move_alloc_string(from: *mut StringDescriptor, to: *mut St
 
     if to_desc.is_allocated() && !to_desc.data.is_null() {
         unsafe {
-            free(to_desc.data);
+            system_free(to_desc.data);
         }
     }
 
