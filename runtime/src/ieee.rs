@@ -542,12 +542,28 @@ pub extern "C" fn afs_ieee_scalb_r4(x: f32, i: i32) -> f32 {
 
 #[no_mangle]
 pub extern "C" fn afs_ieee_next_after_r8(x: f64, y: f64) -> f64 {
-    unsafe { c_nextafter(x, y) }
+    let result = unsafe { c_nextafter(x, y) };
+    if x.is_finite() && result.is_infinite() {
+        fpenv::set_flag(3, true);
+        fpenv::set_flag(5, true);
+    } else if x != result && (result == 0.0 || result.is_subnormal()) {
+        fpenv::set_flag(4, true);
+        fpenv::set_flag(5, true);
+    }
+    result
 }
 
 #[no_mangle]
 pub extern "C" fn afs_ieee_next_after_r4(x: f32, y: f32) -> f32 {
-    unsafe { c_nextafterf(x, y) }
+    let result = unsafe { c_nextafterf(x, y) };
+    if x.is_finite() && result.is_infinite() {
+        fpenv::set_flag(3, true);
+        fpenv::set_flag(5, true);
+    } else if x != result && (result == 0.0 || result.is_subnormal()) {
+        fpenv::set_flag(4, true);
+        fpenv::set_flag(5, true);
+    }
+    result
 }
 
 // ---- F2023 / ISO/IEC 60559:2020 maximum/minimum family ----
