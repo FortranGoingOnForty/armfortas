@@ -274,6 +274,8 @@ struct ReductionWorkspace {
     result: i64,
     real_slots: Vec<u64>,
     real_result: u64,
+    complex_slots: Vec<[u64; 2]>,
+    complex_result: [u64; 2],
 }
 
 #[derive(Debug, Default)]
@@ -665,6 +667,66 @@ impl RealReductionValue for f64 {
     }
 }
 
+trait ComplexReductionValue: Copy {
+    fn zero() -> Self;
+    fn encode(self) -> [u64; 2];
+    fn decode(bits: [u64; 2]) -> Self;
+    fn combine(operator: i32, left: Self, right: Self) -> Option<Self>;
+}
+
+impl ComplexReductionValue for [f32; 2] {
+    fn zero() -> Self {
+        [0.0, 0.0]
+    }
+
+    fn encode(self) -> [u64; 2] {
+        [u64::from(self[0].to_bits()), u64::from(self[1].to_bits())]
+    }
+
+    fn decode(bits: [u64; 2]) -> Self {
+        [
+            f32::from_bits(bits[0] as u32),
+            f32::from_bits(bits[1] as u32),
+        ]
+    }
+
+    fn combine(operator: i32, left: Self, right: Self) -> Option<Self> {
+        match operator {
+            AFS_OMP_REDUCTION_ADD => Some([left[0] + right[0], left[1] + right[1]]),
+            AFS_OMP_REDUCTION_MULTIPLY => Some([
+                left[0] * right[0] - left[1] * right[1],
+                left[0] * right[1] + left[1] * right[0],
+            ]),
+            _ => None,
+        }
+    }
+}
+
+impl ComplexReductionValue for [f64; 2] {
+    fn zero() -> Self {
+        [0.0, 0.0]
+    }
+
+    fn encode(self) -> [u64; 2] {
+        [self[0].to_bits(), self[1].to_bits()]
+    }
+
+    fn decode(bits: [u64; 2]) -> Self {
+        [f64::from_bits(bits[0]), f64::from_bits(bits[1])]
+    }
+
+    fn combine(operator: i32, left: Self, right: Self) -> Option<Self> {
+        match operator {
+            AFS_OMP_REDUCTION_ADD => Some([left[0] + right[0], left[1] + right[1]]),
+            AFS_OMP_REDUCTION_MULTIPLY => Some([
+                left[0] * right[0] - left[1] * right[1],
+                left[0] * right[1] + left[1] * right[0],
+            ]),
+            _ => None,
+        }
+    }
+}
+
 fn reduce_real<T: RealReductionValue>(
     operator: i32,
     private_value: T,
@@ -762,6 +824,117 @@ pub extern "C" fn afs_omp_reduce_f64(
         return AFS_OMP_ERROR_INVALID_REDUCTION;
     }
     let combined = match reduce_real(operator, private_value, original_value) {
+        Ok(combined) => combined,
+        Err(error) => return error,
+    };
+    unsafe {
+        result.write_unaligned(combined);
+    }
+    AFS_OMP_SUCCESS
+}
+
+fn reduce_complex<T: ComplexReductionValue>(
+    operator: i32,
+    private_value: T,
+    original_value: T,
+) -> Result<T, i32> {
+    if T::combine(operator, T::zero(), T::zero()).is_none() {
+        return Err(AFS_OMP_ERROR_INVALID_REDUCTION);
+    }
+    let context = THREAD_STATE.with(|state| {
+        let state = state.borrow();
+        state.teams.last().map(|team| {
+            (
+                team.thread_num,
+                team.team_size,
+                Arc::clone(&team.barrier),
+                Arc::clone(&team.reduction),
+            )
+        })
+    });
+    let Some((thread_num, team_size, barrier, reduction)) = context else {
+        return Err(AFS_OMP_ERROR_NO_TEAM);
+    };
+
+    {
+        let mut workspace = reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let team_size = usize::try_from(team_size).unwrap_or(0);
+        if workspace.complex_slots.len() != team_size {
+            workspace
+                .complex_slots
+                .resize(team_size, T::zero().encode());
+        }
+        workspace.complex_slots[thread_num as usize] = private_value.encode();
+    }
+    barrier.wait();
+
+    if thread_num == 0 {
+        let mut workspace = reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let combined =
+            workspace
+                .complex_slots
+                .iter()
+                .copied()
+                .fold(original_value, |combined, value| {
+                    T::combine(operator, combined, T::decode(value))
+                        .expect("validated OpenMP COMPLEX reduction operator became invalid")
+                });
+        workspace.complex_result = combined.encode();
+    }
+    barrier.wait();
+
+    let combined = reduction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .complex_result;
+    Ok(T::decode(combined))
+}
+
+/// Combine one COMPLEX(4) private value across the current team.
+///
+/// Values cross the runtime boundary as two-lane buffers so this ABI does not
+/// depend on a platform's aggregate argument or return convention.
+#[no_mangle]
+pub extern "C" fn afs_omp_reduce_c32(
+    operator: i32,
+    private_value: *const [f32; 2],
+    original_value: *const [f32; 2],
+    result: *mut [f32; 2],
+) -> i32 {
+    if private_value.is_null() || original_value.is_null() || result.is_null() {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    }
+    let private_value = unsafe { private_value.read_unaligned() };
+    let original_value = unsafe { original_value.read_unaligned() };
+    let combined = match reduce_complex(operator, private_value, original_value) {
+        Ok(combined) => combined,
+        Err(error) => return error,
+    };
+    unsafe {
+        result.write_unaligned(combined);
+    }
+    AFS_OMP_SUCCESS
+}
+
+/// Combine one COMPLEX(8) or DOUBLE COMPLEX private value across the current
+/// team using binary64 component operations.
+#[no_mangle]
+pub extern "C" fn afs_omp_reduce_c64(
+    operator: i32,
+    private_value: *const [f64; 2],
+    original_value: *const [f64; 2],
+    result: *mut [f64; 2],
+) -> i32 {
+    if private_value.is_null() || original_value.is_null() || result.is_null() {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    }
+    let private_value = unsafe { private_value.read_unaligned() };
+    let original_value = unsafe { original_value.read_unaligned() };
+    let combined = match reduce_complex(operator, private_value, original_value) {
         Ok(combined) => combined,
         Err(error) => return error,
     };
@@ -961,6 +1134,63 @@ pub extern "C" fn afs_omp_reduce_f64_nowait(
     original_storage: *mut f64,
 ) -> i32 {
     reduce_real_nowait(operator, private_value, original_storage)
+}
+
+fn reduce_complex_nowait<T: ComplexReductionValue>(
+    operator: i32,
+    private_value: *const T,
+    original_storage: *mut T,
+) -> i32 {
+    if private_value.is_null()
+        || original_storage.is_null()
+        || T::combine(operator, T::zero(), T::zero()).is_none()
+    {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    }
+    let reduction = THREAD_STATE.with(|state| {
+        state
+            .borrow()
+            .teams
+            .last()
+            .map(|team| Arc::clone(&team.reduction))
+    });
+    let Some(reduction) = reduction else {
+        return AFS_OMP_ERROR_NO_TEAM;
+    };
+
+    let _workspace = reduction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let private_value = unsafe { private_value.read_unaligned() };
+    let original = unsafe { original_storage.read_unaligned() };
+    let combined = T::combine(operator, original, private_value)
+        .expect("validated OpenMP COMPLEX reduction operator became invalid");
+    unsafe {
+        original_storage.write_unaligned(combined);
+    }
+    AFS_OMP_SUCCESS
+}
+
+/// Combine one COMPLEX(4) private value directly into the shared object
+/// without a team barrier.
+#[no_mangle]
+pub extern "C" fn afs_omp_reduce_c32_nowait(
+    operator: i32,
+    private_value: *const [f32; 2],
+    original_storage: *mut [f32; 2],
+) -> i32 {
+    reduce_complex_nowait(operator, private_value, original_storage)
+}
+
+/// Combine one COMPLEX(8) or DOUBLE COMPLEX private value directly into the
+/// shared object without a team barrier.
+#[no_mangle]
+pub extern "C" fn afs_omp_reduce_c64_nowait(
+    operator: i32,
+    private_value: *const [f64; 2],
+    original_storage: *mut [f64; 2],
+) -> i32 {
+    reduce_complex_nowait(operator, private_value, original_storage)
 }
 
 /// Compute one thread's contiguous `schedule(static)` iteration interval.
@@ -1633,6 +1863,101 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ComplexReductionObservations {
+        values: Mutex<Vec<ComplexReductionObservation>>,
+    }
+
+    struct ComplexReductionObservation {
+        thread_num: i32,
+        values_f32: [[f32; 2]; 2],
+        values_f64: [[f64; 2]; 2],
+    }
+
+    unsafe extern "C" fn reduce_complex_task(
+        environment: *mut c_void,
+        thread_num: i32,
+        _team_size: i32,
+    ) {
+        let observations = unsafe { &*(environment as *const ComplexReductionObservations) };
+        let private_add_f32 = [thread_num as f32 + 1.0, -1.0];
+        let private_add_f64 = [f64::from(thread_num) + 1.0, -1.0];
+        let private_multiply_f32 = [0.0, 1.0];
+        let private_multiply_f64 = [0.0, 1.0];
+        let originals_f32 = [[10.0, 4.0], [2.0, -3.0]];
+        let originals_f64 = [[10.0, 4.0], [2.0, -3.0]];
+        let mut values_f32 = [[0.0; 2]; 2];
+        let mut values_f64 = [[0.0; 2]; 2];
+        assert_eq!(
+            afs_omp_reduce_c32(
+                AFS_OMP_REDUCTION_ADD,
+                &private_add_f32,
+                &originals_f32[0],
+                &mut values_f32[0],
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_c32(
+                AFS_OMP_REDUCTION_MULTIPLY,
+                &private_multiply_f32,
+                &originals_f32[1],
+                &mut values_f32[1],
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_c64(
+                AFS_OMP_REDUCTION_ADD,
+                &private_add_f64,
+                &originals_f64[0],
+                &mut values_f64[0],
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_c64(
+                AFS_OMP_REDUCTION_MULTIPLY,
+                &private_multiply_f64,
+                &originals_f64[1],
+                &mut values_f64[1],
+            ),
+            AFS_OMP_SUCCESS
+        );
+        observations
+            .values
+            .lock()
+            .unwrap()
+            .push(ComplexReductionObservation {
+                thread_num,
+                values_f32,
+                values_f64,
+            });
+    }
+
+    #[test]
+    fn complex_reductions_preserve_kind_precision_and_thread_order() {
+        reset_thread_state();
+        let observations = ComplexReductionObservations::default();
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(reduce_complex_task),
+                &observations as *const ComplexReductionObservations as *mut c_void,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        let mut values = observations.values.into_inner().unwrap();
+        values.sort_unstable_by_key(|observation| observation.thread_num);
+        assert_eq!(values.len(), 4);
+        for observation in values {
+            assert_eq!(observation.values_f32, [[20.0, 0.0], [2.0, -3.0]]);
+            assert_eq!(observation.values_f64, [[20.0, 0.0], [2.0, -3.0]]);
+        }
+    }
+
     #[repr(C)]
     struct NowaitReductionObservations {
         add_i8: i8,
@@ -1645,6 +1970,10 @@ mod tests {
         real_multiply_f32: f32,
         real_maximum_f64: f64,
         real_minimum_f64: f64,
+        complex_add_f32: [f32; 2],
+        complex_multiply_f32: [f32; 2],
+        complex_add_f64: [f64; 2],
+        complex_multiply_f64: [f64; 2],
     }
 
     unsafe extern "C" fn reduce_nowait_task(
@@ -1730,6 +2059,42 @@ mod tests {
             ),
             AFS_OMP_SUCCESS
         );
+        let private_add_f32 = [private as f32, -1.0];
+        let private_add_f64 = [private as f64 * 0.25, -0.5];
+        let private_multiply_f32 = [0.0, 1.0];
+        let private_multiply_f64 = [0.0, 1.0];
+        assert_eq!(
+            afs_omp_reduce_c32_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                &private_add_f32,
+                std::ptr::addr_of_mut!((*values).complex_add_f32),
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_c32_nowait(
+                AFS_OMP_REDUCTION_MULTIPLY,
+                &private_multiply_f32,
+                std::ptr::addr_of_mut!((*values).complex_multiply_f32),
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_c64_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                &private_add_f64,
+                std::ptr::addr_of_mut!((*values).complex_add_f64),
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_c64_nowait(
+                AFS_OMP_REDUCTION_MULTIPLY,
+                &private_multiply_f64,
+                std::ptr::addr_of_mut!((*values).complex_multiply_f64),
+            ),
+            AFS_OMP_SUCCESS
+        );
     }
 
     #[test]
@@ -1746,6 +2111,10 @@ mod tests {
             real_multiply_f32: 2.0,
             real_maximum_f64: -100.0,
             real_minimum_f64: 100.0,
+            complex_add_f32: [5.0, 4.0],
+            complex_multiply_f32: [2.0, -3.0],
+            complex_add_f64: [10.0, 2.0],
+            complex_multiply_f64: [-4.0, 1.0],
         };
         assert_eq!(
             afs_omp_parallel_region(
@@ -1767,6 +2136,10 @@ mod tests {
         assert_eq!(values.real_multiply_f32, 48.0);
         assert_eq!(values.real_maximum_f64, 0.0);
         assert_eq!(values.real_minimum_f64, 4.0);
+        assert_eq!(values.complex_add_f32, [15.0, 0.0]);
+        assert_eq!(values.complex_multiply_f32, [2.0, -3.0]);
+        assert_eq!(values.complex_add_f64, [12.5, 0.0]);
+        assert_eq!(values.complex_multiply_f64, [-4.0, 1.0]);
     }
 
     #[test]
@@ -1775,6 +2148,12 @@ mod tests {
         let mut result = -1;
         let mut real32_result = -1.0;
         let mut real64_result = -1.0;
+        let complex32_private = [1.0_f32, 2.0];
+        let complex32_original = [3.0_f32, 4.0];
+        let mut complex32_result = [-1.0_f32, -1.0];
+        let complex64_private = [1.0_f64, 2.0];
+        let complex64_original = [3.0_f64, 4.0];
+        let mut complex64_result = [-1.0_f64, -1.0];
         assert_eq!(
             afs_omp_reduce_i64(AFS_OMP_REDUCTION_ADD, 1, 2, &mut result),
             AFS_OMP_ERROR_NO_TEAM
@@ -1841,9 +2220,54 @@ mod tests {
             afs_omp_reduce_f64_nowait(AFS_OMP_REDUCTION_ADD, 1.0, std::ptr::null_mut()),
             AFS_OMP_ERROR_INVALID_REDUCTION
         );
+        assert_eq!(
+            afs_omp_reduce_c32(
+                AFS_OMP_REDUCTION_ADD,
+                &complex32_private,
+                &complex32_original,
+                &mut complex32_result,
+            ),
+            AFS_OMP_ERROR_NO_TEAM
+        );
+        assert_eq!(
+            afs_omp_reduce_c64(
+                AFS_OMP_REDUCTION_MAX,
+                &complex64_private,
+                &complex64_original,
+                &mut complex64_result,
+            ),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(
+            afs_omp_reduce_c32(
+                AFS_OMP_REDUCTION_ADD,
+                std::ptr::null(),
+                &complex32_original,
+                &mut complex32_result,
+            ),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(
+            afs_omp_reduce_c64_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                &complex64_private,
+                &mut complex64_result,
+            ),
+            AFS_OMP_ERROR_NO_TEAM
+        );
+        assert_eq!(
+            afs_omp_reduce_c32_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                &complex32_private,
+                std::ptr::null_mut(),
+            ),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
         assert_eq!(result, -1);
         assert_eq!(real32_result, -1.0);
         assert_eq!(real64_result, -1.0);
+        assert_eq!(complex32_result, [-1.0, -1.0]);
+        assert_eq!(complex64_result, [-1.0, -1.0]);
     }
 
     fn static_bounds(
