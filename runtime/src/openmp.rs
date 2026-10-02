@@ -1554,7 +1554,13 @@ mod tests {
 
     #[derive(Default)]
     struct RealReductionObservations {
-        values: Mutex<Vec<(i32, [f32; 4], [f64; 4])>>,
+        values: Mutex<Vec<RealReductionObservation>>,
+    }
+
+    struct RealReductionObservation {
+        thread_num: i32,
+        values_f32: [f32; 4],
+        values_f64: [f64; 4],
     }
 
     unsafe extern "C" fn reduce_real_task(
@@ -1597,7 +1603,11 @@ mod tests {
             .values
             .lock()
             .unwrap()
-            .push((thread_num, values_f32, values_f64));
+            .push(RealReductionObservation {
+                thread_num,
+                values_f32,
+                values_f64,
+            });
     }
 
     #[test]
@@ -1615,11 +1625,11 @@ mod tests {
             AFS_OMP_SUCCESS
         );
         let mut values = observations.values.into_inner().unwrap();
-        values.sort_unstable_by_key(|(thread_num, _, _)| *thread_num);
+        values.sort_unstable_by_key(|observation| observation.thread_num);
         assert_eq!(values.len(), 4);
-        for (_, values_f32, values_f64) in values {
-            assert_eq!(values_f32, [20.0, 48.0, 1.0, -2.0]);
-            assert_eq!(values_f64, [20.0, 48.0, 1.0, -2.0]);
+        for observation in values {
+            assert_eq!(observation.values_f32, [20.0, 48.0, 1.0, -2.0]);
+            assert_eq!(observation.values_f64, [20.0, 48.0, 1.0, -2.0]);
         }
     }
 
