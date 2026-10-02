@@ -22509,8 +22509,40 @@ fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
             "OpenMP .OR. REDUCTION currently requires a scalar LOGICAL of kind 1, 2, 4, or 8",
         ),
         (
-            "program p\ninteger :: i,total(2)\n!$omp parallel do reduction(+:total)\ndo i=1,4\ntotal(1)=total(1)+i\nend do\n!$omp end parallel do\nend program\n",
-            "OpenMP REDUCTION variable 'total' must currently be a nonallocatable, nonpointer scalar",
+            "program p\ninteger :: i,total(2,2)\n!$omp parallel do reduction(+:total)\ndo i=1,4\ntotal(1,1)=total(1,1)+i\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP REDUCTION array 'total' must currently have rank one",
+        ),
+        (
+            "program p\ninteger :: i\ninteger, allocatable :: total(:)\nallocate(total(4))\n!$omp parallel do reduction(+:total)\ndo i=1,4\ntotal(i)=total(i)+i\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP REDUCTION variable 'total' must currently be nonallocatable and nonpointer",
+        ),
+        (
+            "subroutine s(n)\ninteger :: n,i,total(n)\n!$omp parallel do reduction(+:total)\ndo i=1,n\ntotal(i)=total(i)+i\nend do\n!$omp end parallel do\nend subroutine\n",
+            "OpenMP REDUCTION array 'total' must currently have constant explicit shape",
+        ),
+        (
+            "program p\ninteger :: i,total(8)\n!$omp parallel do reduction(+:total(1:8:2))\ndo i=1,4\ntotal(1)=total(1)+i\nend do\n!$omp end parallel do\nend program\n",
+            "must currently use unit stride",
+        ),
+        (
+            "program p\ninteger :: i,lo,total(8)\nlo=2\n!$omp parallel do reduction(+:total(lo:8))\ndo i=1,4\ntotal(2)=total(2)+i\nend do\n!$omp end parallel do\nend program\n",
+            "must use constant bounds",
+        ),
+        (
+            "program p\ninteger :: i,total(8)\n!$omp parallel do reduction(+:total(4:2))\ndo i=1,4\ntotal(4)=total(4)+i\nend do\n!$omp end parallel do\nend program\n",
+            "may not have zero length",
+        ),
+        (
+            "program p\ninteger :: i,total(8)\n!$omp parallel do reduction(+:total(0:2))\ndo i=1,4\ntotal(1)=total(1)+i\nend do\n!$omp end parallel do\nend program\n",
+            "is outside the declared bounds 1:8",
+        ),
+        (
+            "program p\ninteger :: i,total(8)\n!$omp parallel do reduction(+:total(1:4),total(5:8))\ndo i=1,4\ntotal(i)=total(i)+i\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP REDUCTION base 'total' may currently appear only once on a directive",
+        ),
+        (
+            "program p\ninteger :: i,total(8)\n!$omp parallel do reduction(+:total(i))\ndo i=1,4\ntotal(i)=total(i)+i\nend do\n!$omp end parallel do\nend program\n",
+            "must use a constant subscript",
         ),
         (
             "program p\ninteger :: i,total\n!$omp parallel do shared(total) reduction(+:total)\ndo i=1,4\ntotal=total+i\nend do\n!$omp end parallel do\nend program\n",
