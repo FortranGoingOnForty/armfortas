@@ -1401,8 +1401,8 @@ pub(super) fn function_hidden_result_abi(
 
 /// Recover the complex kind (4 = sp, 8 = dp) declared for a function's
 /// result variable. Used by ComplexBuffer ABI to size the caller's
-/// result buffer (8 bytes for sp, 16 for dp). Falls back to sp (4) if
-/// the result variable was misclassified as complex(sp).
+/// result buffer (8 bytes for sp, 16 for dp). An absent selector follows
+/// the active default REAL kind, as required for default COMPLEX.
 pub(super) fn complex_result_kind(
     function_name: &str,
     result: &Option<String>,
@@ -1431,16 +1431,26 @@ pub(super) fn complex_result_kind(
         }
         match type_spec {
             TypeSpec::Complex(sel) => {
-                return extract_complex_kind_with_context(sel, 4, None, Some(st));
+                return extract_complex_kind_with_context(
+                    sel,
+                    crate::driver::defaults::default_real_kind(),
+                    None,
+                    Some(st),
+                );
             }
             TypeSpec::DoubleComplex => return 8,
             _ => {}
         }
     }
     match return_type {
-        Some(TypeSpec::Complex(sel)) => extract_complex_kind_with_context(sel, 4, None, Some(st)),
+        Some(TypeSpec::Complex(sel)) => extract_complex_kind_with_context(
+            sel,
+            crate::driver::defaults::default_real_kind(),
+            None,
+            Some(st),
+        ),
         Some(TypeSpec::DoubleComplex) => 8,
-        _ => 4,
+        _ => crate::driver::defaults::default_real_kind(),
     }
 }
 
@@ -29768,7 +29778,12 @@ pub(super) fn lower_type_spec_with_param_consts(
         )),
         TypeSpec::DoublePrecision => IrType::Float(FloatWidth::F64),
         TypeSpec::Complex(sel) => {
-            let fw = match extract_complex_kind_with_context(sel, 4, param_consts, st) {
+            let fw = match extract_complex_kind_with_context(
+                sel,
+                crate::driver::defaults::default_real_kind(),
+                param_consts,
+                st,
+            ) {
                 8 => FloatWidth::F64,
                 _ => FloatWidth::F32,
             };
@@ -62578,16 +62593,20 @@ pub(super) fn hidden_result_temp_bytes_for_callee(
         }
         HiddenResultAbi::ComplexBuffer => {
             // Look up the callee's symbol to determine the complex kind
-            // (sp → 8 bytes, dp → 16 bytes). Defaults to sp (8) if the
-            // symbol can't be resolved — same fallback DerivedAggregate
-            // uses for missing layouts.
+            // (sp → 8 bytes, dp → 16 bytes). An absent kind selector
+            // follows the active default REAL kind because Fortran defines
+            // default COMPLEX in terms of that kind. Only a missing symbol
+            // falls back to the standard-default 8-byte buffer.
             use crate::sema::symtab::TypeInfo;
             let kind_bytes = abi_lookup_keys
                 .iter()
                 .find_map(|k| {
                     let sym = st.find_symbol_any_scope(&k.to_lowercase())?;
                     match sym.type_info.as_ref()? {
-                        TypeInfo::Complex { kind } => Some(kind.unwrap_or(4) as u64 * 2),
+                        TypeInfo::Complex { kind } => Some(
+                            kind.unwrap_or_else(crate::driver::defaults::default_real_kind) as u64
+                                * 2,
+                        ),
                         _ => None,
                     }
                 })

@@ -27,12 +27,13 @@ use crate::ir::types::{FloatWidth, IntWidth, IrType};
 use super::alloc::rewrite_heap_promoted_declared_bounds;
 use super::core::{
     array_base_addr, array_descriptor_addr, collect_format_labels, collect_label_blocks,
-    derived_layout_needs_component_deallocation, derived_storage_ir_type,
-    emit_derived_private_allocation_copy, emit_derived_value_copy, emit_memcpy_bytes,
-    ensure_termination, initialize_derived_storage, insert_implicit_dealloc, ir_scalar_byte_size,
-    load_string_descriptor_view, local_char_ptr_and_len, local_declared_rank,
-    local_uses_array_descriptor, lower_do_loop, materialize_array_descriptor_for_info,
-    materialize_array_section_source_descriptor, string_descriptor_addr, DoLoopBody, DoLoopFields,
+    complex_byte_size, complex_float_width, derived_layout_needs_component_deallocation,
+    derived_storage_ir_type, emit_derived_private_allocation_copy, emit_derived_value_copy,
+    emit_memcpy_bytes, ensure_termination, initialize_derived_storage, insert_implicit_dealloc,
+    ir_scalar_byte_size, is_complex_ty, load_string_descriptor_view, local_char_ptr_and_len,
+    local_declared_rank, local_uses_array_descriptor, lower_do_loop,
+    materialize_array_descriptor_for_info, materialize_array_section_source_descriptor,
+    string_descriptor_addr, DoLoopBody, DoLoopFields,
 };
 use super::ctx::{CharKind, LocalInfo, LowerCtx, ProcScopeGuard};
 use super::helpers::coerce_to_type;
@@ -1009,6 +1010,43 @@ fn scalar_reduction_identity(
     b.const_int(value, *width)
 }
 
+fn initialize_scalar_reduction_private(
+    b: &mut FuncBuilder<'_>,
+    operator: OpenMpReductionOperator,
+    info: &LocalInfo,
+) {
+    if is_complex_ty(&info.ty) {
+        let width = complex_float_width(&info.ty);
+        let lane_ty = IrType::Float(width);
+        let real = match (operator, width) {
+            (OpenMpReductionOperator::Add, FloatWidth::F32) => b.const_f32(0.0),
+            (OpenMpReductionOperator::Add, FloatWidth::F64) => b.const_f64(0.0),
+            (OpenMpReductionOperator::Multiply, FloatWidth::F32) => b.const_f32(1.0),
+            (OpenMpReductionOperator::Multiply, FloatWidth::F64) => b.const_f64(1.0),
+            _ => unreachable!("unsupported OpenMP COMPLEX reduction passed semantic validation"),
+        };
+        let imaginary = match width {
+            FloatWidth::F32 => b.const_f32(0.0),
+            FloatWidth::F64 => b.const_f64(0.0),
+        };
+        let zero = b.const_i64(0);
+        let lane_bytes = b.const_i64(match width {
+            FloatWidth::F32 => 4,
+            FloatWidth::F64 => 8,
+        });
+        let real_address = b.gep(info.addr, vec![zero], IrType::Int(IntWidth::I8));
+        let imaginary_address = b.gep(info.addr, vec![lane_bytes], IrType::Int(IntWidth::I8));
+        let real = coerce_to_type(b, real, &lane_ty);
+        let imaginary = coerce_to_type(b, imaginary, &lane_ty);
+        b.store(real, real_address);
+        b.store(imaginary, imaginary_address);
+        return;
+    }
+
+    let identity = scalar_reduction_identity(b, operator, info);
+    b.store(identity, info.addr);
+}
+
 fn prepare_scalar_reductions(
     b: &mut FuncBuilder<'_>,
     ctx: &mut LowerCtx<'_>,
@@ -1032,8 +1070,7 @@ fn prepare_scalar_reductions(
             private.addr = b.alloca(private.ty.clone());
             private.by_ref = false;
             private.inline_const = None;
-            let identity = scalar_reduction_identity(b, *operator, &private);
-            b.store(identity, private.addr);
+            initialize_scalar_reduction_private(b, *operator, &private);
             ctx.locals.insert(key.clone(), private.clone());
             bindings.push(ScalarReductionBinding {
                 name: key,
@@ -1060,11 +1097,36 @@ fn finish_scalar_reductions(
     thread_num: ValueId,
 ) {
     for binding in bindings {
-        let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
         let shared_address = scalar_storage_address(b, &binding.shared);
         let operator = b.const_i32(reduction_runtime_operator(binding.operator));
-        let (status, result_address, result_ty) = match &binding.shared.ty {
+        let (status, result_address, result_ty, copy_bytes) = match &binding.shared.ty {
+            ty if is_complex_ty(ty) => {
+                let width = complex_float_width(ty);
+                let result_ty = ty.clone();
+                let result_address = b.alloca(result_ty.clone());
+                let function = match width {
+                    FloatWidth::F32 => "afs_omp_reduce_c32",
+                    FloatWidth::F64 => "afs_omp_reduce_c64",
+                };
+                let status = b.call(
+                    FuncRef::External(function.into()),
+                    vec![
+                        operator,
+                        binding.private.addr,
+                        shared_address,
+                        result_address,
+                    ],
+                    IrType::Int(IntWidth::I32),
+                );
+                (
+                    status,
+                    result_address,
+                    result_ty,
+                    Some(complex_byte_size(ty)),
+                )
+            }
             IrType::Float(width) => {
+                let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
                 let result_ty = IrType::Float(*width);
                 let original = b.load_typed(shared_address, result_ty.clone());
                 let result_address = b.alloca(result_ty.clone());
@@ -1077,10 +1139,11 @@ fn finish_scalar_reductions(
                     vec![operator, private, original, result_address],
                     IrType::Int(IntWidth::I32),
                 );
-                (status, result_address, result_ty)
+                (status, result_address, result_ty, None)
             }
             _ => {
                 let abi_ty = IrType::Int(IntWidth::I64);
+                let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
                 let private = coerce_to_type(b, private, &abi_ty);
                 let original = b.load_typed(shared_address, binding.shared.ty.clone());
                 let original = coerce_to_type(b, original, &abi_ty);
@@ -1090,7 +1153,7 @@ fn finish_scalar_reductions(
                     vec![operator, private, original, result_address],
                     IrType::Int(IntWidth::I32),
                 );
-                (status, result_address, abi_ty)
+                (status, result_address, abi_ty, None)
             }
         };
         require_scalar_reduction_success(b, status);
@@ -1100,9 +1163,13 @@ fn finish_scalar_reductions(
         let done_bb = b.create_block("omp_reduction_done");
         b.cond_branch(thread_zero, store_bb, vec![], done_bb, vec![]);
         b.set_block(store_bb);
-        let result = b.load_typed(result_address, result_ty);
-        let result = coerce_to_type(b, result, &binding.shared.ty);
-        b.store(result, shared_address);
+        if let Some(copy_bytes) = copy_bytes {
+            emit_memcpy_bytes(b, shared_address, result_address, copy_bytes);
+        } else {
+            let result = b.load_typed(result_address, result_ty);
+            let result = coerce_to_type(b, result, &binding.shared.ty);
+            b.store(result, shared_address);
+        }
         b.branch(done_bb, vec![]);
         b.set_block(done_bb);
     }
@@ -1123,11 +1190,22 @@ fn finish_scalar_reductions(
 
 fn finish_scalar_reductions_nowait(b: &mut FuncBuilder<'_>, bindings: &[ScalarReductionBinding]) {
     for binding in bindings {
-        let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
         let shared_address = scalar_storage_address(b, &binding.shared);
         let operator = b.const_i32(reduction_runtime_operator(binding.operator));
         let status = match &binding.shared.ty {
+            ty if is_complex_ty(ty) => {
+                let function = match complex_float_width(ty) {
+                    FloatWidth::F32 => "afs_omp_reduce_c32_nowait",
+                    FloatWidth::F64 => "afs_omp_reduce_c64_nowait",
+                };
+                b.call(
+                    FuncRef::External(function.into()),
+                    vec![operator, binding.private.addr, shared_address],
+                    IrType::Int(IntWidth::I32),
+                )
+            }
             IrType::Float(width) => {
+                let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
                 let function = match width {
                     FloatWidth::F32 => "afs_omp_reduce_f32_nowait",
                     FloatWidth::F64 => "afs_omp_reduce_f64_nowait",
@@ -1139,6 +1217,7 @@ fn finish_scalar_reductions_nowait(b: &mut FuncBuilder<'_>, bindings: &[ScalarRe
                 )
             }
             _ => {
+                let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
                 let private = coerce_to_type(b, private, &IrType::Int(IntWidth::I64));
                 let storage_bytes = b.const_i32(
                     i32::try_from(ir_scalar_byte_size(&binding.shared.ty, b.layout))
