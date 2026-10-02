@@ -4,7 +4,7 @@
 //! deliberately separate so recognizing a directive can never imply that the
 //! compiler already implements its parallel semantics.
 
-use super::expr::SpannedExpr;
+use super::expr::{Argument, SpannedExpr};
 use super::stmt::SpannedStmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,7 +84,7 @@ pub enum OpenMpClause {
     Nowait,
     Reduction {
         operator: OpenMpReductionOperator,
-        variables: Vec<String>,
+        items: Vec<OpenMpReductionItem>,
     },
 }
 
@@ -105,17 +105,60 @@ impl OpenMpClause {
         }
     }
 
-    pub fn listed_variables(&self) -> Option<&[String]> {
+    pub fn listed_variable_names(&self) -> Vec<&str> {
         match self {
-            Self::Private(names) | Self::FirstPrivate(names) | Self::Shared(names) => Some(names),
-            Self::LastPrivate { variables, .. } => Some(variables),
-            Self::Reduction { variables, .. } => Some(variables),
+            Self::Private(names) | Self::FirstPrivate(names) | Self::Shared(names) => {
+                names.iter().map(String::as_str).collect()
+            }
+            Self::LastPrivate { variables, .. } => variables.iter().map(String::as_str).collect(),
+            Self::Reduction { items, .. } => {
+                items.iter().map(OpenMpReductionItem::base_name).collect()
+            }
             Self::Default(_)
             | Self::If { .. }
             | Self::NumThreads(_)
             | Self::Schedule { .. }
             | Self::Collapse(_)
-            | Self::Nowait => None,
+            | Self::Nowait => Vec::new(),
+        }
+    }
+
+    pub fn reduction_items(&self) -> Option<&[OpenMpReductionItem]> {
+        match self {
+            Self::Reduction { items, .. } => Some(items),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OpenMpReductionItem {
+    Name(String),
+    ArrayDesignator {
+        name: String,
+        subscripts: Vec<Argument>,
+    },
+}
+
+impl OpenMpReductionItem {
+    pub fn base_name(&self) -> &str {
+        match self {
+            Self::Name(name) | Self::ArrayDesignator { name, .. } => name,
+        }
+    }
+
+    pub fn source_text(&self) -> String {
+        match self {
+            Self::Name(name) => name.clone(),
+            Self::ArrayDesignator { name, subscripts } => format!(
+                "{}({})",
+                name,
+                subscripts
+                    .iter()
+                    .map(|subscript| subscript.value.to_sexpr())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 }

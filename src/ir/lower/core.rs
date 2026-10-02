@@ -4465,8 +4465,24 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
         }
         Stmt::OpenMp(construct) => {
             for clause in construct.clauses() {
-                if let Some(names) = clause.listed_variables() {
-                    out.extend(names.iter().cloned());
+                out.extend(
+                    clause
+                        .listed_variable_names()
+                        .into_iter()
+                        .map(str::to_string),
+                );
+                if let Some(items) = clause.reduction_items() {
+                    for item in items {
+                        if let crate::ast::openmp::OpenMpReductionItem::ArrayDesignator {
+                            subscripts,
+                            ..
+                        } = item
+                        {
+                            for subscript in subscripts {
+                                collect_name_refs_subscript(&subscript.value, out);
+                            }
+                        }
+                    }
                 }
                 if let Some(expr) = clause.expression() {
                     collect_name_refs_expr(expr, out);
@@ -8537,12 +8553,23 @@ pub(super) fn check_filtered_in_stmt(
         }
         Stmt::OpenMp(construct) => {
             for clause in construct.clauses() {
-                if let Some(names) = clause.listed_variables() {
-                    for name in names {
-                        check_filtered_in_expr(
-                            &crate::ast::Spanned::new(Expr::Name { name: name.clone() }, stmt.span),
-                            filtered,
-                        );
+                for name in clause.listed_variable_names() {
+                    check_filtered_in_expr(
+                        &crate::ast::Spanned::new(Expr::Name { name: name.into() }, stmt.span),
+                        filtered,
+                    );
+                }
+                if let Some(items) = clause.reduction_items() {
+                    for item in items {
+                        if let crate::ast::openmp::OpenMpReductionItem::ArrayDesignator {
+                            subscripts,
+                            ..
+                        } = item
+                        {
+                            for subscript in subscripts {
+                                check_filtered_in_subscript(&subscript.value, filtered);
+                            }
+                        }
                     }
                 }
                 if let Some(expr) = clause.expression() {

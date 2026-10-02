@@ -12,7 +12,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::openmp::{
-    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionOperator, OpenMpScheduleKind,
+    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionItem, OpenMpReductionOperator,
+    OpenMpScheduleKind,
 };
 use crate::ast::stmt::{IoControl, RankGuard, SpannedStmt, Stmt, TypeGuard};
 use crate::lexer::Span;
@@ -78,14 +79,15 @@ struct ParallelClauseInfo {
 pub(crate) fn parallel_private_names(clauses: &[OpenMpClause]) -> HashSet<String> {
     clauses
         .iter()
-        .filter_map(|clause| match clause {
+        .flat_map(|clause| match clause {
             OpenMpClause::Private(names) | OpenMpClause::FirstPrivate(names) => {
-                Some(names.as_slice())
+                names.iter().map(String::as_str).collect::<Vec<_>>()
             }
-            OpenMpClause::Reduction { variables, .. } => Some(variables.as_slice()),
-            _ => None,
+            OpenMpClause::Reduction { items, .. } => {
+                items.iter().map(OpenMpReductionItem::base_name).collect()
+            }
+            _ => Vec::new(),
         })
-        .flatten()
         .map(|name| name.to_ascii_lowercase())
         .collect()
 }
@@ -186,14 +188,12 @@ fn validate_parallel_clauses(
                     validate_lastprivate_object(ctx, name, span);
                 }
             }
-            OpenMpClause::Reduction {
-                operator,
-                variables,
-            } => {
-                for name in variables {
+            OpenMpClause::Reduction { operator, items } => {
+                for item in items {
+                    let name = item.base_name();
                     let key = name.to_ascii_lowercase();
                     register_data_attribute(ctx, span, &mut data_attributes, &key, "REDUCTION");
-                    validate_reduction_object(ctx, name, span, *operator);
+                    validate_reduction_object(ctx, item, span, *operator);
                 }
             }
             OpenMpClause::Default(OpenMpDefault::Shared) => {}
@@ -427,8 +427,17 @@ fn validate_worksharing_loop(
                 OpenMpClause::LastPrivate { variables, .. } => {
                     (Some(variables.as_slice()), "LASTPRIVATE")
                 }
-                OpenMpClause::Reduction { variables, .. } => {
-                    (Some(variables.as_slice()), "REDUCTION")
+                OpenMpClause::Reduction { items, .. } => {
+                    for item in items {
+                        register_data_attribute(
+                            ctx,
+                            span,
+                            &mut data_attributes,
+                            &item.base_name().to_ascii_lowercase(),
+                            "REDUCTION",
+                        );
+                    }
+                    (None, "")
                 }
                 _ => (None, ""),
             };
@@ -561,9 +570,9 @@ fn validate_worksharing_loop(
                 }
             }
             OpenMpClause::Collapse(_) => {}
-            OpenMpClause::Reduction { variables, .. } if variables
+            OpenMpClause::Reduction { items, .. } if items
                 .iter()
-                .any(|name| associated_loop_keys.contains(&name.to_ascii_lowercase())) =>
+                .any(|item| associated_loop_keys.contains(&item.base_name().to_ascii_lowercase())) =>
             {
                 ctx.error(
                     span,
@@ -576,9 +585,10 @@ fn validate_worksharing_loop(
             OpenMpClause::Reduction { .. } if combined_do => {}
             OpenMpClause::Reduction {
                 operator,
-                variables,
+                items,
             } => {
-                for name in variables {
+                for item in items {
+                    let name = item.base_name();
                     let key = name.to_ascii_lowercase();
                     if ctx
                         .openmp_parallel_private_frames
@@ -592,7 +602,7 @@ fn validate_worksharing_loop(
                             ),
                         );
                     }
-                    validate_reduction_object(ctx, name, span, *operator);
+                    validate_reduction_object(ctx, item, span, *operator);
                 }
             }
             OpenMpClause::Shared(_)
@@ -655,10 +665,11 @@ fn validate_lastprivate_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
 
 fn validate_reduction_object(
     ctx: &mut Ctx<'_>,
-    name: &str,
+    item: &OpenMpReductionItem,
     span: Span,
     operator: OpenMpReductionOperator,
 ) {
+    let name = item.base_name();
     let Some(symbol) = ctx.lookup_lexical(name) else {
         ctx.error(
             span,

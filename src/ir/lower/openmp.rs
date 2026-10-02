@@ -745,10 +745,11 @@ fn lower_parallel_region(
         });
     }
     for clause in clauses {
-        let OpenMpClause::Reduction { variables, .. } = clause else {
+        let OpenMpClause::Reduction { items, .. } = clause else {
             continue;
         };
-        for name in variables {
+        for item in items {
+            let name = item.base_name();
             let key = name.to_ascii_lowercase();
             if !seen_captures.insert(key.clone()) {
                 continue;
@@ -1054,14 +1055,11 @@ fn prepare_scalar_reductions(
 ) -> Vec<ScalarReductionBinding> {
     let mut bindings = Vec::new();
     for clause in clauses {
-        let OpenMpClause::Reduction {
-            operator,
-            variables,
-        } = clause
-        else {
+        let OpenMpClause::Reduction { operator, items } = clause else {
             continue;
         };
-        for name in variables {
+        for item in items {
+            let name = item.base_name();
             let key = name.to_ascii_lowercase();
             let shared = ctx.locals.get(&key).cloned().unwrap_or_else(|| {
                 panic!("validated OpenMP reduction variable '{key}' has no lowering binding")

@@ -3,8 +3,10 @@
 use std::collections::HashSet;
 
 use super::{ParseError, Parser};
+use crate::ast::expr::Expr;
 use crate::ast::openmp::{
-    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionOperator, OpenMpScheduleKind,
+    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionItem, OpenMpReductionOperator,
+    OpenMpScheduleKind,
 };
 use crate::ast::stmt::{SpannedStmt, Stmt};
 use crate::ast::Spanned;
@@ -424,14 +426,14 @@ fn parse_clauses(
             )?),
             "reduction" => {
                 let value = cursor.parenthesized("REDUCTION clause")?;
-                let Some((operator, variables)) = split_top_level_once(value, ':') else {
+                let Some((operator, items)) = split_top_level_once(value, ':') else {
                     return Err(
                         cursor.error("OpenMP REDUCTION requires 'operator: variable-list'".into())
                     );
                 };
                 OpenMpClause::Reduction {
                     operator: parse_reduction_operator(operator, cursor)?,
-                    variables: parse_name_list(variables, span, "REDUCTION list")?,
+                    items: parse_reduction_list(items, span)?,
                 }
             }
             "nowait" => {
@@ -509,6 +511,44 @@ fn parse_name_list(source: &str, span: Span, context: &str) -> Result<Vec<String
     values
         .into_iter()
         .map(|value| parse_single_name(value, span, context))
+        .collect()
+}
+
+fn parse_reduction_list(source: &str, span: Span) -> Result<Vec<OpenMpReductionItem>, ParseError> {
+    let values = split_top_level(source, ',');
+    if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+        return Err(ParseError {
+            span,
+            msg: "OpenMP REDUCTION list must not be empty".into(),
+        });
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            let expression = parse_clause_expr(value, span, "REDUCTION list item")?;
+            match expression.node {
+                Expr::Name { name } => Ok(OpenMpReductionItem::Name(name)),
+                Expr::FunctionCall { callee, args } => match callee.node {
+                    Expr::Name { name } if args.iter().all(|arg| arg.keyword.is_none()) => {
+                        Ok(OpenMpReductionItem::ArrayDesignator {
+                            name,
+                            subscripts: args,
+                        })
+                    }
+                    _ => Err(ParseError {
+                        span,
+                        msg: format!(
+                            "OpenMP REDUCTION list item '{}' must have an identifier base",
+                            value.trim()
+                        ),
+                    }),
+                },
+                _ => Err(ParseError {
+                    span,
+                    msg: format!("unsupported OpenMP REDUCTION list item '{}'", value.trim()),
+                }),
+            }
+        })
         .collect()
 }
 
@@ -790,8 +830,11 @@ mod tests {
             clause,
             OpenMpClause::Reduction {
                 operator: OpenMpReductionOperator::Or,
-                variables,
-            } if variables == &["any_match", "has_error"]
+                items,
+            } if items == &[
+                OpenMpReductionItem::Name("any_match".into()),
+                OpenMpReductionItem::Name("has_error".into()),
+            ]
         )));
         assert!(clauses
             .iter()
@@ -820,6 +863,27 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn parses_array_reduction_items_without_erasing_sections() {
+        let stmt = parse(
+            "!$omp parallel do reduction(+:whole, slice(2:7), element(4))\n\
+             do i = 1, n\n\
+             end do\n\
+             !$omp end parallel do\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::ParallelDo { clauses, .. }) = stmt.node else {
+            panic!("expected parallel-do construct");
+        };
+        let OpenMpClause::Reduction { items, .. } = &clauses[0] else {
+            panic!("expected reduction clause");
+        };
+        assert_eq!(items[0], OpenMpReductionItem::Name("whole".into()));
+        assert_eq!(items[1].source_text(), "slice(2:7)");
+        assert_eq!(items[2].source_text(), "element(4)");
     }
 
     #[test]
