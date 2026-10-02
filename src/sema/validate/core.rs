@@ -2588,6 +2588,7 @@ pub(super) struct NameReference {
     pub(super) name: String,
     pub(super) span: Span,
     pub(super) role: ReferenceRole,
+    pub(super) subscripts: Option<Vec<crate::ast::expr::Argument>>,
 }
 
 #[derive(Default)]
@@ -2609,6 +2610,7 @@ fn collect_name_reference(
             name: key,
             span,
             role,
+            subscripts: None,
         });
     }
 }
@@ -2679,6 +2681,7 @@ pub(super) fn collect_reference_expr(
                         name: key,
                         span: callee.span,
                         role: ReferenceRole::Callable,
+                        subscripts: Some(args.clone()),
                     });
                 }
             } else {
@@ -3148,6 +3151,7 @@ fn collect_reference_stmt(
                                     name: key.clone(),
                                     span: stmt.span,
                                     role: ReferenceRole::Value,
+                                    subscripts: None,
                                 });
                             }
                             nested_shadowed.insert(key);
@@ -3381,6 +3385,7 @@ fn collect_reference_stmt(
                         name: key,
                         span: callee.span,
                         role: ReferenceRole::Callable,
+                        subscripts: None,
                     });
                 }
             } else {

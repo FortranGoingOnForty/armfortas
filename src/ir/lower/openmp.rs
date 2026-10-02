@@ -14,9 +14,9 @@
 //! Standalone worksharing reductions use either the synchronized team
 //! combiner or a lock-protected, barrier-free `NOWAIT` combiner.
 
-use crate::ast::expr::Expr;
+use crate::ast::expr::{Expr, SectionSubscript};
 use crate::ast::openmp::{
-    OpenMpClause, OpenMpConstruct, OpenMpReductionOperator, OpenMpScheduleKind,
+    OpenMpClause, OpenMpConstruct, OpenMpReductionItem, OpenMpReductionOperator, OpenMpScheduleKind,
 };
 use crate::ast::stmt::{SpannedStmt, Stmt};
 use crate::ast::Spanned;
@@ -70,11 +70,22 @@ struct InstalledCaptureCleanup {
     lastprivate_originals: std::collections::HashMap<String, LocalInfo>,
 }
 
-struct ScalarReductionBinding {
+struct ReductionBinding {
     name: String,
     operator: OpenMpReductionOperator,
     shared: LocalInfo,
     private: LocalInfo,
+    restore: LocalInfo,
+    storage: ReductionStorage,
+}
+
+enum ReductionStorage {
+    Scalar,
+    Array {
+        elements: i64,
+        bytes: i64,
+        kind: i32,
+    },
 }
 
 struct LastPrivateBinding {
@@ -838,7 +849,7 @@ fn lower_parallel_region(
             let cleanup = install_shared_captures(&mut outlined, &mut outlined_ctx, &captures);
             let parallel_reductions = match region_body {
                 ParallelRegionBody::Statements(_) => {
-                    prepare_scalar_reductions(&mut outlined, &mut outlined_ctx, clauses)
+                    prepare_reductions(&mut outlined, &mut outlined_ctx, clauses)
                 }
                 ParallelRegionBody::WorksharingDo { .. } => Vec::new(),
             };
@@ -878,7 +889,7 @@ fn lower_parallel_region(
                 .terminator
                 .is_none()
             {
-                finish_scalar_reductions(&mut outlined, &parallel_reductions, ValueId(1));
+                finish_reductions(&mut outlined, &parallel_reductions, ValueId(1));
                 if !cleanup.private_derived_scalars.is_empty() {
                     let closure_locals = outlined_ctx.locals.clone();
                     insert_implicit_dealloc(
@@ -1048,11 +1059,77 @@ fn initialize_scalar_reduction_private(
     b.store(identity, info.addr);
 }
 
-fn prepare_scalar_reductions(
+fn reduction_array_kind(info: &LocalInfo) -> i32 {
+    if is_complex_ty(&info.ty) {
+        return match complex_float_width(&info.ty) {
+            FloatWidth::F32 => 7,
+            FloatWidth::F64 => 8,
+        };
+    }
+    match info.ty {
+        IrType::Bool | IrType::Int(IntWidth::I8) => 1,
+        IrType::Int(IntWidth::I16) => 2,
+        IrType::Int(IntWidth::I32) => 3,
+        IrType::Int(IntWidth::I64) => 4,
+        IrType::Float(FloatWidth::F32) => 5,
+        IrType::Float(FloatWidth::F64) => 6,
+        _ => unreachable!("unsupported OpenMP array reduction type passed semantic validation"),
+    }
+}
+
+fn reduction_selection_bounds(
+    item: &OpenMpReductionItem,
+    shared: &LocalInfo,
+    ctx: &LowerCtx<'_>,
+) -> (i64, i64) {
+    let (declared_lower, declared_extent) = shared.dims[0];
+    let declared_upper = declared_lower + declared_extent - 1;
+    let OpenMpReductionItem::ArrayDesignator { subscripts, .. } = item else {
+        return (declared_lower, declared_extent);
+    };
+    match &subscripts[0].value {
+        SectionSubscript::Element(index) => {
+            let index = super::core::eval_const_int_in_scope_or_any_scope(
+                index,
+                &std::collections::HashMap::new(),
+                ctx.st,
+            )
+            .expect("validated OpenMP array reduction index is not constant");
+            (index, 1)
+        }
+        SectionSubscript::Range { start, end, .. } => {
+            let start = start
+                .as_ref()
+                .map(|start| {
+                    super::core::eval_const_int_in_scope_or_any_scope(
+                        start,
+                        &std::collections::HashMap::new(),
+                        ctx.st,
+                    )
+                    .expect("validated OpenMP array reduction lower bound is not constant")
+                })
+                .unwrap_or(declared_lower);
+            let end = end
+                .as_ref()
+                .map(|end| {
+                    super::core::eval_const_int_in_scope_or_any_scope(
+                        end,
+                        &std::collections::HashMap::new(),
+                        ctx.st,
+                    )
+                    .expect("validated OpenMP array reduction upper bound is not constant")
+                })
+                .unwrap_or(declared_upper);
+            (start, end - start + 1)
+        }
+    }
+}
+
+fn prepare_reductions(
     b: &mut FuncBuilder<'_>,
     ctx: &mut LowerCtx<'_>,
     clauses: &[OpenMpClause],
-) -> Vec<ScalarReductionBinding> {
+) -> Vec<ReductionBinding> {
     let mut bindings = Vec::new();
     for clause in clauses {
         let OpenMpClause::Reduction { operator, items } = clause else {
@@ -1064,17 +1141,62 @@ fn prepare_scalar_reductions(
             let shared = ctx.locals.get(&key).cloned().unwrap_or_else(|| {
                 panic!("validated OpenMP reduction variable '{key}' has no lowering binding")
             });
-            let mut private = shared.clone();
-            private.addr = b.alloca(private.ty.clone());
-            private.by_ref = false;
-            private.inline_const = None;
-            initialize_scalar_reduction_private(b, *operator, &private);
+            let restore = shared.clone();
+            let (shared, private, storage) = if shared.dims.is_empty() {
+                let mut private = shared.clone();
+                private.addr = b.alloca(private.ty.clone());
+                private.by_ref = false;
+                private.inline_const = None;
+                initialize_scalar_reduction_private(b, *operator, &private);
+                (shared, private, ReductionStorage::Scalar)
+            } else {
+                let (selected_lower, selected_extent) =
+                    reduction_selection_bounds(item, &shared, ctx);
+                let (declared_lower, _) = shared.dims[0];
+                let base = array_base_addr(b, &shared);
+                let offset = b.const_i64(selected_lower - declared_lower);
+                let selected_base = b.gep(base, vec![offset], shared.ty.clone());
+                let mut shared_view = shared.clone();
+                shared_view.addr = selected_base;
+                shared_view.dims = vec![(selected_lower, selected_extent)];
+                shared_view.runtime_dim_upper = vec![None];
+                shared_view.by_ref = false;
+                shared_view.inline_const = None;
+
+                let mut private = shared_view.clone();
+                private.addr = b.alloca(fixed_array_storage_type(&private, b.layout));
+                let (elements, bytes) = fixed_array_layout(&private, b.layout)
+                    .expect("validated OpenMP array reduction lost its fixed shape");
+                let elements = i64::try_from(elements)
+                    .expect("validated OpenMP array reduction extent exceeds i64");
+                let kind = reduction_array_kind(&private);
+                let operator_value = b.const_i32(reduction_runtime_operator(*operator));
+                let kind_value = b.const_i32(kind);
+                let count = b.const_i64(elements);
+                let status = b.call(
+                    FuncRef::External("afs_omp_init_reduction_array".into()),
+                    vec![operator_value, kind_value, private.addr, count],
+                    IrType::Int(IntWidth::I32),
+                );
+                require_reduction_success(b, status);
+                (
+                    shared_view,
+                    private,
+                    ReductionStorage::Array {
+                        elements,
+                        bytes,
+                        kind,
+                    },
+                )
+            };
             ctx.locals.insert(key.clone(), private.clone());
-            bindings.push(ScalarReductionBinding {
+            bindings.push(ReductionBinding {
                 name: key,
                 operator: *operator,
                 shared,
                 private,
+                restore,
+                storage,
             });
         }
     }
@@ -1089,72 +1211,93 @@ fn scalar_storage_address(b: &mut FuncBuilder<'_>, info: &LocalInfo) -> ValueId 
     }
 }
 
-fn finish_scalar_reductions(
-    b: &mut FuncBuilder<'_>,
-    bindings: &[ScalarReductionBinding],
-    thread_num: ValueId,
-) {
+fn finish_reductions(b: &mut FuncBuilder<'_>, bindings: &[ReductionBinding], thread_num: ValueId) {
     for binding in bindings {
         let shared_address = scalar_storage_address(b, &binding.shared);
         let operator = b.const_i32(reduction_runtime_operator(binding.operator));
-        let (status, result_address, result_ty, copy_bytes) = match &binding.shared.ty {
-            ty if is_complex_ty(ty) => {
-                let width = complex_float_width(ty);
-                let result_ty = ty.clone();
+        let (status, result_address, result_ty, copy_bytes) = match &binding.storage {
+            ReductionStorage::Array {
+                elements,
+                bytes,
+                kind,
+            } => {
+                let result_ty = fixed_array_storage_type(&binding.private, b.layout);
                 let result_address = b.alloca(result_ty.clone());
-                let function = match width {
-                    FloatWidth::F32 => "afs_omp_reduce_c32",
-                    FloatWidth::F64 => "afs_omp_reduce_c64",
-                };
+                let kind = b.const_i32(*kind);
+                let count = b.const_i64(*elements);
                 let status = b.call(
-                    FuncRef::External(function.into()),
+                    FuncRef::External("afs_omp_reduce_array".into()),
                     vec![
                         operator,
+                        kind,
                         binding.private.addr,
                         shared_address,
+                        count,
                         result_address,
                     ],
                     IrType::Int(IntWidth::I32),
                 );
-                (
-                    status,
-                    result_address,
-                    result_ty,
-                    Some(complex_byte_size(ty)),
-                )
+                (status, result_address, result_ty, Some(*bytes))
             }
-            IrType::Float(width) => {
-                let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
-                let result_ty = IrType::Float(*width);
-                let original = b.load_typed(shared_address, result_ty.clone());
-                let result_address = b.alloca(result_ty.clone());
-                let function = match width {
-                    FloatWidth::F32 => "afs_omp_reduce_f32",
-                    FloatWidth::F64 => "afs_omp_reduce_f64",
-                };
-                let status = b.call(
-                    FuncRef::External(function.into()),
-                    vec![operator, private, original, result_address],
-                    IrType::Int(IntWidth::I32),
-                );
-                (status, result_address, result_ty, None)
-            }
-            _ => {
-                let abi_ty = IrType::Int(IntWidth::I64);
-                let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
-                let private = coerce_to_type(b, private, &abi_ty);
-                let original = b.load_typed(shared_address, binding.shared.ty.clone());
-                let original = coerce_to_type(b, original, &abi_ty);
-                let result_address = b.alloca(abi_ty.clone());
-                let status = b.call(
-                    FuncRef::External("afs_omp_reduce_i64".into()),
-                    vec![operator, private, original, result_address],
-                    IrType::Int(IntWidth::I32),
-                );
-                (status, result_address, abi_ty, None)
-            }
+            ReductionStorage::Scalar => match &binding.shared.ty {
+                ty if is_complex_ty(ty) => {
+                    let width = complex_float_width(ty);
+                    let result_ty = ty.clone();
+                    let result_address = b.alloca(result_ty.clone());
+                    let function = match width {
+                        FloatWidth::F32 => "afs_omp_reduce_c32",
+                        FloatWidth::F64 => "afs_omp_reduce_c64",
+                    };
+                    let status = b.call(
+                        FuncRef::External(function.into()),
+                        vec![
+                            operator,
+                            binding.private.addr,
+                            shared_address,
+                            result_address,
+                        ],
+                        IrType::Int(IntWidth::I32),
+                    );
+                    (
+                        status,
+                        result_address,
+                        result_ty,
+                        Some(complex_byte_size(ty)),
+                    )
+                }
+                IrType::Float(width) => {
+                    let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
+                    let result_ty = IrType::Float(*width);
+                    let original = b.load_typed(shared_address, result_ty.clone());
+                    let result_address = b.alloca(result_ty.clone());
+                    let function = match width {
+                        FloatWidth::F32 => "afs_omp_reduce_f32",
+                        FloatWidth::F64 => "afs_omp_reduce_f64",
+                    };
+                    let status = b.call(
+                        FuncRef::External(function.into()),
+                        vec![operator, private, original, result_address],
+                        IrType::Int(IntWidth::I32),
+                    );
+                    (status, result_address, result_ty, None)
+                }
+                _ => {
+                    let abi_ty = IrType::Int(IntWidth::I64);
+                    let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
+                    let private = coerce_to_type(b, private, &abi_ty);
+                    let original = b.load_typed(shared_address, binding.shared.ty.clone());
+                    let original = coerce_to_type(b, original, &abi_ty);
+                    let result_address = b.alloca(abi_ty.clone());
+                    let status = b.call(
+                        FuncRef::External("afs_omp_reduce_i64".into()),
+                        vec![operator, private, original, result_address],
+                        IrType::Int(IntWidth::I32),
+                    );
+                    (status, result_address, abi_ty, None)
+                }
+            },
         };
-        require_scalar_reduction_success(b, status);
+        require_reduction_success(b, status);
         let zero = b.const_i32(0);
         let thread_zero = b.icmp(CmpOp::Eq, thread_num, zero);
         let store_bb = b.create_block("omp_reduction_store");
@@ -1182,57 +1325,68 @@ fn finish_scalar_reductions(
             vec![],
             IrType::Int(IntWidth::I32),
         );
-        require_scalar_reduction_success(b, status);
+        require_reduction_success(b, status);
     }
 }
 
-fn finish_scalar_reductions_nowait(b: &mut FuncBuilder<'_>, bindings: &[ScalarReductionBinding]) {
+fn finish_reductions_nowait(b: &mut FuncBuilder<'_>, bindings: &[ReductionBinding]) {
     for binding in bindings {
         let shared_address = scalar_storage_address(b, &binding.shared);
         let operator = b.const_i32(reduction_runtime_operator(binding.operator));
-        let status = match &binding.shared.ty {
-            ty if is_complex_ty(ty) => {
-                let function = match complex_float_width(ty) {
-                    FloatWidth::F32 => "afs_omp_reduce_c32_nowait",
-                    FloatWidth::F64 => "afs_omp_reduce_c64_nowait",
-                };
+        let status = match &binding.storage {
+            ReductionStorage::Array { elements, kind, .. } => {
+                let kind = b.const_i32(*kind);
+                let count = b.const_i64(*elements);
                 b.call(
-                    FuncRef::External(function.into()),
-                    vec![operator, binding.private.addr, shared_address],
+                    FuncRef::External("afs_omp_reduce_array_nowait".into()),
+                    vec![operator, kind, binding.private.addr, shared_address, count],
                     IrType::Int(IntWidth::I32),
                 )
             }
-            IrType::Float(width) => {
-                let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
-                let function = match width {
-                    FloatWidth::F32 => "afs_omp_reduce_f32_nowait",
-                    FloatWidth::F64 => "afs_omp_reduce_f64_nowait",
-                };
-                b.call(
-                    FuncRef::External(function.into()),
-                    vec![operator, private, shared_address],
-                    IrType::Int(IntWidth::I32),
-                )
-            }
-            _ => {
-                let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
-                let private = coerce_to_type(b, private, &IrType::Int(IntWidth::I64));
-                let storage_bytes = b.const_i32(
-                    i32::try_from(ir_scalar_byte_size(&binding.shared.ty, b.layout))
-                        .expect("validated OpenMP reduction scalar storage exceeds i32"),
-                );
-                b.call(
-                    FuncRef::External("afs_omp_reduce_i64_nowait".into()),
-                    vec![operator, private, shared_address, storage_bytes],
-                    IrType::Int(IntWidth::I32),
-                )
-            }
+            ReductionStorage::Scalar => match &binding.shared.ty {
+                ty if is_complex_ty(ty) => {
+                    let function = match complex_float_width(ty) {
+                        FloatWidth::F32 => "afs_omp_reduce_c32_nowait",
+                        FloatWidth::F64 => "afs_omp_reduce_c64_nowait",
+                    };
+                    b.call(
+                        FuncRef::External(function.into()),
+                        vec![operator, binding.private.addr, shared_address],
+                        IrType::Int(IntWidth::I32),
+                    )
+                }
+                IrType::Float(width) => {
+                    let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
+                    let function = match width {
+                        FloatWidth::F32 => "afs_omp_reduce_f32_nowait",
+                        FloatWidth::F64 => "afs_omp_reduce_f64_nowait",
+                    };
+                    b.call(
+                        FuncRef::External(function.into()),
+                        vec![operator, private, shared_address],
+                        IrType::Int(IntWidth::I32),
+                    )
+                }
+                _ => {
+                    let private = b.load_typed(binding.private.addr, binding.private.ty.clone());
+                    let private = coerce_to_type(b, private, &IrType::Int(IntWidth::I64));
+                    let storage_bytes = b.const_i32(
+                        i32::try_from(ir_scalar_byte_size(&binding.shared.ty, b.layout))
+                            .expect("validated OpenMP reduction scalar storage exceeds i32"),
+                    );
+                    b.call(
+                        FuncRef::External("afs_omp_reduce_i64_nowait".into()),
+                        vec![operator, private, shared_address, storage_bytes],
+                        IrType::Int(IntWidth::I32),
+                    )
+                }
+            },
         };
-        require_scalar_reduction_success(b, status);
+        require_reduction_success(b, status);
     }
 }
 
-fn require_scalar_reduction_success(b: &mut FuncBuilder<'_>, status: ValueId) {
+fn require_reduction_success(b: &mut FuncBuilder<'_>, status: ValueId) {
     let zero = b.const_i32(0);
     let invalid = b.icmp(CmpOp::Ne, status, zero);
     let error_bb = b.create_block("omp_reduction_invalid");
@@ -1248,10 +1402,10 @@ fn require_scalar_reduction_success(b: &mut FuncBuilder<'_>, status: ValueId) {
     b.set_block(ready_bb);
 }
 
-fn restore_scalar_reductions(ctx: &mut LowerCtx<'_>, bindings: &[ScalarReductionBinding]) {
+fn restore_reductions(ctx: &mut LowerCtx<'_>, bindings: &[ReductionBinding]) {
     for binding in bindings {
         ctx.locals
-            .insert(binding.name.clone(), binding.shared.clone());
+            .insert(binding.name.clone(), binding.restore.clone());
     }
 }
 
@@ -1538,7 +1692,7 @@ fn lower_worksharing_loop(
             inner_count,
         }
     });
-    let reductions = prepare_scalar_reductions(b, ctx, clauses);
+    let reductions = prepare_reductions(b, ctx, clauses);
     let mut lastprivate_bindings =
         prepare_lastprivate_bindings(b, ctx, clauses, captured_lastprivate_originals);
 
@@ -1784,7 +1938,7 @@ fn lower_worksharing_loop(
     restore_temp_binding(ctx, first_name, saved_first);
     restore_temp_binding(ctx, last_name, saved_last);
     restore_temp_binding(ctx, step_name, saved_step);
-    restore_scalar_reductions(ctx, &reductions);
+    restore_reductions(ctx, &reductions);
     restore_lastprivate_bindings(ctx, &lastprivate_bindings);
     if b.func().block(b.current_block()).terminator.is_none() {
         if let Some(sequential_last_addr) = sequential_last_addr {
@@ -1835,9 +1989,9 @@ fn lower_worksharing_loop(
 
     b.set_block(done_bb);
     if nowait {
-        finish_scalar_reductions_nowait(b, &reductions);
+        finish_reductions_nowait(b, &reductions);
     } else {
-        finish_scalar_reductions(b, &reductions, thread_num);
+        finish_reductions(b, &reductions, thread_num);
     }
     if !suppress_barrier && !nowait && reductions.is_empty() {
         b.call(
