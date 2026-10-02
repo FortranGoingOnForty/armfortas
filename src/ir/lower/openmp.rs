@@ -11,8 +11,9 @@
 //! storage below the compiler's stack threshold and owned descriptors above
 //! it. Scalar LASTPRIVATE copy-out is selected by the sequentially last
 //! logical iteration rather than by whichever implicit task finishes last.
-//! Standalone worksharing reductions use either the synchronized team
-//! combiner or a lock-protected, barrier-free `NOWAIT` combiner.
+//! Standalone scalar and fixed-rank-one worksharing reductions use either the
+//! synchronized team combiner or a lock-protected, barrier-free `NOWAIT`
+//! combiner.
 
 use crate::ast::expr::{Expr, SectionSubscript};
 use crate::ast::openmp::{

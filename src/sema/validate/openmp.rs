@@ -3,7 +3,7 @@
 //! The executable slice is intentionally narrow: `PARALLEL` data environments
 //! support selected intrinsic/derived storage, while canonical worksharing
 //! `DO` and combined `PARALLEL DO` support the implemented schedules and
-//! scalar LASTPRIVATE copy-out and scalar INTEGER/REAL/LOGICAL reductions.
+//! scalar LASTPRIVATE copy-out and predefined scalar/fixed-rank-one reductions.
 //! Named and unnamed `CRITICAL` regions retain process-wide lock identity.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
 //! regions without pretending later schedules, loop clauses, or wider object
