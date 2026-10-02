@@ -722,6 +722,13 @@ fn validate_reduction_object(
             Some(TypeInfo::DoublePrecision),
         ) => true,
         (
+            OpenMpReductionOperator::Add | OpenMpReductionOperator::Multiply,
+            Some(TypeInfo::Complex { kind }),
+        ) => matches!(
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
+            4 | 8
+        ),
+        (
             OpenMpReductionOperator::And
             | OpenMpReductionOperator::Or
             | OpenMpReductionOperator::Eqv
@@ -731,16 +738,17 @@ fn validate_reduction_object(
         _ => false,
     };
     if !valid {
-        let requirement = if matches!(
-            operator,
+        let requirement = match operator {
             OpenMpReductionOperator::And
-                | OpenMpReductionOperator::Or
-                | OpenMpReductionOperator::Eqv
-                | OpenMpReductionOperator::Neqv
-        ) {
-            "a scalar LOGICAL of kind 1, 2, 4, or 8"
-        } else {
-            "a scalar INTEGER of kind 1, 2, 4, or 8, or REAL of kind 4 or 8"
+            | OpenMpReductionOperator::Or
+            | OpenMpReductionOperator::Eqv
+            | OpenMpReductionOperator::Neqv => "a scalar LOGICAL of kind 1, 2, 4, or 8",
+            OpenMpReductionOperator::Add | OpenMpReductionOperator::Multiply => {
+                "a scalar INTEGER of kind 1, 2, 4, or 8, REAL of kind 4 or 8, or COMPLEX of kind 4 or 8"
+            }
+            OpenMpReductionOperator::Max | OpenMpReductionOperator::Min => {
+                "a scalar INTEGER of kind 1, 2, 4, or 8, or REAL of kind 4 or 8"
+            }
         };
         ctx.error(
             span,
@@ -1207,6 +1215,10 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
             | Some(TypeInfo::Real { .. })
             | Some(TypeInfo::DoublePrecision)
             | Some(TypeInfo::Logical { .. })
+    ) || matches!(
+        symbol.type_info.as_ref(),
+        Some(TypeInfo::Complex { kind })
+            if matches!(kind.unwrap_or_else(crate::driver::defaults::default_real_kind), 4 | 8)
     );
     let supported_character = matches!(
         symbol.type_info.as_ref(),
@@ -1223,7 +1235,7 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
         ctx.error(
             span,
             format!(
-                "OpenMP PARALLEL shared variable '{}' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or default-kind CHARACTER allocatable",
+                "OpenMP PARALLEL shared variable '{}' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, COMPLEX, LOGICAL, fixed-length default-kind CHARACTER, or default-kind CHARACTER allocatable",
                 name
             ),
         );

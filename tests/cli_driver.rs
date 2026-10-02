@@ -21491,6 +21491,115 @@ end program
 }
 
 #[test]
+fn fopenmp_scalar_complex_reductions_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_scalar_complex_reductions_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: i
+  complex(kind=4) :: sum4, product4, nowait4
+  complex(kind=8) :: sum8, product8, nowait8, untouched8
+  double complex :: parallel_product
+  real(kind=8) :: observed_real8(4), observed_imag8(4)
+  sum4 = cmplx(5.0_4, -2.0_4, kind=4)
+  product4 = cmplx(2.0_4, 0.0_4, kind=4)
+!$omp parallel do default(none) num_threads(4) schedule(dynamic,2) private(i) &
+!$omp& reduction(+:sum4) reduction(*:product4)
+  do i = 1, 4
+    sum4 = sum4 + cmplx(real(i, kind=4), -real(i, kind=4), kind=4)
+    product4 = product4 * cmplx(1.0_4, 1.0_4, kind=4)
+  end do
+!$omp end parallel do
+  if (sum4 /= cmplx(15.0_4, -12.0_4, kind=4)) error stop 1
+  if (product4 /= cmplx(-8.0_4, 0.0_4, kind=4)) error stop 2
+
+  sum8 = cmplx(10.0_8, 1.0_8, kind=8)
+  untouched8 = cmplx(13.0_8, -7.0_8, kind=8)
+  parallel_product = cmplx(2.0_8, -3.0_8, kind=8)
+!$omp parallel default(none) num_threads(4) &
+!$omp& reduction(+:sum8,untouched8) reduction(*:parallel_product)
+  sum8 = sum8 + cmplx(0.25_8, -0.5_8, kind=8)
+  parallel_product = parallel_product * cmplx(0.0_8, 1.0_8, kind=8)
+!$omp end parallel
+  if (sum8 /= cmplx(11.0_8, -1.0_8, kind=8)) error stop 3
+  if (untouched8 /= cmplx(13.0_8, -7.0_8, kind=8)) error stop 4
+  if (parallel_product /= cmplx(2.0_8, -3.0_8, kind=8)) error stop 5
+
+  product8 = cmplx(2.0_8, 0.0_8, kind=8)
+  nowait4 = cmplx(3.0_4, 1.0_4, kind=4)
+  nowait8 = cmplx(3.0_8, 1.0_8, kind=8)
+  observed_real8 = -1.0_8
+  observed_imag8 = -1.0_8
+!$omp parallel default(none) num_threads(4) &
+!$omp& shared(product8,nowait4,nowait8,observed_real8,observed_imag8)
+!$omp do schedule(static,1) reduction(*:product8)
+  do i = 1, 4
+    product8 = product8 * cmplx(0.0_8, 1.0_8, kind=8)
+  end do
+!$omp end do
+  observed_real8(omp_get_thread_num()+1) = real(product8, kind=8)
+  observed_imag8(omp_get_thread_num()+1) = aimag(product8)
+!$omp do schedule(static,2) reduction(+:nowait4,nowait8)
+  do i = 8, 1, -1
+    nowait4 = nowait4 + cmplx(real(i, kind=4), -real(i, kind=4), kind=4)
+    nowait8 = nowait8 + cmplx(real(i, kind=8), -real(i, kind=8), kind=8)
+  end do
+!$omp end do nowait
+!$omp end parallel
+  if (product8 /= cmplx(2.0_8, 0.0_8, kind=8)) error stop 6
+  do i = 1, 4
+    if (observed_real8(i) /= 2.0_8 .or. observed_imag8(i) /= 0.0_8) error stop 7
+  end do
+  if (nowait4 /= cmplx(39.0_4, -35.0_4, kind=4)) error stop 8
+  if (nowait8 /= cmplx(39.0_8, -35.0_8, kind=8)) error stop 9
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_scalar_complex_reductions", "bin");
+        let runtime_cache = unique_dir("openmp_scalar_complex_reductions_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP COMPLEX scalar reductions should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..8 {
+            let run = Command::new(&out).output().expect("failed to run binary");
+            assert!(
+                run.status.success(),
+                "OpenMP COMPLEX scalar reductions failed at {opt}, iteration {iteration}:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_standalone_do_scalar_reductions_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -21703,6 +21812,61 @@ end program
 }
 
 #[test]
+fn fopenmp_complex_nowait_reductions_use_typed_nonblocking_combiners() {
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: i
+  complex(kind=4) :: total4
+  complex(kind=8) :: total8
+  total4 = cmplx(0.0_4, 0.0_4, kind=4)
+  total8 = cmplx(0.0_8, 0.0_8, kind=8)
+!$omp parallel shared(total4,total8)
+!$omp do reduction(+:total4,total8)
+  do i = 1, 4
+    total4 = total4 + cmplx(real(i, kind=4), 1.0_4, kind=4)
+    total8 = total8 + cmplx(real(i, kind=8), 1.0_8, kind=8)
+  end do
+!$omp end do nowait
+!$omp end parallel
+end program
+",
+        "f90",
+    );
+    let out = unique_path("openmp_complex_nowait_reduction", "ir");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-fopenmp",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "standalone OpenMP COMPLEX NOWAIT reductions should lower: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let ir = std::fs::read_to_string(&out).expect("missing OpenMP COMPLEX reduction IR output");
+    for function in ["afs_omp_reduce_c32_nowait", "afs_omp_reduce_c64_nowait"] {
+        assert!(
+            ir.contains(&format!("call @{function}(")),
+            "NOWAIT reduction did not use {function}:\n{ir}"
+        );
+    }
+    for function in ["afs_omp_reduce_c32", "afs_omp_reduce_c64"] {
+        assert!(
+            !ir.contains(&format!("call @{function}(")),
+            "NOWAIT reduction retained synchronizing combiner {function}:\n{ir}"
+        );
+    }
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_default_real_kind_selects_matching_reduction_abi() {
     let src = write_program(
         "program p
@@ -21742,6 +21906,62 @@ end program
         assert!(
             result.status.success(),
             "default-kind OpenMP REAL reduction should lower: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let ir = std::fs::read_to_string(&out).expect("missing default-kind reduction IR");
+        assert!(
+            ir.contains(&format!("call @{expected}(")),
+            "default-kind reduction did not select {expected}:\n{ir}"
+        );
+        assert!(
+            !ir.contains(&format!("call @{unexpected}(")),
+            "default-kind reduction unexpectedly selected {unexpected}:\n{ir}"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_default_complex_kind_selects_matching_reduction_abi() {
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: i
+  complex :: total
+  total = cmplx(0.0, 0.0)
+!$omp parallel do reduction(+:total)
+  do i = 1, 4
+    total = total + cmplx(real(i), 1.0)
+  end do
+!$omp end parallel do
+end program
+",
+        "f90",
+    );
+    for (default_flag, expected, unexpected) in [
+        (None, "afs_omp_reduce_c32", "afs_omp_reduce_c64"),
+        (
+            Some("-fdefault-real-8"),
+            "afs_omp_reduce_c64",
+            "afs_omp_reduce_c32",
+        ),
+    ] {
+        let out = unique_path("openmp_default_complex_reduction", "ir");
+        let mut command = Command::new(compiler("armfortas"));
+        command.args(["-fopenmp", "--emit-ir"]);
+        if let Some(flag) = default_flag {
+            command.arg(flag);
+        }
+        let result = command
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            result.status.success(),
+            "default-kind OpenMP COMPLEX reduction should lower: {}",
             String::from_utf8_lossy(&result.stderr)
         );
         let ir = std::fs::read_to_string(&out).expect("missing default-kind reduction IR");
@@ -22277,8 +22497,12 @@ fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
             "OpenMP DO associated iteration variables may not appear in REDUCTION",
         ),
         (
-            "program p\ninteger :: i\ncomplex :: total\n!$omp parallel shared(total)\n!$omp do reduction(+:total)\ndo i=1,4\ntotal=total+cmplx(i)\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
-            "OpenMP + REDUCTION currently requires a scalar INTEGER of kind 1, 2, 4, or 8, or REAL of kind 4 or 8",
+            "program p\ninteger :: i\ncomplex :: total\n!$omp parallel shared(total)\n!$omp do reduction(max:total)\ndo i=1,4\ntotal=total+cmplx(i)\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
+            "OpenMP MAX REDUCTION currently requires a scalar INTEGER of kind 1, 2, 4, or 8, or REAL of kind 4 or 8",
+        ),
+        (
+            "program p\ninteger :: i\ncomplex(kind=8) :: total\n!$omp parallel do reduction(min:total)\ndo i=1,4\ntotal=total+cmplx(i,kind=8)\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP MIN REDUCTION currently requires a scalar INTEGER of kind 1, 2, 4, or 8, or REAL of kind 4 or 8",
         ),
         (
             "program p\ninteger :: i\nreal :: total\n!$omp parallel do reduction(.or.:total)\ndo i=1,4\ntotal=total+real(i)\nend do\n!$omp end parallel do\nend program\n",
@@ -22351,13 +22575,18 @@ fn fopenmp_worksharing_emits_x86_64_elf_object() {
   integer :: i, j, values(3,3), total, last_value
   real(kind=4) :: real_total
   real(kind=8) :: real_product
+  complex(kind=4) :: complex_total
+  complex(kind=8) :: complex_product
   values = 0
   total = 7
   last_value = -1
   real_total = 1.0_4
   real_product = 2.0_8
+  complex_total = cmplx(1.0_4, -1.0_4, kind=4)
+  complex_product = cmplx(2.0_8, 0.0_8, kind=8)
 !$omp parallel do collapse(2) num_threads(3) schedule(dynamic,2) &
-!$omp& reduction(+:total,real_total) reduction(*:real_product) lastprivate(last_value)
+!$omp& reduction(+:total,real_total,complex_total) &
+!$omp& reduction(*:real_product,complex_product) lastprivate(last_value)
   do i = 3, 1, -1
     do j = 1, 3
 !$omp critical(x86_worksharing)
@@ -22366,15 +22595,21 @@ fn fopenmp_worksharing_emits_x86_64_elf_object() {
       total = total + values(i,j)
       real_total = real_total + real(values(i,j), kind=4)
       real_product = real_product * 1.0_8
+      complex_total = complex_total + cmplx(real(values(i,j), kind=4), 1.0_4, kind=4)
+      complex_product = complex_product * cmplx(1.0_8, 0.0_8, kind=8)
       last_value = 10*i + j
     end do
   end do
 !$omp end parallel do
-!$omp parallel default(none) num_threads(2) shared(total,real_total)
-!$omp do schedule(static,1) reduction(+:total,real_total)
+!$omp parallel default(none) num_threads(2) &
+!$omp& shared(total,real_total,complex_total,complex_product)
+!$omp do schedule(static,1) reduction(+:total,real_total,complex_total) &
+!$omp& reduction(*:complex_product)
   do i = 1, 3
     total = total + i
     real_total = real_total + real(i, kind=4)
+    complex_total = complex_total + cmplx(real(i, kind=4), 1.0_4, kind=4)
+    complex_product = complex_product * cmplx(1.0_8, 0.0_8, kind=8)
   end do
 !$omp end do nowait
 !$omp end parallel
@@ -24876,7 +25111,7 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
     assert!(
         stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
             && stderr.contains("shared array 'assumed_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
-            && stderr.contains("shared variable 'assumed_text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or default-kind CHARACTER allocatable")
+            && stderr.contains("shared variable 'assumed_text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, COMPLEX, LOGICAL, fixed-length default-kind CHARACTER, or default-kind CHARACTER allocatable")
             && stderr.contains("shared array 'assumed_rank' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy")
             && stderr.contains("shared OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
             && stderr.contains("PRIVATE pointer or target variable 'target_values' is recognized but not yet implemented")
