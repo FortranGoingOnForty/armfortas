@@ -12,6 +12,8 @@ use crate::descriptor::*;
 use std::ffi::c_void;
 use std::ptr;
 
+// These are imports from libc, not replacement definitions of Rust runtime symbols.
+#[allow(suspicious_runtime_symbol_definitions)]
 extern "C" {
     #[link_name = "malloc"]
     fn system_malloc(size: usize) -> *mut u8;

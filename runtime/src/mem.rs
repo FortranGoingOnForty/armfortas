@@ -9,6 +9,8 @@ use std::ptr;
 // Use libc malloc/free directly so allocate/deallocate are paired correctly
 // without needing to track Rust Layout. The system allocator on macOS returns
 // 16-byte aligned pointers from malloc, satisfying our alignment requirement.
+// These are imports from libc, not replacement definitions of Rust runtime symbols.
+#[allow(suspicious_runtime_symbol_definitions)]
 extern "C" {
     #[link_name = "malloc"]
     fn system_malloc(size: usize) -> *mut u8;

@@ -2374,6 +2374,8 @@ pub extern "C" fn afs_create_section(
 
 // ---- libc interop ----
 
+// These are imports from libc, not replacement definitions of Rust runtime symbols.
+#[allow(suspicious_runtime_symbol_definitions)]
 extern "C" {
     #[link_name = "malloc"]
     fn system_malloc(size: usize) -> *mut u8;
