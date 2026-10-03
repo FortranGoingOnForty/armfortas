@@ -2588,6 +2588,7 @@ pub(super) struct NameReference {
     pub(super) name: String,
     pub(super) span: Span,
     pub(super) role: ReferenceRole,
+    pub(super) subscripts: Option<Vec<crate::ast::expr::Argument>>,
 }
 
 #[derive(Default)]
@@ -2609,6 +2610,7 @@ fn collect_name_reference(
             name: key,
             span,
             role,
+            subscripts: None,
         });
     }
 }
@@ -2679,6 +2681,7 @@ pub(super) fn collect_reference_expr(
                         name: key,
                         span: callee.span,
                         role: ReferenceRole::Callable,
+                        subscripts: Some(args.clone()),
                     });
                 }
             } else {
@@ -3148,6 +3151,7 @@ fn collect_reference_stmt(
                                     name: key.clone(),
                                     span: stmt.span,
                                     role: ReferenceRole::Value,
+                                    subscripts: None,
                                 });
                             }
                             nested_shadowed.insert(key);
@@ -3381,6 +3385,7 @@ fn collect_reference_stmt(
                         name: key,
                         span: callee.span,
                         role: ReferenceRole::Callable,
+                        subscripts: None,
                     });
                 }
             } else {
@@ -3405,15 +3410,20 @@ fn collect_reference_stmt(
         }
         Stmt::OpenMp(construct) => {
             for clause in construct.clauses() {
-                if let Some(names) = clause.listed_variables() {
-                    for name in names {
-                        collect_name_reference(
-                            name,
-                            stmt.span,
-                            ReferenceRole::Value,
-                            shadowed,
-                            facts,
-                        );
+                for name in clause.listed_variable_names() {
+                    collect_name_reference(name, stmt.span, ReferenceRole::Value, shadowed, facts);
+                }
+                if let Some(items) = clause.reduction_items() {
+                    for item in items {
+                        if let crate::ast::openmp::OpenMpReductionItem::ArrayDesignator {
+                            subscripts,
+                            ..
+                        } = item
+                        {
+                            for subscript in subscripts {
+                                collect_reference_subscript(&subscript.value, shadowed, facts);
+                            }
+                        }
                     }
                 }
                 if let Some(expr) = clause.expression() {

@@ -21600,6 +21600,110 @@ end program
 }
 
 #[test]
+fn fopenmp_rank_one_array_and_section_reductions_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_rank_one_array_and_section_reductions_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: i, j, tid
+  integer :: totals(4), sectioned(0:5), point(0:1), nowait_values(4)
+  real(kind=8) :: products(4), maxima(4)
+  logical(kind=1) :: flags(4)
+  complex(kind=4) :: complex_totals(4)
+  totals = [10,20,30,40]
+  products = 2.0_8
+  maxima = -100.0_8
+  flags = .false.
+  complex_totals = cmplx(1.0_4, 2.0_4, kind=4)
+!$omp parallel default(none) num_threads(4) private(j,tid) &
+!$omp& reduction(+:totals,complex_totals) reduction(*:products(:)) &
+!$omp& reduction(max:maxima) reduction(.or.:flags)
+  tid = omp_get_thread_num()
+  do j = 1, 4
+    totals(j) = totals(j) + j
+    products(j) = products(j) * real(j+1, kind=8)
+    maxima(j) = max(maxima(j), real(j+tid, kind=8))
+    flags(j) = flags(j) .or. (tid == mod(j-1,4))
+    complex_totals(j) = complex_totals(j) + cmplx(real(j,kind=4),-real(j,kind=4),kind=4)
+  end do
+!$omp end parallel
+  if (any(totals /= [14,28,42,56])) error stop 1
+  if (any(products /= [32.0_8,162.0_8,512.0_8,1250.0_8])) error stop 2
+  if (any(maxima /= [4.0_8,5.0_8,6.0_8,7.0_8])) error stop 3
+  if (.not. all(flags)) error stop 4
+  do j = 1, 4
+    if (complex_totals(j) /= cmplx(real(1+4*j,kind=4),real(2-4*j,kind=4),kind=4)) error stop 5
+  end do
+
+  sectioned = [10,20,30,40,50,60]
+  point = [7,99]
+!$omp parallel default(none) num_threads(4) private(j) &
+!$omp& reduction(+:sectioned(1:4),point(0))
+  do j = 1, 4
+    sectioned(j) = sectioned(j) + j
+  end do
+  point(0) = point(0) + 1
+!$omp end parallel
+  if (any(sectioned /= [10,24,38,52,66,60])) error stop 6
+  if (any(point /= [11,99])) error stop 7
+
+  nowait_values = [10,20,30,40]
+!$omp parallel default(none) num_threads(4) shared(nowait_values)
+!$omp do schedule(static,1) reduction(+:nowait_values)
+  do i = 1, 4
+    nowait_values(i) = nowait_values(i) + i
+  end do
+!$omp end do nowait
+!$omp end parallel
+  if (any(nowait_values /= [11,22,33,44])) error stop 8
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_array_reductions", "bin");
+        let runtime_cache = unique_dir("openmp_array_reductions_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP array reductions should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..4 {
+            let run = Command::new(&out).output().expect("failed to run binary");
+            assert!(
+                run.status.success(),
+                "OpenMP array reductions failed at {opt}, iteration {iteration}:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_standalone_do_scalar_reductions_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -21714,12 +21818,14 @@ fn fopenmp_standalone_do_nowait_reduction_uses_nonblocking_combiner() {
     let src = write_program(
         "program p
   implicit none
-  integer :: i, total
+  integer :: i, total, values(4)
   total = 0
-!$omp parallel shared(total)
-!$omp do reduction(+:total)
+  values = 0
+!$omp parallel shared(total,values)
+!$omp do reduction(+:total,values)
   do i = 1, 4
     total = total + i
+    values(i) = values(i) + i
   end do
 !$omp end do nowait
 !$omp end parallel
@@ -21751,6 +21857,18 @@ end program
     assert!(
         !ir.contains("call @afs_omp_reduce_i64("),
         "NOWAIT reduction retained the synchronizing combiner:\n{ir}"
+    );
+    assert!(
+        ir.contains("call @afs_omp_init_reduction_array("),
+        "array reduction did not initialize its private copy:\n{ir}"
+    );
+    assert!(
+        ir.contains("call @afs_omp_reduce_array_nowait("),
+        "NOWAIT array reduction did not use its nonblocking combiner:\n{ir}"
+    );
+    assert!(
+        !ir.contains("call @afs_omp_reduce_array("),
+        "NOWAIT array reduction retained the synchronizing combiner:\n{ir}"
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -22509,8 +22627,52 @@ fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
             "OpenMP .OR. REDUCTION currently requires a scalar LOGICAL of kind 1, 2, 4, or 8",
         ),
         (
-            "program p\ninteger :: i,total(2)\n!$omp parallel do reduction(+:total)\ndo i=1,4\ntotal(1)=total(1)+i\nend do\n!$omp end parallel do\nend program\n",
-            "OpenMP REDUCTION variable 'total' must currently be a nonallocatable, nonpointer scalar",
+            "program p\ninteger :: i,total(2,2)\n!$omp parallel do reduction(+:total)\ndo i=1,4\ntotal(1,1)=total(1,1)+i\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP REDUCTION array 'total' must currently have rank one",
+        ),
+        (
+            "program p\ninteger :: i\ninteger, allocatable :: total(:)\nallocate(total(4))\n!$omp parallel do reduction(+:total)\ndo i=1,4\ntotal(i)=total(i)+i\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP REDUCTION variable 'total' must currently be nonallocatable and nonpointer",
+        ),
+        (
+            "subroutine s(n)\ninteger :: n,i,total(n)\n!$omp parallel do reduction(+:total)\ndo i=1,n\ntotal(i)=total(i)+i\nend do\n!$omp end parallel do\nend subroutine\n",
+            "OpenMP REDUCTION array 'total' must currently have constant explicit shape",
+        ),
+        (
+            "program p\ninteger :: i,total(8)\n!$omp parallel do reduction(+:total(1:8:2))\ndo i=1,4\ntotal(1)=total(1)+i\nend do\n!$omp end parallel do\nend program\n",
+            "must currently use unit stride",
+        ),
+        (
+            "program p\ninteger :: i,lo,total(8)\nlo=2\n!$omp parallel do reduction(+:total(lo:8))\ndo i=1,4\ntotal(2)=total(2)+i\nend do\n!$omp end parallel do\nend program\n",
+            "must use constant bounds",
+        ),
+        (
+            "program p\ninteger :: i,total(8)\n!$omp parallel do reduction(+:total(4:2))\ndo i=1,4\ntotal(4)=total(4)+i\nend do\n!$omp end parallel do\nend program\n",
+            "may not have zero length",
+        ),
+        (
+            "program p\ninteger :: i,total(8)\n!$omp parallel do reduction(+:total(0:2))\ndo i=1,4\ntotal(1)=total(1)+i\nend do\n!$omp end parallel do\nend program\n",
+            "is outside the declared bounds 1:8",
+        ),
+        (
+            "program p\ninteger :: i,total(8)\n!$omp parallel do reduction(+:total(1:4),total(5:8))\ndo i=1,4\ntotal(i)=total(i)+i\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP REDUCTION base 'total' may currently appear only once on a directive",
+        ),
+        (
+            "program p\ninteger :: i,total(8)\n!$omp parallel do reduction(+:total(i))\ndo i=1,4\ntotal(i)=total(i)+i\nend do\n!$omp end parallel do\nend program\n",
+            "must use a constant subscript",
+        ),
+        (
+            "program p\ninteger :: i,total(4)\n!$omp parallel do reduction(+:total(2:3))\ndo i=1,4\ntotal=total+i\nend do\n!$omp end parallel do\nend program\n",
+            "may not currently be referenced as the whole array inside the region",
+        ),
+        (
+            "program p\ninteger :: i,total(4)\n!$omp parallel do reduction(+:total(2:3))\ndo i=1,4\ntotal(1)=total(1)+i\nend do\n!$omp end parallel do\nend program\n",
+            "does not include element 1",
+        ),
+        (
+            "program p\ninteger :: i,total(4)\n!$omp parallel do reduction(+:total(2:3))\ndo i=1,4\ntotal(1:4)=total(1:4)+i\nend do\n!$omp end parallel do\nend program\n",
+            "does not include referenced section 1:4",
         ),
         (
             "program p\ninteger :: i,total\n!$omp parallel do shared(total) reduction(+:total)\ndo i=1,4\ntotal=total+i\nend do\n!$omp end parallel do\nend program\n",
@@ -22572,12 +22734,13 @@ fn fopenmp_worksharing_emits_x86_64_elf_object() {
     let src = write_program(
         "program p
   implicit none
-  integer :: i, j, values(3,3), total, last_value
+  integer :: i, j, values(3,3), array_total(3), total, last_value
   real(kind=4) :: real_total
   real(kind=8) :: real_product
   complex(kind=4) :: complex_total
   complex(kind=8) :: complex_product
   values = 0
+  array_total = 1
   total = 7
   last_value = -1
   real_total = 1.0_4
@@ -22585,7 +22748,7 @@ fn fopenmp_worksharing_emits_x86_64_elf_object() {
   complex_total = cmplx(1.0_4, -1.0_4, kind=4)
   complex_product = cmplx(2.0_8, 0.0_8, kind=8)
 !$omp parallel do collapse(2) num_threads(3) schedule(dynamic,2) &
-!$omp& reduction(+:total,real_total,complex_total) &
+!$omp& reduction(+:total,array_total,real_total,complex_total) &
 !$omp& reduction(*:real_product,complex_product) lastprivate(last_value)
   do i = 3, 1, -1
     do j = 1, 3
@@ -22593,6 +22756,7 @@ fn fopenmp_worksharing_emits_x86_64_elf_object() {
       values(i,j) = i + j
 !$omp end critical(x86_worksharing)
       total = total + values(i,j)
+      array_total(j) = array_total(j) + values(i,j)
       real_total = real_total + real(values(i,j), kind=4)
       real_product = real_product * 1.0_8
       complex_total = complex_total + cmplx(real(values(i,j), kind=4), 1.0_4, kind=4)
@@ -22602,11 +22766,12 @@ fn fopenmp_worksharing_emits_x86_64_elf_object() {
   end do
 !$omp end parallel do
 !$omp parallel default(none) num_threads(2) &
-!$omp& shared(total,real_total,complex_total,complex_product)
-!$omp do schedule(static,1) reduction(+:total,real_total,complex_total) &
+!$omp& shared(total,array_total,real_total,complex_total,complex_product)
+!$omp do schedule(static,1) reduction(+:total,array_total,real_total,complex_total) &
 !$omp& reduction(*:complex_product)
   do i = 1, 3
     total = total + i
+    array_total(i) = array_total(i) + i
     real_total = real_total + real(i, kind=4)
     complex_total = complex_total + cmplx(real(i, kind=4), 1.0_4, kind=4)
     complex_product = complex_product * cmplx(1.0_8, 0.0_8, kind=8)

@@ -3,7 +3,7 @@
 //! The executable slice is intentionally narrow: `PARALLEL` data environments
 //! support selected intrinsic/derived storage, while canonical worksharing
 //! `DO` and combined `PARALLEL DO` support the implemented schedules and
-//! scalar LASTPRIVATE copy-out and scalar INTEGER/REAL/LOGICAL reductions.
+//! scalar LASTPRIVATE copy-out and predefined scalar/fixed-rank-one reductions.
 //! Named and unnamed `CRITICAL` regions retain process-wide lock identity.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
 //! regions without pretending later schedules, loop clauses, or wider object
@@ -11,8 +11,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::ast::expr::SectionSubscript;
 use crate::ast::openmp::{
-    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionOperator, OpenMpScheduleKind,
+    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionItem, OpenMpReductionOperator,
+    OpenMpScheduleKind,
 };
 use crate::ast::stmt::{IoControl, RankGuard, SpannedStmt, Stmt, TypeGuard};
 use crate::lexer::Span;
@@ -31,6 +33,7 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
         OpenMpConstruct::Parallel { clauses, body } => {
             reject_in_pure(ctx, span, "PARALLEL");
             let clause_info = validate_parallel_clauses(ctx, span, clauses, false);
+            validate_partial_reduction_references(ctx, clauses, body);
             let predetermined_private = predetermined_private_names(ctx.st, body);
             validate_data_environment(ctx, body, &clause_info, &predetermined_private);
             validate_structured_block(ctx, body);
@@ -44,6 +47,11 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
                 );
             }
             validate_worksharing_loop(ctx, span, clauses, loop_stmt, false);
+            validate_partial_reduction_references(
+                ctx,
+                clauses,
+                std::slice::from_ref(loop_stmt.as_ref()),
+            );
         }
         OpenMpConstruct::ParallelDo { clauses, loop_stmt } => {
             reject_in_pure(ctx, span, "PARALLEL DO");
@@ -52,12 +60,150 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             let predetermined_private = predetermined_private_names(ctx.st, loop_body);
             validate_data_environment(ctx, loop_body, &clause_info, &predetermined_private);
             validate_worksharing_loop(ctx, span, clauses, loop_stmt, true);
+            validate_partial_reduction_references(ctx, clauses, loop_body);
         }
         OpenMpConstruct::Critical { body, .. } => {
             reject_in_pure(ctx, span, "CRITICAL");
             validate_structured_block(ctx, body);
         }
     }
+}
+
+fn validate_partial_reduction_references(
+    ctx: &mut Ctx<'_>,
+    clauses: &[OpenMpClause],
+    body: &[SpannedStmt],
+) {
+    let mut facts = ProcedureReferenceFacts::default();
+    collect_reference_stmts(body, &HashSet::new(), &mut facts);
+    for item in clauses.iter().flat_map(|clause| {
+        clause
+            .reduction_items()
+            .into_iter()
+            .flatten()
+            .filter(|item| matches!(item, OpenMpReductionItem::ArrayDesignator { .. }))
+    }) {
+        let Some(symbol) = ctx.lookup_lexical(item.base_name()) else {
+            continue;
+        };
+        let Some((selected_lower, selected_upper, declared_lower, declared_upper)) =
+            validated_reduction_selection_bounds(ctx, item, symbol)
+        else {
+            continue;
+        };
+        if selected_lower == declared_lower && selected_upper == declared_upper {
+            continue;
+        }
+        let key = item.base_name().to_ascii_lowercase();
+        for reference in facts
+            .references
+            .iter()
+            .filter(|reference| reference.name == key)
+        {
+            let Some(subscripts) = reference.subscripts.as_deref() else {
+                ctx.error(
+                    reference.span,
+                    format!(
+                        "OpenMP partial REDUCTION item '{}' may not currently be referenced as the whole array inside the region",
+                        item.source_text()
+                    ),
+                );
+                continue;
+            };
+            if subscripts.len() != 1 {
+                continue;
+            }
+            match &subscripts[0].value {
+                SectionSubscript::Element(index) => {
+                    if let Some(index) = validation_const_int_value(ctx, index) {
+                        if index < selected_lower || index > selected_upper {
+                            ctx.error(
+                                reference.span,
+                                format!(
+                                    "OpenMP partial REDUCTION item '{}' does not include element {}",
+                                    item.source_text(),
+                                    index
+                                ),
+                            );
+                        }
+                    }
+                }
+                SectionSubscript::Range { start, end, stride } => {
+                    let stride = match stride {
+                        Some(stride) => validation_const_int_value(ctx, stride),
+                        None => Some(1),
+                    };
+                    let start = match start {
+                        Some(start) => validation_const_int_value(ctx, start),
+                        None => Some(declared_lower),
+                    };
+                    let end = match end {
+                        Some(end) => validation_const_int_value(ctx, end),
+                        None => Some(declared_upper),
+                    };
+                    let (Some(stride), Some(start), Some(end)) = (stride, start, end) else {
+                        ctx.error(
+                            reference.span,
+                            format!(
+                                "OpenMP partial REDUCTION item '{}' requires constant bounds on section references inside the region",
+                                item.source_text()
+                            ),
+                        );
+                        continue;
+                    };
+                    if stride != 1 || start < selected_lower || end > selected_upper {
+                        ctx.error(
+                            reference.span,
+                            format!(
+                                "OpenMP partial REDUCTION item '{}' does not include referenced section {}",
+                                item.source_text(),
+                                subscripts[0].value.to_sexpr()
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validated_reduction_selection_bounds(
+    ctx: &Ctx<'_>,
+    item: &OpenMpReductionItem,
+    symbol: &crate::sema::symtab::Symbol,
+) -> Option<(i128, i128, i128, i128)> {
+    let (declared_lower, declared_upper) =
+        validation_explicit_dim_bounds(ctx, symbol.attrs.array_spec.first()?)?;
+    let OpenMpReductionItem::ArrayDesignator { subscripts, .. } = item else {
+        return Some((
+            declared_lower,
+            declared_upper,
+            declared_lower,
+            declared_upper,
+        ));
+    };
+    let subscript = &subscripts.first()?.value;
+    let (selected_lower, selected_upper) = match subscript {
+        SectionSubscript::Element(index) => {
+            let index = validation_const_int_value(ctx, index)?;
+            (index, index)
+        }
+        SectionSubscript::Range { start, end, .. } => (
+            start
+                .as_ref()
+                .map(|start| validation_const_int_value(ctx, start))
+                .unwrap_or(Some(declared_lower))?,
+            end.as_ref()
+                .map(|end| validation_const_int_value(ctx, end))
+                .unwrap_or(Some(declared_upper))?,
+        ),
+    };
+    Some((
+        selected_lower,
+        selected_upper,
+        declared_lower,
+        declared_upper,
+    ))
 }
 
 fn reject_in_pure(ctx: &mut Ctx<'_>, span: Span, construct: &str) {
@@ -78,14 +224,15 @@ struct ParallelClauseInfo {
 pub(crate) fn parallel_private_names(clauses: &[OpenMpClause]) -> HashSet<String> {
     clauses
         .iter()
-        .filter_map(|clause| match clause {
+        .flat_map(|clause| match clause {
             OpenMpClause::Private(names) | OpenMpClause::FirstPrivate(names) => {
-                Some(names.as_slice())
+                names.iter().map(String::as_str).collect::<Vec<_>>()
             }
-            OpenMpClause::Reduction { variables, .. } => Some(variables.as_slice()),
-            _ => None,
+            OpenMpClause::Reduction { items, .. } => {
+                items.iter().map(OpenMpReductionItem::base_name).collect()
+            }
+            _ => Vec::new(),
         })
-        .flatten()
         .map(|name| name.to_ascii_lowercase())
         .collect()
 }
@@ -186,14 +333,12 @@ fn validate_parallel_clauses(
                     validate_lastprivate_object(ctx, name, span);
                 }
             }
-            OpenMpClause::Reduction {
-                operator,
-                variables,
-            } => {
-                for name in variables {
+            OpenMpClause::Reduction { operator, items } => {
+                for item in items {
+                    let name = item.base_name();
                     let key = name.to_ascii_lowercase();
                     register_data_attribute(ctx, span, &mut data_attributes, &key, "REDUCTION");
-                    validate_reduction_object(ctx, name, span, *operator);
+                    validate_reduction_object(ctx, item, span, *operator);
                 }
             }
             OpenMpClause::Default(OpenMpDefault::Shared) => {}
@@ -427,8 +572,17 @@ fn validate_worksharing_loop(
                 OpenMpClause::LastPrivate { variables, .. } => {
                     (Some(variables.as_slice()), "LASTPRIVATE")
                 }
-                OpenMpClause::Reduction { variables, .. } => {
-                    (Some(variables.as_slice()), "REDUCTION")
+                OpenMpClause::Reduction { items, .. } => {
+                    for item in items {
+                        register_data_attribute(
+                            ctx,
+                            span,
+                            &mut data_attributes,
+                            &item.base_name().to_ascii_lowercase(),
+                            "REDUCTION",
+                        );
+                    }
+                    (None, "")
                 }
                 _ => (None, ""),
             };
@@ -561,9 +715,9 @@ fn validate_worksharing_loop(
                 }
             }
             OpenMpClause::Collapse(_) => {}
-            OpenMpClause::Reduction { variables, .. } if variables
+            OpenMpClause::Reduction { items, .. } if items
                 .iter()
-                .any(|name| associated_loop_keys.contains(&name.to_ascii_lowercase())) =>
+                .any(|item| associated_loop_keys.contains(&item.base_name().to_ascii_lowercase())) =>
             {
                 ctx.error(
                     span,
@@ -576,9 +730,10 @@ fn validate_worksharing_loop(
             OpenMpClause::Reduction { .. } if combined_do => {}
             OpenMpClause::Reduction {
                 operator,
-                variables,
+                items,
             } => {
-                for name in variables {
+                for item in items {
+                    let name = item.base_name();
                     let key = name.to_ascii_lowercase();
                     if ctx
                         .openmp_parallel_private_frames
@@ -592,7 +747,7 @@ fn validate_worksharing_loop(
                             ),
                         );
                     }
-                    validate_reduction_object(ctx, name, span, *operator);
+                    validate_reduction_object(ctx, item, span, *operator);
                 }
             }
             OpenMpClause::Shared(_)
@@ -655,10 +810,11 @@ fn validate_lastprivate_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
 
 fn validate_reduction_object(
     ctx: &mut Ctx<'_>,
-    name: &str,
+    item: &OpenMpReductionItem,
     span: Span,
     operator: OpenMpReductionOperator,
 ) {
+    let name = item.base_name();
     let Some(symbol) = ctx.lookup_lexical(name) else {
         ctx.error(
             span,
@@ -673,11 +829,11 @@ fn validate_reduction_object(
         );
         return;
     }
-    if !symbol.attrs.array_spec.is_empty() || symbol.attrs.allocatable || symbol.attrs.pointer {
+    if symbol.attrs.allocatable || symbol.attrs.pointer {
         ctx.error(
             span,
             format!(
-                "OpenMP REDUCTION variable '{name}' must currently be a nonallocatable, nonpointer scalar"
+                "OpenMP REDUCTION variable '{name}' must currently be nonallocatable and nonpointer"
             ),
         );
         return;
@@ -694,6 +850,26 @@ fn validate_reduction_object(
             ),
         );
         return;
+    }
+
+    let is_array = !symbol.attrs.array_spec.is_empty();
+    match (is_array, item) {
+        (false, OpenMpReductionItem::Name(_)) => {}
+        (false, OpenMpReductionItem::ArrayDesignator { .. }) => {
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP REDUCTION list item '{}' must designate an array",
+                    item.source_text()
+                ),
+            );
+            return;
+        }
+        (true, _) => {
+            if !validate_rank_one_reduction_selection(ctx, item, symbol, span) {
+                return;
+            }
+        }
     }
 
     let valid = match (operator, symbol.type_info.as_ref()) {
@@ -738,18 +914,7 @@ fn validate_reduction_object(
         _ => false,
     };
     if !valid {
-        let requirement = match operator {
-            OpenMpReductionOperator::And
-            | OpenMpReductionOperator::Or
-            | OpenMpReductionOperator::Eqv
-            | OpenMpReductionOperator::Neqv => "a scalar LOGICAL of kind 1, 2, 4, or 8",
-            OpenMpReductionOperator::Add | OpenMpReductionOperator::Multiply => {
-                "a scalar INTEGER of kind 1, 2, 4, or 8, REAL of kind 4 or 8, or COMPLEX of kind 4 or 8"
-            }
-            OpenMpReductionOperator::Max | OpenMpReductionOperator::Min => {
-                "a scalar INTEGER of kind 1, 2, 4, or 8, or REAL of kind 4 or 8"
-            }
-        };
+        let requirement = reduction_type_requirement(operator, is_array);
         ctx.error(
             span,
             format!(
@@ -757,6 +922,189 @@ fn validate_reduction_object(
                 reduction_operator_name(operator),
             ),
         );
+    }
+}
+
+fn validate_rank_one_reduction_selection(
+    ctx: &mut Ctx<'_>,
+    item: &OpenMpReductionItem,
+    symbol: &crate::sema::symtab::Symbol,
+    span: Span,
+) -> bool {
+    let name = item.base_name();
+    if symbol.attrs.array_spec.len() != 1 {
+        ctx.error(
+            span,
+            format!("OpenMP REDUCTION array '{name}' must currently have rank one"),
+        );
+        return false;
+    }
+    let Some((declared_lower, declared_upper)) =
+        validation_explicit_dim_bounds(ctx, &symbol.attrs.array_spec[0])
+    else {
+        ctx.error(
+            span,
+            format!("OpenMP REDUCTION array '{name}' must currently have constant explicit shape"),
+        );
+        return false;
+    };
+    if declared_upper < declared_lower {
+        ctx.error(
+            span,
+            format!("OpenMP REDUCTION array '{name}' may not have zero size"),
+        );
+        return false;
+    }
+
+    let OpenMpReductionItem::ArrayDesignator { subscripts, .. } = item else {
+        return true;
+    };
+    if subscripts.len() != 1 {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP REDUCTION list item '{}' must have exactly one subscript",
+                item.source_text()
+            ),
+        );
+        return false;
+    }
+    match &subscripts[0].value {
+        SectionSubscript::Element(index) => {
+            let Some(index) = validation_const_int_value(ctx, index) else {
+                ctx.error(
+                    span,
+                    format!(
+                        "OpenMP REDUCTION array element '{}' must use a constant subscript",
+                        item.source_text()
+                    ),
+                );
+                return false;
+            };
+            validate_reduction_bounds(
+                ctx,
+                item,
+                index,
+                index,
+                declared_lower,
+                declared_upper,
+                span,
+            )
+        }
+        SectionSubscript::Range { start, end, stride } => {
+            let stride = match stride {
+                Some(stride) => validation_const_int_value(ctx, stride),
+                None => Some(1),
+            };
+            let Some(stride) = stride else {
+                ctx.error(
+                    span,
+                    format!(
+                        "OpenMP REDUCTION array section '{}' must use a constant unit stride",
+                        item.source_text()
+                    ),
+                );
+                return false;
+            };
+            if stride != 1 {
+                ctx.error(
+                    span,
+                    format!(
+                        "OpenMP REDUCTION array section '{}' must currently use unit stride",
+                        item.source_text()
+                    ),
+                );
+                return false;
+            }
+            let start = match start {
+                Some(start) => validation_const_int_value(ctx, start),
+                None => Some(declared_lower),
+            };
+            let end = match end {
+                Some(end) => validation_const_int_value(ctx, end),
+                None => Some(declared_upper),
+            };
+            let (Some(start), Some(end)) = (start, end) else {
+                ctx.error(
+                    span,
+                    format!(
+                        "OpenMP REDUCTION array section '{}' must use constant bounds",
+                        item.source_text()
+                    ),
+                );
+                return false;
+            };
+            if end < start {
+                ctx.error(
+                    span,
+                    format!(
+                        "OpenMP REDUCTION array section '{}' may not have zero length",
+                        item.source_text()
+                    ),
+                );
+                return false;
+            }
+            validate_reduction_bounds(ctx, item, start, end, declared_lower, declared_upper, span)
+        }
+    }
+}
+
+fn validate_reduction_bounds(
+    ctx: &mut Ctx<'_>,
+    item: &OpenMpReductionItem,
+    selected_lower: i128,
+    selected_upper: i128,
+    declared_lower: i128,
+    declared_upper: i128,
+    span: Span,
+) -> bool {
+    if selected_lower < declared_lower || selected_upper > declared_upper {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP REDUCTION list item '{}' is outside the declared bounds {}:{}",
+                item.source_text(),
+                declared_lower,
+                declared_upper
+            ),
+        );
+        false
+    } else {
+        true
+    }
+}
+
+fn reduction_type_requirement(operator: OpenMpReductionOperator, is_array: bool) -> &'static str {
+    match (operator, is_array) {
+        (
+            OpenMpReductionOperator::And
+            | OpenMpReductionOperator::Or
+            | OpenMpReductionOperator::Eqv
+            | OpenMpReductionOperator::Neqv,
+            false,
+        ) => "a scalar LOGICAL of kind 1, 2, 4, or 8",
+        (
+            OpenMpReductionOperator::Add | OpenMpReductionOperator::Multiply,
+            false,
+        ) => {
+            "a scalar INTEGER of kind 1, 2, 4, or 8, REAL of kind 4 or 8, or COMPLEX of kind 4 or 8"
+        }
+        (OpenMpReductionOperator::Max | OpenMpReductionOperator::Min, false) => {
+            "a scalar INTEGER of kind 1, 2, 4, or 8, or REAL of kind 4 or 8"
+        }
+        (
+            OpenMpReductionOperator::And
+            | OpenMpReductionOperator::Or
+            | OpenMpReductionOperator::Eqv
+            | OpenMpReductionOperator::Neqv,
+            true,
+        ) => "rank-one LOGICAL elements of kind 1, 2, 4, or 8",
+        (OpenMpReductionOperator::Add | OpenMpReductionOperator::Multiply, true) => {
+            "rank-one INTEGER elements of kind 1, 2, 4, or 8, REAL elements of kind 4 or 8, or COMPLEX elements of kind 4 or 8"
+        }
+        (OpenMpReductionOperator::Max | OpenMpReductionOperator::Min, true) => {
+            "rank-one INTEGER elements of kind 1, 2, 4, or 8, or REAL elements of kind 4 or 8"
+        }
     }
 }
 
@@ -794,6 +1142,17 @@ fn register_data_attribute(
     let compatible_first_last = (attribute == "FIRSTPRIVATE"
         && existing.as_slice() == ["LASTPRIVATE"])
         || (attribute == "LASTPRIVATE" && existing.as_slice() == ["FIRSTPRIVATE"]);
+    if attribute == "REDUCTION" && existing.contains(&"REDUCTION") {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP REDUCTION base '{}' may currently appear only once on a directive",
+                name
+            ),
+        );
+        existing.push(attribute);
+        return;
+    }
     if !existing.is_empty() && !compatible_first_last {
         let previous = existing.join(" and ");
         ctx.error(

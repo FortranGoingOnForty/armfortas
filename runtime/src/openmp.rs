@@ -41,6 +41,15 @@ pub const AFS_OMP_REDUCTION_OR: i32 = 6;
 pub const AFS_OMP_REDUCTION_EQV: i32 = 7;
 pub const AFS_OMP_REDUCTION_NEQV: i32 = 8;
 
+pub const AFS_OMP_REDUCTION_KIND_I8: i32 = 1;
+pub const AFS_OMP_REDUCTION_KIND_I16: i32 = 2;
+pub const AFS_OMP_REDUCTION_KIND_I32: i32 = 3;
+pub const AFS_OMP_REDUCTION_KIND_I64: i32 = 4;
+pub const AFS_OMP_REDUCTION_KIND_F32: i32 = 5;
+pub const AFS_OMP_REDUCTION_KIND_F64: i32 = 6;
+pub const AFS_OMP_REDUCTION_KIND_C32: i32 = 7;
+pub const AFS_OMP_REDUCTION_KIND_C64: i32 = 8;
+
 pub type AfsOmpRegionEntry = unsafe extern "C" fn(*mut c_void, i32, i32);
 
 const SUPPORTED_ACTIVE_LEVELS: usize = 64;
@@ -276,6 +285,9 @@ struct ReductionWorkspace {
     real_result: u64,
     complex_slots: Vec<[u64; 2]>,
     complex_result: [u64; 2],
+    array_slots: Vec<Vec<u8>>,
+    array_result: Vec<u8>,
+    array_status: i32,
 }
 
 #[derive(Debug, Default)]
@@ -1191,6 +1203,355 @@ pub extern "C" fn afs_omp_reduce_c64_nowait(
     original_storage: *mut [f64; 2],
 ) -> i32 {
     reduce_complex_nowait(operator, private_value, original_storage)
+}
+
+fn reduction_array_element_bytes(kind: i32) -> Option<usize> {
+    match kind {
+        AFS_OMP_REDUCTION_KIND_I8 => Some(1),
+        AFS_OMP_REDUCTION_KIND_I16 => Some(2),
+        AFS_OMP_REDUCTION_KIND_I32 | AFS_OMP_REDUCTION_KIND_F32 => Some(4),
+        AFS_OMP_REDUCTION_KIND_I64 | AFS_OMP_REDUCTION_KIND_F64 => Some(8),
+        AFS_OMP_REDUCTION_KIND_C32 => Some(8),
+        AFS_OMP_REDUCTION_KIND_C64 => Some(16),
+        _ => None,
+    }
+}
+
+fn valid_reduction_array_operator(operator: i32, kind: i32) -> bool {
+    match kind {
+        AFS_OMP_REDUCTION_KIND_I8
+        | AFS_OMP_REDUCTION_KIND_I16
+        | AFS_OMP_REDUCTION_KIND_I32
+        | AFS_OMP_REDUCTION_KIND_I64 => matches!(
+            operator,
+            AFS_OMP_REDUCTION_ADD
+                | AFS_OMP_REDUCTION_MULTIPLY
+                | AFS_OMP_REDUCTION_MAX
+                | AFS_OMP_REDUCTION_MIN
+                | AFS_OMP_REDUCTION_AND
+                | AFS_OMP_REDUCTION_OR
+                | AFS_OMP_REDUCTION_EQV
+                | AFS_OMP_REDUCTION_NEQV
+        ),
+        AFS_OMP_REDUCTION_KIND_F32 | AFS_OMP_REDUCTION_KIND_F64 => matches!(
+            operator,
+            AFS_OMP_REDUCTION_ADD
+                | AFS_OMP_REDUCTION_MULTIPLY
+                | AFS_OMP_REDUCTION_MAX
+                | AFS_OMP_REDUCTION_MIN
+        ),
+        AFS_OMP_REDUCTION_KIND_C32 | AFS_OMP_REDUCTION_KIND_C64 => {
+            matches!(operator, AFS_OMP_REDUCTION_ADD | AFS_OMP_REDUCTION_MULTIPLY)
+        }
+        _ => false,
+    }
+}
+
+fn reduction_array_byte_len(kind: i32, count: i64) -> Option<usize> {
+    let count = usize::try_from(count).ok().filter(|count| *count > 0)?;
+    let bytes = count.checked_mul(reduction_array_element_bytes(kind)?)?;
+    (bytes <= isize::MAX as usize).then_some(bytes)
+}
+
+unsafe fn read_reduction_element<T: Copy>(bytes: &[u8], offset: usize) -> T {
+    unsafe { bytes.as_ptr().add(offset).cast::<T>().read_unaligned() }
+}
+
+unsafe fn write_reduction_element<T>(bytes: &mut [u8], offset: usize, value: T) {
+    unsafe {
+        bytes
+            .as_mut_ptr()
+            .add(offset)
+            .cast::<T>()
+            .write_unaligned(value)
+    }
+}
+
+macro_rules! combine_integer_array {
+    ($operator:expr, $left:expr, $right:expr, $ty:ty) => {{
+        let width = std::mem::size_of::<$ty>();
+        for offset in (0..$left.len()).step_by(width) {
+            let left_value = unsafe { read_reduction_element::<$ty>($left, offset) };
+            let right_value = unsafe { read_reduction_element::<$ty>($right, offset) };
+            let combined = match $operator {
+                AFS_OMP_REDUCTION_ADD => left_value.wrapping_add(right_value),
+                AFS_OMP_REDUCTION_MULTIPLY => left_value.wrapping_mul(right_value),
+                AFS_OMP_REDUCTION_MAX => left_value.max(right_value),
+                AFS_OMP_REDUCTION_MIN => left_value.min(right_value),
+                AFS_OMP_REDUCTION_AND => <$ty>::from(left_value != 0 && right_value != 0),
+                AFS_OMP_REDUCTION_OR => <$ty>::from(left_value != 0 || right_value != 0),
+                AFS_OMP_REDUCTION_EQV => <$ty>::from((left_value != 0) == (right_value != 0)),
+                AFS_OMP_REDUCTION_NEQV => <$ty>::from((left_value != 0) != (right_value != 0)),
+                _ => return false,
+            };
+            unsafe { write_reduction_element($left, offset, combined) };
+        }
+        true
+    }};
+}
+
+macro_rules! combine_real_array {
+    ($operator:expr, $left:expr, $right:expr, $ty:ty) => {{
+        let width = std::mem::size_of::<$ty>();
+        for offset in (0..$left.len()).step_by(width) {
+            let left_value = unsafe { read_reduction_element::<$ty>($left, offset) };
+            let right_value = unsafe { read_reduction_element::<$ty>($right, offset) };
+            let combined = match $operator {
+                AFS_OMP_REDUCTION_ADD => left_value + right_value,
+                AFS_OMP_REDUCTION_MULTIPLY => left_value * right_value,
+                AFS_OMP_REDUCTION_MAX => left_value.max(right_value),
+                AFS_OMP_REDUCTION_MIN => left_value.min(right_value),
+                _ => return false,
+            };
+            unsafe { write_reduction_element($left, offset, combined) };
+        }
+        true
+    }};
+}
+
+macro_rules! combine_complex_array {
+    ($operator:expr, $left:expr, $right:expr, $ty:ty) => {{
+        let width = std::mem::size_of::<[$ty; 2]>();
+        for offset in (0..$left.len()).step_by(width) {
+            let left_value = unsafe { read_reduction_element::<[$ty; 2]>($left, offset) };
+            let right_value = unsafe { read_reduction_element::<[$ty; 2]>($right, offset) };
+            let combined = match $operator {
+                AFS_OMP_REDUCTION_ADD => [
+                    left_value[0] + right_value[0],
+                    left_value[1] + right_value[1],
+                ],
+                AFS_OMP_REDUCTION_MULTIPLY => [
+                    left_value[0] * right_value[0] - left_value[1] * right_value[1],
+                    left_value[0] * right_value[1] + left_value[1] * right_value[0],
+                ],
+                _ => return false,
+            };
+            unsafe { write_reduction_element($left, offset, combined) };
+        }
+        true
+    }};
+}
+
+fn combine_reduction_arrays(operator: i32, kind: i32, left: &mut [u8], right: &[u8]) -> bool {
+    if left.len() != right.len() || !valid_reduction_array_operator(operator, kind) {
+        return false;
+    }
+    match kind {
+        AFS_OMP_REDUCTION_KIND_I8 => combine_integer_array!(operator, left, right, i8),
+        AFS_OMP_REDUCTION_KIND_I16 => combine_integer_array!(operator, left, right, i16),
+        AFS_OMP_REDUCTION_KIND_I32 => combine_integer_array!(operator, left, right, i32),
+        AFS_OMP_REDUCTION_KIND_I64 => combine_integer_array!(operator, left, right, i64),
+        AFS_OMP_REDUCTION_KIND_F32 => combine_real_array!(operator, left, right, f32),
+        AFS_OMP_REDUCTION_KIND_F64 => combine_real_array!(operator, left, right, f64),
+        AFS_OMP_REDUCTION_KIND_C32 => combine_complex_array!(operator, left, right, f32),
+        AFS_OMP_REDUCTION_KIND_C64 => combine_complex_array!(operator, left, right, f64),
+        _ => false,
+    }
+}
+
+fn reduction_array_identity(operator: i32, kind: i32) -> Option<Vec<u8>> {
+    macro_rules! scalar_identity {
+        ($ty:ty) => {{
+            let value: $ty = match operator {
+                AFS_OMP_REDUCTION_ADD | AFS_OMP_REDUCTION_OR | AFS_OMP_REDUCTION_NEQV => 0,
+                AFS_OMP_REDUCTION_MULTIPLY | AFS_OMP_REDUCTION_AND | AFS_OMP_REDUCTION_EQV => 1,
+                AFS_OMP_REDUCTION_MAX => <$ty>::MIN,
+                AFS_OMP_REDUCTION_MIN => <$ty>::MAX,
+                _ => return None,
+            };
+            value.to_ne_bytes().to_vec()
+        }};
+    }
+    macro_rules! real_identity {
+        ($ty:ty) => {{
+            let value: $ty = match operator {
+                AFS_OMP_REDUCTION_ADD => 0.0,
+                AFS_OMP_REDUCTION_MULTIPLY => 1.0,
+                AFS_OMP_REDUCTION_MAX => <$ty>::MIN,
+                AFS_OMP_REDUCTION_MIN => <$ty>::MAX,
+                _ => return None,
+            };
+            value.to_ne_bytes().to_vec()
+        }};
+    }
+    let identity = match kind {
+        AFS_OMP_REDUCTION_KIND_I8 => scalar_identity!(i8),
+        AFS_OMP_REDUCTION_KIND_I16 => scalar_identity!(i16),
+        AFS_OMP_REDUCTION_KIND_I32 => scalar_identity!(i32),
+        AFS_OMP_REDUCTION_KIND_I64 => scalar_identity!(i64),
+        AFS_OMP_REDUCTION_KIND_F32 => real_identity!(f32),
+        AFS_OMP_REDUCTION_KIND_F64 => real_identity!(f64),
+        AFS_OMP_REDUCTION_KIND_C32 => {
+            let real = match operator {
+                AFS_OMP_REDUCTION_ADD => 0.0_f32,
+                AFS_OMP_REDUCTION_MULTIPLY => 1.0_f32,
+                _ => return None,
+            };
+            [real.to_ne_bytes(), 0.0_f32.to_ne_bytes()].concat()
+        }
+        AFS_OMP_REDUCTION_KIND_C64 => {
+            let real = match operator {
+                AFS_OMP_REDUCTION_ADD => 0.0_f64,
+                AFS_OMP_REDUCTION_MULTIPLY => 1.0_f64,
+                _ => return None,
+            };
+            [real.to_ne_bytes(), 0.0_f64.to_ne_bytes()].concat()
+        }
+        _ => return None,
+    };
+    Some(identity)
+}
+
+/// Initialize each element of one private array reduction copy.
+#[no_mangle]
+pub extern "C" fn afs_omp_init_reduction_array(
+    operator: i32,
+    kind: i32,
+    storage: *mut c_void,
+    count: i64,
+) -> i32 {
+    let Some(byte_len) = reduction_array_byte_len(kind, count) else {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    };
+    let Some(identity) = reduction_array_identity(operator, kind) else {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    };
+    if storage.is_null() {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    }
+    let storage = unsafe { std::slice::from_raw_parts_mut(storage.cast::<u8>(), byte_len) };
+    for element in storage.chunks_exact_mut(identity.len()) {
+        element.copy_from_slice(&identity);
+    }
+    AFS_OMP_SUCCESS
+}
+
+/// Combine one contiguous private array copy across the current team.
+#[no_mangle]
+pub extern "C" fn afs_omp_reduce_array(
+    operator: i32,
+    kind: i32,
+    private_storage: *const c_void,
+    original_storage: *const c_void,
+    count: i64,
+    result_storage: *mut c_void,
+) -> i32 {
+    let Some(byte_len) = reduction_array_byte_len(kind, count) else {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    };
+    if private_storage.is_null()
+        || original_storage.is_null()
+        || result_storage.is_null()
+        || !valid_reduction_array_operator(operator, kind)
+    {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    }
+    let context = THREAD_STATE.with(|state| {
+        let state = state.borrow();
+        state.teams.last().map(|team| {
+            (
+                team.thread_num,
+                team.team_size,
+                Arc::clone(&team.barrier),
+                Arc::clone(&team.reduction),
+            )
+        })
+    });
+    let Some((thread_num, team_size, barrier, reduction)) = context else {
+        return AFS_OMP_ERROR_NO_TEAM;
+    };
+    {
+        let mut workspace = reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let team_size = usize::try_from(team_size).unwrap_or(0);
+        workspace.array_slots.resize_with(team_size, Vec::new);
+        let slot = &mut workspace.array_slots[thread_num as usize];
+        slot.resize(byte_len, 0);
+        unsafe {
+            std::ptr::copy_nonoverlapping(private_storage.cast::<u8>(), slot.as_mut_ptr(), byte_len)
+        };
+    }
+    barrier.wait();
+
+    if thread_num == 0 {
+        let mut workspace = reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut combined = vec![0; byte_len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                original_storage.cast::<u8>(),
+                combined.as_mut_ptr(),
+                byte_len,
+            )
+        };
+        let mut status = AFS_OMP_SUCCESS;
+        for slot in &workspace.array_slots {
+            if !combine_reduction_arrays(operator, kind, &mut combined, slot) {
+                status = AFS_OMP_ERROR_INVALID_REDUCTION;
+                break;
+            }
+        }
+        workspace.array_result = combined;
+        workspace.array_status = status;
+    }
+    barrier.wait();
+
+    let workspace = reduction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if workspace.array_status != AFS_OMP_SUCCESS {
+        return workspace.array_status;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            workspace.array_result.as_ptr(),
+            result_storage.cast::<u8>(),
+            byte_len,
+        )
+    };
+    AFS_OMP_SUCCESS
+}
+
+/// Atomically combine one contiguous private array copy into shared storage.
+#[no_mangle]
+pub extern "C" fn afs_omp_reduce_array_nowait(
+    operator: i32,
+    kind: i32,
+    private_storage: *const c_void,
+    original_storage: *mut c_void,
+    count: i64,
+) -> i32 {
+    let Some(byte_len) = reduction_array_byte_len(kind, count) else {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    };
+    if private_storage.is_null()
+        || original_storage.is_null()
+        || !valid_reduction_array_operator(operator, kind)
+    {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    }
+    let reduction = THREAD_STATE.with(|state| {
+        state
+            .borrow()
+            .teams
+            .last()
+            .map(|team| Arc::clone(&team.reduction))
+    });
+    let Some(reduction) = reduction else {
+        return AFS_OMP_ERROR_NO_TEAM;
+    };
+    let _workspace = reduction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let original =
+        unsafe { std::slice::from_raw_parts_mut(original_storage.cast::<u8>(), byte_len) };
+    let private = unsafe { std::slice::from_raw_parts(private_storage.cast::<u8>(), byte_len) };
+    if !combine_reduction_arrays(operator, kind, original, private) {
+        return AFS_OMP_ERROR_INVALID_REDUCTION;
+    }
+    AFS_OMP_SUCCESS
 }
 
 /// Compute one thread's contiguous `schedule(static)` iteration interval.
@@ -2143,6 +2504,232 @@ mod tests {
     }
 
     #[test]
+    fn array_reduction_initializer_uses_typed_openmp_identities() {
+        let mut maximum = [0_i16; 3];
+        assert_eq!(
+            afs_omp_init_reduction_array(
+                AFS_OMP_REDUCTION_MAX,
+                AFS_OMP_REDUCTION_KIND_I16,
+                maximum.as_mut_ptr().cast(),
+                3,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(maximum, [i16::MIN; 3]);
+
+        let mut logical_and = [0_i8; 4];
+        assert_eq!(
+            afs_omp_init_reduction_array(
+                AFS_OMP_REDUCTION_AND,
+                AFS_OMP_REDUCTION_KIND_I8,
+                logical_and.as_mut_ptr().cast(),
+                4,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(logical_and, [1; 4]);
+
+        let mut complex_product = [[0.0_f32; 2]; 2];
+        assert_eq!(
+            afs_omp_init_reduction_array(
+                AFS_OMP_REDUCTION_MULTIPLY,
+                AFS_OMP_REDUCTION_KIND_C32,
+                complex_product.as_mut_ptr().cast(),
+                2,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(complex_product, [[1.0, 0.0]; 2]);
+    }
+
+    #[derive(Default)]
+    struct ArrayReductionObservations {
+        values: Mutex<Vec<ArrayReductionObservation>>,
+    }
+
+    struct ArrayReductionObservation {
+        thread_num: i32,
+        integer: [i8; 2],
+        logical: [i16; 2],
+        real: [f64; 2],
+        complex: [f32; 2],
+    }
+
+    unsafe extern "C" fn reduce_array_task(
+        environment: *mut c_void,
+        thread_num: i32,
+        _team_size: i32,
+    ) {
+        let observations = unsafe { &*(environment as *const ArrayReductionObservations) };
+        let value = thread_num as i8 + 3;
+        let private_integer = [value, -value];
+        let original_integer = [120_i8, -120_i8];
+        let mut integer = [0_i8; 2];
+        assert_eq!(
+            afs_omp_reduce_array(
+                AFS_OMP_REDUCTION_ADD,
+                AFS_OMP_REDUCTION_KIND_I8,
+                private_integer.as_ptr().cast(),
+                original_integer.as_ptr().cast(),
+                2,
+                integer.as_mut_ptr().cast(),
+            ),
+            AFS_OMP_SUCCESS
+        );
+
+        let private_logical = [1_i16, i16::from(thread_num != 3)];
+        let original_logical = [1_i16, 1_i16];
+        let mut logical = [0_i16; 2];
+        assert_eq!(
+            afs_omp_reduce_array(
+                AFS_OMP_REDUCTION_AND,
+                AFS_OMP_REDUCTION_KIND_I16,
+                private_logical.as_ptr().cast(),
+                original_logical.as_ptr().cast(),
+                2,
+                logical.as_mut_ptr().cast(),
+            ),
+            AFS_OMP_SUCCESS
+        );
+
+        let private_real = [f64::from(thread_num) + 1.0, 1.0];
+        let original_real = [2.0_f64, 4.0];
+        let mut real = [0.0_f64; 2];
+        assert_eq!(
+            afs_omp_reduce_array(
+                AFS_OMP_REDUCTION_MULTIPLY,
+                AFS_OMP_REDUCTION_KIND_F64,
+                private_real.as_ptr().cast(),
+                original_real.as_ptr().cast(),
+                2,
+                real.as_mut_ptr().cast(),
+            ),
+            AFS_OMP_SUCCESS
+        );
+
+        let private_complex = [thread_num as f32 + 1.0, -1.0];
+        let original_complex = [10.0_f32, 4.0];
+        let mut complex = [0.0_f32; 2];
+        assert_eq!(
+            afs_omp_reduce_array(
+                AFS_OMP_REDUCTION_ADD,
+                AFS_OMP_REDUCTION_KIND_C32,
+                private_complex.as_ptr().cast(),
+                original_complex.as_ptr().cast(),
+                1,
+                complex.as_mut_ptr().cast(),
+            ),
+            AFS_OMP_SUCCESS
+        );
+        observations
+            .values
+            .lock()
+            .unwrap()
+            .push(ArrayReductionObservation {
+                thread_num,
+                integer,
+                logical,
+                real,
+                complex,
+            });
+    }
+
+    #[test]
+    fn array_reductions_preserve_element_kinds_and_thread_order() {
+        reset_thread_state();
+        let observations = ArrayReductionObservations::default();
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(reduce_array_task),
+                &observations as *const ArrayReductionObservations as *mut c_void,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        let mut values = observations.values.into_inner().unwrap();
+        values.sort_unstable_by_key(|observation| observation.thread_num);
+        assert_eq!(values.len(), 4);
+        for observation in values {
+            assert_eq!(observation.integer, [-118, 118]);
+            assert_eq!(observation.logical, [1, 0]);
+            assert_eq!(observation.real, [48.0, 4.0]);
+            assert_eq!(observation.complex, [20.0, 0.0]);
+        }
+    }
+
+    struct NowaitArrayReductionObservations {
+        integer: [i32; 2],
+        real: [f32; 2],
+        complex: [f64; 2],
+    }
+
+    unsafe extern "C" fn reduce_array_nowait_task(
+        environment: *mut c_void,
+        thread_num: i32,
+        _team_size: i32,
+    ) {
+        let observations = environment.cast::<NowaitArrayReductionObservations>();
+        let private_integer = [thread_num + 1, thread_num + 1];
+        assert_eq!(
+            afs_omp_reduce_array_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                AFS_OMP_REDUCTION_KIND_I32,
+                private_integer.as_ptr().cast(),
+                std::ptr::addr_of_mut!((*observations).integer).cast(),
+                2,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        let private_real = [thread_num as f32 - 2.0, 10.0 - thread_num as f32];
+        assert_eq!(
+            afs_omp_reduce_array_nowait(
+                AFS_OMP_REDUCTION_MAX,
+                AFS_OMP_REDUCTION_KIND_F32,
+                private_real.as_ptr().cast(),
+                std::ptr::addr_of_mut!((*observations).real).cast(),
+                2,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        let private_complex = [0.0_f64, 1.0];
+        assert_eq!(
+            afs_omp_reduce_array_nowait(
+                AFS_OMP_REDUCTION_MULTIPLY,
+                AFS_OMP_REDUCTION_KIND_C64,
+                private_complex.as_ptr().cast(),
+                std::ptr::addr_of_mut!((*observations).complex).cast(),
+                1,
+            ),
+            AFS_OMP_SUCCESS
+        );
+    }
+
+    #[test]
+    fn nowait_array_reductions_update_shared_storage_without_a_barrier() {
+        reset_thread_state();
+        let mut observations = NowaitArrayReductionObservations {
+            integer: [5, -5],
+            real: [-9.0, -9.0],
+            complex: [2.0, -3.0],
+        };
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(reduce_array_nowait_task),
+                std::ptr::addr_of_mut!(observations).cast(),
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(observations.integer, [15, 5]);
+        assert_eq!(observations.real, [1.0, 10.0]);
+        assert_eq!(observations.complex, [2.0, -3.0]);
+    }
+
+    #[test]
     fn reduction_runtime_rejects_invalid_context_or_arguments() {
         reset_thread_state();
         let mut result = -1;
@@ -2154,6 +2741,9 @@ mod tests {
         let complex64_private = [1.0_f64, 2.0];
         let complex64_original = [3.0_f64, 4.0];
         let mut complex64_result = [-1.0_f64, -1.0];
+        let private_array = [1_i32, 2];
+        let original_array = [3_i32, 4];
+        let mut result_array = [-1_i32; 2];
         assert_eq!(
             afs_omp_reduce_i64(AFS_OMP_REDUCTION_ADD, 1, 2, &mut result),
             AFS_OMP_ERROR_NO_TEAM
@@ -2263,11 +2853,51 @@ mod tests {
             ),
             AFS_OMP_ERROR_INVALID_REDUCTION
         );
+        assert_eq!(
+            afs_omp_init_reduction_array(
+                AFS_OMP_REDUCTION_ADD,
+                AFS_OMP_REDUCTION_KIND_I32,
+                std::ptr::null_mut(),
+                2,
+            ),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(
+            afs_omp_init_reduction_array(
+                AFS_OMP_REDUCTION_MAX,
+                AFS_OMP_REDUCTION_KIND_C32,
+                result_array.as_mut_ptr().cast(),
+                1,
+            ),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
+        assert_eq!(
+            afs_omp_reduce_array(
+                AFS_OMP_REDUCTION_ADD,
+                AFS_OMP_REDUCTION_KIND_I32,
+                private_array.as_ptr().cast(),
+                original_array.as_ptr().cast(),
+                2,
+                result_array.as_mut_ptr().cast(),
+            ),
+            AFS_OMP_ERROR_NO_TEAM
+        );
+        assert_eq!(
+            afs_omp_reduce_array_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                AFS_OMP_REDUCTION_KIND_I32,
+                private_array.as_ptr().cast(),
+                result_array.as_mut_ptr().cast(),
+                0,
+            ),
+            AFS_OMP_ERROR_INVALID_REDUCTION
+        );
         assert_eq!(result, -1);
         assert_eq!(real32_result, -1.0);
         assert_eq!(real64_result, -1.0);
         assert_eq!(complex32_result, [-1.0, -1.0]);
         assert_eq!(complex64_result, [-1.0, -1.0]);
+        assert_eq!(result_array, [-1, -1]);
     }
 
     fn static_bounds(
