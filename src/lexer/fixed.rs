@@ -940,6 +940,14 @@ fn split_fixed_keyword_prefix(
         return None;
     }
 
+    // USE is the only three-letter specification keyword whose following
+    // module name is joined to it when fixed-form blanks are removed.  Keep
+    // the general scan at four characters so shorter identifier prefixes do
+    // not become broadly ambiguous, but expose USE at statement start.
+    if at_action_start && run[..3].eq_ignore_ascii_case("use") {
+        return Some(3);
+    }
+
     for prefix_len in (4..run.len()).rev() {
         let prefix = &run[..prefix_len];
         let prefix_lower = prefix.to_ascii_lowercase();
@@ -2303,6 +2311,18 @@ C     Hello World
     fn whitespace_stripped_program_name() {
         let texts = fixed_texts("      PROGRAMHELLO\n");
         assert_eq!(texts, vec!["PROGRAM", "HELLO"], "got: {:?}", texts);
+    }
+
+    #[test]
+    fn whitespace_stripped_use_module_name() {
+        for source in ["      USE OMP_LIB\n", "      USEOMP_LIB\n"] {
+            assert_eq!(
+                fixed_texts(source),
+                vec!["USE", "OMP_LIB"],
+                "got different tokens for {source:?}"
+            );
+        }
+        assert_eq!(fixed_texts("      USEFUL=1\n"), vec!["USEFUL", "=", "1"]);
     }
 
     #[test]

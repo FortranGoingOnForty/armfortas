@@ -249,6 +249,9 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
             cursor.finish()?;
             OpenMpHeader::Critical(name)
         }
+        "enddo" => OpenMpHeader::EndDo {
+            nowait: parse_end_loop_clause(&mut cursor)?,
+        },
         "end" => parse_openmp_end_header(&mut cursor)?,
         other => {
             return Err(ParseError {
@@ -496,6 +499,9 @@ fn parse_reduction_operator(
         ".or." => Ok(OpenMpReductionOperator::Or),
         ".eqv." => Ok(OpenMpReductionOperator::Eqv),
         ".neqv." => Ok(OpenMpReductionOperator::Neqv),
+        "iand" => Ok(OpenMpReductionOperator::Iand),
+        "ior" => Ok(OpenMpReductionOperator::Ior),
+        "ieor" => Ok(OpenMpReductionOperator::Ieor),
         other => Err(cursor.error(format!("unsupported OpenMP reduction operator '{other}'"))),
     }
 }
@@ -866,6 +872,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_integer_intrinsic_reduction_operators() {
+        let stmt = parse(
+            "!$omp parallel do reduction(iand:all_bits) reduction(ior:any_bits) &\n\
+             !$omp& reduction(ieor:parity_bits)\n\
+             do i = 1, n\n\
+             end do\n\
+             !$omp end parallel do\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::ParallelDo { clauses, .. }) = stmt.node else {
+            panic!("expected parallel-do construct");
+        };
+        let operators = clauses
+            .iter()
+            .filter_map(|clause| match clause {
+                OpenMpClause::Reduction { operator, .. } => Some(*operator),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operators,
+            [
+                OpenMpReductionOperator::Iand,
+                OpenMpReductionOperator::Ior,
+                OpenMpReductionOperator::Ieor,
+            ]
+        );
+    }
+
+    #[test]
     fn parses_array_reduction_items_without_erasing_sections() {
         let stmt = parse(
             "!$omp parallel do reduction(+:whole, slice(2:7), element(4))\n\
@@ -930,6 +967,21 @@ mod tests {
         assert!(clauses
             .iter()
             .any(|clause| matches!(clause, OpenMpClause::Collapse(_))));
+        assert!(clauses
+            .iter()
+            .any(|clause| matches!(clause, OpenMpClause::Nowait)));
+    }
+
+    #[test]
+    fn parses_compact_fixed_form_enddo_directive() {
+        let stmt = parse(
+            "C$OMP DO\n      DO I=1,4\n      ENDDO\nC$OMP ENDDO NOWAIT\n",
+            SourceForm::FixedForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::Do { clauses, .. }) = stmt.node else {
+            panic!("expected worksharing-do construct");
+        };
         assert!(clauses
             .iter()
             .any(|clause| matches!(clause, OpenMpClause::Nowait)));

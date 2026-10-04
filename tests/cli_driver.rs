@@ -21377,6 +21377,100 @@ end program
 }
 
 #[test]
+fn fopenmp_integer_intrinsic_reductions_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_integer_intrinsic_reductions_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: i, tid, all_bits, any_bits, parity_bits, nowait_bits
+  integer :: and_values(2), or_values(2), xor_values(2)
+  all_bits = 31
+  any_bits = 16
+  parity_bits = 16
+!$omp parallel do default(none) num_threads(4) schedule(static,1) private(i) &
+!$omp& reduction(iand:all_bits) reduction(ior:any_bits) reduction(ieor:parity_bits)
+  do i = 1, 4
+    all_bits = iand(all_bits, ishft(2, i-1)-1)
+    any_bits = ior(any_bits, ishft(1, i-1))
+    parity_bits = ieor(parity_bits, ishft(1, i-1))
+  end do
+!$omp end parallel do
+  if (all_bits /= 1 .or. any_bits /= 31 .or. parity_bits /= 31) error stop 1
+
+  and_values = [31, 63]
+  or_values = [16, 32]
+  xor_values = [16, 32]
+!$omp parallel default(none) num_threads(4) private(tid) &
+!$omp& reduction(iand:and_values) reduction(ior:or_values) reduction(ieor:xor_values)
+  tid = omp_get_thread_num()
+  and_values(1) = iand(and_values(1), ishft(2, tid)-1)
+  and_values(2) = iand(and_values(2), ishft(4, tid)-1)
+  or_values(1) = ior(or_values(1), ishft(1, tid))
+  or_values(2) = ior(or_values(2), ishft(2, tid))
+  xor_values(1) = ieor(xor_values(1), ishft(1, tid))
+  xor_values(2) = ieor(xor_values(2), ishft(2, tid))
+!$omp end parallel
+  if (any(and_values /= [1,3])) error stop 2
+  if (any(or_values /= [31,62])) error stop 3
+  if (any(xor_values /= [31,62])) error stop 4
+
+  nowait_bits = 16
+!$omp parallel default(none) num_threads(4) shared(nowait_bits)
+!$omp do schedule(static,1) reduction(ieor:nowait_bits)
+  do i = 1, 4
+    nowait_bits = ieor(nowait_bits, ishft(1, i-1))
+  end do
+!$omp end do nowait
+!$omp end parallel
+  if (nowait_bits /= 31) error stop 5
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_integer_intrinsic_reductions", "bin");
+        let runtime_cache = unique_dir("openmp_integer_intrinsic_reductions_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP integer intrinsic reductions should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..4 {
+            let run = Command::new(&out).output().expect("failed to run binary");
+            assert!(
+                run.status.success(),
+                "OpenMP integer intrinsic reductions failed at {opt}, iteration {iteration}:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_scalar_real_reductions_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -40,6 +40,9 @@ pub const AFS_OMP_REDUCTION_AND: i32 = 5;
 pub const AFS_OMP_REDUCTION_OR: i32 = 6;
 pub const AFS_OMP_REDUCTION_EQV: i32 = 7;
 pub const AFS_OMP_REDUCTION_NEQV: i32 = 8;
+pub const AFS_OMP_REDUCTION_IAND: i32 = 9;
+pub const AFS_OMP_REDUCTION_IOR: i32 = 10;
+pub const AFS_OMP_REDUCTION_IEOR: i32 = 11;
 
 pub const AFS_OMP_REDUCTION_KIND_I8: i32 = 1;
 pub const AFS_OMP_REDUCTION_KIND_I16: i32 = 2;
@@ -620,6 +623,9 @@ fn combine_i64_reduction(operator: i32, left: i64, right: i64) -> Option<i64> {
         AFS_OMP_REDUCTION_OR => Some(i64::from(left != 0 || right != 0)),
         AFS_OMP_REDUCTION_EQV => Some(i64::from((left != 0) == (right != 0))),
         AFS_OMP_REDUCTION_NEQV => Some(i64::from((left != 0) != (right != 0))),
+        AFS_OMP_REDUCTION_IAND => Some(left & right),
+        AFS_OMP_REDUCTION_IOR => Some(left | right),
+        AFS_OMP_REDUCTION_IEOR => Some(left ^ right),
         _ => None,
     }
 }
@@ -1232,6 +1238,9 @@ fn valid_reduction_array_operator(operator: i32, kind: i32) -> bool {
                 | AFS_OMP_REDUCTION_OR
                 | AFS_OMP_REDUCTION_EQV
                 | AFS_OMP_REDUCTION_NEQV
+                | AFS_OMP_REDUCTION_IAND
+                | AFS_OMP_REDUCTION_IOR
+                | AFS_OMP_REDUCTION_IEOR
         ),
         AFS_OMP_REDUCTION_KIND_F32 | AFS_OMP_REDUCTION_KIND_F64 => matches!(
             operator,
@@ -1282,6 +1291,9 @@ macro_rules! combine_integer_array {
                 AFS_OMP_REDUCTION_OR => <$ty>::from(left_value != 0 || right_value != 0),
                 AFS_OMP_REDUCTION_EQV => <$ty>::from((left_value != 0) == (right_value != 0)),
                 AFS_OMP_REDUCTION_NEQV => <$ty>::from((left_value != 0) != (right_value != 0)),
+                AFS_OMP_REDUCTION_IAND => left_value & right_value,
+                AFS_OMP_REDUCTION_IOR => left_value | right_value,
+                AFS_OMP_REDUCTION_IEOR => left_value ^ right_value,
                 _ => return false,
             };
             unsafe { write_reduction_element($left, offset, combined) };
@@ -1353,8 +1365,13 @@ fn reduction_array_identity(operator: i32, kind: i32) -> Option<Vec<u8>> {
     macro_rules! scalar_identity {
         ($ty:ty) => {{
             let value: $ty = match operator {
-                AFS_OMP_REDUCTION_ADD | AFS_OMP_REDUCTION_OR | AFS_OMP_REDUCTION_NEQV => 0,
+                AFS_OMP_REDUCTION_ADD
+                | AFS_OMP_REDUCTION_OR
+                | AFS_OMP_REDUCTION_NEQV
+                | AFS_OMP_REDUCTION_IOR
+                | AFS_OMP_REDUCTION_IEOR => 0,
                 AFS_OMP_REDUCTION_MULTIPLY | AFS_OMP_REDUCTION_AND | AFS_OMP_REDUCTION_EQV => 1,
+                AFS_OMP_REDUCTION_IAND => -1,
                 AFS_OMP_REDUCTION_MAX => <$ty>::MIN,
                 AFS_OMP_REDUCTION_MIN => <$ty>::MAX,
                 _ => return None,

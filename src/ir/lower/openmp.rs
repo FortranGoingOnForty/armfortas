@@ -969,6 +969,9 @@ fn reduction_runtime_operator(operator: OpenMpReductionOperator) -> i32 {
         OpenMpReductionOperator::Or => 6,
         OpenMpReductionOperator::Eqv => 7,
         OpenMpReductionOperator::Neqv => 8,
+        OpenMpReductionOperator::Iand => 9,
+        OpenMpReductionOperator::Ior => 10,
+        OpenMpReductionOperator::Ieor => 11,
     }
 }
 
@@ -1017,7 +1020,10 @@ fn scalar_reduction_identity(
         OpenMpReductionOperator::Multiply => 1,
         OpenMpReductionOperator::Max => least,
         OpenMpReductionOperator::Min => greatest,
-        OpenMpReductionOperator::Add => 0,
+        OpenMpReductionOperator::Iand => -1,
+        OpenMpReductionOperator::Add
+        | OpenMpReductionOperator::Ior
+        | OpenMpReductionOperator::Ieor => 0,
         _ => unreachable!("logical OpenMP reduction applied to INTEGER"),
     };
     b.const_int(value, *width)
