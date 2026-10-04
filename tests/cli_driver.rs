@@ -22927,6 +22927,86 @@ fn fopenmp_outlines_capture_free_parallel_regions() {
 }
 
 #[test]
+fn fopenmp_captured_assumed_size_forwarding_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_captured_assumed_size_forwarding_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  real :: values(4)
+  character(len=3) :: words(2)
+  values = 0.0
+  words = 'no'
+  call forward_numeric(values)
+  call forward_character(words)
+  if (values(4) /= 77.0) error stop 1
+  if (words(2) /= 'yes') error stop 2
+  print *, 'ok'
+contains
+  subroutine forward_numeric(items)
+    real, intent(inout) :: items(*)
+!$omp parallel if(.false.) shared(items)
+    call store_numeric(items, 4)
+!$omp end parallel
+  end subroutine
+  subroutine store_numeric(items, index)
+    real, intent(inout) :: items(*)
+    integer, intent(in) :: index
+    items(index) = 77.0
+  end subroutine
+  subroutine forward_character(items)
+    character(len=3), intent(inout) :: items(*)
+!$omp parallel if(.false.) shared(items)
+    call store_character(items)
+!$omp end parallel
+  end subroutine
+  subroutine store_character(items)
+    character(len=3), intent(inout) :: items(*)
+    items(2) = 'yes'
+  end subroutine
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_assumed_size_forward", "bin");
+        let runtime_cache = unique_dir("openmp_assumed_size_forward_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "captured assumed-size forwarding should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "captured assumed-size forwarding failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_outlined_parallel_emits_x86_64_elf_object() {
     let src = write_program(
         "program p\n  implicit none\n  integer :: shared_value, seed, scratch, values(-1:0,0:1), descriptor_values(2)\n  integer :: private_values(-1:0), first_values(2)\n  integer, allocatable :: owned(:), private_owned(:), first_owned(:), empty_owned(:)\n  shared_value = 1\n  seed = 40\n  values = 0\n  descriptor_values = 0\n  private_values = -1\n  first_values = 40\n  allocate(owned(-1:0), private_owned(-1:0), first_owned(-1:0))\n  owned = 0\n  private_owned = -1\n  first_owned = 40\n!$omp parallel if(.false.) default(none) shared(shared_value, values, owned) &\n!$omp& firstprivate(seed, first_values, first_owned, empty_owned) &\n!$omp& private(scratch, private_values, private_owned)\n  scratch = seed + 2\n  private_values = first_values + 2\n  if (.not. allocated(private_owned) .or. .not. allocated(first_owned)) error stop 3\n  if (allocated(empty_owned)) error stop 4\n  if (lbound(private_owned, 1) /= -1 .or. ubound(private_owned, 1) /= 0) error stop 5\n  if (any(first_owned /= 40)) error stop 6\n  private_owned = 42\n  first_owned = first_owned + 2\n  shared_value = scratch + private_values(-1) - 42\n  values(-1,0) = private_values(0) + private_owned(-1) - first_owned(1)\n  owned(-1) = 42\n!$omp end parallel\n  call touch_descriptor(descriptor_values)\n  if (shared_value /= 42 .or. seed /= 40 .or. values(-1,0) /= 42 .or. descriptor_values(1) /= 42 .or. owned(-1) /= 42) error stop 7\n  if (any(private_values /= -1) .or. any(first_values /= 40)) error stop 8\n  if (any(private_owned /= -1) .or. any(first_owned /= 40) .or. allocated(empty_owned)) error stop 9\ncontains\n  subroutine touch_descriptor(items)\n    integer, intent(inout) :: items(:)\n!$omp parallel if(.false.) default(none) shared(items)\n    items(1) = 42\n!$omp end parallel\n  end subroutine\nend program\n",

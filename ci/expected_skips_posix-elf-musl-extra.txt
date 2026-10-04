@@ -1545,6 +1545,7 @@ multifile module_scalar_allocatable_and_pointer_preserve_cross_tu_state 1
 # OpenMP native E2E regressions added by the host parallel foundation.
 cli_driver embedded_omp_lib_header_calls_the_owned_runtime 1
 cli_driver fopenmp_capture_free_parallel_regions_run 1
+cli_driver fopenmp_captured_assumed_size_forwarding_runs 1
 cli_driver fopenmp_collapse_two_static_runs 1
 cli_driver fopenmp_default_none_and_predetermined_scalars_run 1
 cli_driver fopenmp_deferred_character_allocatable_scalars_run 1

@@ -65932,6 +65932,24 @@ pub(super) fn lower_sequence_array_actual(
     copy_back: bool,
     temps: &mut Vec<SequenceAssociationTemp>,
 ) -> Option<ValueId> {
+    // An assumed-size dummy is already associated with a contiguous storage
+    // sequence. Its caller has materialized any temporary required by a
+    // noncontiguous original actual, and the final dimension deliberately has
+    // no recoverable extent. Pass that sequence through directly. In
+    // particular, do not allocate from the `(lower=1, upper=0)` descriptor
+    // view used when an OpenMP callback captures the dummy: that descriptor
+    // preserves address/rank metadata but cannot describe a copy extent.
+    if let Expr::Name { name } = &expr.node {
+        if let Some(info) = locals
+            .get(&name.to_lowercase())
+            .filter(|info| info.last_dim_assumed_size)
+        {
+            if sequence_supported_elem_ty(&info.ty) {
+                return Some(array_data_ptr_for_call(b, info));
+            }
+        }
+    }
+
     // A fixed inline array component of a scalar derived object is already a
     // contiguous storage sequence.  Keep its real address so an explicit-
     // shape dummy can apply sequence association beyond the component's
@@ -66036,6 +66054,17 @@ pub(super) fn lower_sequence_char_array_actual(
     copy_back: bool,
     temps: &mut Vec<SequenceAssociationTemp>,
 ) -> Option<ValueId> {
+    if let Expr::Name { name } = &expr.node {
+        if let Some(info) = locals
+            .get(&name.to_lowercase())
+            .filter(|info| info.last_dim_assumed_size)
+        {
+            if sequence_char_supported_elem_ty(&info.ty) {
+                return Some(array_data_ptr_for_call(b, info));
+            }
+        }
+    }
+
     let (source_desc, elem_ty) = lower_array_expr_descriptor(
         b,
         locals,
