@@ -2,6 +2,7 @@ id	upstream_path	local_source	source_form	operation	upstream_expect	version	cove
 get_nthrs.2	parallel_execution/sources/get_nthrs.2.f	parallel_execution/get_nthrs.2.f	fixed	compile	success	pre_omp_3.0	parallel,private,omp_get_thread_num	pass
 nowait.1	parallel_execution/sources/nowait.1.f	parallel_execution/nowait.1.f	fixed	compile	success	pre_omp_3.0	parallel,do,nowait	pass
 nowait.2	parallel_execution/sources/nowait.2.f90	parallel_execution/nowait.2.f90	free	compile	success	pre_omp_3.0	parallel,do,schedule(static),nowait	pass
+parallel.1	parallel_execution/sources/parallel.1.f	parallel_execution/parallel.1.f	fixed	link	success	pre_omp_3.0	parallel,default(private),shared,omp_get_thread_num,omp_get_num_threads,assumed-size-forwarding	pass
 private.1	data_environment/sources/private.1.f	data_environment/private.1.f	fixed	run	success	pre_omp_3.0	parallel,private,firstprivate	pass
 fort_loopvar.1	data_environment/sources/fort_loopvar.1.f90	data_environment/fort_loopvar.1.f90	free	compile	success	pre_omp_3.0	parallel,private,predetermined-loop-variable	pass
 lastprivate.1	data_environment/sources/lastprivate.1.f	data_environment/lastprivate.1.f	fixed	compile	success	pre_omp_3.0	parallel,do,lastprivate	pass

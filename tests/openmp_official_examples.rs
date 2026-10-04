@@ -61,7 +61,10 @@ fn cases() -> Vec<Case<'static>> {
                 armfortas_state: fields[8],
             };
             assert!(matches!(case.source_form, "fixed" | "free"), "{case:?}");
-            assert!(matches!(case.operation, "compile" | "run"), "{case:?}");
+            assert!(
+                matches!(case.operation, "compile" | "link" | "run"),
+                "{case:?}"
+            );
             assert_eq!(case.upstream_expect, "success", "{case:?}");
             assert_eq!(case.armfortas_state, "pass", "{case:?}");
             assert!(
@@ -96,7 +99,7 @@ fn assert_pinned_source(case: &Case<'_>, source: &Path) {
 }
 
 #[test]
-fn selected_official_examples_compile_at_o0_and_o3() {
+fn selected_official_examples_build_at_o0_and_o3() {
     let root = fixture_root();
     let build = unique_dir("compile");
     let runtime_cache = build.join("runtime-cache");
@@ -104,25 +107,34 @@ fn selected_official_examples_compile_at_o0_and_o3() {
         let source = root.join(case.local_source);
         assert_pinned_source(&case, &source);
         for opt in ["-O0", "-O3"] {
-            let object = build.join(format!(
-                "{}-{}.o",
+            let output = build.join(format!(
+                "{}-{}{}",
                 case.id,
-                opt.trim_start_matches('-').to_ascii_lowercase()
+                opt.trim_start_matches('-').to_ascii_lowercase(),
+                if case.operation == "compile" {
+                    ".o"
+                } else {
+                    ""
+                }
             ));
-            let result = Command::new(compiler())
-                .current_dir(&build)
-                .args(["-fopenmp", opt, "-c"])
+            let mut command = Command::new(compiler());
+            command.current_dir(&build).args(["-fopenmp", opt]);
+            if case.operation == "compile" {
+                command.arg("-c");
+            }
+            let result = command
                 .arg(&source)
                 .args(["-o"])
-                .arg(&object)
+                .arg(&output)
                 .env("AFS_RUNTIME_CACHE", &runtime_cache)
                 .output()
                 .expect("failed to launch armfortas");
             assert!(
                 result.status.success(),
-                "official example {} ({}) failed to compile at {opt}:\n{}",
+                "official example {} ({}) failed to {} at {opt}:\n{}",
                 case.id,
                 case.upstream_path,
+                case.operation,
                 String::from_utf8_lossy(&result.stderr)
             );
         }
