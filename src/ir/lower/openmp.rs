@@ -726,9 +726,7 @@ fn lower_parallel_region(
                     || predetermined_shared
                 {
                     CaptureKind::Shared
-                } else if predetermined_private.contains(&name) {
-                    CaptureKind::Private
-                } else if default_private {
+                } else if predetermined_private.contains(&name) || default_private {
                     CaptureKind::Private
                 } else {
                     CaptureKind::Shared
