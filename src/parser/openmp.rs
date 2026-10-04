@@ -249,6 +249,9 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
             cursor.finish()?;
             OpenMpHeader::Critical(name)
         }
+        "enddo" => OpenMpHeader::EndDo {
+            nowait: parse_end_loop_clause(&mut cursor)?,
+        },
         "end" => parse_openmp_end_header(&mut cursor)?,
         other => {
             return Err(ParseError {
@@ -930,6 +933,21 @@ mod tests {
         assert!(clauses
             .iter()
             .any(|clause| matches!(clause, OpenMpClause::Collapse(_))));
+        assert!(clauses
+            .iter()
+            .any(|clause| matches!(clause, OpenMpClause::Nowait)));
+    }
+
+    #[test]
+    fn parses_compact_fixed_form_enddo_directive() {
+        let stmt = parse(
+            "C$OMP DO\n      DO I=1,4\n      ENDDO\nC$OMP ENDDO NOWAIT\n",
+            SourceForm::FixedForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::Do { clauses, .. }) = stmt.node else {
+            panic!("expected worksharing-do construct");
+        };
         assert!(clauses
             .iter()
             .any(|clause| matches!(clause, OpenMpClause::Nowait)));
