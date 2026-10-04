@@ -877,7 +877,10 @@ fn validate_reduction_object(
             OpenMpReductionOperator::Add
             | OpenMpReductionOperator::Multiply
             | OpenMpReductionOperator::Max
-            | OpenMpReductionOperator::Min,
+            | OpenMpReductionOperator::Min
+            | OpenMpReductionOperator::Iand
+            | OpenMpReductionOperator::Ior
+            | OpenMpReductionOperator::Ieor,
             Some(TypeInfo::Integer { kind }),
         ) => matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8),
         (
@@ -1077,6 +1080,18 @@ fn validate_reduction_bounds(
 fn reduction_type_requirement(operator: OpenMpReductionOperator, is_array: bool) -> &'static str {
     match (operator, is_array) {
         (
+            OpenMpReductionOperator::Iand
+            | OpenMpReductionOperator::Ior
+            | OpenMpReductionOperator::Ieor,
+            false,
+        ) => "a scalar INTEGER of kind 1, 2, 4, or 8",
+        (
+            OpenMpReductionOperator::Iand
+            | OpenMpReductionOperator::Ior
+            | OpenMpReductionOperator::Ieor,
+            true,
+        ) => "rank-one INTEGER elements of kind 1, 2, 4, or 8",
+        (
             OpenMpReductionOperator::And
             | OpenMpReductionOperator::Or
             | OpenMpReductionOperator::Eqv
@@ -1118,6 +1133,9 @@ fn reduction_operator_name(operator: OpenMpReductionOperator) -> &'static str {
         OpenMpReductionOperator::Or => ".OR.",
         OpenMpReductionOperator::Eqv => ".EQV.",
         OpenMpReductionOperator::Neqv => ".NEQV.",
+        OpenMpReductionOperator::Iand => "IAND",
+        OpenMpReductionOperator::Ior => "IOR",
+        OpenMpReductionOperator::Ieor => "IEOR",
     }
 }
 

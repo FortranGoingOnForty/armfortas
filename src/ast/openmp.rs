@@ -190,4 +190,7 @@ pub enum OpenMpReductionOperator {
     Or,
     Eqv,
     Neqv,
+    Iand,
+    Ior,
+    Ieor,
 }

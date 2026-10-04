@@ -499,6 +499,9 @@ fn parse_reduction_operator(
         ".or." => Ok(OpenMpReductionOperator::Or),
         ".eqv." => Ok(OpenMpReductionOperator::Eqv),
         ".neqv." => Ok(OpenMpReductionOperator::Neqv),
+        "iand" => Ok(OpenMpReductionOperator::Iand),
+        "ior" => Ok(OpenMpReductionOperator::Ior),
+        "ieor" => Ok(OpenMpReductionOperator::Ieor),
         other => Err(cursor.error(format!("unsupported OpenMP reduction operator '{other}'"))),
     }
 }
@@ -865,6 +868,37 @@ mod tests {
                 .filter(|clause| matches!(clause, OpenMpClause::Reduction { .. }))
                 .count(),
             3
+        );
+    }
+
+    #[test]
+    fn parses_integer_intrinsic_reduction_operators() {
+        let stmt = parse(
+            "!$omp parallel do reduction(iand:all_bits) reduction(ior:any_bits) &\n\
+             !$omp& reduction(ieor:parity_bits)\n\
+             do i = 1, n\n\
+             end do\n\
+             !$omp end parallel do\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::ParallelDo { clauses, .. }) = stmt.node else {
+            panic!("expected parallel-do construct");
+        };
+        let operators = clauses
+            .iter()
+            .filter_map(|clause| match clause {
+                OpenMpClause::Reduction { operator, .. } => Some(*operator),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operators,
+            [
+                OpenMpReductionOperator::Iand,
+                OpenMpReductionOperator::Ior,
+                OpenMpReductionOperator::Ieor,
+            ]
         );
     }
 
