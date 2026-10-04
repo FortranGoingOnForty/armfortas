@@ -103,23 +103,36 @@ fn selected_official_examples_build_at_o0_and_o3() {
     let root = fixture_root();
     let build = unique_dir("compile");
     let runtime_cache = build.join("runtime-cache");
-    for case in cases() {
+    let cases = cases();
+    let native_link = armfortas::testing::native_e2e_support();
+    if cases.iter().any(|case| case.operation == "link") {
+        if let Err(reason) = &native_link {
+            armfortas::testing::report_harness_skip(
+                "openmp_official_examples",
+                "selected_official_examples_build_at_o0_and_o3",
+                1,
+                &format!("official link operation unavailable: {reason}"),
+            );
+        }
+    }
+    for case in cases {
         let source = root.join(case.local_source);
         assert_pinned_source(&case, &source);
+        // RUN rows are compiled here and exercised by the dedicated native
+        // execution test below. Keep compiling LINK rows on hosts whose
+        // native link path is intentionally unavailable, while accounting
+        // for the missing upstream-requested operation as a platform skip.
+        let compile_only = case.operation != "link" || native_link.is_err();
         for opt in ["-O0", "-O3"] {
             let output = build.join(format!(
                 "{}-{}{}",
                 case.id,
                 opt.trim_start_matches('-').to_ascii_lowercase(),
-                if case.operation == "compile" {
-                    ".o"
-                } else {
-                    ""
-                }
+                if compile_only { ".o" } else { "" }
             ));
             let mut command = Command::new(compiler());
             command.current_dir(&build).args(["-fopenmp", opt]);
-            if case.operation == "compile" {
+            if compile_only {
                 command.arg("-c");
             }
             let result = command
@@ -134,7 +147,7 @@ fn selected_official_examples_build_at_o0_and_o3() {
                 "official example {} ({}) failed to {} at {opt}:\n{}",
                 case.id,
                 case.upstream_path,
-                case.operation,
+                if compile_only { "compile" } else { "link" },
                 String::from_utf8_lossy(&result.stderr)
             );
         }
