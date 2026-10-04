@@ -215,14 +215,17 @@ fn reject_in_pure(ctx: &mut Ctx<'_>, span: Span, construct: &str) {
     }
 }
 
-#[derive(Default)]
 struct ParallelClauseInfo {
     explicitly_scoped: HashSet<String>,
-    default_none: bool,
+    default_data_sharing: Option<OpenMpDefault>,
 }
 
-pub(crate) fn parallel_private_names(clauses: &[OpenMpClause]) -> HashSet<String> {
-    clauses
+pub(super) fn parallel_private_names(
+    ctx: &Ctx<'_>,
+    clauses: &[OpenMpClause],
+    body: &[SpannedStmt],
+) -> HashSet<String> {
+    let mut private = clauses
         .iter()
         .flat_map(|clause| match clause {
             OpenMpClause::Private(names) | OpenMpClause::FirstPrivate(names) => {
@@ -234,7 +237,60 @@ pub(crate) fn parallel_private_names(clauses: &[OpenMpClause]) -> HashSet<String
             _ => Vec::new(),
         })
         .map(|name| name.to_ascii_lowercase())
-        .collect()
+        .collect::<HashSet<_>>();
+    if !clauses
+        .iter()
+        .any(|clause| matches!(clause, OpenMpClause::Default(OpenMpDefault::Private)))
+    {
+        return private;
+    }
+
+    let explicitly_scoped = clauses
+        .iter()
+        .flat_map(|clause| match clause {
+            OpenMpClause::Shared(names)
+            | OpenMpClause::Private(names)
+            | OpenMpClause::FirstPrivate(names) => {
+                names.iter().map(String::as_str).collect::<Vec<_>>()
+            }
+            OpenMpClause::LastPrivate { variables, .. } => {
+                variables.iter().map(String::as_str).collect()
+            }
+            OpenMpClause::Reduction { items, .. } => {
+                items.iter().map(OpenMpReductionItem::base_name).collect()
+            }
+            _ => Vec::new(),
+        })
+        .map(str::to_ascii_lowercase)
+        .collect::<HashSet<_>>();
+    private.extend(predetermined_private_names(ctx.st, body));
+
+    for (name, _, role) in capture_references(ctx.st, body) {
+        let is_data_reference = role == ReferenceRole::Value
+            || (role == ReferenceRole::Callable
+                && ctx.lookup_lexical(&name).is_some_and(|symbol| {
+                    matches!(
+                        symbol.kind,
+                        SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::ProcedurePointer
+                    )
+                }));
+        if !is_data_reference || explicitly_scoped.contains(&name) {
+            continue;
+        }
+        let Some(symbol) = ctx.lookup_lexical(&name) else {
+            continue;
+        };
+        let predetermined_shared = symbol.kind == SymbolKind::Parameter
+            || symbol
+                .attrs
+                .array_spec
+                .iter()
+                .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedSize { .. }));
+        if !predetermined_shared {
+            private.insert(name);
+        }
+    }
+    private
 }
 
 fn validate_parallel_clauses(
@@ -245,6 +301,8 @@ fn validate_parallel_clauses(
 ) -> ParallelClauseInfo {
     let mut saw_if = false;
     let mut saw_num_threads = false;
+    let mut saw_default = false;
+    let mut default_data_sharing = None;
     let mut data_attributes = HashMap::new();
 
     for clause in clauses {
@@ -341,8 +399,20 @@ fn validate_parallel_clauses(
                     validate_reduction_object(ctx, item, span, *operator);
                 }
             }
-            OpenMpClause::Default(OpenMpDefault::Shared) => {}
-            OpenMpClause::Default(OpenMpDefault::None) => {}
+            OpenMpClause::Default(value) => {
+                if std::mem::replace(&mut saw_default, true) {
+                    ctx.error(span, "OpenMP PARALLEL may not repeat the DEFAULT clause");
+                }
+                match value {
+                    OpenMpDefault::Shared | OpenMpDefault::Private | OpenMpDefault::None => {
+                        default_data_sharing = Some(*value)
+                    }
+                    OpenMpDefault::FirstPrivate => ctx.error(
+                        span,
+                        "OpenMP DEFAULT(FIRSTPRIVATE) clause on PARALLEL is recognized but not yet implemented",
+                    ),
+                }
+            }
             OpenMpClause::Schedule { .. } if combined_do => {}
             OpenMpClause::Collapse(_) if combined_do => {}
             OpenMpClause::Nowait if combined_do => {
@@ -359,9 +429,7 @@ fn validate_parallel_clauses(
     }
     ParallelClauseInfo {
         explicitly_scoped: data_attributes.into_keys().collect(),
-        default_none: clauses
-            .iter()
-            .any(|clause| matches!(clause, OpenMpClause::Default(OpenMpDefault::None))),
+        default_data_sharing,
     }
 }
 
@@ -1451,16 +1519,22 @@ fn validate_data_environment(
             validate_shared_object(ctx, &name, span);
         } else if predetermined_private.contains(&name) {
             validate_private_object(ctx, &name, span, "predetermined PRIVATE");
-        } else if clause_info.default_none {
-            ctx.error(
-                span,
-                format!(
-                    "OpenMP DEFAULT(NONE) variable '{}' must appear in a data-sharing clause",
-                    name
-                ),
-            );
         } else {
-            validate_shared_object(ctx, &name, span);
+            match clause_info.default_data_sharing {
+                Some(OpenMpDefault::Private) => {
+                    validate_private_object(ctx, &name, span, "DEFAULT(PRIVATE)")
+                }
+                Some(OpenMpDefault::None) => ctx.error(
+                    span,
+                    format!(
+                        "OpenMP DEFAULT(NONE) variable '{}' must appear in a data-sharing clause",
+                        name
+                    ),
+                ),
+                Some(OpenMpDefault::Shared) | Some(OpenMpDefault::FirstPrivate) | None => {
+                    validate_shared_object(ctx, &name, span)
+                }
+            }
         }
     }
 }

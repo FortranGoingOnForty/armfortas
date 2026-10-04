@@ -24579,6 +24579,111 @@ fn fopenmp_default_none_rejects_implicit_data() {
 }
 
 #[test]
+fn fopenmp_default_private_scalars_and_combined_do_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_default_private_scalars_and_combined_do_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer, parameter :: base = 40
+  integer, parameter :: offsets(0:3) = [0, 1, 2, 3]
+  integer :: tid, scratch, seed, slots(0:3), i, work(4)
+  tid = -1
+  scratch = -1
+  seed = 2
+  slots = -1
+  i = 77
+  work = -1
+!$omp parallel default(private) num_threads(4) firstprivate(seed) shared(slots)
+  tid = omp_get_thread_num()
+  scratch = base + seed + offsets(tid)
+  seed = seed + 100
+  slots(tid) = scratch + seed
+!$omp end parallel
+  if (tid /= -1 .or. scratch /= -1 .or. seed /= 2) error stop 1
+  if (any(slots /= [144, 145, 146, 147])) error stop 2
+!$omp parallel do default(private) num_threads(4) shared(work)
+  do i = 1, 4
+    scratch = 3 * i
+    work(i) = scratch
+  end do
+!$omp end parallel do
+  if (i /= 77 .or. scratch /= -1) error stop 3
+  if (any(work /= [3, 6, 9, 12])) error stop 4
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_default_private", "bin");
+        let runtime_cache = unique_dir("openmp_default_private_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP DEFAULT(PRIVATE) should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP DEFAULT(PRIVATE) failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_default_private_enforces_data_environment_rules() {
+    let cases = [
+        (
+            "program p\n!$omp parallel default(shared) default(private)\ncontinue\n!$omp end parallel\nend program\n",
+            "duplicate OpenMP default clause",
+        ),
+        (
+            "subroutine s(value)\ninteger :: value\n!$omp parallel default(private)\nvalue=1\n!$omp end parallel\nend subroutine\n",
+            "OpenMP DEFAULT(PRIVATE) dummy argument 'value' is recognized but not yet implemented",
+        ),
+        (
+            "program p\ninteger :: i,total\ntotal=0\n!$omp parallel default(private)\n!$omp do reduction(+:total)\ndo i=1,4\ntotal=total+i\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
+            "OpenMP DO REDUCTION variable 'total' must be shared in the binding PARALLEL region",
+        ),
+    ];
+    for (source, expected) in cases {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &["-fopenmp"]);
+        assert!(
+            !result.status.success(),
+            "invalid OpenMP DEFAULT(PRIVATE) data environment compiled"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(expected), "unexpected diagnostic: {stderr}");
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
 fn fopenmp_shared_module_scalar_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
