@@ -31201,8 +31201,10 @@ pub(super) enum DoLoopBody<'a> {
         inner_addr: ValueId,
         inner_ty: IrType,
         inner_lower: ValueId,
+        inner_upper: ValueId,
         inner_step: ValueId,
         inner_value_addr: ValueId,
+        nonrectangular_flags: Option<i32>,
         statements: &'a [SpannedStmt],
     },
     ConcurrentTail {
@@ -31733,26 +31735,48 @@ fn lower_do_loop_body(b: &mut FuncBuilder, ctx: &mut LowerCtx, body: DoLoopBody<
             inner_addr,
             inner_ty,
             inner_lower,
+            inner_upper,
             inner_step,
             inner_value_addr,
+            nonrectangular_flags,
             statements,
         } => {
             let flat_index = b.load_typed(flat_addr, IrType::Int(IntWidth::I64));
-            let status = b.call(
-                FuncRef::External("afs_omp_collapse2_indices".into()),
-                vec![
-                    flat_index,
-                    outer_count,
-                    inner_count,
-                    outer_lower,
-                    outer_step,
-                    inner_lower,
-                    inner_step,
-                    outer_value_addr,
-                    inner_value_addr,
-                ],
-                IrType::Int(IntWidth::I32),
-            );
+            let status = if let Some(nonrectangular_flags) = nonrectangular_flags {
+                let flags = b.const_i32(nonrectangular_flags);
+                b.call(
+                    FuncRef::External("afs_omp_collapse2_nonrect_indices".into()),
+                    vec![
+                        flat_index,
+                        outer_count,
+                        outer_lower,
+                        outer_step,
+                        inner_lower,
+                        inner_upper,
+                        inner_step,
+                        flags,
+                        outer_value_addr,
+                        inner_value_addr,
+                    ],
+                    IrType::Int(IntWidth::I32),
+                )
+            } else {
+                b.call(
+                    FuncRef::External("afs_omp_collapse2_indices".into()),
+                    vec![
+                        flat_index,
+                        outer_count,
+                        inner_count,
+                        outer_lower,
+                        outer_step,
+                        inner_lower,
+                        inner_step,
+                        outer_value_addr,
+                        inner_value_addr,
+                    ],
+                    IrType::Int(IntWidth::I32),
+                )
+            };
             let zero = b.const_i32(0);
             let invalid = b.icmp(CmpOp::Lt, status, zero);
             let error_bb = b.create_block("omp_collapse_index_invalid");

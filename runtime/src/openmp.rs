@@ -1852,6 +1852,148 @@ pub extern "C" fn afs_omp_collapse2_indices(
     AFS_OMP_SUCCESS
 }
 
+fn nonrect_inner_bounds(
+    outer: i128,
+    fixed_lower: i64,
+    fixed_upper: i64,
+    flags: i32,
+) -> Option<(i128, i128)> {
+    if !(1..=3).contains(&flags) {
+        return None;
+    }
+    let lower = if flags & 1 != 0 {
+        outer
+    } else {
+        i128::from(fixed_lower)
+    };
+    let upper = if flags & 2 != 0 {
+        outer
+    } else {
+        i128::from(fixed_upper)
+    };
+    Some((lower, upper))
+}
+
+/// Compute the logical size of a `collapse(2)` space whose inner lower and/or
+/// upper bound is the outer iteration variable itself.
+///
+/// Bit zero of `flags` selects an outer-dependent lower bound and bit one an
+/// outer-dependent upper bound. The deliberately narrow ABI matches the
+/// compiler's current, diagnosed subset of OpenMP nonrectangular bounds.
+#[no_mangle]
+pub extern "C" fn afs_omp_collapse2_nonrect_shape(
+    outer_lower: i64,
+    outer_upper: i64,
+    outer_step: i64,
+    inner_lower: i64,
+    inner_upper: i64,
+    inner_step: i64,
+    flags: i32,
+    outer_count: *mut i64,
+    total_count: *mut i64,
+) -> i32 {
+    if outer_count.is_null() || total_count.is_null() {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+    unsafe {
+        *outer_count = 0;
+        *total_count = 0;
+    }
+    if outer_step == 0 || inner_step == 0 || !(1..=3).contains(&flags) {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+
+    let outer_iterations = loop_iteration_count(
+        i128::from(outer_lower),
+        i128::from(outer_upper),
+        i128::from(outer_step),
+    );
+    let Ok(outer_iterations_i64) = i64::try_from(outer_iterations) else {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    };
+    let mut total_iterations = 0_i128;
+    let mut outer_index = 0_i128;
+    while outer_index < outer_iterations {
+        let outer = i128::from(outer_lower) + outer_index * i128::from(outer_step);
+        let Some((lower, upper)) = nonrect_inner_bounds(outer, inner_lower, inner_upper, flags)
+        else {
+            return -AFS_OMP_ERROR_INVALID_LOOP;
+        };
+        let inner_iterations = loop_iteration_count(lower, upper, i128::from(inner_step));
+        let Some(next_total) = total_iterations.checked_add(inner_iterations) else {
+            return -AFS_OMP_ERROR_INVALID_LOOP;
+        };
+        total_iterations = next_total;
+        outer_index += 1;
+    }
+    let Ok(total_iterations) = i64::try_from(total_iterations) else {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    };
+
+    unsafe {
+        *outer_count = outer_iterations_i64;
+        *total_count = total_iterations;
+    }
+    AFS_OMP_SUCCESS
+}
+
+/// Reconstruct one logical iteration from the direct-bound nonrectangular
+/// `collapse(2)` space described by `afs_omp_collapse2_nonrect_shape`.
+#[no_mangle]
+pub extern "C" fn afs_omp_collapse2_nonrect_indices(
+    flat_index: i64,
+    outer_count: i64,
+    outer_lower: i64,
+    outer_step: i64,
+    inner_lower: i64,
+    inner_upper: i64,
+    inner_step: i64,
+    flags: i32,
+    outer_value: *mut i64,
+    inner_value: *mut i64,
+) -> i32 {
+    if outer_value.is_null() || inner_value.is_null() {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+    unsafe {
+        *outer_value = 0;
+        *inner_value = 0;
+    }
+    if flat_index < 0
+        || outer_count <= 0
+        || outer_step == 0
+        || inner_step == 0
+        || !(1..=3).contains(&flags)
+    {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    }
+
+    let mut remaining = i128::from(flat_index);
+    let mut outer_index = 0_i128;
+    while outer_index < i128::from(outer_count) {
+        let outer = i128::from(outer_lower) + outer_index * i128::from(outer_step);
+        let Some((lower, upper)) = nonrect_inner_bounds(outer, inner_lower, inner_upper, flags)
+        else {
+            return -AFS_OMP_ERROR_INVALID_LOOP;
+        };
+        let inner_iterations = loop_iteration_count(lower, upper, i128::from(inner_step));
+        if remaining < inner_iterations {
+            let inner = lower + remaining * i128::from(inner_step);
+            let (Ok(outer), Ok(inner)) = (i64::try_from(outer), i64::try_from(inner)) else {
+                return -AFS_OMP_ERROR_INVALID_LOOP;
+            };
+            unsafe {
+                *outer_value = outer;
+                *inner_value = inner;
+            }
+            return AFS_OMP_SUCCESS;
+        }
+        remaining -= inner_iterations;
+        outer_index += 1;
+    }
+    -AFS_OMP_ERROR_INVALID_LOOP
+}
+
 fn loop_iteration_count(lower: i128, upper: i128, step: i128) -> i128 {
     if step > 0 {
         if lower > upper {
@@ -3207,6 +3349,104 @@ mod tests {
         );
         assert_eq!(
             collapse2_indices(6, (3, 2), (1, 1), (1, 1)),
+            Err(-AFS_OMP_ERROR_INVALID_LOOP)
+        );
+    }
+
+    fn nonrect_shape(
+        outer: (i64, i64, i64),
+        inner: (i64, i64, i64),
+        flags: i32,
+    ) -> Result<(i64, i64), i32> {
+        let mut outer_count = -1;
+        let mut total_count = -1;
+        let status = afs_omp_collapse2_nonrect_shape(
+            outer.0,
+            outer.1,
+            outer.2,
+            inner.0,
+            inner.1,
+            inner.2,
+            flags,
+            &mut outer_count,
+            &mut total_count,
+        );
+        if status == AFS_OMP_SUCCESS {
+            Ok((outer_count, total_count))
+        } else {
+            Err(status)
+        }
+    }
+
+    fn nonrect_indices(
+        flat_index: i64,
+        outer_count: i64,
+        outer: (i64, i64),
+        inner: (i64, i64, i64),
+        flags: i32,
+    ) -> Result<(i64, i64), i32> {
+        let mut outer_value = -1;
+        let mut inner_value = -1;
+        let status = afs_omp_collapse2_nonrect_indices(
+            flat_index,
+            outer_count,
+            outer.0,
+            outer.1,
+            inner.0,
+            inner.1,
+            inner.2,
+            flags,
+            &mut outer_value,
+            &mut inner_value,
+        );
+        if status == AFS_OMP_SUCCESS {
+            Ok((outer_value, inner_value))
+        } else {
+            Err(status)
+        }
+    }
+
+    #[test]
+    fn collapse2_nonrect_direct_bounds_preserve_sequential_iteration_order() {
+        assert_eq!(nonrect_shape((1, 4, 1), (0, 4, 1), 1), Ok((4, 10)));
+        assert_eq!(nonrect_indices(0, 4, (1, 1), (0, 4, 1), 1), Ok((1, 1)));
+        assert_eq!(nonrect_indices(3, 4, (1, 1), (0, 4, 1), 1), Ok((1, 4)));
+        assert_eq!(nonrect_indices(4, 4, (1, 1), (0, 4, 1), 1), Ok((2, 2)));
+        assert_eq!(nonrect_indices(9, 4, (1, 1), (0, 4, 1), 1), Ok((4, 4)));
+
+        assert_eq!(nonrect_shape((4, 0, -2), (4, 0, -2), 2), Ok((3, 6)));
+        assert_eq!(nonrect_indices(0, 3, (4, -2), (4, 0, -2), 2), Ok((4, 4)));
+        assert_eq!(nonrect_indices(1, 3, (4, -2), (4, 0, -2), 2), Ok((2, 4)));
+        assert_eq!(nonrect_indices(5, 3, (4, -2), (4, 0, -2), 2), Ok((0, 0)));
+
+        assert_eq!(nonrect_shape((1, 4, 1), (0, 2, 1), 1), Ok((4, 3)));
+        assert_eq!(
+            nonrect_indices(3, 4, (1, 1), (0, 2, 1), 1),
+            Err(-AFS_OMP_ERROR_INVALID_LOOP)
+        );
+        assert_eq!(nonrect_shape((1, 3, 1), (0, 0, -7), 3), Ok((3, 3)));
+    }
+
+    #[test]
+    fn collapse2_nonrect_rejects_invalid_shapes_and_indices() {
+        assert_eq!(
+            nonrect_shape((1, 4, 1), (1, 4, 1), 0),
+            Err(-AFS_OMP_ERROR_INVALID_LOOP)
+        );
+        assert_eq!(
+            nonrect_shape((1, 4, 0), (1, 4, 1), 1),
+            Err(-AFS_OMP_ERROR_INVALID_LOOP)
+        );
+        assert_eq!(
+            nonrect_shape((1, 4, 1), (1, 4, 0), 1),
+            Err(-AFS_OMP_ERROR_INVALID_LOOP)
+        );
+        assert_eq!(
+            nonrect_indices(-1, 4, (1, 1), (0, 4, 1), 1),
+            Err(-AFS_OMP_ERROR_INVALID_LOOP)
+        );
+        assert_eq!(
+            nonrect_indices(0, 0, (1, 1), (0, 4, 1), 1),
             Err(-AFS_OMP_ERROR_INVALID_LOOP)
         );
     }

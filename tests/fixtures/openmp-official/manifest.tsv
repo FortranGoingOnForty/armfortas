@@ -1,4 +1,5 @@
 id	upstream_path	local_source	source_form	operation	upstream_expect	version	coverage	armfortas_state
+collapse.4	parallel_execution/sources/collapse.4.f90	parallel_execution/collapse.4.f90	free	compile	success	omp_5.0	parallel-do,collapse(2),nonrectangular-direct-bound,private	pass
 get_nthrs.2	parallel_execution/sources/get_nthrs.2.f	parallel_execution/get_nthrs.2.f	fixed	compile	success	pre_omp_3.0	parallel,private,omp_get_thread_num	pass
 nowait.1	parallel_execution/sources/nowait.1.f	parallel_execution/nowait.1.f	fixed	compile	success	pre_omp_3.0	parallel,do,nowait	pass
 nowait.2	parallel_execution/sources/nowait.2.f90	parallel_execution/nowait.2.f90	free	compile	success	pre_omp_3.0	parallel,do,schedule(static),nowait	pass

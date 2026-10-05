@@ -21277,6 +21277,109 @@ end program
 }
 
 #[test]
+fn fopenmp_nonrectangular_collapse_two_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_nonrectangular_collapse_two_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: i, j, tid
+  integer :: upper(4,4), owners(4,4), descending(0:4,0:4), diagonal(-2:2)
+  i = -91
+  j = -92
+  upper = 0
+  owners = -1
+!$omp parallel do collapse(2) num_threads(3) schedule(static,2) &
+!$omp& shared(upper,owners) private(i,j,tid)
+  do i = 1, 4
+    do j = i, 4
+      tid = omp_get_thread_num()
+      upper(i,j) = upper(i,j) + 1
+      owners(i,j) = tid
+    end do
+  end do
+!$omp end parallel do
+  if (i /= -91 .or. j /= -92) error stop 1
+  if (sum(upper) /= 10) error stop 2
+  do i = 1, 4
+    do j = 1, 4
+      if (upper(i,j) /= merge(1,0,j >= i)) error stop 3
+    end do
+  end do
+  if (owners(1,1) /= 0 .or. owners(1,2) /= 0) error stop 4
+  if (owners(1,3) /= 1 .or. owners(1,4) /= 1) error stop 5
+  if (owners(2,2) /= 2 .or. owners(2,3) /= 2) error stop 6
+  if (owners(2,4) /= 0 .or. owners(3,3) /= 0) error stop 7
+  if (owners(3,4) /= 1 .or. owners(4,4) /= 1) error stop 8
+
+  descending = 0
+!$omp parallel do collapse(2) num_threads(4) schedule(dynamic,2) shared(descending) private(i,j)
+  do i = 4, 0, -2
+    do j = 4, i, -2
+      descending(i,j) = descending(i,j) + 1
+    end do
+  end do
+!$omp end parallel do
+  if (sum(descending) /= 6) error stop 9
+  if (descending(4,4) /= 1) error stop 10
+  if (descending(2,4) /= 1 .or. descending(2,2) /= 1) error stop 11
+  if (descending(0,4) /= 1 .or. descending(0,2) /= 1 .or. descending(0,0) /= 1) error stop 12
+
+  diagonal = 0
+!$omp parallel do collapse(2) num_threads(2) shared(diagonal) private(i,j)
+  do i = -2, 2, 2
+    do j = i, i, -7
+      diagonal(i) = diagonal(i) + 1
+    end do
+  end do
+!$omp end parallel do
+  if (sum(diagonal) /= 3) error stop 13
+  if (diagonal(-2) /= 1 .or. diagonal(0) /= 1 .or. diagonal(2) /= 1) error stop 14
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_nonrectangular_collapse_two", "bin");
+        let runtime_cache = unique_dir("openmp_nonrectangular_collapse_two_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP nonrectangular COLLAPSE(2) should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP nonrectangular COLLAPSE(2) failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_scalar_integer_and_logical_reductions_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -22689,8 +22792,16 @@ fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
             "OpenMP COLLAPSE(2) requires a perfectly nested second counted DO loop",
         ),
         (
-            "program p\ninteger :: i,j\n!$omp parallel do collapse(2)\ndo i=1,4\ndo j=1,i\nend do\nend do\n!$omp end parallel do\nend program\n",
-            "OpenMP COLLAPSE(2) currently requires a rectangular loop nest",
+            "program p\ninteger :: i,j\n!$omp parallel do collapse(2)\ndo i=1,4\ndo j=1,2*i\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP nonrectangular COLLAPSE(2) bounds currently support only a direct reference to the outer iteration variable",
+        ),
+        (
+            "program p\ninteger(kind=8) :: i\ninteger :: j\n!$omp parallel do collapse(2)\ndo i=1,4\ndo j=i,4\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP nonrectangular COLLAPSE(2) iteration variables must have the same INTEGER kind",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do collapse(2) lastprivate(i)\ndo i=1,4\ndo j=i,4\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP LASTPRIVATE on a nonrectangular COLLAPSE(2) loop is recognized but not yet implemented",
         ),
         (
             "program p\ninteger :: i,j\n!$omp parallel do collapse(2) shared(j)\ndo i=1,4\ndo j=1,4\nend do\nend do\n!$omp end parallel do\nend program\n",

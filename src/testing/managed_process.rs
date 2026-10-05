@@ -934,12 +934,12 @@ mod tests {
     #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
     #[test]
     fn managed_command_preserves_nonzero_exit_status() {
-        let output = run_with_limits(
-            Command::new("/bin/sh").args(["-c", "exit 7"]),
-            short_limits(1024),
-            None,
-        )
-        .unwrap();
+        let limits = CommandLimits {
+            timeout: Duration::from_secs(2),
+            ..short_limits(1024)
+        };
+        let output =
+            run_with_limits(Command::new("/bin/sh").args(["-c", "exit 7"]), limits, None).unwrap();
 
         assert_eq!(output.status.code(), Some(7));
     }
