@@ -1439,9 +1439,11 @@ struct CollapsedLoopSource<'a> {
     outer_lower: ValueId,
     outer_step: ValueId,
     inner_lower: ValueId,
+    inner_upper: ValueId,
     inner_step: ValueId,
     outer_count: ValueId,
     inner_count: ValueId,
+    nonrectangular_flags: Option<i32>,
 }
 
 fn worksharing_collapse_depth(ctx: &LowerCtx<'_>, clauses: &[OpenMpClause]) -> i64 {
@@ -1459,6 +1461,13 @@ fn worksharing_collapse_depth(ctx: &LowerCtx<'_>, clauses: &[OpenMpClause]) -> i
             _ => None,
         })
         .unwrap_or(1)
+}
+
+fn collapse_bound_is_outer_variable(expr: &crate::ast::expr::SpannedExpr, outer: &str) -> bool {
+    matches!(
+        &expr.node,
+        Expr::Name { name } if name.eq_ignore_ascii_case(outer)
+    )
 }
 
 fn privatize_worksharing_variable(
@@ -1667,10 +1676,22 @@ fn lower_worksharing_loop(
         else {
             unreachable!("non-canonical COLLAPSE(2) loop passed semantic validation")
         };
-        let inner_lower_raw = super::expr::lower_expr_ctx(b, ctx, inner_start);
-        let inner_lower = coerce_to_type(b, inner_lower_raw, &i64_ty);
-        let inner_upper_raw = super::expr::lower_expr_ctx(b, ctx, inner_end);
-        let inner_upper = coerce_to_type(b, inner_upper_raw, &i64_ty);
+        let lower_depends_on_outer = collapse_bound_is_outer_variable(inner_start, var);
+        let upper_depends_on_outer = collapse_bound_is_outer_variable(inner_end, var);
+        let nonrectangular_flags =
+            i32::from(lower_depends_on_outer) | (i32::from(upper_depends_on_outer) << 1);
+        let inner_lower = if lower_depends_on_outer {
+            b.const_i64(0)
+        } else {
+            let raw = super::expr::lower_expr_ctx(b, ctx, inner_start);
+            coerce_to_type(b, raw, &i64_ty)
+        };
+        let inner_upper = if upper_depends_on_outer {
+            b.const_i64(0)
+        } else {
+            let raw = super::expr::lower_expr_ctx(b, ctx, inner_end);
+            coerce_to_type(b, raw, &i64_ty)
+        };
         let inner_step = if let Some(inner_step) = inner_step {
             let raw = super::expr::lower_expr_ctx(b, ctx, inner_step);
             coerce_to_type(b, raw, &i64_ty)
@@ -1681,21 +1702,42 @@ fn lower_worksharing_loop(
         let outer_count_addr = b.alloca(i64_ty.clone());
         let inner_count_addr = b.alloca(i64_ty.clone());
         let total_count_addr = b.alloca(i64_ty.clone());
-        shape_status = Some(b.call(
-            FuncRef::External("afs_omp_collapse2_shape".into()),
-            vec![
-                outer_lower,
-                outer_upper,
-                outer_step,
-                inner_lower,
-                inner_upper,
-                inner_step,
-                outer_count_addr,
-                inner_count_addr,
-                total_count_addr,
-            ],
-            IrType::Int(IntWidth::I32),
-        ));
+        shape_status = Some(if nonrectangular_flags == 0 {
+            b.call(
+                FuncRef::External("afs_omp_collapse2_shape".into()),
+                vec![
+                    outer_lower,
+                    outer_upper,
+                    outer_step,
+                    inner_lower,
+                    inner_upper,
+                    inner_step,
+                    outer_count_addr,
+                    inner_count_addr,
+                    total_count_addr,
+                ],
+                IrType::Int(IntWidth::I32),
+            )
+        } else {
+            let zero = b.const_i64(0);
+            b.store(zero, inner_count_addr);
+            let flags = b.const_i32(nonrectangular_flags);
+            b.call(
+                FuncRef::External("afs_omp_collapse2_nonrect_shape".into()),
+                vec![
+                    outer_lower,
+                    outer_upper,
+                    outer_step,
+                    inner_lower,
+                    inner_upper,
+                    inner_step,
+                    flags,
+                    outer_count_addr,
+                    total_count_addr,
+                ],
+                IrType::Int(IntWidth::I32),
+            )
+        });
         let outer_count = b.load_typed(outer_count_addr, i64_ty.clone());
         let inner_count = b.load_typed(inner_count_addr, i64_ty.clone());
         let total_count = b.load_typed(total_count_addr, i64_ty.clone());
@@ -1710,9 +1752,11 @@ fn lower_worksharing_loop(
             outer_lower,
             outer_step,
             inner_lower,
+            inner_upper,
             inner_step,
             outer_count,
             inner_count,
+            nonrectangular_flags: (nonrectangular_flags != 0).then_some(nonrectangular_flags),
         }
     });
     let reductions = prepare_reductions(b, ctx, clauses);
@@ -1920,8 +1964,10 @@ fn lower_worksharing_loop(
             inner_addr: inner.addr,
             inner_ty: inner.ty.clone(),
             inner_lower: collapsed.inner_lower,
+            inner_upper: collapsed.inner_upper,
             inner_step: collapsed.inner_step,
             inner_value_addr,
+            nonrectangular_flags: collapsed.nonrectangular_flags,
             statements: collapsed.inner_body,
         }
     } else {

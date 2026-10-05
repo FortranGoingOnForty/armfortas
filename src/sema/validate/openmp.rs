@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::expr::SectionSubscript;
+use crate::ast::expr::{Expr, SectionSubscript};
 use crate::ast::openmp::{
     OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionItem, OpenMpReductionOperator,
     OpenMpScheduleKind,
@@ -568,6 +568,21 @@ fn expression_references_name(expr: &crate::ast::expr::SpannedExpr, name: &str) 
         .any(|reference| reference.name == key)
 }
 
+fn expression_is_name(expr: &crate::ast::expr::SpannedExpr, name: &str) -> bool {
+    matches!(
+        &expr.node,
+        Expr::Name { name: candidate } if candidate.eq_ignore_ascii_case(name)
+    )
+}
+
+fn integer_variable_kind(ctx: &Ctx<'_>, name: &str) -> Option<u8> {
+    let symbol = ctx.lookup_lexical(name)?;
+    let TypeInfo::Integer { kind } = symbol.type_info.as_ref()? else {
+        return None;
+    };
+    Some(kind.unwrap_or(crate::driver::defaults::default_int_kind()))
+}
+
 fn validate_worksharing_loop(
     ctx: &mut Ctx<'_>,
     span: Span,
@@ -604,20 +619,46 @@ fn validate_worksharing_loop(
                 "OpenMP COLLAPSE(2) associated loops must use distinct iteration variables",
             );
         }
-        for expr in [
-            Some(inner_loop.start),
-            Some(inner_loop.end),
-            inner_loop.step,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if expression_references_name(expr, outer_loop.var) {
+        let lower_depends_on_outer = expression_references_name(inner_loop.start, outer_loop.var);
+        let upper_depends_on_outer = expression_references_name(inner_loop.end, outer_loop.var);
+        for bound in [inner_loop.start, inner_loop.end] {
+            if expression_references_name(bound, outer_loop.var)
+                && !expression_is_name(bound, outer_loop.var)
+            {
                 ctx.error(
-                    expr.span,
-                    "OpenMP COLLAPSE(2) currently requires a rectangular loop nest",
+                    bound.span,
+                    "OpenMP nonrectangular COLLAPSE(2) bounds currently support only a direct reference to the outer iteration variable",
                 );
             }
+        }
+        if inner_loop
+            .step
+            .is_some_and(|step| expression_references_name(step, outer_loop.var))
+        {
+            ctx.error(
+                inner_loop.step.expect("checked OpenMP loop increment").span,
+                "OpenMP COLLAPSE(2) inner increment may not reference the outer iteration variable",
+            );
+        }
+        let nonrectangular = lower_depends_on_outer || upper_depends_on_outer;
+        if nonrectangular
+            && integer_variable_kind(ctx, outer_loop.var)
+                != integer_variable_kind(ctx, inner_loop.var)
+        {
+            ctx.error(
+                inner_stmt.span,
+                "OpenMP nonrectangular COLLAPSE(2) iteration variables must have the same INTEGER kind",
+            );
+        }
+        if nonrectangular
+            && clauses
+                .iter()
+                .any(|clause| matches!(clause, OpenMpClause::LastPrivate { .. }))
+        {
+            ctx.error(
+                span,
+                "OpenMP LASTPRIVATE on a nonrectangular COLLAPSE(2) loop is recognized but not yet implemented",
+            );
         }
         associated_loop_keys.insert(inner_loop.var.to_ascii_lowercase());
     }
