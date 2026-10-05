@@ -6069,8 +6069,8 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             }
             if let Some(body) = construct.region_body() {
                 let parallel_private_frame = match construct {
-                    crate::ast::openmp::OpenMpConstruct::Parallel { clauses, .. } => {
-                        Some(super::openmp::parallel_private_names(clauses))
+                    crate::ast::openmp::OpenMpConstruct::Parallel { clauses, body, .. } => {
+                        Some(super::openmp::parallel_private_names(ctx, clauses, body))
                     }
                     _ => None,
                 };

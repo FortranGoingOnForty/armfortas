@@ -22927,6 +22927,86 @@ fn fopenmp_outlines_capture_free_parallel_regions() {
 }
 
 #[test]
+fn fopenmp_captured_assumed_size_forwarding_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_captured_assumed_size_forwarding_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  real :: values(4)
+  character(len=3) :: words(2)
+  values = 0.0
+  words = 'no'
+  call forward_numeric(values)
+  call forward_character(words)
+  if (values(4) /= 77.0) error stop 1
+  if (words(2) /= 'yes') error stop 2
+  print *, 'ok'
+contains
+  subroutine forward_numeric(items)
+    real, intent(inout) :: items(*)
+!$omp parallel if(.false.) shared(items)
+    call store_numeric(items, 4)
+!$omp end parallel
+  end subroutine
+  subroutine store_numeric(items, index)
+    real, intent(inout) :: items(*)
+    integer, intent(in) :: index
+    items(index) = 77.0
+  end subroutine
+  subroutine forward_character(items)
+    character(len=3), intent(inout) :: items(*)
+!$omp parallel if(.false.) shared(items)
+    call store_character(items)
+!$omp end parallel
+  end subroutine
+  subroutine store_character(items)
+    character(len=3), intent(inout) :: items(*)
+    items(2) = 'yes'
+  end subroutine
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_assumed_size_forward", "bin");
+        let runtime_cache = unique_dir("openmp_assumed_size_forward_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "captured assumed-size forwarding should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "captured assumed-size forwarding failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_outlined_parallel_emits_x86_64_elf_object() {
     let src = write_program(
         "program p\n  implicit none\n  integer :: shared_value, seed, scratch, values(-1:0,0:1), descriptor_values(2)\n  integer :: private_values(-1:0), first_values(2)\n  integer, allocatable :: owned(:), private_owned(:), first_owned(:), empty_owned(:)\n  shared_value = 1\n  seed = 40\n  values = 0\n  descriptor_values = 0\n  private_values = -1\n  first_values = 40\n  allocate(owned(-1:0), private_owned(-1:0), first_owned(-1:0))\n  owned = 0\n  private_owned = -1\n  first_owned = 40\n!$omp parallel if(.false.) default(none) shared(shared_value, values, owned) &\n!$omp& firstprivate(seed, first_values, first_owned, empty_owned) &\n!$omp& private(scratch, private_values, private_owned)\n  scratch = seed + 2\n  private_values = first_values + 2\n  if (.not. allocated(private_owned) .or. .not. allocated(first_owned)) error stop 3\n  if (allocated(empty_owned)) error stop 4\n  if (lbound(private_owned, 1) /= -1 .or. ubound(private_owned, 1) /= 0) error stop 5\n  if (any(first_owned /= 40)) error stop 6\n  private_owned = 42\n  first_owned = first_owned + 2\n  shared_value = scratch + private_values(-1) - 42\n  values(-1,0) = private_values(0) + private_owned(-1) - first_owned(1)\n  owned(-1) = 42\n!$omp end parallel\n  call touch_descriptor(descriptor_values)\n  if (shared_value /= 42 .or. seed /= 40 .or. values(-1,0) /= 42 .or. descriptor_values(1) /= 42 .or. owned(-1) /= 42) error stop 7\n  if (any(private_values /= -1) .or. any(first_values /= 40)) error stop 8\n  if (any(private_owned /= -1) .or. any(first_owned /= 40) .or. allocated(empty_owned)) error stop 9\ncontains\n  subroutine touch_descriptor(items)\n    integer, intent(inout) :: items(:)\n!$omp parallel if(.false.) default(none) shared(items)\n    items(1) = 42\n!$omp end parallel\n  end subroutine\nend program\n",
@@ -24496,6 +24576,111 @@ fn fopenmp_default_none_rejects_implicit_data() {
         "explicitly shared data was rejected: {stderr}"
     );
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_default_private_scalars_and_combined_do_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_default_private_scalars_and_combined_do_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer, parameter :: base = 40
+  integer, parameter :: offsets(0:3) = [0, 1, 2, 3]
+  integer :: tid, scratch, seed, slots(0:3), i, work(4)
+  tid = -1
+  scratch = -1
+  seed = 2
+  slots = -1
+  i = 77
+  work = -1
+!$omp parallel default(private) num_threads(4) firstprivate(seed) shared(slots)
+  tid = omp_get_thread_num()
+  scratch = base + seed + offsets(tid)
+  seed = seed + 100
+  slots(tid) = scratch + seed
+!$omp end parallel
+  if (tid /= -1 .or. scratch /= -1 .or. seed /= 2) error stop 1
+  if (any(slots /= [144, 145, 146, 147])) error stop 2
+!$omp parallel do default(private) num_threads(4) shared(work)
+  do i = 1, 4
+    scratch = 3 * i
+    work(i) = scratch
+  end do
+!$omp end parallel do
+  if (i /= 77 .or. scratch /= -1) error stop 3
+  if (any(work /= [3, 6, 9, 12])) error stop 4
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_default_private", "bin");
+        let runtime_cache = unique_dir("openmp_default_private_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP DEFAULT(PRIVATE) should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP DEFAULT(PRIVATE) failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_default_private_enforces_data_environment_rules() {
+    let cases = [
+        (
+            "program p\n!$omp parallel default(shared) default(private)\ncontinue\n!$omp end parallel\nend program\n",
+            "duplicate OpenMP default clause",
+        ),
+        (
+            "subroutine s(value)\ninteger :: value\n!$omp parallel default(private)\nvalue=1\n!$omp end parallel\nend subroutine\n",
+            "OpenMP DEFAULT(PRIVATE) dummy argument 'value' is recognized but not yet implemented",
+        ),
+        (
+            "program p\ninteger :: i,total\ntotal=0\n!$omp parallel default(private)\n!$omp do reduction(+:total)\ndo i=1,4\ntotal=total+i\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
+            "OpenMP DO REDUCTION variable 'total' must be shared in the binding PARALLEL region",
+        ),
+    ];
+    for (source, expected) in cases {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &["-fopenmp"]);
+        assert!(
+            !result.status.success(),
+            "invalid OpenMP DEFAULT(PRIVATE) data environment compiled"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(expected), "unexpected diagnostic: {stderr}");
+        let _ = std::fs::remove_file(&src);
+    }
 }
 
 #[test]

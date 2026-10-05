@@ -17,7 +17,8 @@
 
 use crate::ast::expr::{Expr, SectionSubscript};
 use crate::ast::openmp::{
-    OpenMpClause, OpenMpConstruct, OpenMpReductionItem, OpenMpReductionOperator, OpenMpScheduleKind,
+    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionItem, OpenMpReductionOperator,
+    OpenMpScheduleKind,
 };
 use crate::ast::stmt::{SpannedStmt, Stmt};
 use crate::ast::Spanned;
@@ -665,6 +666,9 @@ fn lower_parallel_region(
         .flatten()
         .map(|name| name.to_ascii_lowercase())
         .collect();
+    let default_private = clauses
+        .iter()
+        .any(|clause| matches!(clause, OpenMpClause::Default(OpenMpDefault::Private)));
     let lastprivate_names: std::collections::HashSet<_> = clauses
         .iter()
         .filter_map(|clause| match clause {
@@ -702,15 +706,27 @@ fn lower_parallel_region(
                 let info = ctx.locals.get(&name).cloned().unwrap_or_else(|| {
                     panic!("validated OpenMP shared capture '{name}' has no lowering binding")
                 });
+                let predetermined_shared = ctx
+                    .st
+                    .lookup_local_then_any(ctx.proc_scope_id, &name)
+                    .is_some_and(|symbol| {
+                        symbol.kind == crate::sema::symtab::SymbolKind::Parameter
+                            || symbol.attrs.array_spec.iter().any(|spec| {
+                                matches!(spec, crate::ast::decl::ArraySpec::AssumedSize { .. })
+                            })
+                    });
                 let kind = if firstprivate_names.contains(&name) {
                     CaptureKind::FirstPrivate
                 } else if private_names.contains(&name) || lastprivate_names.contains(&name) {
                     CaptureKind::Private
                 } else if info.inline_const.is_some() {
                     CaptureKind::InlineConstant
-                } else if shared_names.contains(&name) || standalone_lastprivate.contains(&name) {
+                } else if shared_names.contains(&name)
+                    || standalone_lastprivate.contains(&name)
+                    || predetermined_shared
+                {
                     CaptureKind::Shared
-                } else if predetermined_private.contains(&name) {
+                } else if predetermined_private.contains(&name) || default_private {
                     CaptureKind::Private
                 } else {
                     CaptureKind::Shared
