@@ -1608,9 +1608,25 @@ fn lower_worksharing_loop(
     else {
         unreachable!("non-canonical OpenMP DO passed semantic validation")
     };
-    let (thread_num, team_size) = ctx
-        .openmp_team
-        .expect("OpenMP DO lowered outside an outlined team callback");
+    let (thread_num, team_size) = if let Some(team) = ctx.openmp_team {
+        team
+    } else {
+        // An orphaned worksharing construct binds to the current team at
+        // execution time. The runtime queries also describe the implicit
+        // initial team as thread zero of a one-thread team.
+        (
+            b.call(
+                FuncRef::External("afs_omp_get_thread_num".into()),
+                vec![],
+                IrType::Int(IntWidth::I32),
+            ),
+            b.call(
+                FuncRef::External("afs_omp_get_num_threads".into()),
+                vec![],
+                IrType::Int(IntWidth::I32),
+            ),
+        )
+    };
     let nowait = clauses
         .iter()
         .any(|clause| matches!(clause, OpenMpClause::Nowait));

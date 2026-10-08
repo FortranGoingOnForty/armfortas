@@ -151,8 +151,9 @@ pub(super) struct Ctx<'a> {
     /// Full `-fopenmp` compilation is enabled. SIMD-only mode deliberately
     /// leaves this false so threaded constructs cannot cross into lowering.
     pub(super) openmp_full: bool,
-    /// Number of lexically enclosing OpenMP parallel regions. Worksharing DO
-    /// constructs bind to the innermost such team and are invalid without it.
+    /// Number of lexically enclosing OpenMP parallel regions. Orphaned
+    /// worksharing constructs bind dynamically, so this tracks only the data
+    /// environment that semantic validation can prove from the source tree.
     pub(super) openmp_parallel_depth: usize,
     /// Explicitly private data-sharing attributes on each enclosing OpenMP
     /// PARALLEL region. LASTPRIVATE on a bound worksharing loop may not name
