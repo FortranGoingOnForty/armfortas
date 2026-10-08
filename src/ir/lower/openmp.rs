@@ -545,10 +545,10 @@ pub(super) fn lower_construct(
             lower_parallel_region(b, ctx, clauses, body, ParallelRegionBody::Statements(body));
         }
         OpenMpConstruct::Do { clauses, loop_stmt } => {
-            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, None, None);
+            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, false, None, None);
         }
         OpenMpConstruct::Loop { clauses, loop_stmt } => {
-            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, None, None);
+            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, false, None, None);
         }
         OpenMpConstruct::ParallelDo { clauses, loop_stmt } => {
             let capture_body = std::slice::from_ref(loop_stmt.as_ref());
@@ -897,6 +897,7 @@ fn lower_parallel_region(
                         &mut outlined_ctx,
                         clauses,
                         loop_stmt,
+                        true,
                         true,
                         outlined_worksharing_chunk,
                         Some(&cleanup.lastprivate_originals),
@@ -1623,6 +1624,7 @@ fn lower_worksharing_loop(
     clauses: &[OpenMpClause],
     loop_stmt: &SpannedStmt,
     suppress_barrier: bool,
+    clauses_materialized_by_parallel: bool,
     precomputed_chunk: Option<ValueId>,
     captured_lastprivate_originals: Option<&std::collections::HashMap<String, LocalInfo>>,
 ) {
@@ -1858,13 +1860,17 @@ fn lower_worksharing_loop(
     let private_inner = collapsed
         .as_ref()
         .map(|collapsed| privatize_worksharing_variable(b, ctx, collapsed.inner_var));
-    let clause_private_bindings = privatize_worksharing_clause_variables(
-        b,
-        ctx,
-        clauses,
-        &outer_key,
-        private_inner.as_ref().map(|(key, _, _)| key.as_str()),
-    );
+    let clause_private_bindings = if clauses_materialized_by_parallel {
+        Vec::new()
+    } else {
+        privatize_worksharing_clause_variables(
+            b,
+            ctx,
+            clauses,
+            &outer_key,
+            private_inner.as_ref().map(|(key, _, _)| key.as_str()),
+        )
+    };
     let collapsed_value_addrs = collapsed.as_ref().map(|_| {
         (
             b.alloca(IrType::Int(IntWidth::I64)),
