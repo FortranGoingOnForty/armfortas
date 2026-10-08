@@ -16,10 +16,12 @@ use crate::lexer::{Lexer, Span, TokenKind};
 enum OpenMpHeader {
     Parallel(Vec<OpenMpClause>),
     Do(Vec<OpenMpClause>),
+    Loop(Vec<OpenMpClause>),
     ParallelDo(Vec<OpenMpClause>),
     Critical(Option<String>),
     EndParallel,
     EndDo { nowait: bool },
+    EndLoop,
     EndParallelDo { nowait: bool },
     EndCritical(Option<String>),
 }
@@ -28,6 +30,7 @@ enum OpenMpHeader {
 enum BeginKind {
     Parallel,
     Do,
+    Loop,
     ParallelDo,
 }
 
@@ -37,7 +40,7 @@ impl<'a> Parser<'a> {
         directive.kind == TokenKind::OmpDirective
             && matches!(
                 parse_openmp_header(&directive.text, directive.span),
-                Ok(OpenMpHeader::Do(_) | OpenMpHeader::ParallelDo(_))
+                Ok(OpenMpHeader::Do(_) | OpenMpHeader::Loop(_) | OpenMpHeader::ParallelDo(_))
             )
     }
 
@@ -58,7 +61,7 @@ impl<'a> Parser<'a> {
                 let loop_stmt = self.parse_openmp_controlled_loop("do")?;
                 let mut end_span = loop_stmt.span;
                 self.skip_newlines();
-                if let Some((span, nowait)) = self.consume_openmp_loop_end(false)? {
+                if let Some((span, nowait)) = self.consume_openmp_loop_end(BeginKind::Do)? {
                     end_span = span;
                     if nowait {
                         clauses.push(OpenMpClause::Nowait);
@@ -72,12 +75,28 @@ impl<'a> Parser<'a> {
                     span_through(directive.span, end_span),
                 ))
             }
+            OpenMpHeader::Loop(clauses) => {
+                self.skip_newlines();
+                let loop_stmt = self.parse_openmp_controlled_loop("loop")?;
+                let mut end_span = loop_stmt.span;
+                self.skip_newlines();
+                if let Some((span, _)) = self.consume_openmp_loop_end(BeginKind::Loop)? {
+                    end_span = span;
+                }
+                Ok(Spanned::new(
+                    Stmt::OpenMp(OpenMpConstruct::Loop {
+                        clauses,
+                        loop_stmt: Box::new(loop_stmt),
+                    }),
+                    span_through(directive.span, end_span),
+                ))
+            }
             OpenMpHeader::ParallelDo(mut clauses) => {
                 self.skip_newlines();
                 let loop_stmt = self.parse_openmp_controlled_loop("parallel do")?;
                 let mut end_span = loop_stmt.span;
                 self.skip_newlines();
-                if let Some((span, nowait)) = self.consume_openmp_loop_end(true)? {
+                if let Some((span, nowait)) = self.consume_openmp_loop_end(BeginKind::ParallelDo)? {
                     end_span = span;
                     if nowait {
                         clauses.push(OpenMpClause::Nowait);
@@ -101,6 +120,7 @@ impl<'a> Parser<'a> {
             }
             OpenMpHeader::EndParallel
             | OpenMpHeader::EndDo { .. }
+            | OpenMpHeader::EndLoop
             | OpenMpHeader::EndParallelDo { .. }
             | OpenMpHeader::EndCritical(_) => Err(ParseError {
                 span: directive.span,
@@ -125,16 +145,19 @@ impl<'a> Parser<'a> {
 
     fn consume_openmp_loop_end(
         &mut self,
-        combined_parallel: bool,
+        begin: BeginKind,
     ) -> Result<Option<(Span, bool)>, ParseError> {
         if self.peek() != &TokenKind::OmpDirective {
             return Ok(None);
         }
         let directive = self.current().clone();
         let header = parse_openmp_header(&directive.text, directive.span)?;
-        let result = match (combined_parallel, header) {
-            (false, OpenMpHeader::EndDo { nowait })
-            | (true, OpenMpHeader::EndParallelDo { nowait }) => Some((directive.span, nowait)),
+        let result = match (begin, header) {
+            (BeginKind::Do, OpenMpHeader::EndDo { nowait })
+            | (BeginKind::ParallelDo, OpenMpHeader::EndParallelDo { nowait }) => {
+                Some((directive.span, nowait))
+            }
+            (BeginKind::Loop, OpenMpHeader::EndLoop) => Some((directive.span, false)),
             _ => return Ok(None),
         };
         self.advance();
@@ -189,6 +212,7 @@ impl<'a> Parser<'a> {
                     header,
                     OpenMpHeader::EndParallel
                         | OpenMpHeader::EndDo { .. }
+                        | OpenMpHeader::EndLoop
                         | OpenMpHeader::EndParallelDo { .. }
                         | OpenMpHeader::EndCritical(_)
                 ) {
@@ -245,6 +269,7 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
             }
         }
         "do" => OpenMpHeader::Do(parse_clauses(&mut cursor, span, BeginKind::Do)?),
+        "loop" => OpenMpHeader::Loop(parse_clauses(&mut cursor, span, BeginKind::Loop)?),
         "critical" => {
             let name = if cursor.peek_nonblank() == Some(b'(') {
                 Some(parse_single_name(
@@ -261,6 +286,10 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
         "enddo" => OpenMpHeader::EndDo {
             nowait: parse_end_loop_clause(&mut cursor)?,
         },
+        "endloop" => {
+            cursor.finish()?;
+            OpenMpHeader::EndLoop
+        }
         "end" => parse_openmp_end_header(&mut cursor)?,
         other => {
             return Err(ParseError {
@@ -289,6 +318,10 @@ fn parse_openmp_end_header(cursor: &mut DirectiveCursor<'_>) -> Result<OpenMpHea
         "do" => {
             let nowait = parse_end_loop_clause(cursor)?;
             Ok(OpenMpHeader::EndDo { nowait })
+        }
+        "loop" => {
+            cursor.finish()?;
+            Ok(OpenMpHeader::EndLoop)
         }
         "critical" => {
             let name = if cursor.peek_nonblank() == Some(b'(') {
@@ -483,6 +516,13 @@ fn validate_clause_for_construct(
                 | OpenMpClause::FirstPrivate(_)
                 | OpenMpClause::LastPrivate { .. }
                 | OpenMpClause::Schedule { .. }
+                | OpenMpClause::Collapse(_)
+                | OpenMpClause::Reduction { .. }
+        ),
+        BeginKind::Loop => matches!(
+            clause,
+            OpenMpClause::Private(_)
+                | OpenMpClause::LastPrivate { .. }
                 | OpenMpClause::Collapse(_)
                 | OpenMpClause::Reduction { .. }
         ),
@@ -979,6 +1019,39 @@ mod tests {
         assert!(clauses
             .iter()
             .any(|clause| matches!(clause, OpenMpClause::Nowait)));
+    }
+
+    #[test]
+    fn parses_loop_private_clause_and_optional_end() {
+        let stmt = parse(
+            "!$omp loop private(scratch)\n\
+             do i = 1, n\n\
+               scratch = i\n\
+             end do\n\
+             !$omp end loop\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::Loop { clauses, loop_stmt }) = stmt.node else {
+            panic!("expected loop construct");
+        };
+        assert!(matches!(loop_stmt.node, Stmt::DoLoop { .. }));
+        assert!(matches!(
+            clauses.as_slice(),
+            [OpenMpClause::Private(names)] if names == &["scratch"]
+        ));
+
+        let implicit_end = parse(
+            "!$omp loop\n\
+             do i = 1, n\n\
+             end do\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        assert!(matches!(
+            implicit_end.node,
+            Stmt::OpenMp(OpenMpConstruct::Loop { .. })
+        ));
     }
 
     #[test]

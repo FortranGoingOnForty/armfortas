@@ -547,6 +547,9 @@ pub(super) fn lower_construct(
         OpenMpConstruct::Do { clauses, loop_stmt } => {
             lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, None, None);
         }
+        OpenMpConstruct::Loop { clauses, loop_stmt } => {
+            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, None, None);
+        }
         OpenMpConstruct::ParallelDo { clauses, loop_stmt } => {
             let capture_body = std::slice::from_ref(loop_stmt.as_ref());
             lower_parallel_region(

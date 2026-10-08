@@ -47,6 +47,21 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
                 std::slice::from_ref(loop_stmt.as_ref()),
             );
         }
+        OpenMpConstruct::Loop { clauses, loop_stmt } => {
+            reject_in_pure(ctx, span, "LOOP");
+            if ctx.openmp_parallel_depth == 0 {
+                ctx.error(
+                    span,
+                    "OpenMP LOOP without BIND must be nested inside an OpenMP PARALLEL region",
+                );
+            }
+            validate_worksharing_loop(ctx, span, clauses, loop_stmt, false);
+            validate_partial_reduction_references(
+                ctx,
+                clauses,
+                std::slice::from_ref(loop_stmt.as_ref()),
+            );
+        }
         OpenMpConstruct::ParallelDo { clauses, loop_stmt } => {
             reject_in_pure(ctx, span, "PARALLEL DO");
             let clause_info = validate_parallel_clauses(ctx, span, clauses, true);
