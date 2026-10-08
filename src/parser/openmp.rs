@@ -32,6 +32,15 @@ enum BeginKind {
 }
 
 impl<'a> Parser<'a> {
+    pub(super) fn current_openmp_directive_starts_loop(&self) -> bool {
+        let directive = self.current();
+        directive.kind == TokenKind::OmpDirective
+            && matches!(
+                parse_openmp_header(&directive.text, directive.span),
+                Ok(OpenMpHeader::Do(_) | OpenMpHeader::ParallelDo(_))
+            )
+    }
+
     pub(crate) fn parse_openmp_construct(&mut self) -> Result<SpannedStmt, ParseError> {
         let directive = self.advance().clone();
         let header = parse_openmp_header(&directive.text, directive.span)?;
@@ -985,6 +994,49 @@ mod tests {
         assert!(clauses
             .iter()
             .any(|clause| matches!(clause, OpenMpClause::Nowait)));
+    }
+
+    #[test]
+    fn preserves_shared_labeled_termination_through_worksharing_do() {
+        let stmt = parse(
+            concat!(
+                "      DO 100 I=1,10\n",
+                "!$OMP DO\n",
+                "      DO 100 J=1,10\n",
+                "100   CONTINUE\n",
+            ),
+            SourceForm::FixedForm,
+        )
+        .unwrap();
+        let Stmt::DoLoop {
+            body: outer_body, ..
+        } = stmt.node
+        else {
+            panic!("expected outer labeled DO loop");
+        };
+        let [Spanned {
+            node: Stmt::OpenMp(OpenMpConstruct::Do { loop_stmt, .. }),
+            ..
+        }] = outer_body.as_slice()
+        else {
+            panic!("expected directive-wrapped inner DO loop");
+        };
+        let Stmt::DoLoop {
+            body: inner_body,
+            shared_terminating_label,
+            ..
+        } = &loop_stmt.node
+        else {
+            panic!("expected inner labeled DO loop");
+        };
+        assert!(*shared_terminating_label);
+        assert!(matches!(
+            inner_body.as_slice(),
+            [Spanned {
+                node: Stmt::Labeled { label: 100, .. },
+                ..
+            }]
+        ));
     }
 
     #[test]

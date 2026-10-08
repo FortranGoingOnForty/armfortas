@@ -7,6 +7,7 @@
 use super::expr::span_from_to;
 use super::{ParseError, Parser};
 use crate::ast::expr::{Expr, SpannedExpr};
+use crate::ast::openmp::OpenMpConstruct;
 use crate::ast::stmt::*;
 use crate::ast::Spanned;
 use crate::lexer::TokenKind;
@@ -1589,6 +1590,24 @@ impl<'a> Parser<'a> {
 
     fn current_stmt_is_do_with_terminating_label(&self, label: u64) -> bool {
         let mut pos = self.pos;
+        if self
+            .tokens
+            .get(pos)
+            .is_some_and(|token| token.kind == TokenKind::OmpDirective)
+        {
+            if !self.current_openmp_directive_starts_loop() {
+                return false;
+            }
+            pos += 1;
+            while self.tokens.get(pos).is_some_and(|token| {
+                matches!(
+                    token.kind,
+                    TokenKind::Newline | TokenKind::Comment | TokenKind::Semicolon
+                )
+            }) {
+                pos += 1;
+            }
+        }
         if self.tokens.get(pos).map(|t| &t.kind) == Some(&TokenKind::IntegerLiteral) {
             let Some(next) = self.tokens.get(pos + 1) else {
                 return false;
@@ -1622,6 +1641,10 @@ impl<'a> Parser<'a> {
                 ..
             } => *shared_terminating_label = true,
             Stmt::Labeled { stmt: inner, .. } => Self::mark_shared_labeled_do(inner),
+            Stmt::OpenMp(OpenMpConstruct::Do { loop_stmt, .. })
+            | Stmt::OpenMp(OpenMpConstruct::ParallelDo { loop_stmt, .. }) => {
+                Self::mark_shared_labeled_do(loop_stmt)
+            }
             _ => {}
         }
     }
