@@ -55,6 +55,17 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
                     "OpenMP LOOP without BIND must be nested inside an OpenMP PARALLEL region",
                 );
             }
+            for clause in clauses {
+                if !matches!(clause, OpenMpClause::Private(_)) {
+                    ctx.error(
+                        span,
+                        format!(
+                            "OpenMP {} clause on LOOP is recognized but not yet implemented",
+                            clause_name(clause)
+                        ),
+                    );
+                }
+            }
             validate_worksharing_loop(ctx, span, clauses, loop_stmt, false);
             validate_partial_reduction_references(
                 ctx,
@@ -759,6 +770,13 @@ fn validate_worksharing_loop(
                     && names
                         .iter()
                         .all(|name| associated_loop_keys.contains(&name.to_ascii_lowercase())) => {}
+            OpenMpClause::Private(names) if !combined_do => {
+                for name in names {
+                    if !associated_loop_keys.contains(&name.to_ascii_lowercase()) {
+                        validate_worksharing_private_object(ctx, name, span);
+                    }
+                }
+            }
             OpenMpClause::FirstPrivate(names)
                 if !combined_do
                     && names
@@ -772,9 +790,7 @@ fn validate_worksharing_loop(
                     && names
                         .iter()
                         .all(|name| lastprivate_names.contains(&name.to_ascii_lowercase())) => {}
-            OpenMpClause::Private(_)
-            | OpenMpClause::FirstPrivate(_)
-                if !combined_do => ctx.error(
+            OpenMpClause::FirstPrivate(_) if !combined_do => ctx.error(
                     span,
                     format!(
                         "OpenMP {} clause on DO is recognized but not yet implemented",
@@ -921,6 +937,34 @@ fn validate_lastprivate_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
             span,
             format!(
                 "OpenMP LASTPRIVATE variable '{name}' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER"
+            ),
+        );
+    }
+}
+
+fn validate_worksharing_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
+    validate_private_object(ctx, name, span, "PRIVATE");
+    let Some(symbol) = ctx.lookup_lexical(name) else {
+        return;
+    };
+    let supported_type = matches!(
+        symbol.type_info.as_ref(),
+        Some(TypeInfo::Integer { .. })
+            | Some(TypeInfo::Real { .. })
+            | Some(TypeInfo::DoublePrecision)
+            | Some(TypeInfo::Complex { .. })
+            | Some(TypeInfo::Logical { .. })
+    );
+    if symbol.kind == SymbolKind::Variable
+        && (!symbol.attrs.array_spec.is_empty()
+            || symbol.attrs.allocatable
+            || symbol.attrs.pointer
+            || !supported_type)
+    {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP worksharing PRIVATE variable '{name}' must currently be a nonallocatable, nonpointer scalar INTEGER, REAL, DOUBLE PRECISION, COMPLEX, or LOGICAL"
             ),
         );
     }
@@ -1523,7 +1567,9 @@ fn collect_predetermined_private_names(stmts: &[SpannedStmt], names: &mut Vec<(S
             // available as private state in that enclosing callback. A
             // nested PARALLEL or combined PARALLEL DO owns a distinct data
             // environment and must not affect this region's classification.
-            Stmt::OpenMp(OpenMpConstruct::Do { loop_stmt, .. }) => {
+            Stmt::OpenMp(
+                OpenMpConstruct::Do { loop_stmt, .. } | OpenMpConstruct::Loop { loop_stmt, .. },
+            ) => {
                 collect_predetermined_private_names(std::slice::from_ref(loop_stmt.as_ref()), names)
             }
             Stmt::OpenMp(_) => {}
