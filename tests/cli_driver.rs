@@ -21164,6 +21164,73 @@ end program
 }
 
 #[test]
+fn fopenmp_orphaned_fixed_form_do_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_orphaned_fixed_form_do_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        concat!(
+            "      PROGRAM P\n",
+            "      INTEGER VALUES(4,4),I,J\n",
+            "      VALUES=0\n",
+            "!$OMP PARALLEL SHARED(VALUES) NUM_THREADS(4)\n",
+            "      CALL FILL(VALUES)\n",
+            "!$OMP END PARALLEL\n",
+            "      DO 20 I=1,4\n",
+            "      DO 20 J=1,4\n",
+            "      IF (VALUES(I,J).NE.10*I+J) STOP 1\n",
+            "20    CONTINUE\n",
+            "      PRINT *, 'ok'\n",
+            "      END\n",
+            "      SUBROUTINE FILL(VALUES)\n",
+            "      INTEGER VALUES(4,4),I,J\n",
+            "      DO 100 I=1,4\n",
+            "!$OMP DO SCHEDULE(STATIC)\n",
+            "      DO 100 J=1,4\n",
+            "100   VALUES(I,J)=10*I+J\n",
+            "!$OMP ENDDO\n",
+            "      END\n",
+        ),
+        "f",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_orphaned_fixed_do", "bin");
+        let runtime_cache = unique_dir("openmp_orphaned_fixed_do_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "orphaned fixed-form OpenMP DO should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "orphaned fixed-form OpenMP DO failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_collapse_two_static_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -22741,12 +22808,8 @@ end program
 }
 
 #[test]
-fn fopenmp_worksharing_rejects_unsupported_or_orphan_forms() {
+fn fopenmp_worksharing_rejects_unsupported_forms() {
     let cases = [
-        (
-            "program p\ninteger :: i\n!$omp do\ndo i=1,4\nend do\n!$omp end do\nend program\n",
-            "OpenMP DO must be closely nested inside an OpenMP PARALLEL region",
-        ),
         (
             "program p\ninteger :: i\n!$omp parallel\n!$omp do schedule(dynamic)\ndo i=1,4\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
             "OpenMP SCHEDULE(DYNAMIC) is recognized but not yet implemented",

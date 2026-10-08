@@ -40,12 +40,6 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
         }
         OpenMpConstruct::Do { clauses, loop_stmt } => {
             reject_in_pure(ctx, span, "DO");
-            if ctx.openmp_parallel_depth == 0 {
-                ctx.error(
-                    span,
-                    "OpenMP DO must be closely nested inside an OpenMP PARALLEL region",
-                );
-            }
             validate_worksharing_loop(ctx, span, clauses, loop_stmt, false);
             validate_partial_reduction_references(
                 ctx,
