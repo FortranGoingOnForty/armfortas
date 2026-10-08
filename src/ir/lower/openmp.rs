@@ -545,7 +545,10 @@ pub(super) fn lower_construct(
             lower_parallel_region(b, ctx, clauses, body, ParallelRegionBody::Statements(body));
         }
         OpenMpConstruct::Do { clauses, loop_stmt } => {
-            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, None, None);
+            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, false, None, None);
+        }
+        OpenMpConstruct::Loop { clauses, loop_stmt } => {
+            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, false, None, None);
         }
         OpenMpConstruct::ParallelDo { clauses, loop_stmt } => {
             let capture_body = std::slice::from_ref(loop_stmt.as_ref());
@@ -894,6 +897,7 @@ fn lower_parallel_region(
                         &mut outlined_ctx,
                         clauses,
                         loop_stmt,
+                        true,
                         true,
                         outlined_worksharing_chunk,
                         Some(&cleanup.lastprivate_originals),
@@ -1489,6 +1493,33 @@ fn privatize_worksharing_variable(
     (key, saved, private)
 }
 
+fn privatize_worksharing_clause_variables(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    clauses: &[OpenMpClause],
+    outer_key: &str,
+    inner_key: Option<&str>,
+) -> Vec<(String, LocalInfo)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut bindings = Vec::new();
+    for name in clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            OpenMpClause::Private(names) => Some(names.as_slice()),
+            _ => None,
+        })
+        .flatten()
+    {
+        let key = name.to_ascii_lowercase();
+        if key == outer_key || inner_key.is_some_and(|inner| key == inner) || !seen.insert(key) {
+            continue;
+        }
+        let (key, saved, _) = privatize_worksharing_variable(b, ctx, name);
+        bindings.push((key, saved));
+    }
+    bindings
+}
+
 fn prepare_lastprivate_bindings(
     b: &mut FuncBuilder<'_>,
     ctx: &mut LowerCtx<'_>,
@@ -1593,6 +1624,7 @@ fn lower_worksharing_loop(
     clauses: &[OpenMpClause],
     loop_stmt: &SpannedStmt,
     suppress_barrier: bool,
+    clauses_materialized_by_parallel: bool,
     precomputed_chunk: Option<ValueId>,
     captured_lastprivate_originals: Option<&std::collections::HashMap<String, LocalInfo>>,
 ) {
@@ -1828,6 +1860,17 @@ fn lower_worksharing_loop(
     let private_inner = collapsed
         .as_ref()
         .map(|collapsed| privatize_worksharing_variable(b, ctx, collapsed.inner_var));
+    let clause_private_bindings = if clauses_materialized_by_parallel {
+        Vec::new()
+    } else {
+        privatize_worksharing_clause_variables(
+            b,
+            ctx,
+            clauses,
+            &outer_key,
+            private_inner.as_ref().map(|(key, _, _)| key.as_str()),
+        )
+    };
     let collapsed_value_addrs = collapsed.as_ref().map(|_| {
         (
             b.alloca(IrType::Int(IntWidth::I64)),
@@ -2016,6 +2059,9 @@ fn lower_worksharing_loop(
     ctx.locals.insert(outer_key.clone(), saved_outer);
     if let Some((inner_key, saved_inner, _)) = private_inner {
         ctx.locals.insert(inner_key, saved_inner);
+    }
+    for (key, saved) in clause_private_bindings {
+        ctx.locals.insert(key, saved);
     }
     if let Some((_, saved_flat)) = flat_binding {
         restore_temp_binding(ctx, flat_name, saved_flat);

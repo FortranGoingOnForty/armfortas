@@ -1642,6 +1642,7 @@ impl<'a> Parser<'a> {
             } => *shared_terminating_label = true,
             Stmt::Labeled { stmt: inner, .. } => Self::mark_shared_labeled_do(inner),
             Stmt::OpenMp(OpenMpConstruct::Do { loop_stmt, .. })
+            | Stmt::OpenMp(OpenMpConstruct::Loop { loop_stmt, .. })
             | Stmt::OpenMp(OpenMpConstruct::ParallelDo { loop_stmt, .. }) => {
                 Self::mark_shared_labeled_do(loop_stmt)
             }

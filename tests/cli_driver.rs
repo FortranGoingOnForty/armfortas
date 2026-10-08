@@ -21164,6 +21164,84 @@ end program
 }
 
 #[test]
+fn fopenmp_loop_private_scalar_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_loop_private_scalar_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_num_threads, omp_get_thread_num
+  implicit none
+  integer, parameter :: n = 256
+  integer :: a(n), b(n), c(n), d(n)
+  integer :: privatized, num_threads, x, y
+  privatized = -77
+  num_threads = -1
+  do x = 1, n
+    a(x) = 1
+    b(x) = x
+    c(x) = 2*x
+    d(x) = 0
+  end do
+!$omp parallel num_threads(4)
+!$omp loop private(privatized)
+  do x = 1, n
+    privatized = 0
+    do y = 1, a(x) + b(x)
+      privatized = privatized + 1
+    end do
+    d(x) = c(x) * privatized
+  end do
+!$omp end loop
+  if (omp_get_thread_num() == 0) num_threads = omp_get_num_threads()
+!$omp end parallel
+  if (num_threads /= 4 .or. privatized /= -77) error stop 1
+  do x = 1, n
+    if (d(x) /= (1 + x)*2*x) error stop 2
+  end do
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_loop_private_scalar", "bin");
+        let runtime_cache = unique_dir("openmp_loop_private_scalar_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP LOOP PRIVATE should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP LOOP PRIVATE failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_orphaned_fixed_form_do_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -22810,6 +22888,18 @@ end program
 #[test]
 fn fopenmp_worksharing_rejects_unsupported_forms() {
     let cases = [
+        (
+            "program p\ninteger :: i\n!$omp loop\ndo i=1,4\nend do\n!$omp end loop\nend program\n",
+            "OpenMP LOOP without BIND must be nested inside an OpenMP PARALLEL region",
+        ),
+        (
+            "program p\ninteger :: i,values(2)\n!$omp parallel\n!$omp loop private(values)\ndo i=1,4\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
+            "OpenMP worksharing PRIVATE variable 'values' must currently be a nonallocatable, nonpointer scalar",
+        ),
+        (
+            "program p\ninteger :: i\n!$omp parallel\n!$omp loop lastprivate(i)\ndo i=1,4\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
+            "OpenMP LASTPRIVATE clause on LOOP is recognized but not yet implemented",
+        ),
         (
             "program p\ninteger :: i\n!$omp parallel\n!$omp do schedule(dynamic)\ndo i=1,4\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
             "OpenMP SCHEDULE(DYNAMIC) is recognized but not yet implemented",
