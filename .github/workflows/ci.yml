@@ -246,7 +246,7 @@ jobs:
       - run: ci/check_skips.sh /tmp/tests.log posix-elf-musl
 
   build-freebsd:
-    name: "FreeBSD 15: build + lib tests (VM)"
+    name: "FreeBSD 15.1: build + lib tests (VM)"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -257,7 +257,7 @@ jobs:
       # Keep the surface small; e2e sweeps on FreeBSD wait for x06/x07.
       - uses: vmactions/freebsd-vm@v1
         with:
-          release: "15.0"
+          release: "15.1"
           usesh: true
           # No later host step consumes VM outputs. Avoid copying the multi-GiB
           # Cargo target tree back over SSH after the test body succeeds.
@@ -266,7 +266,11 @@ jobs:
           # tools), and the rust package's dependency set has drifted
           # on whether it pulls one in. The driver shells out to `as`
           # for ELF assembly (until afs-as x86 lands in x14).
-          prepare: pkg install -y rust binutils bash
+          # Upgrade pkgbase first: the action's immutable VM cache can lag the
+          # package repository ABI (for example, Rust requiring a newer libc).
+          prepare: |
+            pkg upgrade -y -r FreeBSD-base
+            pkg install -y rust binutils bash
           run: |
             # This ephemeral 6 GiB VM does not reuse incremental state or
             # consume test debuginfo. Keeping either enabled pushes rustc's
