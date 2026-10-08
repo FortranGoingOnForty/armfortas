@@ -61,29 +61,29 @@ deterministic. Applicable cases from the [official examples][omp-examples] and
 the [OpenMP Validation and Verification suite][omp-vv] are added incrementally
 rather than treated as an opaque pass/fail corpus.
 
-The pinned official-example corpus uses eleven unchanged Fortran sources
+The pinned official-example corpus uses twelve unchanged Fortran sources
 from OpenMP Examples v6.0.1 at revision
 `3e4757ae2b52e51df6cd5d363d6fc1d894509719`. Its manifest covers `parallel`,
 `do`, `schedule(static)`, `nowait`, `private`, `firstprivate`, `lastprivate`,
 `shared`, `default(private)`, rectangular and direct-bound nonrectangular
 `collapse(2)`, predefined reductions, runtime thread queries, assumed-size
-sequence forwarding, and named and unnamed critical regions.
+sequence forwarding, dynamically bound orphaned worksharing, fixed-form shared
+DO termination labels, and named and unnamed critical regions.
 Every source completes its upstream-requested compile or link operation at
 `-O0` and `-O3`; the upstream run example executes at both levels. The corpus,
 license, revision record, and harness live under `tests/fixtures/openmp-official/` and
 `tests/openmp_official_examples.rs`.
 
-The same sweep identified the next official-example boundary without weakening
-its source: orphaned fixed-form worksharing loops with shared labeled
-termination are not yet supported. Wider affine nonrectangular bounds remain a
-separate diagnosed extension beyond the direct-bound form exercised by
-`collapse.4`.
+An orphaned worksharing loop obtains its current thread and team size from the
+runtime when its procedure is called, while lexically nested worksharing keeps
+using the outlined callback parameters. Wider affine nonrectangular bounds
+remain a separate diagnosed extension beyond the direct-bound form exercised
+by `collapse.4`.
 
 ## Next milestones
 
-1. Widen the pinned official-example tranche and add applicable host cases from
-   the OpenMP Validation and Verification suite, starting with the documented
-   orphaned-worksharing gap.
+1. Add applicable host cases from the OpenMP Validation and Verification suite
+   under the same pinned-source and manifest discipline.
 2. Run NPB EP Class S through the owned runtime and preserve minimized compiler
    edges as focused regressions.
 3. Extend array reductions beyond constant-shape rank one only with a truthful
