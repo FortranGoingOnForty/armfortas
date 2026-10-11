@@ -1,0 +1,2 @@
+id	upstream_path	local_source	support_header	operation	upstream_expect	version	coverage	armfortas_state	sha256
+test_loop_private	tests/5.0/loop/test_loop_private.F90	5.0/loop/test_loop_private.F90	support/ompvv.F90	run	success	omp_5.0	loop,private,implicit-parallel-binding	pass	dadd4e8f6ac532d1394cd9c8e5314907af22646f3d4f7675f0455fe3308989d8

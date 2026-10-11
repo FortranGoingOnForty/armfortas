@@ -17,6 +17,10 @@ pub enum OpenMpConstruct {
         clauses: Vec<OpenMpClause>,
         loop_stmt: Box<SpannedStmt>,
     },
+    Loop {
+        clauses: Vec<OpenMpClause>,
+        loop_stmt: Box<SpannedStmt>,
+    },
     ParallelDo {
         clauses: Vec<OpenMpClause>,
         loop_stmt: Box<SpannedStmt>,
@@ -32,6 +36,7 @@ impl OpenMpConstruct {
         match self {
             Self::Parallel { .. } => "PARALLEL",
             Self::Do { .. } => "DO",
+            Self::Loop { .. } => "LOOP",
             Self::ParallelDo { .. } => "PARALLEL DO",
             Self::Critical { .. } => "CRITICAL",
         }
@@ -41,6 +46,7 @@ impl OpenMpConstruct {
         match self {
             Self::Parallel { clauses, .. }
             | Self::Do { clauses, .. }
+            | Self::Loop { clauses, .. }
             | Self::ParallelDo { clauses, .. } => clauses,
             Self::Critical { .. } => &[],
         }
@@ -49,13 +55,15 @@ impl OpenMpConstruct {
     pub fn region_body(&self) -> Option<&[SpannedStmt]> {
         match self {
             Self::Parallel { body, .. } | Self::Critical { body, .. } => Some(body),
-            Self::Do { .. } | Self::ParallelDo { .. } => None,
+            Self::Do { .. } | Self::Loop { .. } | Self::ParallelDo { .. } => None,
         }
     }
 
     pub fn loop_stmt(&self) -> Option<&SpannedStmt> {
         match self {
-            Self::Do { loop_stmt, .. } | Self::ParallelDo { loop_stmt, .. } => Some(loop_stmt),
+            Self::Do { loop_stmt, .. }
+            | Self::Loop { loop_stmt, .. }
+            | Self::ParallelDo { loop_stmt, .. } => Some(loop_stmt),
             Self::Parallel { .. } | Self::Critical { .. } => None,
         }
     }

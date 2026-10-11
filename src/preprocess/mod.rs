@@ -1087,7 +1087,9 @@ impl Preprocessor {
             // Fixed-form: C, c, or * in column 1 is a comment line.
             if self.fixed_form {
                 let first = logical_line.text.as_bytes().first().copied().unwrap_or(0);
-                if first == b'C' || first == b'c' || first == b'*' {
+                if (first == b'C' || first == b'c' || first == b'*')
+                    && openmp_directive_sentinel_end(&logical_line.text, true).is_none()
+                {
                     // Comment line — emit as-is without expansion.
                     if self.is_emitting() {
                         output.push_str(&logical_line.text);
@@ -1736,7 +1738,17 @@ impl Preprocessor {
 
     fn expand_mapped_macros(&self, line: &MappedText) -> Result<MappedText, PreprocError> {
         let expanding = std::collections::HashSet::new();
-        self.expand_mapped_macros_inner(line, &expanding, MacroContext::Source)
+        let Some(sentinel_end) = openmp_directive_sentinel_end(&line.text, self.fixed_form) else {
+            return self.expand_mapped_macros_inner(line, &expanding, MacroContext::Source);
+        };
+        let mut expanded = MappedText::empty(line.fallback.clone());
+        expanded.append_slice(line, 0..sentinel_end);
+        expanded.append(&self.expand_mapped_macros_inner(
+            &line.slice(sentinel_end..line.text.len()),
+            &expanding,
+            MacroContext::Source,
+        )?);
+        Ok(expanded)
     }
 
     fn expand_mapped_macros_inner(
@@ -2716,6 +2728,35 @@ fn scan_trailing_ampersand(piece: &str, base: usize, carried: Option<u8>) -> Amp
     }
 }
 
+fn openmp_directive_sentinel_end(line: &str, fixed_form: bool) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let start = if fixed_form {
+        0
+    } else {
+        bytes
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .unwrap_or(bytes.len())
+    };
+    let sentinel = bytes.get(start..start + 5)?;
+    let valid_prefix = if fixed_form {
+        matches!(sentinel[0], b'!' | b'C' | b'c' | b'*')
+    } else {
+        sentinel[0] == b'!'
+    };
+    if !valid_prefix || sentinel[1] != b'$' || !sentinel[2..5].eq_ignore_ascii_case(b"omp") {
+        return None;
+    }
+    let end = start + 5;
+    if bytes
+        .get(end)
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'&')
+    {
+        return None;
+    }
+    Some(end)
+}
+
 fn parse_fortran_include_path(line: &str, fixed_form: bool) -> Result<Option<String>, String> {
     let statement = if fixed_form && !line.starts_with('\t') {
         let end = line
@@ -3007,6 +3048,35 @@ mod tests {
     fn define_and_expand_object_macro() {
         let out = pp("#define FOO 42\nx = FOO\n");
         assert!(out.contains("x = 42"));
+    }
+
+    #[test]
+    fn expands_macros_inside_free_form_openmp_directives() {
+        let out = pp(
+            "#define THREADS 4\n  !$omp parallel num_threads(THREADS) ! THREADS stays a comment\n",
+        );
+        assert!(
+            out.contains("!$omp parallel num_threads(4) ! THREADS stays a comment"),
+            "got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn expands_macros_inside_fixed_form_openmp_directives() {
+        let config = PreprocConfig {
+            fixed_form: true,
+            ..PreprocConfig::default()
+        };
+        let out = preprocess(
+            "#define THREADS 4\nC$OMP PARALLEL NUM_THREADS(THREADS)\n",
+            &config,
+        )
+        .unwrap()
+        .text;
+        assert!(
+            out.contains("C$OMP PARALLEL NUM_THREADS(4)"),
+            "got: {out:?}"
+        );
     }
 
     #[test]
