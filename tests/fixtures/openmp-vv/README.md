@@ -15,9 +15,11 @@ and SHA-256 for every imported source. `tests/openmp_vv.rs` builds each passing
 row at `-O0` and `-O3` and performs its requested host operation when the test
 runner has a native execution path.
 
-The selected OpenMP 5.0 `loop` cases currently cover scalar `private` and
-scalar INTEGER addition `reduction` clauses with implicit binding to an
-enclosing `parallel` region.
+The selected OpenMP 5.0 `loop` cases currently cover scalar `private`, scalar
+INTEGER addition `reduction`, and rectangular `collapse(1)`/`collapse(2)`
+clauses with implicit binding to an enclosing `parallel` region. The collapse
+case also verifies that a loop outside the requested collapse depth remains
+sequential.
 
 The upstream `ompvv/ompvv.F90` umbrella header contains device-offload probes
 outside the current ARMFORTAS tranche. The local `support/ompvv.F90` adapter
