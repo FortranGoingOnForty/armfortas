@@ -15,6 +15,10 @@ and SHA-256 for every imported source. `tests/openmp_vv.rs` builds each passing
 row at `-O0` and `-O3` and performs its requested host operation when the test
 runner has a native execution path.
 
+The selected OpenMP 5.0 `loop` cases currently cover scalar `private` and
+scalar INTEGER addition `reduction` clauses with implicit binding to an
+enclosing `parallel` region.
+
 The upstream `ompvv/ompvv.F90` umbrella header contains device-offload probes
 outside the current ARMFORTAS tranche. The local `support/ompvv.F90` adapter
 implements only the result-reporting macros required by the selected host

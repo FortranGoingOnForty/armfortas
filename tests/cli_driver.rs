@@ -21242,6 +21242,70 @@ end program
 }
 
 #[test]
+fn fopenmp_loop_scalar_integer_add_reduction_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_loop_scalar_integer_add_reduction_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer, parameter :: n = 256
+  integer :: i
+  integer(kind=8) :: total
+  total = 7_8
+!$omp parallel default(none) shared(total) num_threads(4)
+!$omp loop reduction(+:total)
+  do i = 1, n
+    total = total + int(i, kind=8)
+  end do
+!$omp end loop
+!$omp end parallel
+  if (total /= 32903_8) error stop 1
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_loop_integer_add_reduction", "bin");
+        let runtime_cache = unique_dir("openmp_loop_integer_add_reduction_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP LOOP scalar INTEGER + REDUCTION should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..4 {
+            let run = Command::new(&out).output().expect("failed to run binary");
+            assert!(
+                run.status.success(),
+                "OpenMP LOOP scalar INTEGER + REDUCTION failed at {opt}, iteration {iteration}:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_orphaned_fixed_form_do_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -22899,6 +22963,26 @@ fn fopenmp_worksharing_rejects_unsupported_forms() {
         (
             "program p\ninteger :: i\n!$omp parallel\n!$omp loop lastprivate(i)\ndo i=1,4\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
             "OpenMP LASTPRIVATE clause on LOOP is recognized but not yet implemented",
+        ),
+        (
+            "program p\ninteger :: i,total\n!$omp parallel private(total)\n!$omp loop reduction(+:total)\ndo i=1,4\ntotal=total+i\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
+            "OpenMP LOOP REDUCTION variable 'total' must be shared in the binding PARALLEL region",
+        ),
+        (
+            "program p\ninteger :: i,total\n!$omp parallel shared(total)\n!$omp loop reduction(*:total)\ndo i=1,4\ntotal=total*i\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
+            "OpenMP LOOP REDUCTION currently supports only the + operator with scalar INTEGER list items",
+        ),
+        (
+            "program p\ninteger :: i\nreal :: total\n!$omp parallel shared(total)\n!$omp loop reduction(+:total)\ndo i=1,4\ntotal=total+real(i)\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
+            "OpenMP LOOP REDUCTION currently supports only the + operator with scalar INTEGER list items",
+        ),
+        (
+            "program p\ninteger :: i,total(2)\n!$omp parallel shared(total)\n!$omp loop reduction(+:total)\ndo i=1,4\ntotal=total+i\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
+            "OpenMP LOOP REDUCTION currently supports only the + operator with scalar INTEGER list items",
+        ),
+        (
+            "program p\ninteger :: i\n!$omp parallel\n!$omp loop reduction(+:i)\ndo i=1,4\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
+            "OpenMP LOOP associated iteration variables may not appear in REDUCTION",
         ),
         (
             "program p\ninteger :: i\n!$omp parallel\n!$omp do schedule(dynamic)\ndo i=1,4\nend do\n!$omp end do\n!$omp end parallel\nend program\n",

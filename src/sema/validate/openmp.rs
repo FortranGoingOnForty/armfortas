@@ -28,6 +28,27 @@ use super::core::{
 
 pub(crate) use super::core::ReferenceRole;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorksharingLoopKind {
+    Do,
+    Loop,
+    ParallelDo,
+}
+
+impl WorksharingLoopKind {
+    fn is_combined(self) -> bool {
+        self == Self::ParallelDo
+    }
+
+    fn directive_name(self) -> &'static str {
+        match self {
+            Self::Do => "DO",
+            Self::Loop => "LOOP",
+            Self::ParallelDo => "PARALLEL DO",
+        }
+    }
+}
+
 pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &OpenMpConstruct) {
     match construct {
         OpenMpConstruct::Parallel { clauses, body } => {
@@ -40,7 +61,7 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
         }
         OpenMpConstruct::Do { clauses, loop_stmt } => {
             reject_in_pure(ctx, span, "DO");
-            validate_worksharing_loop(ctx, span, clauses, loop_stmt, false);
+            validate_worksharing_loop(ctx, span, clauses, loop_stmt, WorksharingLoopKind::Do);
             validate_partial_reduction_references(
                 ctx,
                 clauses,
@@ -56,7 +77,10 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
                 );
             }
             for clause in clauses {
-                if !matches!(clause, OpenMpClause::Private(_)) {
+                if !matches!(
+                    clause,
+                    OpenMpClause::Private(_) | OpenMpClause::Reduction { .. }
+                ) {
                     ctx.error(
                         span,
                         format!(
@@ -66,7 +90,7 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
                     );
                 }
             }
-            validate_worksharing_loop(ctx, span, clauses, loop_stmt, false);
+            validate_worksharing_loop(ctx, span, clauses, loop_stmt, WorksharingLoopKind::Loop);
             validate_partial_reduction_references(
                 ctx,
                 clauses,
@@ -79,7 +103,13 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             let loop_body = std::slice::from_ref(loop_stmt.as_ref());
             let predetermined_private = predetermined_private_names(ctx.st, loop_body);
             validate_data_environment(ctx, loop_body, &clause_info, &predetermined_private);
-            validate_worksharing_loop(ctx, span, clauses, loop_stmt, true);
+            validate_worksharing_loop(
+                ctx,
+                span,
+                clauses,
+                loop_stmt,
+                WorksharingLoopKind::ParallelDo,
+            );
             validate_partial_reduction_references(ctx, clauses, loop_body);
         }
         OpenMpConstruct::Critical { body, .. } => {
@@ -608,9 +638,11 @@ fn validate_worksharing_loop(
     span: Span,
     clauses: &[OpenMpClause],
     loop_stmt: &SpannedStmt,
-    combined_do: bool,
+    kind: WorksharingLoopKind,
 ) {
-    let Some(outer_loop) = validate_associated_loop(ctx, span, loop_stmt, "DO") else {
+    let combined_do = kind.is_combined();
+    let directive_name = kind.directive_name();
+    let Some(outer_loop) = validate_associated_loop(ctx, span, loop_stmt, directive_name) else {
         return;
     };
     let collapse_depth = validate_collapse_depth(ctx, span, clauses);
@@ -783,7 +815,9 @@ fn validate_worksharing_loop(
                         .iter()
                         .any(|name| associated_loop_keys.contains(&name.to_ascii_lowercase())) => ctx.error(
                             span,
-                            "OpenMP DO associated iteration variables may not appear in FIRSTPRIVATE",
+                            format!(
+                                "OpenMP {directive_name} associated iteration variables may not appear in FIRSTPRIVATE"
+                            ),
                         ),
             OpenMpClause::FirstPrivate(names)
                 if !combined_do
@@ -841,7 +875,7 @@ fn validate_worksharing_loop(
                         ctx.error(
                             span,
                             format!(
-                                "OpenMP DO LASTPRIVATE variable '{name}' may not be private in the binding PARALLEL region"
+                                "OpenMP {directive_name} LASTPRIVATE variable '{name}' may not be private in the binding PARALLEL region"
                             ),
                         );
                     }
@@ -856,9 +890,17 @@ fn validate_worksharing_loop(
                 ctx.error(
                     span,
                     format!(
-                        "OpenMP {} associated iteration variables may not appear in REDUCTION",
-                        if combined_do { "PARALLEL DO" } else { "DO" }
+                        "OpenMP {directive_name} associated iteration variables may not appear in REDUCTION"
                     ),
+                )
+            }
+            OpenMpClause::Reduction { operator, items }
+                if kind == WorksharingLoopKind::Loop
+                    && !loop_reduction_frontier_supported(ctx, *operator, items) =>
+            {
+                ctx.error(
+                    span,
+                    "OpenMP LOOP REDUCTION currently supports only the + operator with scalar INTEGER list items",
                 )
             }
             OpenMpClause::Reduction { .. } if combined_do => {}
@@ -877,7 +919,7 @@ fn validate_worksharing_loop(
                         ctx.error(
                             span,
                             format!(
-                                "OpenMP DO REDUCTION variable '{name}' must be shared in the binding PARALLEL region"
+                                "OpenMP {directive_name} REDUCTION variable '{name}' must be shared in the binding PARALLEL region"
                             ),
                         );
                     }
@@ -888,10 +930,12 @@ fn validate_worksharing_loop(
             | OpenMpClause::Default(_)
             | OpenMpClause::If { .. }
             | OpenMpClause::NumThreads(_) => unreachable!(
-                "parser admitted a parallel-only clause on standalone OpenMP DO"
+                "parser admitted a parallel-only clause on standalone OpenMP {directive_name}"
             ),
             OpenMpClause::Private(_) | OpenMpClause::FirstPrivate(_) => {
-                unreachable!("OpenMP DO data clause escaped construct-specific validation")
+                unreachable!(
+                    "OpenMP {directive_name} data clause escaped construct-specific validation"
+                )
             }
         }
     }
@@ -968,6 +1012,30 @@ fn validate_worksharing_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span
             ),
         );
     }
+}
+
+fn loop_reduction_frontier_supported(
+    ctx: &Ctx<'_>,
+    operator: OpenMpReductionOperator,
+    items: &[OpenMpReductionItem],
+) -> bool {
+    operator == OpenMpReductionOperator::Add
+        && items.iter().all(|item| {
+            let OpenMpReductionItem::Name(name) = item else {
+                return false;
+            };
+            let Some(symbol) = ctx.lookup_lexical(name) else {
+                // Let the general reduction validator issue the unresolved-name
+                // diagnostic instead of obscuring it with a frontier error.
+                return true;
+            };
+            if symbol.kind != SymbolKind::Variable {
+                // Likewise, preserve the more precise non-variable diagnostic.
+                return true;
+            }
+            symbol.attrs.array_spec.is_empty()
+                && matches!(symbol.type_info.as_ref(), Some(TypeInfo::Integer { .. }))
+        })
 }
 
 fn validate_reduction_object(

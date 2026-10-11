@@ -32,8 +32,8 @@ toward [OpenMP 6.0][omp-60] without silently changing existing behavior.
 | Data sharing | Partial | `shared`, `private`, `firstprivate`, `lastprivate`, `default(shared)`, `default(private)`, and `default(none)` for the scalar and array forms accepted by semantic validation. Predetermined named constants and assumed-size arrays remain shared under `default(private)`; explicit clauses retain precedence. `lastprivate` is currently limited to supported intrinsic scalars on worksharing loops. |
 | Scalar data | Partial | INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, selected allocatable/pointer forms, and nonpolymorphic derived-type privatization. Unsupported ownership, dynamic-length, optional, volatile, and asynchronous cases are diagnosed. |
 | Array data | Partial | Numeric, logical, and fixed-length default-kind CHARACTER constant-shape storage plus selected descriptor-backed dummy, allocatable, pointer, section, and shared derived-type views. Unsupported ownership or lifetime cases are diagnosed. |
-| Worksharing loops | Preview | Canonical `do` and combined `parallel do`, positive/negative strides, static contiguous and chunked schedules, combined dynamic schedules, rectangular and direct-bound nonrectangular `collapse(2)`, implicit barriers, standalone `nowait`, scalar `private` and `lastprivate`, and predefined scalar/fixed-rank-one reductions. OpenMP 5.0 `loop private(...)` is supported when it binds implicitly to an enclosing `parallel` region. Other `loop` clauses, explicit `bind`, general affine nonrectangular bounds, and nonrectangular `lastprivate` remain diagnosed; standalone dynamic scheduling remains rejected. |
-| Reductions and synchronization | Partial | Scalar objects and constant-explicit-shape rank-one arrays of INTEGER support `+`, `*`, `max`, `min`, `iand`, `ior`, and `ieor`; REAL/DOUBLE PRECISION support `+`, `*`, `max`, and `min`; COMPLEX supports `+` and `*`; and LOGICAL supports `.and.`, `.or.`, `.eqv.`, and `.neqv.` on `parallel`, combined `parallel do`, and standalone worksharing `do`. Whole arrays, constant contiguous unit-stride sections, and constant elements are accepted. Partial selections reject whole-array and provably out-of-selection references within the region; dynamic element references retain bounds enforcement. Narrow integers combine at their storage width, and REAL(4)/REAL(8) and COMPLEX(4)/COMPLEX(8) combine at their declared precision. Standalone `do reduction` supports result publication at its implicit barrier and barrier-free `nowait` completion. Atomics, flush, locks, ordered regions, `single`, `masked`, the `sections` construct, higher-rank/runtime-shaped arrays, and user-defined reductions remain unimplemented. |
+| Worksharing loops | Preview | Canonical `do` and combined `parallel do`, positive/negative strides, static contiguous and chunked schedules, combined dynamic schedules, rectangular and direct-bound nonrectangular `collapse(2)`, implicit barriers, standalone `nowait`, scalar `private` and `lastprivate`, and predefined scalar/fixed-rank-one reductions. OpenMP 5.0 `loop private(...)` and scalar INTEGER `loop reduction(+:...)` are supported when they bind implicitly to an enclosing `parallel` region. Other `loop` clauses and reduction forms, explicit `bind`, general affine nonrectangular bounds, and nonrectangular `lastprivate` remain diagnosed; standalone dynamic scheduling remains rejected. |
+| Reductions and synchronization | Partial | Scalar objects and constant-explicit-shape rank-one arrays of INTEGER support `+`, `*`, `max`, `min`, `iand`, `ior`, and `ieor`; REAL/DOUBLE PRECISION support `+`, `*`, `max`, and `min`; COMPLEX supports `+` and `*`; and LOGICAL supports `.and.`, `.or.`, `.eqv.`, and `.neqv.` on `parallel`, combined `parallel do`, and standalone worksharing `do`. OpenMP 5.0 `loop` currently supports only scalar INTEGER addition reductions. Whole arrays, constant contiguous unit-stride sections, and constant elements are accepted on the broader constructs. Partial selections reject whole-array and provably out-of-selection references within the region; dynamic element references retain bounds enforcement. Narrow integers combine at their storage width, and REAL(4)/REAL(8) and COMPLEX(4)/COMPLEX(8) combine at their declared precision. Standalone `do reduction` supports result publication at its implicit barrier and barrier-free `nowait` completion. Atomics, flush, locks, ordered regions, `single`, `masked`, the `sections` construct, higher-rank/runtime-shaped arrays, and user-defined reductions remain unimplemented. |
 | Runtime library | Partial | Initial `omp_lib` queries, setters, timing routines, team execution, barriers, work dispatch, reductions, and critical locks. Unsupported API names are not published as implemented procedures. |
 | Environment variables | Partial | Initial handling for `OMP_NUM_THREADS`, `OMP_DYNAMIC`, `OMP_THREAD_LIMIT`, `OMP_MAX_ACTIVE_LEVELS`, and `OMP_SCHEDULE`. |
 | SIMD semantics | Not implemented | `-fopenmp-simd` does not yet change loop vectorization or accept a SIMD construct as executable support. |
@@ -81,19 +81,20 @@ remain a separate diagnosed extension beyond the direct-bound form exercised
 by `collapse.4`.
 
 The pinned OpenMP V&V corpus starts with the unchanged OpenMP 5.0
-`test_loop_private.F90` host case at revision
-`f7d95b342b9330ecac735ed31b9fb193d8f60a9b`. The source is SHA-256 pinned and
-runs at `-O0` and `-O3` using a documented host-only compatibility header; the
-upstream umbrella header also contains unsupported device-offload probes. This
-case covers implicit binding to an enclosing `parallel` region, per-loop scalar
-privatization, preprocessing constants inside directive lines, and completion
-synchronization. Its license, manifest, adapter, and harness live under
-`tests/fixtures/openmp-vv/` and `tests/openmp_vv.rs`.
+`test_loop_private.F90` and `test_loop_reduction_add.F90` host cases at
+revision `f7d95b342b9330ecac735ed31b9fb193d8f60a9b`. Each source is SHA-256
+pinned and runs at `-O0` and `-O3` using a documented host-only compatibility
+header; the upstream umbrella header also contains unsupported device-offload
+probes. These cases cover implicit binding to an enclosing `parallel` region,
+per-loop scalar privatization, scalar INTEGER addition reduction, preprocessing
+constants inside directive lines, and completion synchronization. Their
+license, manifest, adapter, and harness live under `tests/fixtures/openmp-vv/`
+and `tests/openmp_vv.rs`.
 
 ## Next milestones
 
-1. Grow the pinned host OpenMP V&V set through the next supported `loop`
-   clauses, starting with scalar reduction and then rectangular collapse.
+1. Grow the pinned host OpenMP V&V set through rectangular `loop collapse`
+   while preserving construct-specific diagnostics for unsupported forms.
 2. Run NPB EP Class S through the owned runtime and preserve minimized compiler
    edges as focused regressions.
 3. Extend array reductions beyond constant-shape rank one only with a truthful
