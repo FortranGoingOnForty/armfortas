@@ -21306,6 +21306,88 @@ end program
 }
 
 #[test]
+fn fopenmp_loop_rectangular_collapse_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_loop_rectangular_collapse_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: i, j, k
+  integer :: chain1(0:5,4), chain2(0:6,5,4)
+  chain1 = 0
+  chain2 = 0
+!$omp parallel default(none) shared(chain1,chain2) num_threads(4)
+!$omp loop collapse(1)
+  do i = 1, 4
+    do j = 1, 5
+      chain1(j,i) = chain1(j-1,i) + i + j
+    end do
+  end do
+!$omp end loop
+!$omp loop collapse(2)
+  do i = 1, 4
+    do j = 1, 5
+      do k = 1, 6
+        chain2(k,j,i) = chain2(k-1,j,i) + i + j + k
+      end do
+    end do
+  end do
+!$omp end loop
+!$omp end parallel
+  do i = 1, 4
+    do j = 1, 5
+      if (chain1(j,i) /= j*i + j*(j+1)/2) error stop 1
+      do k = 1, 6
+        if (chain2(k,j,i) /= k*(i+j) + k*(k+1)/2) error stop 2
+      end do
+    end do
+  end do
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_loop_rectangular_collapse", "bin");
+        let runtime_cache = unique_dir("openmp_loop_rectangular_collapse_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP LOOP rectangular COLLAPSE should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..4 {
+            let run = Command::new(&out).output().expect("failed to run binary");
+            assert!(
+                run.status.success(),
+                "OpenMP LOOP rectangular COLLAPSE failed at {opt}, iteration {iteration}:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_orphaned_fixed_form_do_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -22983,6 +23065,10 @@ fn fopenmp_worksharing_rejects_unsupported_forms() {
         (
             "program p\ninteger :: i\n!$omp parallel\n!$omp loop reduction(+:i)\ndo i=1,4\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
             "OpenMP LOOP associated iteration variables may not appear in REDUCTION",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel\n!$omp loop collapse(2)\ndo i=1,4\ndo j=i,4\nend do\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
+            "OpenMP LOOP nonrectangular COLLAPSE(2) is recognized but not yet implemented",
         ),
         (
             "program p\ninteger :: i\n!$omp parallel\n!$omp do schedule(dynamic)\ndo i=1,4\nend do\n!$omp end do\n!$omp end parallel\nend program\n",

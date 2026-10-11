@@ -1078,6 +1078,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_loop_collapse_clause() {
+        let stmt = parse(
+            "!$omp loop collapse(2)\n\
+             do i = 1, n\n\
+               do j = 1, n\n\
+               end do\n\
+             end do\n\
+             !$omp end loop\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::Loop { clauses, .. }) = stmt.node else {
+            panic!("expected loop construct");
+        };
+        assert!(matches!(
+            clauses.as_slice(),
+            [OpenMpClause::Collapse(argument)]
+                if matches!(&argument.node, Expr::IntegerLiteral { text, .. } if text == "2")
+        ));
+    }
+
+    #[test]
     fn parses_compact_fixed_form_enddo_directive() {
         let stmt = parse(
             "C$OMP DO\n      DO I=1,4\n      ENDDO\nC$OMP ENDDO NOWAIT\n",
