@@ -79,7 +79,9 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             for clause in clauses {
                 if !matches!(
                     clause,
-                    OpenMpClause::Private(_) | OpenMpClause::Reduction { .. }
+                    OpenMpClause::Private(_)
+                        | OpenMpClause::Collapse(_)
+                        | OpenMpClause::Reduction { .. }
                 ) {
                     ctx.error(
                         span,
@@ -525,7 +527,7 @@ fn validate_associated_loop<'a>(
     let Some(symbol) = ctx.lookup_lexical(var) else {
         ctx.error(
             loop_stmt.span,
-            format!("OpenMP DO iteration variable '{var}' is not declared"),
+            format!("OpenMP {description} iteration variable '{var}' is not declared"),
         );
         return None;
     };
@@ -535,7 +537,9 @@ fn validate_associated_loop<'a>(
     {
         ctx.error(
             loop_stmt.span,
-            format!("OpenMP DO iteration variable '{var}' must be a scalar INTEGER variable"),
+            format!(
+                "OpenMP {description} iteration variable '{var}' must be a scalar INTEGER variable"
+            ),
         );
     }
     for (label, expr) in [("lower bound", start), ("upper bound", end)]
@@ -550,7 +554,7 @@ fn validate_associated_loop<'a>(
         {
             ctx.error(
                 expr.span,
-                format!("OpenMP DO {label} must be a scalar INTEGER expression"),
+                format!("OpenMP {description} {label} must be a scalar INTEGER expression"),
             );
         }
     }
@@ -565,7 +569,12 @@ fn validate_associated_loop<'a>(
     })
 }
 
-fn validate_collapse_depth(ctx: &mut Ctx<'_>, span: Span, clauses: &[OpenMpClause]) -> usize {
+fn validate_collapse_depth(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    clauses: &[OpenMpClause],
+    kind: WorksharingLoopKind,
+) -> usize {
     let mut depth = 1;
     let mut saw_collapse = false;
     for clause in clauses {
@@ -573,7 +582,13 @@ fn validate_collapse_depth(ctx: &mut Ctx<'_>, span: Span, clauses: &[OpenMpClaus
             continue;
         };
         if std::mem::replace(&mut saw_collapse, true) {
-            ctx.error(span, "OpenMP DO may not repeat the COLLAPSE clause");
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP {} may not repeat the COLLAPSE clause",
+                    kind.directive_name()
+                ),
+            );
             continue;
         }
         if validation_expr_rank(ctx, argument) != Some(0)
@@ -645,7 +660,7 @@ fn validate_worksharing_loop(
     let Some(outer_loop) = validate_associated_loop(ctx, span, loop_stmt, directive_name) else {
         return;
     };
-    let collapse_depth = validate_collapse_depth(ctx, span, clauses);
+    let collapse_depth = validate_collapse_depth(ctx, span, clauses, kind);
     let mut associated_loop_keys = HashSet::from([outer_loop.var.to_ascii_lowercase()]);
     if collapse_depth == 2 {
         let inner_stmt = if outer_loop.body.len() == 1 {
@@ -693,6 +708,12 @@ fn validate_worksharing_loop(
             );
         }
         let nonrectangular = lower_depends_on_outer || upper_depends_on_outer;
+        if kind == WorksharingLoopKind::Loop && nonrectangular {
+            ctx.error(
+                span,
+                "OpenMP LOOP nonrectangular COLLAPSE(2) is recognized but not yet implemented",
+            );
+        }
         if nonrectangular
             && integer_variable_kind(ctx, outer_loop.var)
                 != integer_variable_kind(ctx, inner_loop.var)
