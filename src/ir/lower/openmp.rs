@@ -592,6 +592,13 @@ pub(super) fn lower_construct(
             lower_critical_region(b, ctx, name.as_deref(), body)
         }
         OpenMpConstruct::Master { body } => lower_master_region(b, ctx, body),
+        OpenMpConstruct::Barrier => {
+            b.call(
+                FuncRef::External("afs_omp_barrier".into()),
+                vec![],
+                IrType::Int(IntWidth::I32),
+            );
+        }
         OpenMpConstruct::AtomicUpdate { assignment } => {
             b.call(
                 FuncRef::External("afs_omp_atomic_enter".into()),

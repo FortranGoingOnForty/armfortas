@@ -6,7 +6,8 @@
 //! scalar LASTPRIVATE copy-out and predefined scalar/fixed-rank-one reductions.
 //! Named and unnamed `CRITICAL` regions retain process-wide lock identity,
 //! `MASTER` regions execute only on the primary thread without an implicit
-//! barrier, and the initial `ATOMIC UPDATE` slice covers scalar numeric addition.
+//! barrier, explicit `BARRIER` directives synchronize the current team, and
+//! the initial `ATOMIC UPDATE` slice covers scalar numeric addition.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
 //! regions without pretending later schedules, loop clauses, or wider object
 //! ownership cases are already implemented.
@@ -139,6 +140,22 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
                 );
             }
             validate_structured_block(ctx, body);
+        }
+        OpenMpConstruct::Barrier => {
+            reject_in_pure(ctx, span, "BARRIER");
+            if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
+                if matches!(
+                    enclosing,
+                    "DO" | "LOOP" | "PARALLEL DO" | "CRITICAL" | "MASTER" | "ATOMIC UPDATE"
+                ) {
+                    ctx.error(
+                        span,
+                        format!(
+                            "OpenMP BARRIER may not be closely nested inside an OpenMP {enclosing} region"
+                        ),
+                    );
+                }
+            }
         }
         OpenMpConstruct::AtomicUpdate { assignment } => {
             reject_in_pure(ctx, span, "ATOMIC UPDATE");

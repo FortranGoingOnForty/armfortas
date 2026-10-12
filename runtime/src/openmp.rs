@@ -586,7 +586,9 @@ pub extern "C" fn afs_omp_parallel_region(
 /// Wait until every implicit task in the current team reaches this point.
 ///
 /// The barrier is reusable, so successive worksharing constructs in one
-/// parallel region share the same team synchronization object.
+/// parallel region share the same team synchronization object. A thread with
+/// no explicit team belongs to the one-thread initial team, so its barrier is
+/// already complete.
 #[no_mangle]
 pub extern "C" fn afs_omp_barrier() -> i32 {
     let barrier = THREAD_STATE.with(|state| {
@@ -596,10 +598,9 @@ pub extern "C" fn afs_omp_barrier() -> i32 {
             .last()
             .map(|team| Arc::clone(&team.barrier))
     });
-    let Some(barrier) = barrier else {
-        return AFS_OMP_ERROR_NO_TEAM;
-    };
-    barrier.wait();
+    if let Some(barrier) = barrier {
+        barrier.wait();
+    }
     AFS_OMP_SUCCESS
 }
 
@@ -2352,6 +2353,12 @@ mod tests {
         all_arrived_after_barrier: AtomicBool,
     }
 
+    #[test]
+    fn barrier_outside_explicit_team_completes_initial_team() {
+        reset_thread_state();
+        assert_eq!(afs_omp_barrier(), AFS_OMP_SUCCESS);
+    }
+
     unsafe extern "C" fn synchronize_task(
         environment: *mut c_void,
         _thread_num: i32,
@@ -2370,7 +2377,6 @@ mod tests {
     #[test]
     fn team_barrier_waits_for_every_implicit_task() {
         reset_thread_state();
-        assert_eq!(afs_omp_barrier(), AFS_OMP_ERROR_NO_TEAM);
         let observations = BarrierObservations {
             arrived: AtomicUsize::new(0),
             all_arrived_after_barrier: AtomicBool::new(true),

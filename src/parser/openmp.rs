@@ -21,6 +21,7 @@ enum OpenMpHeader {
     ParallelDo(Vec<OpenMpClause>),
     Critical(Option<String>),
     Master,
+    Barrier,
     AtomicUpdate,
     EndParallel,
     EndDo { nowait: bool },
@@ -168,6 +169,10 @@ impl<'a> Parser<'a> {
                     span_through(directive.span, end_span),
                 ))
             }
+            OpenMpHeader::Barrier => Ok(Spanned::new(
+                Stmt::OpenMp(OpenMpConstruct::Barrier),
+                directive.span,
+            )),
             OpenMpHeader::AtomicUpdate => {
                 self.skip_newlines();
                 let assignment = self.parse_stmt()?;
@@ -358,6 +363,10 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
         "master" => {
             cursor.finish()?;
             OpenMpHeader::Master
+        }
+        "barrier" => {
+            cursor.finish()?;
+            OpenMpHeader::Barrier
         }
         "atomic" => {
             if !cursor.finished() {
@@ -1101,6 +1110,23 @@ mod tests {
                 ..
             }] if body.len() == 1
         ));
+    }
+
+    #[test]
+    fn parses_free_and_fixed_form_barrier_directives() {
+        for (source, form) in [
+            ("!$omp barrier\n", SourceForm::FreeForm),
+            ("C$OMP BARRIER\n", SourceForm::FixedForm),
+        ] {
+            let stmt = parse(source, form).unwrap();
+            assert!(matches!(stmt.node, Stmt::OpenMp(OpenMpConstruct::Barrier)));
+        }
+    }
+
+    #[test]
+    fn rejects_clauses_on_barrier_directive() {
+        let error = parse("!$omp barrier nowait\n", SourceForm::FreeForm).unwrap_err();
+        assert!(error.msg.contains("unexpected text 'nowait'"), "{error}");
     }
 
     #[test]
