@@ -183,6 +183,9 @@ fn capture_base_needs_environment(
         && (is_allocatable_entity(&capture.info)
             || is_deferred_character_allocatable_scalar(&capture.info)))
         || (capture.kind == CaptureKind::Private
+            && is_array(&capture.info)
+            && shared_capture_uses_descriptor(&capture.info))
+        || (capture.kind == CaptureKind::Private
             && capture
                 .info
                 .derived_type
@@ -451,7 +454,7 @@ fn allocate_private_array(
     private.runtime_dim_upper.clear();
     private.last_dim_assumed_size = false;
 
-    if !fixed_array_uses_heap(outside, b.layout) {
+    if shape_descriptor.is_none() && !fixed_array_uses_heap(outside, b.layout) {
         private.addr = b.alloca(fixed_array_storage_type(outside, b.layout));
         return (private, None);
     }
@@ -2364,6 +2367,19 @@ fn materialize_shared_environment(
             // callbacks inspect its metadata but never read or free its
             // payload pointer.
             snapshot_array_descriptor(b, source)
+        } else if capture.kind == CaptureKind::Private
+            && is_array(&capture.info)
+            && shared_capture_uses_descriptor(&capture.info)
+        {
+            let source = if local_uses_array_descriptor(&capture.info) {
+                array_descriptor_addr(b, &capture.info)
+            } else {
+                materialize_array_descriptor_for_info(b, &capture.info)
+            };
+            // The caller's payload is deliberately retained only as inert
+            // descriptor metadata. Each implicit task allocates independent
+            // storage with these encounter-time bounds.
+            snapshot_array_descriptor(b, source)
         } else if capture.kind == CaptureKind::FirstPrivate
             && is_deferred_character_allocatable_scalar(&capture.info)
         {
@@ -2645,8 +2661,24 @@ fn install_shared_captures(
                         }
                     }
                 } else {
+                    let shape_descriptor = if shared_capture_uses_descriptor(&capture.info) {
+                        let index = b.const_i64(slot_index);
+                        let slot = b.gep(
+                            environment_slots.expect("missing OpenMP environment slots"),
+                            vec![index],
+                            IrType::Int(IntWidth::I64),
+                        );
+                        let raw_address = b.load_typed(slot, IrType::Int(IntWidth::I64));
+                        slot_index += 1;
+                        Some(b.int_to_ptr(
+                            raw_address,
+                            IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392),
+                        ))
+                    } else {
+                        None
+                    };
                     let (private, cleanup_descriptor) =
-                        allocate_private_array(b, &capture.info, None);
+                        allocate_private_array(b, &capture.info, shape_descriptor);
                     local = private;
                     cleanup.array_descriptors.extend(cleanup_descriptor);
                 }

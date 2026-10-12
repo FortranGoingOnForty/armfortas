@@ -2430,7 +2430,15 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         }
         return;
     }
-    if is_dummy && !symbol.attrs.array_spec.is_empty() {
+    let private_explicit_shape_dummy = is_dummy
+        && clause == "PRIVATE"
+        && !symbol.attrs.array_spec.is_empty()
+        && symbol
+            .attrs
+            .array_spec
+            .iter()
+            .all(|spec| matches!(spec, crate::ast::decl::ArraySpec::Explicit { .. }));
+    if is_dummy && !symbol.attrs.array_spec.is_empty() && !private_explicit_shape_dummy {
         ctx.error(
             span,
             format!(
@@ -2441,11 +2449,12 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         return;
     }
     if !symbol.attrs.array_spec.is_empty() {
-        if symbol
-            .attrs
-            .array_spec
-            .iter()
-            .any(|spec| validation_explicit_dim_bounds(ctx, spec).is_none())
+        if !private_explicit_shape_dummy
+            && symbol
+                .attrs
+                .array_spec
+                .iter()
+                .any(|spec| validation_explicit_dim_bounds(ctx, spec).is_none())
         {
             ctx.error(
                 span,
@@ -2462,6 +2471,10 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
                 | Some(TypeInfo::Real { .. })
                 | Some(TypeInfo::DoublePrecision)
                 | Some(TypeInfo::Logical { .. })
+        ) || matches!(
+            symbol.type_info.as_ref(),
+            Some(TypeInfo::Complex { kind })
+                if matches!(kind.unwrap_or_else(crate::driver::defaults::default_real_kind), 4 | 8)
         );
         let supported_character = matches!(
             symbol.type_info.as_ref(),
@@ -2474,7 +2487,7 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
             ctx.error(
                 span,
                 format!(
-                    "OpenMP {} array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, or fixed-length default-kind CHARACTER elements",
+                    "OpenMP {} array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, COMPLEX, LOGICAL, or fixed-length default-kind CHARACTER elements",
                     clause, name
                 ),
             );
