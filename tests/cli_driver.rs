@@ -26059,8 +26059,8 @@ fn fopenmp_default_private_enforces_data_environment_rules() {
             "duplicate OpenMP default clause",
         ),
         (
-            "subroutine s(value)\ninteger :: value\n!$omp parallel default(private)\nvalue=1\n!$omp end parallel\nend subroutine\n",
-            "OpenMP DEFAULT(PRIVATE) dummy argument 'value' is recognized but not yet implemented",
+            "subroutine s(value)\ninteger, optional :: value\n!$omp parallel default(private)\nvalue=1\n!$omp end parallel\nend subroutine\n",
+            "OpenMP DEFAULT(PRIVATE) OPTIONAL dummy 'value' is recognized but not yet implemented",
         ),
         (
             "program p\ninteger :: i,total\ntotal=0\n!$omp parallel default(private)\n!$omp do reduction(+:total)\ndo i=1,4\ntotal=total+i\nend do\n!$omp end do\n!$omp end parallel\nend program\n",

@@ -172,6 +172,13 @@ fn is_array(info: &LocalInfo) -> bool {
     local_declared_rank(info) > 0
 }
 
+fn private_array_needs_shape_snapshot(info: &LocalInfo) -> bool {
+    is_array(info)
+        && !info.allocatable
+        && !info.is_pointer
+        && info.runtime_dim_upper.iter().any(Option::is_some)
+}
+
 fn capture_base_needs_environment(
     capture: &Capture,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
@@ -183,8 +190,7 @@ fn capture_base_needs_environment(
         && (is_allocatable_entity(&capture.info)
             || is_deferred_character_allocatable_scalar(&capture.info)))
         || (capture.kind == CaptureKind::Private
-            && is_array(&capture.info)
-            && shared_capture_uses_descriptor(&capture.info))
+            && private_array_needs_shape_snapshot(&capture.info))
         || (capture.kind == CaptureKind::Private
             && capture
                 .info
@@ -2368,8 +2374,7 @@ fn materialize_shared_environment(
             // payload pointer.
             snapshot_array_descriptor(b, source)
         } else if capture.kind == CaptureKind::Private
-            && is_array(&capture.info)
-            && shared_capture_uses_descriptor(&capture.info)
+            && private_array_needs_shape_snapshot(&capture.info)
         {
             let source = if local_uses_array_descriptor(&capture.info) {
                 array_descriptor_addr(b, &capture.info)
@@ -2661,7 +2666,7 @@ fn install_shared_captures(
                         }
                     }
                 } else {
-                    let shape_descriptor = if shared_capture_uses_descriptor(&capture.info) {
+                    let shape_descriptor = if private_array_needs_shape_snapshot(&capture.info) {
                         let index = b.const_i64(slot_index);
                         let slot = b.gep(
                             environment_slots.expect("missing OpenMP environment slots"),
