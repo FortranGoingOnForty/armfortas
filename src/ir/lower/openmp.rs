@@ -619,8 +619,8 @@ fn lower_master_region(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, body: &[
     let thread_num = if let Some((thread_num, _)) = ctx.openmp_team {
         thread_num
     } else {
-        // Semantic validation requires close nesting in PARALLEL. Keep the
-        // runtime query as a defensive lowering fallback for recovered ASTs.
+        // An orphaned MASTER binds dynamically to the current team. Outside
+        // an active parallel region the initial team's thread number is zero.
         b.call(
             FuncRef::External("afs_omp_get_thread_num".into()),
             vec![],

@@ -133,11 +133,15 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
         }
         OpenMpConstruct::Master { body } => {
             reject_in_pure(ctx, span, "MASTER");
-            if ctx.openmp_construct_stack.last().copied() != Some("PARALLEL") {
-                ctx.error(
-                    span,
-                    "OpenMP MASTER must be closely nested inside an OpenMP PARALLEL region",
-                );
+            if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
+                if matches!(enclosing, "DO" | "LOOP" | "PARALLEL DO" | "ATOMIC UPDATE") {
+                    ctx.error(
+                        span,
+                        format!(
+                            "OpenMP MASTER may not be closely nested inside an OpenMP {enclosing} region"
+                        ),
+                    );
+                }
             }
             validate_structured_block(ctx, body);
         }

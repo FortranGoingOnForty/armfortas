@@ -23144,7 +23144,48 @@ fn fopenmp_master_region_runs_only_on_primary_thread() {
         return;
     }
     let src = write_program(
-        "program p\n  use omp_lib, only: omp_get_thread_num\n  implicit none\n  integer :: count, primary_thread\n  count = 0\n  primary_thread = -1\n!$omp parallel default(none) num_threads(4) shared(count,primary_thread)\n!$omp master\n  count = count + 1\n  primary_thread = omp_get_thread_num()\n!$omp end master\n!$omp end parallel\n  if (count /= 1) error stop 1\n  if (primary_thread /= 0) error stop 2\n  print *, 'ok'\nend program p\n",
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: count, primary_thread
+
+  count = 0
+  primary_thread = -1
+  call orphaned_master(count, primary_thread)
+  if (count /= 1) error stop 1
+  if (primary_thread /= 0) error stop 2
+
+  count = 0
+  primary_thread = -1
+!$omp parallel default(none) num_threads(4) shared(count,primary_thread)
+!$omp master
+  count = count + 1
+  primary_thread = omp_get_thread_num()
+!$omp end master
+!$omp end parallel
+  if (count /= 1) error stop 3
+  if (primary_thread /= 0) error stop 4
+
+  count = 0
+  primary_thread = -1
+!$omp parallel default(none) num_threads(4) shared(count,primary_thread)
+  call orphaned_master(count, primary_thread)
+!$omp end parallel
+  if (count /= 1) error stop 5
+  if (primary_thread /= 0) error stop 6
+  print *, 'ok'
+end program p
+
+subroutine orphaned_master(count, primary_thread)
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer, intent(inout) :: count, primary_thread
+!$omp master
+  count = count + 1
+  primary_thread = omp_get_thread_num()
+!$omp end master
+end subroutine orphaned_master
+",
         "f90",
     );
     for opt in ["-O0", "-O3"] {
@@ -23244,20 +23285,33 @@ end program p
 }
 
 #[test]
-fn fopenmp_master_requires_close_parallel_nesting() {
-    for source in [
-        "program p\n!$omp master\ncontinue\n!$omp end master\nend program p\n",
-        "program p\n!$omp parallel\n!$omp critical\n!$omp master\ncontinue\n!$omp end master\n!$omp end critical\n!$omp end parallel\nend program p\n",
+fn fopenmp_master_rejects_illegal_close_nesting() {
+    for (source, enclosing) in [
+        (
+            "program p\n  integer :: i\n!$omp parallel\n!$omp do\n  do i = 1, 4\n!$omp master\n  continue\n!$omp end master\n  end do\n!$omp end do\n!$omp end parallel\nend program p\n",
+            "DO",
+        ),
+        (
+            "program p\n  integer :: i\n!$omp parallel\n!$omp loop\n  do i = 1, 4\n!$omp master\n  continue\n!$omp end master\n  end do\n!$omp end loop\n!$omp end parallel\nend program p\n",
+            "LOOP",
+        ),
+        (
+            "program p\n  integer :: i\n!$omp parallel do\n  do i = 1, 4\n!$omp master\n  continue\n!$omp end master\n  end do\n!$omp end parallel do\nend program p\n",
+            "PARALLEL DO",
+        ),
     ] {
         let src = write_program(source, "f90");
         let result = diagnostic_output(&src, &["-fopenmp"]);
-        assert!(!result.status.success(), "misnested OpenMP MASTER compiled");
+        assert!(
+            !result.status.success(),
+            "OpenMP MASTER closely nested in {enclosing} compiled"
+        );
         let stderr = String::from_utf8_lossy(&result.stderr);
         assert!(
-            stderr.contains(
-                "OpenMP MASTER must be closely nested inside an OpenMP PARALLEL region"
-            ),
-            "unexpected diagnostic: {stderr}"
+            stderr.contains(&format!(
+                "OpenMP MASTER may not be closely nested inside an OpenMP {enclosing} region"
+            )),
+            "unexpected diagnostic for {enclosing}: {stderr}"
         );
         let _ = std::fs::remove_file(&src);
     }
