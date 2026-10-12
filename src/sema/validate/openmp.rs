@@ -57,7 +57,14 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             reject_in_pure(ctx, span, "PARALLEL");
             let clause_info = validate_parallel_clauses(ctx, span, clauses, false);
             validate_partial_reduction_references(ctx, clauses, body);
-            let predetermined_private = predetermined_private_names(ctx.st, body);
+            let standalone_lastprivate =
+                standalone_worksharing_lastprivate_names(body, |clauses| {
+                    worksharing_collapse_depth_value(ctx, clauses)
+                });
+            let mut predetermined_private = predetermined_private_names(ctx.st, body, |clauses| {
+                worksharing_collapse_depth_value(ctx, clauses)
+            });
+            predetermined_private.retain(|name| !standalone_lastprivate.contains(name));
             validate_data_environment(ctx, body, &clause_info, &predetermined_private);
             validate_structured_block(ctx, body);
         }
@@ -82,6 +89,7 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
                 if !matches!(
                     clause,
                     OpenMpClause::Private(_)
+                        | OpenMpClause::LastPrivate { .. }
                         | OpenMpClause::Collapse(_)
                         | OpenMpClause::Reduction { .. }
                 ) {
@@ -105,7 +113,9 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             reject_in_pure(ctx, span, "PARALLEL DO");
             let clause_info = validate_parallel_clauses(ctx, span, clauses, true);
             let loop_body = std::slice::from_ref(loop_stmt.as_ref());
-            let predetermined_private = predetermined_private_names(ctx.st, loop_body);
+            let predetermined_private = predetermined_private_names(ctx.st, loop_body, |clauses| {
+                worksharing_collapse_depth_value(ctx, clauses)
+            });
             validate_data_environment(ctx, loop_body, &clause_info, &predetermined_private);
             validate_worksharing_loop(
                 ctx,
@@ -449,7 +459,16 @@ pub(super) fn parallel_private_names(
         })
         .map(str::to_ascii_lowercase)
         .collect::<HashSet<_>>();
-    private.extend(predetermined_private_names(ctx.st, body));
+    let standalone_lastprivate = standalone_worksharing_lastprivate_names(body, |clauses| {
+        worksharing_collapse_depth_value(ctx, clauses)
+    });
+    private.extend(
+        predetermined_private_names(ctx.st, body, |clauses| {
+            worksharing_collapse_depth_value(ctx, clauses)
+        })
+        .into_iter()
+        .filter(|name| !standalone_lastprivate.contains(name)),
+    );
 
     for (name, _, role) in capture_references(ctx.st, body) {
         let is_data_reference = role == ReferenceRole::Value
@@ -754,6 +773,17 @@ fn validate_collapse_depth(
     depth
 }
 
+fn worksharing_collapse_depth_value(ctx: &Ctx<'_>, clauses: &[OpenMpClause]) -> i64 {
+    clauses
+        .iter()
+        .find_map(|clause| match clause {
+            OpenMpClause::Collapse(argument) => validation_const_int_value(ctx, argument)
+                .and_then(|value| i64::try_from(value).ok()),
+            _ => None,
+        })
+        .unwrap_or(1)
+}
+
 fn expression_references_name(expr: &crate::ast::expr::SpannedExpr, name: &str) -> bool {
     let mut facts = ProcedureReferenceFacts::default();
     collect_reference_expr(expr, &HashSet::new(), &mut facts);
@@ -1019,6 +1049,17 @@ fn validate_worksharing_loop(
                 }
                 for name in variables {
                     let key = name.to_ascii_lowercase();
+                    if kind == WorksharingLoopKind::Loop
+                        && !associated_loop_keys.contains(&key)
+                    {
+                        ctx.error(
+                            span,
+                            format!(
+                                "OpenMP LOOP LASTPRIVATE variable '{name}' must be an associated iteration variable"
+                            ),
+                        );
+                        continue;
+                    }
                     if ctx
                         .openmp_parallel_private_frames
                         .last()
@@ -1641,12 +1682,16 @@ pub(crate) fn callable_reference_needs_capture(
     }
 }
 
-pub(crate) fn predetermined_private_names(
+pub(crate) fn predetermined_private_names<F>(
     st: &SymbolTable,
     body: &[SpannedStmt],
-) -> HashSet<String> {
+    mut collapse_depth: F,
+) -> HashSet<String>
+where
+    F: FnMut(&[OpenMpClause]) -> i64,
+{
     let mut candidates = Vec::new();
-    collect_predetermined_private_names(body, &mut candidates);
+    collect_predetermined_private_names(body, &mut candidates, &mut collapse_depth);
     let references = capture_references(st, body);
     candidates
         .into_iter()
@@ -1661,22 +1706,74 @@ pub(crate) fn predetermined_private_names(
         .collect()
 }
 
-pub(crate) fn standalone_worksharing_lastprivate_names(body: &[SpannedStmt]) -> HashSet<String> {
+pub(crate) fn standalone_worksharing_lastprivate_names<F>(
+    body: &[SpannedStmt],
+    mut collapse_depth: F,
+) -> HashSet<String>
+where
+    F: FnMut(&[OpenMpClause]) -> i64,
+{
     let mut names = HashSet::new();
-    collect_standalone_worksharing_lastprivate_names(body, &mut names);
+    collect_standalone_worksharing_lastprivate_names(body, &mut names, &mut collapse_depth);
     names
 }
 
-fn collect_standalone_worksharing_lastprivate_names(
+fn collect_standalone_worksharing_lastprivate_names<F>(
     stmts: &[SpannedStmt],
     names: &mut HashSet<String>,
-) {
+    collapse_depth: &mut F,
+) where
+    F: FnMut(&[OpenMpClause]) -> i64,
+{
     for stmt in stmts {
         match &stmt.node {
             Stmt::OpenMp(OpenMpConstruct::Do { clauses, .. }) => {
                 for clause in clauses {
                     if let OpenMpClause::LastPrivate { variables, .. } = clause {
                         names.extend(variables.iter().map(|name| name.to_ascii_lowercase()));
+                    }
+                }
+            }
+            Stmt::OpenMp(OpenMpConstruct::Loop { clauses, loop_stmt }) => {
+                let explicitly_private: HashSet<_> = clauses
+                    .iter()
+                    .filter_map(|clause| match clause {
+                        OpenMpClause::Private(variables) => Some(variables.as_slice()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect();
+                for clause in clauses {
+                    if let OpenMpClause::LastPrivate { variables, .. } = clause {
+                        names.extend(variables.iter().map(|name| name.to_ascii_lowercase()));
+                    }
+                }
+                let Stmt::DoLoop {
+                    var: Some(outer),
+                    body,
+                    ..
+                } = &loop_stmt.node
+                else {
+                    unreachable!("non-canonical OpenMP LOOP passed semantic validation")
+                };
+                let outer = outer.to_ascii_lowercase();
+                if !explicitly_private.contains(&outer) {
+                    names.insert(outer);
+                }
+                if collapse_depth(clauses) == 2 {
+                    let [inner_stmt] = body.as_slice() else {
+                        unreachable!("non-perfect OpenMP LOOP COLLAPSE(2) passed validation")
+                    };
+                    let Stmt::DoLoop {
+                        var: Some(inner), ..
+                    } = &inner_stmt.node
+                    else {
+                        unreachable!("non-canonical OpenMP LOOP COLLAPSE(2) passed validation")
+                    };
+                    let inner = inner.to_ascii_lowercase();
+                    if !explicitly_private.contains(&inner) {
+                        names.insert(inner);
                     }
                 }
             }
@@ -1690,7 +1787,7 @@ fn collect_standalone_worksharing_lastprivate_names(
             | Stmt::Block { body, .. }
             | Stmt::Associate { body, .. }
             | Stmt::ForallConstruct { body, .. } => {
-                collect_standalone_worksharing_lastprivate_names(body, names)
+                collect_standalone_worksharing_lastprivate_names(body, names, collapse_depth)
             }
             Stmt::IfConstruct {
                 then_body,
@@ -1698,12 +1795,12 @@ fn collect_standalone_worksharing_lastprivate_names(
                 else_body,
                 ..
             } => {
-                collect_standalone_worksharing_lastprivate_names(then_body, names);
+                collect_standalone_worksharing_lastprivate_names(then_body, names, collapse_depth);
                 for (_, body) in else_ifs {
-                    collect_standalone_worksharing_lastprivate_names(body, names);
+                    collect_standalone_worksharing_lastprivate_names(body, names, collapse_depth);
                 }
                 if let Some(body) = else_body {
-                    collect_standalone_worksharing_lastprivate_names(body, names);
+                    collect_standalone_worksharing_lastprivate_names(body, names, collapse_depth);
                 }
             }
             Stmt::IfStmt { action, .. }
@@ -1713,11 +1810,16 @@ fn collect_standalone_worksharing_lastprivate_names(
                 collect_standalone_worksharing_lastprivate_names(
                     std::slice::from_ref(action.as_ref()),
                     names,
+                    collapse_depth,
                 )
             }
             Stmt::SelectCase { cases, .. } => {
                 for case in cases {
-                    collect_standalone_worksharing_lastprivate_names(&case.body, names);
+                    collect_standalone_worksharing_lastprivate_names(
+                        &case.body,
+                        names,
+                        collapse_depth,
+                    );
                 }
             }
             Stmt::SelectType { guards, .. } => {
@@ -1727,7 +1829,7 @@ fn collect_standalone_worksharing_lastprivate_names(
                         | TypeGuard::ClassIs { body, .. }
                         | TypeGuard::ClassDefault { body } => body,
                     };
-                    collect_standalone_worksharing_lastprivate_names(body, names);
+                    collect_standalone_worksharing_lastprivate_names(body, names, collapse_depth);
                 }
             }
             Stmt::SelectRank { guards, .. } => {
@@ -1737,15 +1839,15 @@ fn collect_standalone_worksharing_lastprivate_names(
                         | RankGuard::RankStar { body }
                         | RankGuard::RankDefault { body } => body,
                     };
-                    collect_standalone_worksharing_lastprivate_names(body, names);
+                    collect_standalone_worksharing_lastprivate_names(body, names, collapse_depth);
                 }
             }
             Stmt::WhereConstruct {
                 body, elsewhere, ..
             } => {
-                collect_standalone_worksharing_lastprivate_names(body, names);
+                collect_standalone_worksharing_lastprivate_names(body, names, collapse_depth);
                 for (_, body) in elsewhere {
-                    collect_standalone_worksharing_lastprivate_names(body, names);
+                    collect_standalone_worksharing_lastprivate_names(body, names, collapse_depth);
                 }
             }
             _ => {}
@@ -1753,14 +1855,20 @@ fn collect_standalone_worksharing_lastprivate_names(
     }
 }
 
-fn collect_predetermined_private_names(stmts: &[SpannedStmt], names: &mut Vec<(String, Span)>) {
+fn collect_predetermined_private_names<F>(
+    stmts: &[SpannedStmt],
+    names: &mut Vec<(String, Span)>,
+    collapse_depth: &mut F,
+) where
+    F: FnMut(&[OpenMpClause]) -> i64,
+{
     for stmt in stmts {
         match &stmt.node {
             Stmt::DoLoop { var, body, .. } => {
                 if let Some(var) = var {
                     names.push((var.to_ascii_lowercase(), stmt.span));
                 }
-                collect_predetermined_private_names(body, names);
+                collect_predetermined_private_names(body, names, collapse_depth);
             }
             Stmt::IfConstruct {
                 then_body,
@@ -1768,30 +1876,34 @@ fn collect_predetermined_private_names(stmts: &[SpannedStmt], names: &mut Vec<(S
                 else_body,
                 ..
             } => {
-                collect_predetermined_private_names(then_body, names);
+                collect_predetermined_private_names(then_body, names, collapse_depth);
                 for (_, body) in else_ifs {
-                    collect_predetermined_private_names(body, names);
+                    collect_predetermined_private_names(body, names, collapse_depth);
                 }
                 if let Some(body) = else_body {
-                    collect_predetermined_private_names(body, names);
+                    collect_predetermined_private_names(body, names, collapse_depth);
                 }
             }
             Stmt::IfStmt { action, .. }
             | Stmt::WhereStmt { stmt: action, .. }
             | Stmt::ForallStmt { stmt: action, .. }
             | Stmt::Labeled { stmt: action, .. } => {
-                collect_predetermined_private_names(std::slice::from_ref(action.as_ref()), names);
+                collect_predetermined_private_names(
+                    std::slice::from_ref(action.as_ref()),
+                    names,
+                    collapse_depth,
+                );
             }
             Stmt::DoWhile { body, .. }
             | Stmt::DoConcurrent { body, .. }
             | Stmt::Block { body, .. }
             | Stmt::Associate { body, .. }
             | Stmt::ForallConstruct { body, .. } => {
-                collect_predetermined_private_names(body, names);
+                collect_predetermined_private_names(body, names, collapse_depth);
             }
             Stmt::SelectCase { cases, .. } => {
                 for case in cases {
-                    collect_predetermined_private_names(&case.body, names);
+                    collect_predetermined_private_names(&case.body, names, collapse_depth);
                 }
             }
             Stmt::SelectType { guards, .. } => {
@@ -1801,7 +1913,7 @@ fn collect_predetermined_private_names(stmts: &[SpannedStmt], names: &mut Vec<(S
                         | TypeGuard::ClassIs { body, .. }
                         | TypeGuard::ClassDefault { body } => body,
                     };
-                    collect_predetermined_private_names(body, names);
+                    collect_predetermined_private_names(body, names, collapse_depth);
                 }
             }
             Stmt::SelectRank { guards, .. } => {
@@ -1811,15 +1923,15 @@ fn collect_predetermined_private_names(stmts: &[SpannedStmt], names: &mut Vec<(S
                         | RankGuard::RankStar { body }
                         | RankGuard::RankDefault { body } => body,
                     };
-                    collect_predetermined_private_names(body, names);
+                    collect_predetermined_private_names(body, names, collapse_depth);
                 }
             }
             Stmt::WhereConstruct {
                 body, elsewhere, ..
             } => {
-                collect_predetermined_private_names(body, names);
+                collect_predetermined_private_names(body, names, collapse_depth);
                 for (_, body) in elsewhere {
-                    collect_predetermined_private_names(body, names);
+                    collect_predetermined_private_names(body, names, collapse_depth);
                 }
             }
             // A standalone worksharing DO uses the current parallel team's
@@ -1827,10 +1939,59 @@ fn collect_predetermined_private_names(stmts: &[SpannedStmt], names: &mut Vec<(S
             // available as private state in that enclosing callback. A
             // nested PARALLEL or combined PARALLEL DO owns a distinct data
             // environment and must not affect this region's classification.
-            Stmt::OpenMp(
-                OpenMpConstruct::Do { loop_stmt, .. } | OpenMpConstruct::Loop { loop_stmt, .. },
-            ) => {
-                collect_predetermined_private_names(std::slice::from_ref(loop_stmt.as_ref()), names)
+            Stmt::OpenMp(OpenMpConstruct::Do { loop_stmt, .. }) => {
+                collect_predetermined_private_names(
+                    std::slice::from_ref(loop_stmt.as_ref()),
+                    names,
+                    collapse_depth,
+                )
+            }
+            Stmt::OpenMp(OpenMpConstruct::Loop { clauses, loop_stmt }) => {
+                let explicitly_private: HashSet<_> = clauses
+                    .iter()
+                    .filter_map(|clause| match clause {
+                        OpenMpClause::Private(variables) => Some(variables.as_slice()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect();
+                let Stmt::DoLoop {
+                    var: Some(outer),
+                    body,
+                    ..
+                } = &loop_stmt.node
+                else {
+                    collect_predetermined_private_names(
+                        std::slice::from_ref(loop_stmt.as_ref()),
+                        names,
+                        collapse_depth,
+                    );
+                    continue;
+                };
+                if explicitly_private.contains(&outer.to_ascii_lowercase()) {
+                    names.push((outer.to_ascii_lowercase(), loop_stmt.span));
+                }
+                if collapse_depth(clauses) == 2 {
+                    let Some(inner_stmt) = body.first() else {
+                        continue;
+                    };
+                    let Stmt::DoLoop {
+                        var: Some(inner),
+                        body: inner_body,
+                        ..
+                    } = &inner_stmt.node
+                    else {
+                        collect_predetermined_private_names(body, names, collapse_depth);
+                        continue;
+                    };
+                    if explicitly_private.contains(&inner.to_ascii_lowercase()) {
+                        names.push((inner.to_ascii_lowercase(), inner_stmt.span));
+                    }
+                    collect_predetermined_private_names(inner_body, names, collapse_depth);
+                } else {
+                    collect_predetermined_private_names(body, names, collapse_depth);
+                }
             }
             Stmt::OpenMp(_) => {}
             _ => {}

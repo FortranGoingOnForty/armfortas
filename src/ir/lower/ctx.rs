@@ -311,6 +311,10 @@ pub(super) struct LowerCtx<'a> {
     /// Current implicit-task identity while lowering an outlined OpenMP
     /// callback. Standalone worksharing constructs require this team context.
     pub(super) openmp_team: Option<(ValueId, ValueId)>,
+    /// Shared originals retained alongside per-task private bindings when one
+    /// name is both a sequential-loop iterator and a standalone worksharing
+    /// LASTPRIVATE item in the same outlined parallel region.
+    pub(super) openmp_lastprivate_originals: HashMap<String, LocalInfo>,
     pub(super) st: &'a SymbolTable,
     /// Module-scoped globals visible by (lowercase module name,
     /// lowercase variable name). Populated by the lower_file
@@ -415,6 +419,7 @@ impl<'a> LowerCtx<'a> {
             next_block_save_scope: 0,
             next_openmp_region: 0,
             openmp_team: None,
+            openmp_lastprivate_originals: HashMap::new(),
             st,
             globals,
             type_layouts,
