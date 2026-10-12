@@ -6,6 +6,8 @@ nowait.1	parallel_execution/sources/nowait.1.f	parallel_execution/nowait.1.f	fix
 nowait.2	parallel_execution/sources/nowait.2.f90	parallel_execution/nowait.2.f90	free	compile	success	pre_omp_3.0	parallel,do,schedule(static),nowait	pass
 parallel.1	parallel_execution/sources/parallel.1.f	parallel_execution/parallel.1.f	fixed	link	success	pre_omp_3.0	parallel,default(private),shared,omp_get_thread_num,omp_get_num_threads,assumed-size-forwarding	pass
 private.1	data_environment/sources/private.1.f	data_environment/private.1.f	fixed	run	success	pre_omp_3.0	parallel,private,firstprivate	pass
+copyin.1	data_environment/sources/copyin.1.f	data_environment/copyin.1.f	fixed	compile	success	pre_omp_3.0	parallel,threadprivate,copyin,scalar-integer-real,pointer-threadprivate,cross-procedure	pass
+threadprivate.6	data_environment/sources/threadprivate.6.f	data_environment/threadprivate.6.f	fixed	run	success	pre_omp_3.0	parallel,private,pointer-threadprivate,per-thread-allocation,cross-procedure,implicit-typing	pass
 fort_loopvar.1	data_environment/sources/fort_loopvar.1.f90	data_environment/fort_loopvar.1.f90	free	compile	success	pre_omp_3.0	parallel,private,predetermined-loop-variable	pass
 lastprivate.1	data_environment/sources/lastprivate.1.f	data_environment/lastprivate.1.f	fixed	compile	success	pre_omp_3.0	parallel,do,lastprivate	pass
 reduction.1	data_environment/sources/reduction.1.f90	data_environment/reduction.1.f90	free	compile	success	pre_omp_3.0	parallel-do,private,shared,reduction-add-ieor-min-max	pass

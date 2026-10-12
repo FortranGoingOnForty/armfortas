@@ -68,18 +68,18 @@ deterministic. Applicable cases from the [official examples][omp-examples] and
 the [OpenMP Validation and Verification suite][omp-vv] are added incrementally
 rather than treated as an opaque pass/fail corpus.
 
-The pinned official-example corpus uses twelve unchanged Fortran sources
+The pinned official-example corpus uses fourteen unchanged Fortran sources
 from OpenMP Examples v6.0.1 at revision
 `3e4757ae2b52e51df6cd5d363d6fc1d894509719`. Its manifest covers `parallel`,
 `do`, `schedule(static)`, `nowait`, `private`, `firstprivate`, `lastprivate`,
-`shared`, `default(private)`, rectangular and direct-bound nonrectangular
-`collapse(2)`, predefined reductions, runtime thread queries, assumed-size
-sequence forwarding, dynamically bound orphaned worksharing, fixed-form shared
-DO termination labels, and named and unnamed critical regions.
-Every source completes its upstream-requested compile or link operation at
-`-O0` and `-O3`; the upstream run example executes at both levels. The corpus,
-license, revision record, and harness live under `tests/fixtures/openmp-official/` and
-`tests/openmp_official_examples.rs`.
+`shared`, `default(private)`, `threadprivate`, `copyin`, rectangular and
+direct-bound nonrectangular `collapse(2)`, predefined reductions, runtime
+thread queries, assumed-size sequence forwarding, dynamically bound orphaned
+worksharing, fixed-form shared DO termination labels, and named and unnamed
+critical regions. Every source completes its upstream-requested compile, link,
+or run operation at `-O0` and `-O3`; run cases also assert their deterministic
+numeric output. The corpus, license, revision record, and harness live under
+`tests/fixtures/openmp-official/` and `tests/openmp_official_examples.rs`.
 
 An orphaned worksharing loop obtains its current thread and team size from the
 runtime when its procedure is called, while lexically nested worksharing keeps
@@ -228,19 +228,24 @@ also verify persistence in a following equal-team region and the combined
 hard errors. Pointer association copying remains outside this boundary until
 its ownership contract is designed explicitly.
 
+The unchanged official `copyin.1.f` compile example covers scalar INTEGER and
+REAL `copyin` beside a pointer THREADPRIVATE allocation in a called external
+procedure. The unchanged `threadprivate.6.f` run example allocates a rank-one
+REAL pointer independently in every implicit task, calls across an implicit
+external interface, and verifies a sum of `100.0` from every requested thread
+at `-O0` and `-O3`. The pinned OpenMP V&V revision contains no Fortran source
+using `copyin` or `threadprivate`, so no V&V case is claimed for this slice.
+
 ## Next milestones
 
-1. Add official-example and V&V coverage for cross-region `threadprivate`
-   persistence and the supported `copyin` boundary before widening storage
-   categories.
-2. Add the `sections` worksharing construct with a generation-safe dispatch and
+1. Add the `sections` worksharing construct with a generation-safe dispatch and
    implicit-barrier model; keep `lastprivate`, `reduction`, and `nowait`
    extensions independently testable.
-3. Extend array reductions beyond constant-shape rank one only with a truthful
+2. Extend array reductions beyond constant-shape rank one only with a truthful
    descriptor and partial-storage mapping design.
-4. Add guided/runtime scheduling only after each worksharing construct owns an
+3. Add guided/runtime scheduling only after each worksharing construct owns an
    explicit dispatch-generation protocol.
-5. Extend atomic capture/compare and acquire/release flush semantics only with
+4. Extend atomic capture/compare and acquire/release flush semantics only with
    explicit memory-order tests; the current conservative lock and `seq_cst`
    fence are truthful but intentionally stronger than those future forms.
 

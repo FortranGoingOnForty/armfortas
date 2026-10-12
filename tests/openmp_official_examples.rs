@@ -201,13 +201,36 @@ fn selected_official_run_examples_pass_at_o0_and_o3() {
                 String::from_utf8_lossy(&run.stdout),
                 String::from_utf8_lossy(&run.stderr)
             );
-            if case.id == "private.1" {
-                assert_eq!(
-                    String::from_utf8_lossy(&run.stdout)
+            let stdout = String::from_utf8_lossy(&run.stdout);
+            match case.id {
+                "private.1" => {
+                    assert_eq!(stdout.split_whitespace().collect::<Vec<_>>(), ["1", "2"]);
+                }
+                "threadprivate.6" => {
+                    let values = stdout
                         .split_whitespace()
-                        .collect::<Vec<_>>(),
-                    ["1", "2"]
-                );
+                        .map(|value| {
+                            value.parse::<f32>().unwrap_or_else(|error| {
+                                panic!(
+                                    "official example {} emitted nonnumeric output {value:?}: {error}",
+                                    case.id
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        values.len(),
+                        4,
+                        "official example {} must print once per requested thread: {stdout}",
+                        case.id
+                    );
+                    assert!(
+                        values.iter().all(|value| (*value - 100.0).abs() < 1.0e-5),
+                        "official example {} computed the wrong per-thread sum: {stdout}",
+                        case.id
+                    );
+                }
+                _ => {}
             }
         }
     }
