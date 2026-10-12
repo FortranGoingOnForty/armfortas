@@ -145,6 +145,24 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             }
             validate_structured_block(ctx, body);
         }
+        OpenMpConstruct::Ordered { body } => {
+            reject_in_pure(ctx, span, "ORDERED");
+            if !matches!(
+                ctx.openmp_construct_stack.last().copied(),
+                Some("DO" | "PARALLEL DO")
+            ) {
+                ctx.error(
+                    span,
+                    "OpenMP ORDERED must be closely nested inside an OpenMP DO or PARALLEL DO region",
+                );
+            } else if ctx.openmp_ordered_binding_depth == 0 {
+                ctx.error(
+                    span,
+                    "the binding OpenMP worksharing loop must specify the ORDERED clause",
+                );
+            }
+            validate_structured_block(ctx, body);
+        }
         OpenMpConstruct::Barrier => {
             reject_in_pure(ctx, span, "BARRIER");
             if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
@@ -638,6 +656,7 @@ fn validate_parallel_clauses(
             }
             OpenMpClause::Schedule { .. } if combined_do => {}
             OpenMpClause::Collapse(_) if combined_do => {}
+            OpenMpClause::Ordered if combined_do => {}
             OpenMpClause::Nowait if combined_do => {
                 ctx.error(span, "OpenMP PARALLEL DO may not specify NOWAIT")
             }
@@ -843,6 +862,7 @@ fn validate_worksharing_loop(
         return;
     };
     let collapse_depth = validate_collapse_depth(ctx, span, clauses, kind);
+    validate_ordered_worksharing_shape(ctx, span, clauses, &outer_loop, kind, collapse_depth);
     let mut associated_loop_keys = HashSet::from([outer_loop.var.to_ascii_lowercase()]);
     if collapse_depth == 2 {
         let inner_stmt = if outer_loop.body.len() == 1 {
@@ -1097,6 +1117,7 @@ fn validate_worksharing_loop(
                 }
             }
             OpenMpClause::Collapse(_) => {}
+            OpenMpClause::Ordered => {}
             OpenMpClause::Reduction { items, .. } if items
                 .iter()
                 .any(|item| associated_loop_keys.contains(&item.base_name().to_ascii_lowercase())) =>
@@ -1165,6 +1186,57 @@ fn validate_worksharing_loop(
         &mut cycle_targets,
         &internal_labels,
     );
+}
+
+fn validate_ordered_worksharing_shape(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    clauses: &[OpenMpClause],
+    outer_loop: &AssociatedLoop<'_>,
+    kind: WorksharingLoopKind,
+    collapse_depth: usize,
+) {
+    if !clauses
+        .iter()
+        .any(|clause| matches!(clause, OpenMpClause::Ordered))
+    {
+        return;
+    }
+    if collapse_depth != 1 {
+        ctx.error(
+            span,
+            "OpenMP ORDERED with COLLAPSE is recognized but not yet implemented",
+        );
+    }
+    if clauses.iter().any(|clause| {
+        matches!(
+            clause,
+            OpenMpClause::Schedule {
+                kind,
+                ..
+            } if *kind != OpenMpScheduleKind::Static
+        )
+    }) {
+        ctx.error(
+            span,
+            "OpenMP ORDERED currently supports only the default or STATIC schedule",
+        );
+    }
+    if !matches!(
+        outer_loop.body,
+        [SpannedStmt {
+            node: Stmt::OpenMp(OpenMpConstruct::Ordered { .. }),
+            ..
+        }]
+    ) {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP {} ORDERED currently requires exactly one directly nested unconditional ORDERED region per logical iteration",
+                kind.directive_name()
+            ),
+        );
+    }
 }
 
 fn validate_lastprivate_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
@@ -1653,6 +1725,7 @@ fn clause_name(clause: &OpenMpClause) -> &'static str {
         OpenMpClause::NumThreads(_) => "NUM_THREADS",
         OpenMpClause::Schedule { .. } => "SCHEDULE",
         OpenMpClause::Collapse(_) => "COLLAPSE",
+        OpenMpClause::Ordered => "ORDERED",
         OpenMpClause::Nowait => "NOWAIT",
         OpenMpClause::Reduction { .. } => "REDUCTION",
     }

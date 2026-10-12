@@ -23318,6 +23318,97 @@ fn fopenmp_master_rejects_illegal_close_nesting() {
 }
 
 #[test]
+fn fopenmp_ordered_regions_follow_logical_iteration_order() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_ordered_regions_follow_logical_iteration_order count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: ascending(48,4), descending(48,4)
+  integer :: ascending_pos(4), descending_pos(4)
+  integer :: i, round
+
+  ascending = 0
+  descending = 0
+  ascending_pos = 0
+  descending_pos = 0
+!$omp parallel default(none) num_threads(4) &
+!$omp& shared(ascending,descending,ascending_pos,descending_pos) private(i,round)
+  do round = 1, 4
+!$omp do ordered schedule(static,2)
+    do i = 1, 48
+!$omp ordered
+      ascending_pos(round) = ascending_pos(round) + 1
+      ascending(ascending_pos(round),round) = i
+!$omp end ordered
+    end do
+!$omp end do
+!$omp do ordered schedule(static)
+    do i = 48, 1, -1
+!$omp ordered
+      descending_pos(round) = descending_pos(round) + 1
+      descending(descending_pos(round),round) = i
+!$omp end ordered
+    end do
+!$omp end do
+  end do
+!$omp end parallel
+
+  do round = 1, 4
+    if (ascending_pos(round) /= 48) error stop 1
+    if (descending_pos(round) /= 48) error stop 2
+    do i = 1, 48
+      if (ascending(i,round) /= i) error stop 3
+      if (descending(i,round) /= 49-i) error stop 4
+    end do
+  end do
+  print *, 'ok'
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_ordered", "bin");
+        let runtime_cache = unique_dir("openmp_ordered_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP ORDERED compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP ORDERED should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..4 {
+            let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+                .expect("OpenMP ORDERED binary timed out");
+            assert!(
+                run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+                "OpenMP ORDERED failed at {opt}, iteration {iteration}: status={:?} stdout={} stderr={}",
+                run.status,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr),
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_explicit_and_orphaned_barriers_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -24038,6 +24129,26 @@ fn fopenmp_worksharing_rejects_unsupported_forms() {
         (
             "program p\ninteger :: i\n!$omp parallel do\ndo i=1,4\nend do\n!$omp end parallel do nowait\nend program\n",
             "OpenMP PARALLEL DO may not specify NOWAIT",
+        ),
+        (
+            "program p\ninteger :: i\n!$omp parallel\n!$omp do\ndo i=1,4\n!$omp ordered\ncontinue\n!$omp end ordered\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
+            "the binding OpenMP worksharing loop must specify the ORDERED clause",
+        ),
+        (
+            "program p\ninteger :: i,value\n!$omp parallel\n!$omp do ordered\ndo i=1,4\nvalue=i\n!$omp ordered\nvalue=i\n!$omp end ordered\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
+            "OpenMP DO ORDERED currently requires exactly one directly nested unconditional ORDERED region per logical iteration",
+        ),
+        (
+            "program p\ninteger :: i\n!$omp parallel do ordered schedule(dynamic)\ndo i=1,4\n!$omp ordered\ncontinue\n!$omp end ordered\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP ORDERED currently supports only the default or STATIC schedule",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do ordered collapse(2)\ndo i=1,4\ndo j=1,4\n!$omp ordered\ncontinue\n!$omp end ordered\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP ORDERED with COLLAPSE is recognized but not yet implemented",
+        ),
+        (
+            "program p\n!$omp parallel\n!$omp ordered\ncontinue\n!$omp end ordered\n!$omp end parallel\nend program\n",
+            "OpenMP ORDERED must be closely nested inside an OpenMP DO or PARALLEL DO region",
         ),
     ];
     for (source, expected) in cases {

@@ -34,6 +34,7 @@ pub const AFS_OMP_ERROR_NO_TEAM: i32 = 4;
 pub const AFS_OMP_ERROR_INVALID_LOOP: i32 = 5;
 pub const AFS_OMP_ERROR_INVALID_REDUCTION: i32 = 6;
 pub const AFS_OMP_ERROR_INVALID_CRITICAL: i32 = 7;
+pub const AFS_OMP_ERROR_INVALID_ORDERED: i32 = 8;
 
 pub const AFS_OMP_REDUCTION_ADD: i32 = 1;
 pub const AFS_OMP_REDUCTION_MULTIPLY: i32 = 2;
@@ -281,6 +282,9 @@ struct TeamContext {
     barrier: Arc<Barrier>,
     reduction: Arc<Mutex<ReductionWorkspace>>,
     dynamic: Arc<Mutex<DynamicWorkspace>>,
+    ordered: Arc<OrderedWorkspace>,
+    ordered_generation: u64,
+    ordered_active_generation: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -299,6 +303,23 @@ struct ReductionWorkspace {
 #[derive(Debug, Default)]
 struct DynamicWorkspace {
     next_index: i128,
+}
+
+#[derive(Debug, Default)]
+struct OrderedWorkspace {
+    state: Mutex<OrderedWorkspaceState>,
+    available: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct OrderedWorkspaceState {
+    generations: HashMap<u64, OrderedGeneration>,
+}
+
+#[derive(Debug, Default)]
+struct OrderedGeneration {
+    prepared_tasks: usize,
+    next_ordinal: i128,
 }
 
 #[derive(Debug, Default)]
@@ -480,6 +501,7 @@ fn run_implicit_task(
     barrier: Arc<Barrier>,
     reduction: Arc<Mutex<ReductionWorkspace>>,
     dynamic: Arc<Mutex<DynamicWorkspace>>,
+    ordered: Arc<OrderedWorkspace>,
 ) {
     let _guard = enter_team(
         TeamContext {
@@ -490,6 +512,9 @@ fn run_implicit_task(
             barrier,
             reduction,
             dynamic,
+            ordered,
+            ordered_generation: 0,
+            ordered_active_generation: None,
         },
         inherited_requested_threads,
     );
@@ -539,6 +564,7 @@ pub extern "C" fn afs_omp_parallel_region(
     let barrier = Arc::new(Barrier::new(team_size as usize));
     let reduction = Arc::new(Mutex::new(ReductionWorkspace::default()));
     let dynamic = Arc::new(Mutex::new(DynamicWorkspace::default()));
+    let ordered = Arc::new(OrderedWorkspace::default());
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         std::thread::scope(|scope| {
@@ -547,6 +573,7 @@ pub extern "C" fn afs_omp_parallel_region(
                 let barrier = Arc::clone(&barrier);
                 let reduction = Arc::clone(&reduction);
                 let dynamic = Arc::clone(&dynamic);
+                let ordered = Arc::clone(&ordered);
                 scope.spawn(move || {
                     run_implicit_task(
                         entry,
@@ -558,6 +585,7 @@ pub extern "C" fn afs_omp_parallel_region(
                         barrier,
                         reduction,
                         dynamic,
+                        ordered,
                     );
                 });
             }
@@ -571,6 +599,7 @@ pub extern "C" fn afs_omp_parallel_region(
                 Arc::clone(&barrier),
                 Arc::clone(&reduction),
                 Arc::clone(&dynamic),
+                Arc::clone(&ordered),
             );
         });
     }));
@@ -601,6 +630,142 @@ pub extern "C" fn afs_omp_barrier() -> i32 {
     if let Some(barrier) = barrier {
         barrier.wait();
     }
+    AFS_OMP_SUCCESS
+}
+
+/// Begin the next block-associated ORDERED worksharing loop encountered by
+/// the current implicit task.
+///
+/// Every task in a team encounters worksharing regions in the same order.
+/// A task-local generation number therefore distinguishes repeated ordered
+/// loops without imposing an entry barrier or coupling a later NOWAIT loop to
+/// completion of an earlier generation.
+#[no_mangle]
+pub extern "C" fn afs_omp_ordered_prepare() -> i32 {
+    THREAD_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(team) = state.teams.last_mut() else {
+            return AFS_OMP_SUCCESS;
+        };
+        if team.ordered_active_generation.is_some() {
+            return AFS_OMP_ERROR_INVALID_ORDERED;
+        }
+        team.ordered_generation = team.ordered_generation.wrapping_add(1);
+        if team.ordered_generation == 0 {
+            return AFS_OMP_ERROR_INVALID_ORDERED;
+        }
+        let generation = team.ordered_generation;
+        let team_size = usize::try_from(team.team_size).unwrap_or(0);
+        let mut workspace = team
+            .ordered
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = workspace.generations.entry(generation).or_default();
+        entry.prepared_tasks += 1;
+        if entry.prepared_tasks > team_size {
+            return AFS_OMP_ERROR_INVALID_ORDERED;
+        }
+        if entry.prepared_tasks == team_size && generation > 1 {
+            workspace.generations.remove(&(generation - 1));
+        }
+        AFS_OMP_SUCCESS
+    })
+}
+
+/// Wait until `iteration` is the next logical iteration of the current
+/// ordered worksharing loop.
+#[no_mangle]
+pub extern "C" fn afs_omp_ordered_enter(iteration: i64, lower: i64, step: i64) -> i32 {
+    if step == 0 {
+        return AFS_OMP_ERROR_INVALID_ORDERED;
+    }
+    let delta = i128::from(iteration) - i128::from(lower);
+    let step = i128::from(step);
+    if delta % step != 0 {
+        return AFS_OMP_ERROR_INVALID_ORDERED;
+    }
+    let ordinal = delta / step;
+    if ordinal < 0 {
+        return AFS_OMP_ERROR_INVALID_ORDERED;
+    }
+
+    let context = THREAD_STATE.with(|state| {
+        let state = state.borrow();
+        let team = state.teams.last()?;
+        if team.ordered_generation == 0 || team.ordered_active_generation.is_some() {
+            return None;
+        }
+        Some((team.ordered_generation, Arc::clone(&team.ordered)))
+    });
+    let Some((generation, ordered)) = context else {
+        return if afs_omp_get_level() == 0 {
+            AFS_OMP_SUCCESS
+        } else {
+            AFS_OMP_ERROR_INVALID_ORDERED
+        };
+    };
+
+    let mut workspace = ordered
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        let Some(entry) = workspace.generations.get(&generation) else {
+            return AFS_OMP_ERROR_INVALID_ORDERED;
+        };
+        if ordinal < entry.next_ordinal {
+            return AFS_OMP_ERROR_INVALID_ORDERED;
+        }
+        if ordinal == entry.next_ordinal {
+            break;
+        }
+        workspace = ordered
+            .available
+            .wait(workspace)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    drop(workspace);
+    THREAD_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(team) = state.teams.last_mut() else {
+            return AFS_OMP_ERROR_INVALID_ORDERED;
+        };
+        if team.ordered_generation != generation || team.ordered_active_generation.is_some() {
+            return AFS_OMP_ERROR_INVALID_ORDERED;
+        }
+        team.ordered_active_generation = Some(generation);
+        AFS_OMP_SUCCESS
+    })
+}
+
+/// Release the current ordered region and wake the task that owns the next
+/// logical iteration.
+#[no_mangle]
+pub extern "C" fn afs_omp_ordered_exit() -> i32 {
+    let context = THREAD_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let team = state.teams.last_mut()?;
+        let generation = team.ordered_active_generation.take()?;
+        Some((generation, Arc::clone(&team.ordered)))
+    });
+    let Some((generation, ordered)) = context else {
+        return if afs_omp_get_level() == 0 {
+            AFS_OMP_SUCCESS
+        } else {
+            AFS_OMP_ERROR_INVALID_ORDERED
+        };
+    };
+    let mut workspace = ordered
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(entry) = workspace.generations.get_mut(&generation) else {
+        return AFS_OMP_ERROR_INVALID_ORDERED;
+    };
+    entry.next_ordinal += 1;
+    drop(workspace);
+    ordered.available.notify_all();
     AFS_OMP_SUCCESS
 }
 
@@ -2395,6 +2560,82 @@ mod tests {
         assert!(observations
             .all_arrived_after_barrier
             .load(Ordering::SeqCst));
+    }
+
+    #[derive(Default)]
+    struct OrderedObservations {
+        ascending: Mutex<Vec<i64>>,
+        descending: Mutex<Vec<i64>>,
+    }
+
+    unsafe extern "C" fn ordered_task(environment: *mut c_void, thread_num: i32, team_size: i32) {
+        let observations = unsafe { &*(environment as *const OrderedObservations) };
+        for (lower, upper, step, values) in [
+            (1_i64, 48_i64, 1_i64, &observations.ascending),
+            (48_i64, 1_i64, -1_i64, &observations.descending),
+        ] {
+            assert_eq!(afs_omp_ordered_prepare(), AFS_OMP_SUCCESS);
+            let mut first = 0;
+            let mut last = 0;
+            let has_iterations = afs_omp_static_bounds(
+                lower, upper, step, thread_num, team_size, &mut first, &mut last,
+            );
+            assert!(has_iterations >= 0);
+            if thread_num == 0 {
+                std::thread::yield_now();
+            }
+            if has_iterations > 0 {
+                let mut iteration = first;
+                loop {
+                    assert_eq!(
+                        afs_omp_ordered_enter(iteration, lower, step),
+                        AFS_OMP_SUCCESS
+                    );
+                    values.lock().unwrap().push(iteration);
+                    assert_eq!(afs_omp_ordered_exit(), AFS_OMP_SUCCESS);
+                    if iteration == last {
+                        break;
+                    }
+                    iteration += step;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_regions_follow_logical_iteration_order_across_generations() {
+        reset_thread_state();
+        let observations = OrderedObservations::default();
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(ordered_task),
+                &observations as *const OrderedObservations as *mut c_void,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            observations.ascending.into_inner().unwrap(),
+            (1_i64..=48).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            observations.descending.into_inner().unwrap(),
+            (1_i64..=48).rev().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ordered_runtime_handles_the_serial_initial_team_and_rejects_bad_steps() {
+        reset_thread_state();
+        assert_eq!(afs_omp_ordered_prepare(), AFS_OMP_SUCCESS);
+        assert_eq!(afs_omp_ordered_enter(7, 7, 1), AFS_OMP_SUCCESS);
+        assert_eq!(afs_omp_ordered_exit(), AFS_OMP_SUCCESS);
+        assert_eq!(
+            afs_omp_ordered_enter(1, 1, 0),
+            AFS_OMP_ERROR_INVALID_ORDERED
+        );
     }
 
     struct CriticalObservations {

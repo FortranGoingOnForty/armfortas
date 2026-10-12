@@ -37,7 +37,7 @@ use super::core::{
     materialize_array_descriptor_for_info, materialize_array_section_source_descriptor,
     string_descriptor_addr, DoLoopBody, DoLoopFields,
 };
-use super::ctx::{CharKind, LocalInfo, LowerCtx, ProcScopeGuard};
+use super::ctx::{CharKind, LocalInfo, LowerCtx, OpenMpOrderedLoopState, ProcScopeGuard};
 use super::helpers::coerce_to_type;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -601,6 +601,7 @@ pub(super) fn lower_construct(
             lower_critical_region(b, ctx, name.as_deref(), body)
         }
         OpenMpConstruct::Master { body } => lower_master_region(b, ctx, body),
+        OpenMpConstruct::Ordered { body } => lower_ordered_region(b, ctx, body),
         OpenMpConstruct::Barrier => {
             b.call(
                 FuncRef::External("afs_omp_barrier".into()),
@@ -649,6 +650,46 @@ fn lower_master_region(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, body: &[
     }
     // MASTER has no implicit barrier; non-primary threads continue directly.
     b.set_block(done_bb);
+}
+
+fn lower_ordered_region(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, body: &[SpannedStmt]) {
+    let ordered = ctx
+        .openmp_ordered_loop
+        .clone()
+        .expect("validated OpenMP ORDERED construct has no binding loop state");
+    let iteration = b.load_typed(ordered.iteration.addr, ordered.iteration.ty);
+    let iteration = coerce_to_type(b, iteration, &IrType::Int(IntWidth::I64));
+    let status = b.call(
+        FuncRef::External("afs_omp_ordered_enter".into()),
+        vec![iteration, ordered.lower, ordered.step],
+        IrType::Int(IntWidth::I32),
+    );
+    require_ordered_success(b, status);
+    super::stmt::lower_stmts(b, ctx, body);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        let status = b.call(
+            FuncRef::External("afs_omp_ordered_exit".into()),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        );
+        require_ordered_success(b, status);
+    }
+}
+
+fn require_ordered_success(b: &mut FuncBuilder<'_>, status: ValueId) {
+    let zero = b.const_i32(0);
+    let invalid = b.icmp(CmpOp::Ne, status, zero);
+    let error_bb = b.create_block("omp_ordered_invalid");
+    let ready_bb = b.create_block("omp_ordered_ready");
+    b.cond_branch(invalid, error_bb, vec![], ready_bb, vec![]);
+    b.set_block(error_bb);
+    b.runtime_call(
+        crate::ir::inst::RuntimeFunc::ErrorStop,
+        vec![],
+        IrType::Void,
+    );
+    b.branch(ready_bb, vec![]);
+    b.set_block(ready_bb);
 }
 
 fn lower_critical_region(
@@ -722,6 +763,7 @@ fn lower_parallel_region(
             | OpenMpClause::Default(_)
             | OpenMpClause::Schedule { .. }
             | OpenMpClause::Collapse(_)
+            | OpenMpClause::Ordered
             | OpenMpClause::Reduction { .. } => {}
             _ => unreachable!("unsupported OpenMP PARALLEL clause passed semantic validation"),
         }
@@ -1850,6 +1892,17 @@ fn lower_worksharing_loop(
     } else {
         b.const_i64(1)
     };
+    let ordered = clauses
+        .iter()
+        .any(|clause| matches!(clause, OpenMpClause::Ordered));
+    if ordered {
+        let status = b.call(
+            FuncRef::External("afs_omp_ordered_prepare".into()),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        );
+        require_ordered_success(b, status);
+    }
 
     let collapse_two = worksharing_collapse_depth(ctx, clauses) == 2;
     let mut lower = outer_lower;
@@ -2203,6 +2256,14 @@ fn lower_worksharing_loop(
     } else {
         DoLoopBody::Statements(body)
     };
+    let saved_ordered_loop = ctx.openmp_ordered_loop.take();
+    if ordered {
+        ctx.openmp_ordered_loop = Some(OpenMpOrderedLoopState {
+            lower: outer_lower,
+            step: outer_step,
+            iteration: private_outer.clone(),
+        });
+    }
     lower_do_loop(
         b,
         ctx,
@@ -2227,6 +2288,7 @@ fn lower_worksharing_loop(
             span: loop_stmt.span,
         },
     );
+    ctx.openmp_ordered_loop = saved_ordered_loop;
     ctx.locals.insert(outer_key.clone(), saved_outer);
     if let Some((inner_key, saved_inner, _)) = private_inner {
         ctx.locals.insert(inner_key, saved_inner);
