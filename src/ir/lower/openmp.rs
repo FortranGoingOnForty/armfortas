@@ -17,8 +17,8 @@
 
 use crate::ast::expr::{Expr, SectionSubscript};
 use crate::ast::openmp::{
-    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionItem, OpenMpReductionOperator,
-    OpenMpScheduleKind,
+    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpDoacrossDependence, OpenMpReductionItem,
+    OpenMpReductionOperator, OpenMpScheduleKind,
 };
 use crate::ast::stmt::{SpannedStmt, Stmt};
 use crate::ast::Spanned;
@@ -37,7 +37,9 @@ use super::core::{
     materialize_array_descriptor_for_info, materialize_array_section_source_descriptor,
     string_descriptor_addr, DoLoopBody, DoLoopFields,
 };
-use super::ctx::{CharKind, LocalInfo, LowerCtx, OpenMpOrderedLoopState, ProcScopeGuard};
+use super::ctx::{
+    CharKind, LocalInfo, LowerCtx, OpenMpDoacrossLoopState, OpenMpOrderedLoopState, ProcScopeGuard,
+};
 use super::helpers::coerce_to_type;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -603,8 +605,8 @@ pub(super) fn lower_construct(
         OpenMpConstruct::Master { body } => lower_master_region(b, ctx, body),
         OpenMpConstruct::Single { clauses, body } => lower_single_region(b, ctx, clauses, body),
         OpenMpConstruct::Ordered { body } => lower_ordered_region(b, ctx, body),
-        OpenMpConstruct::OrderedDoacross { .. } => {
-            unreachable!("unsupported OpenMP ORDERED doacross escaped semantic validation")
+        OpenMpConstruct::OrderedDoacross { dependence } => {
+            lower_doacross_directive(b, ctx, dependence)
         }
         OpenMpConstruct::Barrier => {
             b.call(
@@ -737,6 +739,55 @@ fn lower_ordered_region(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, body: &
             IrType::Int(IntWidth::I32),
         );
         require_ordered_success(b, status);
+    }
+}
+
+fn lower_doacross_directive(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    dependence: &OpenMpDoacrossDependence,
+) {
+    let doacross = ctx
+        .openmp_doacross_loop
+        .clone()
+        .expect("validated OpenMP doacross directive has no binding loop state");
+    let i64_ty = IrType::Int(IntWidth::I64);
+    match dependence {
+        OpenMpDoacrossDependence::Source => {
+            let outer = b.load_typed(
+                doacross.outer_iteration.addr,
+                doacross.outer_iteration.ty.clone(),
+            );
+            let outer = coerce_to_type(b, outer, &i64_ty);
+            let inner = b.load_typed(
+                doacross.inner_iteration.addr,
+                doacross.inner_iteration.ty.clone(),
+            );
+            let inner = coerce_to_type(b, inner, &i64_ty);
+            let status = b.call(
+                FuncRef::External("afs_omp_doacross_post".into()),
+                vec![outer, inner],
+                IrType::Int(IntWidth::I32),
+            );
+            require_ordered_success(b, status);
+        }
+        OpenMpDoacrossDependence::Sink { vectors } => {
+            for vector in vectors {
+                let [outer, inner] = vector.as_slice() else {
+                    unreachable!("validated OpenMP ORDERED(2) sink vector changed shape")
+                };
+                let outer = super::expr::lower_expr_ctx(b, ctx, outer);
+                let outer = coerce_to_type(b, outer, &i64_ty);
+                let inner = super::expr::lower_expr_ctx(b, ctx, inner);
+                let inner = coerce_to_type(b, inner, &i64_ty);
+                let status = b.call(
+                    FuncRef::External("afs_omp_doacross_wait".into()),
+                    vec![outer, inner],
+                    IrType::Int(IntWidth::I32),
+                );
+                require_ordered_success(b, status);
+            }
+        }
     }
 }
 
@@ -1699,6 +1750,13 @@ struct CollapsedLoopSource<'a> {
     nonrectangular_flags: Option<i32>,
 }
 
+struct DoacrossLoopSource<'a> {
+    inner_var: &'a str,
+    inner_lower: ValueId,
+    inner_upper: ValueId,
+    inner_step: ValueId,
+}
+
 fn worksharing_collapse_depth(ctx: &LowerCtx<'_>, clauses: &[OpenMpClause]) -> i64 {
     clauses
         .iter()
@@ -1714,6 +1772,20 @@ fn worksharing_collapse_depth(ctx: &LowerCtx<'_>, clauses: &[OpenMpClause]) -> i
             _ => None,
         })
         .unwrap_or(1)
+}
+
+fn worksharing_ordered_depth(ctx: &LowerCtx<'_>, clauses: &[OpenMpClause]) -> Option<i64> {
+    clauses.iter().find_map(|clause| match clause {
+        OpenMpClause::Ordered(Some(depth)) => Some(
+            super::core::eval_const_int_in_scope_or_any_scope(
+                depth,
+                &std::collections::HashMap::new(),
+                ctx.st,
+            )
+            .expect("validated OpenMP ORDERED depth is not constant"),
+        ),
+        _ => None,
+    })
 }
 
 fn collapse_bound_is_outer_variable(expr: &crate::ast::expr::SpannedExpr, outer: &str) -> bool {
@@ -1956,10 +2028,10 @@ fn lower_worksharing_loop(
     } else {
         b.const_i64(1)
     };
-    let ordered = clauses
+    let block_ordered = clauses
         .iter()
         .any(|clause| matches!(clause, OpenMpClause::Ordered(None)));
-    if ordered {
+    if block_ordered {
         let status = b.call(
             FuncRef::External("afs_omp_ordered_prepare".into()),
             vec![],
@@ -1967,6 +2039,51 @@ fn lower_worksharing_loop(
         );
         require_ordered_success(b, status);
     }
+
+    let doacross = (worksharing_ordered_depth(ctx, clauses) == Some(2)).then(|| {
+        let [inner_stmt] = body.as_slice() else {
+            unreachable!("non-perfect OpenMP ORDERED(2) nest passed semantic validation")
+        };
+        let Stmt::DoLoop {
+            var: Some(inner_var),
+            start: Some(inner_start),
+            end: Some(inner_end),
+            step: inner_step,
+            ..
+        } = &inner_stmt.node
+        else {
+            unreachable!("non-canonical OpenMP ORDERED(2) inner loop passed semantic validation")
+        };
+        let raw = super::expr::lower_expr_ctx(b, ctx, inner_start);
+        let inner_lower = coerce_to_type(b, raw, &i64_ty);
+        let raw = super::expr::lower_expr_ctx(b, ctx, inner_end);
+        let inner_upper = coerce_to_type(b, raw, &i64_ty);
+        let inner_step = if let Some(inner_step) = inner_step {
+            let raw = super::expr::lower_expr_ctx(b, ctx, inner_step);
+            coerce_to_type(b, raw, &i64_ty)
+        } else {
+            b.const_i64(1)
+        };
+        let status = b.call(
+            FuncRef::External("afs_omp_doacross_prepare".into()),
+            vec![
+                outer_lower,
+                outer_upper,
+                outer_step,
+                inner_lower,
+                inner_upper,
+                inner_step,
+            ],
+            IrType::Int(IntWidth::I32),
+        );
+        require_ordered_success(b, status);
+        DoacrossLoopSource {
+            inner_var,
+            inner_lower,
+            inner_upper,
+            inner_step,
+        }
+    });
 
     let collapse_two = worksharing_collapse_depth(ctx, clauses) == 2;
     let mut lower = outer_lower;
@@ -2145,9 +2262,12 @@ fn lower_worksharing_loop(
     ctx.insert_scalar(step_name.clone(), step_addr, i64_ty);
 
     let (outer_key, saved_outer, private_outer) = privatize_worksharing_variable(b, ctx, var);
-    let private_inner = collapsed
+    let private_inner_var = collapsed
         .as_ref()
-        .map(|collapsed| privatize_worksharing_variable(b, ctx, collapsed.inner_var));
+        .map(|collapsed| collapsed.inner_var)
+        .or_else(|| doacross.as_ref().map(|doacross| doacross.inner_var));
+    let private_inner =
+        private_inner_var.map(|inner_var| privatize_worksharing_variable(b, ctx, inner_var));
     let clause_private_bindings = if clauses_materialized_by_parallel {
         Vec::new()
     } else {
@@ -2321,11 +2441,21 @@ fn lower_worksharing_loop(
         DoLoopBody::Statements(body)
     };
     let saved_ordered_loop = ctx.openmp_ordered_loop.take();
-    if ordered {
+    if block_ordered {
         ctx.openmp_ordered_loop = Some(OpenMpOrderedLoopState {
             lower: outer_lower,
             step: outer_step,
             iteration: private_outer.clone(),
+        });
+    }
+    let saved_doacross_loop = ctx.openmp_doacross_loop.take();
+    if doacross.is_some() {
+        let (_, _, private_inner) = private_inner
+            .as_ref()
+            .expect("validated OpenMP doacross inner variable was not privatized");
+        ctx.openmp_doacross_loop = Some(OpenMpDoacrossLoopState {
+            outer_iteration: private_outer.clone(),
+            inner_iteration: private_inner.clone(),
         });
     }
     lower_do_loop(
@@ -2352,6 +2482,7 @@ fn lower_worksharing_loop(
             span: loop_stmt.span,
         },
     );
+    ctx.openmp_doacross_loop = saved_doacross_loop;
     ctx.openmp_ordered_loop = saved_ordered_loop;
     ctx.locals.insert(outer_key.clone(), saved_outer);
     if let Some((inner_key, saved_inner, _)) = private_inner {

@@ -1649,10 +1649,6 @@ fn validate_doacross_worksharing_shape(
             "OpenMP ORDERED(2) currently requires directly nested sink dependencies followed by exactly one source dependency in every inner iteration",
         );
     }
-    ctx.error(
-        span,
-        "OpenMP ORDERED source/sink dependencies are recognized but not yet implemented",
-    );
 }
 
 fn doacross_constant_step(ctx: &Ctx<'_>, associated: &AssociatedLoop<'_>) -> Option<i128> {
