@@ -73,4 +73,20 @@ interface
 
   double precision function omp_get_wtick() bind(C, name="afs_omp_get_wtick")
   end function omp_get_wtick
+
+  subroutine omp_init_lock(lock) bind(C, name="afs_omp_init_lock")
+    integer(omp_lock_kind) :: lock
+  end subroutine omp_init_lock
+
+  subroutine omp_destroy_lock(lock) bind(C, name="afs_omp_destroy_lock")
+    integer(omp_lock_kind) :: lock
+  end subroutine omp_destroy_lock
+
+  subroutine omp_set_lock(lock) bind(C, name="afs_omp_set_lock")
+    integer(omp_lock_kind) :: lock
+  end subroutine omp_set_lock
+
+  subroutine omp_unset_lock(lock) bind(C, name="afs_omp_unset_lock")
+    integer(omp_lock_kind) :: lock
+  end subroutine omp_unset_lock
 end interface

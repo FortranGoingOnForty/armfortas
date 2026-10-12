@@ -11206,7 +11206,11 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         | "cpu_time"
         | "ieee_is_nan"
         | "ieee_is_finite"
-        | "ieee_is_normal" => (1, Some(1)),
+        | "ieee_is_normal"
+        | "omp_init_lock"
+        | "omp_destroy_lock"
+        | "omp_set_lock"
+        | "omp_unset_lock" => (1, Some(1)),
         // Exactly two.
         "atan2" | "atan2d" | "atan2pi" | "hypot" | "mod" | "modulo" | "sign" | "dim" | "dprod"
         | "lge" | "lgt" | "lle" | "llt" | "bge" | "bgt" | "ble" | "blt" | "ishft" | "shiftl"
@@ -11288,6 +11292,10 @@ fn intrinsic_is_subroutine(name: &str) -> bool {
             | "c_f_pointer"
             | "c_f_strpointer"
             | "omp_set_num_threads"
+            | "omp_init_lock"
+            | "omp_destroy_lock"
+            | "omp_set_lock"
+            | "omp_unset_lock"
     )
 }
 
@@ -11765,6 +11773,28 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
                 IntrinsicArgumentType::Integer,
             );
             require_intrinsic_scalar_argument(ctx, span, &key, args, 0, "num_threads");
+        }
+        "omp_init_lock" | "omp_destroy_lock" | "omp_set_lock" | "omp_unset_lock" => {
+            const FORMALS: [&str; 1] = ["lock"];
+            validate_intrinsic_argument_associations(ctx, span, &key, args, &FORMALS, 1);
+            let Some(lock) = call_rank_argument_expr(args, 0, &FORMALS) else {
+                return;
+            };
+            let lock_kind = matches!(
+                validation_expr_type_info(ctx, lock),
+                Some(TypeInfo::Integer { kind: Some(8) })
+            );
+            let scalar = validation_expr_rank(ctx, lock) == Some(0);
+            let definable = actual_is_definable(ctx, lock, false).is_none_or(|value| value);
+            if !lock_kind || !scalar || !definable {
+                ctx.error(
+                    lock.span,
+                    format!(
+                        "OpenMP {} LOCK must be a definable scalar INTEGER(omp_lock_kind) variable",
+                        key.to_ascii_uppercase()
+                    ),
+                );
+            }
         }
         _ => {}
     }
