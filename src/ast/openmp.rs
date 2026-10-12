@@ -32,6 +32,10 @@ pub enum OpenMpConstruct {
     Master {
         body: Vec<SpannedStmt>,
     },
+    Single {
+        clauses: Vec<OpenMpClause>,
+        body: Vec<SpannedStmt>,
+    },
     Ordered {
         body: Vec<SpannedStmt>,
     },
@@ -50,6 +54,7 @@ impl OpenMpConstruct {
             Self::ParallelDo { .. } => "PARALLEL DO",
             Self::Critical { .. } => "CRITICAL",
             Self::Master { .. } => "MASTER",
+            Self::Single { .. } => "SINGLE",
             Self::Ordered { .. } => "ORDERED",
             Self::Barrier => "BARRIER",
             Self::AtomicUpdate { .. } => "ATOMIC UPDATE",
@@ -61,7 +66,8 @@ impl OpenMpConstruct {
             Self::Parallel { clauses, .. }
             | Self::Do { clauses, .. }
             | Self::Loop { clauses, .. }
-            | Self::ParallelDo { clauses, .. } => clauses,
+            | Self::ParallelDo { clauses, .. }
+            | Self::Single { clauses, .. } => clauses,
             Self::Critical { .. }
             | Self::Master { .. }
             | Self::Ordered { .. }
@@ -75,6 +81,7 @@ impl OpenMpConstruct {
             Self::Parallel { body, .. }
             | Self::Critical { body, .. }
             | Self::Master { body }
+            | Self::Single { body, .. }
             | Self::Ordered { body } => Some(body),
             Self::AtomicUpdate { assignment } => Some(std::slice::from_ref(assignment.as_ref())),
             Self::Do { .. } | Self::Loop { .. } | Self::ParallelDo { .. } | Self::Barrier => None,
@@ -89,6 +96,7 @@ impl OpenMpConstruct {
             Self::Parallel { .. }
             | Self::Critical { .. }
             | Self::Master { .. }
+            | Self::Single { .. }
             | Self::Ordered { .. }
             | Self::Barrier
             | Self::AtomicUpdate { .. } => None,

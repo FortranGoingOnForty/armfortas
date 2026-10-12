@@ -145,6 +145,14 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             }
             validate_structured_block(ctx, body);
         }
+        OpenMpConstruct::Single { body, .. } => {
+            reject_in_pure(ctx, span, "SINGLE");
+            ctx.error(
+                span,
+                "OpenMP SINGLE execution is recognized but not yet implemented",
+            );
+            validate_structured_block(ctx, body);
+        }
         OpenMpConstruct::Ordered { body } => {
             reject_in_pure(ctx, span, "ORDERED");
             if !matches!(

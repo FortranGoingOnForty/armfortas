@@ -21,6 +21,7 @@ enum OpenMpHeader {
     ParallelDo(Vec<OpenMpClause>),
     Critical(Option<String>),
     Master,
+    Single(Vec<OpenMpClause>),
     Ordered,
     Barrier,
     AtomicUpdate,
@@ -30,6 +31,7 @@ enum OpenMpHeader {
     EndParallelDo { nowait: bool },
     EndCritical(Option<String>),
     EndMaster,
+    EndSingle { nowait: bool },
     EndOrdered,
 }
 
@@ -39,6 +41,7 @@ enum BeginKind {
     Do,
     Loop,
     ParallelDo,
+    Single,
 }
 
 impl<'a> Parser<'a> {
@@ -96,7 +99,8 @@ impl<'a> Parser<'a> {
 
         match header {
             OpenMpHeader::Parallel(clauses) => {
-                let (body, end_span) = self.parse_openmp_region_end(OpenMpEnd::Parallel, None)?;
+                let (body, end_span, _) =
+                    self.parse_openmp_region_end(OpenMpEnd::Parallel, None)?;
                 Ok(Spanned::new(
                     Stmt::OpenMp(OpenMpConstruct::Parallel { clauses, body }),
                     span_through(directive.span, end_span),
@@ -157,7 +161,7 @@ impl<'a> Parser<'a> {
                 ))
             }
             OpenMpHeader::Critical(name) => {
-                let (body, end_span) =
+                let (body, end_span, _) =
                     self.parse_openmp_region_end(OpenMpEnd::Critical, name.as_deref())?;
                 Ok(Spanned::new(
                     Stmt::OpenMp(OpenMpConstruct::Critical { name, body }),
@@ -165,14 +169,34 @@ impl<'a> Parser<'a> {
                 ))
             }
             OpenMpHeader::Master => {
-                let (body, end_span) = self.parse_openmp_region_end(OpenMpEnd::Master, None)?;
+                let (body, end_span, _) = self.parse_openmp_region_end(OpenMpEnd::Master, None)?;
                 Ok(Spanned::new(
                     Stmt::OpenMp(OpenMpConstruct::Master { body }),
                     span_through(directive.span, end_span),
                 ))
             }
+            OpenMpHeader::Single(mut clauses) => {
+                let (body, end_span, end_nowait) =
+                    self.parse_openmp_region_end(OpenMpEnd::Single, None)?;
+                if end_nowait {
+                    if clauses
+                        .iter()
+                        .any(|clause| matches!(clause, OpenMpClause::Nowait))
+                    {
+                        return Err(ParseError {
+                            span: end_span,
+                            msg: "duplicate OpenMP nowait clause".into(),
+                        });
+                    }
+                    clauses.push(OpenMpClause::Nowait);
+                }
+                Ok(Spanned::new(
+                    Stmt::OpenMp(OpenMpConstruct::Single { clauses, body }),
+                    span_through(directive.span, end_span),
+                ))
+            }
             OpenMpHeader::Ordered => {
-                let (body, end_span) = self.parse_openmp_region_end(OpenMpEnd::Ordered, None)?;
+                let (body, end_span, _) = self.parse_openmp_region_end(OpenMpEnd::Ordered, None)?;
                 Ok(Spanned::new(
                     Stmt::OpenMp(OpenMpConstruct::Ordered { body }),
                     span_through(directive.span, end_span),
@@ -205,6 +229,7 @@ impl<'a> Parser<'a> {
             | OpenMpHeader::EndParallelDo { .. }
             | OpenMpHeader::EndCritical(_)
             | OpenMpHeader::EndMaster
+            | OpenMpHeader::EndSingle { .. }
             | OpenMpHeader::EndOrdered => Err(ParseError {
                 span: directive.span,
                 msg: format!("unexpected OpenMP end directive '!$omp {}'", directive.text),
@@ -251,7 +276,7 @@ impl<'a> Parser<'a> {
         &mut self,
         expected: OpenMpEnd,
         critical_name: Option<&str>,
-    ) -> Result<(Vec<SpannedStmt>, Span), ParseError> {
+    ) -> Result<(Vec<SpannedStmt>, Span, bool), ParseError> {
         let mut body = Vec::new();
         loop {
             self.skip_newlines();
@@ -265,8 +290,8 @@ impl<'a> Parser<'a> {
             if self.peek() == &TokenKind::OmpDirective {
                 let directive = self.current().clone();
                 let header = parse_openmp_header(&directive.text, directive.span)?;
-                let matches = match (&expected, &header) {
-                    (OpenMpEnd::Parallel, OpenMpHeader::EndParallel) => true,
+                let end_nowait = match (&expected, &header) {
+                    (OpenMpEnd::Parallel, OpenMpHeader::EndParallel) => Some(false),
                     (OpenMpEnd::Critical, OpenMpHeader::EndCritical(end_name)) => {
                         let names_match = match (critical_name, end_name.as_deref()) {
                             (None, None) => true,
@@ -283,15 +308,16 @@ impl<'a> Parser<'a> {
                                 ),
                             });
                         }
-                        true
+                        Some(false)
                     }
-                    (OpenMpEnd::Master, OpenMpHeader::EndMaster) => true,
-                    (OpenMpEnd::Ordered, OpenMpHeader::EndOrdered) => true,
-                    _ => false,
+                    (OpenMpEnd::Master, OpenMpHeader::EndMaster) => Some(false),
+                    (OpenMpEnd::Single, OpenMpHeader::EndSingle { nowait }) => Some(*nowait),
+                    (OpenMpEnd::Ordered, OpenMpHeader::EndOrdered) => Some(false),
+                    _ => None,
                 };
-                if matches {
+                if let Some(end_nowait) = end_nowait {
                     self.advance();
-                    return Ok((body, directive.span));
+                    return Ok((body, directive.span, end_nowait));
                 }
                 if matches!(
                     header,
@@ -301,6 +327,7 @@ impl<'a> Parser<'a> {
                         | OpenMpHeader::EndParallelDo { .. }
                         | OpenMpHeader::EndCritical(_)
                         | OpenMpHeader::EndMaster
+                        | OpenMpHeader::EndSingle { .. }
                         | OpenMpHeader::EndOrdered
                 ) {
                     return Err(ParseError {
@@ -323,6 +350,7 @@ enum OpenMpEnd {
     Parallel,
     Critical,
     Master,
+    Single,
     Ordered,
 }
 
@@ -332,6 +360,7 @@ impl OpenMpEnd {
             Self::Parallel => "parallel",
             Self::Critical => "critical",
             Self::Master => "master",
+            Self::Single => "single",
             Self::Ordered => "ordered",
         }
     }
@@ -378,6 +407,7 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
             cursor.finish()?;
             OpenMpHeader::Master
         }
+        "single" => OpenMpHeader::Single(parse_clauses(&mut cursor, span, BeginKind::Single)?),
         "ordered" => {
             cursor.finish()?;
             OpenMpHeader::Ordered
@@ -455,6 +485,9 @@ fn parse_openmp_end_header(cursor: &mut DirectiveCursor<'_>) -> Result<OpenMpHea
             cursor.finish()?;
             Ok(OpenMpHeader::EndMaster)
         }
+        "single" => Ok(OpenMpHeader::EndSingle {
+            nowait: parse_end_single_clause(cursor)?,
+        }),
         "ordered" => {
             cursor.finish()?;
             Ok(OpenMpHeader::EndOrdered)
@@ -471,6 +504,20 @@ fn parse_end_loop_clause(cursor: &mut DirectiveCursor<'_>) -> Result<bool, Parse
     if !clause.eq_ignore_ascii_case("nowait") {
         return Err(cursor.error(format!(
             "unsupported clause '{clause}' on OpenMP loop end directive; expected NOWAIT"
+        )));
+    }
+    cursor.finish()?;
+    Ok(true)
+}
+
+fn parse_end_single_clause(cursor: &mut DirectiveCursor<'_>) -> Result<bool, ParseError> {
+    if cursor.finished() {
+        return Ok(false);
+    }
+    let clause = cursor.identifier("clause after OpenMP END SINGLE")?;
+    if !clause.eq_ignore_ascii_case("nowait") {
+        return Err(cursor.error(format!(
+            "unsupported clause '{clause}' on OpenMP END SINGLE directive; expected NOWAIT"
         )));
     }
     cursor.finish()?;
@@ -612,6 +659,7 @@ fn parse_clauses(
                     items: parse_reduction_list(items, span)?,
                 }
             }
+            "nowait" if matches!(construct, BeginKind::Single) => OpenMpClause::Nowait,
             "nowait" => {
                 return Err(cursor.error(
                     "OpenMP NOWAIT belongs on the END DO or END PARALLEL DO directive".into(),
@@ -659,6 +707,10 @@ fn validate_clause_for_construct(
                 | OpenMpClause::Reduction { .. }
         ),
         BeginKind::ParallelDo => !matches!(clause, OpenMpClause::Nowait),
+        BeginKind::Single => matches!(
+            clause,
+            OpenMpClause::Private(_) | OpenMpClause::FirstPrivate(_) | OpenMpClause::Nowait
+        ),
     };
     if allowed {
         Ok(())
@@ -1141,6 +1193,37 @@ mod tests {
                 ..
             }] if body.len() == 1
         ));
+    }
+
+    #[test]
+    fn parses_single_regions_with_nowait_on_either_directive() {
+        for (source, form) in [
+            (
+                "!$omp single nowait\nvalue = 1\n!$omp end single\n",
+                SourceForm::FreeForm,
+            ),
+            (
+                "C$OMP SINGLE\n      VALUE = 1\nC$OMP END SINGLE NOWAIT\n",
+                SourceForm::FixedForm,
+            ),
+        ] {
+            let stmt = parse(source, form).unwrap();
+            assert!(matches!(
+                stmt.node,
+                Stmt::OpenMp(OpenMpConstruct::Single { clauses, body })
+                    if clauses == vec![OpenMpClause::Nowait] && body.len() == 1
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_single_nowait_clause() {
+        let error = parse(
+            "!$omp single nowait\nvalue = 1\n!$omp end single nowait\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap_err();
+        assert!(error.msg.contains("duplicate OpenMP nowait clause"));
     }
 
     #[test]
