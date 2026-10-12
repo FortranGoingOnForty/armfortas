@@ -923,6 +923,7 @@ pub(super) fn resolve_unit(
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            finalize_implicit_dummy_types(st, scope_id);
             let binding = if is_separate_body && bind.is_none() {
                 ProcedureBinding {
                     bind_c: st.scope(scope_id).bind_c,
@@ -1009,6 +1010,7 @@ pub(super) fn resolve_unit(
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            finalize_implicit_dummy_types(st, scope_id);
             let binding = resolved_procedure_binding(bind.as_ref(), name, st, scope_id)?;
             st.scope_mut(scope_id).bind_c = binding.bind_c;
             st.scope_mut(scope_id).binding_label = binding.label;
@@ -2971,6 +2973,23 @@ fn implicit_type_to_type_info(implicit_type: ImplicitType) -> TypeInfo {
     }
 }
 
+fn finalize_implicit_dummy_types(st: &mut SymbolTable, scope_id: ScopeId) {
+    let arg_names = st.scope(scope_id).arg_order.clone();
+    for name in arg_names {
+        let implicit_type = st
+            .scope(scope_id)
+            .implicit_rules
+            .type_for(&name)
+            .map(implicit_type_to_type_info);
+        let Some(symbol) = st.scope_mut(scope_id).symbols.get_mut(&name) else {
+            continue;
+        };
+        if symbol.type_info.is_none() {
+            symbol.type_info = implicit_type;
+        }
+    }
+}
+
 fn is_unresolved_declaration_placeholder(
     st: &SymbolTable,
     name: &str,
@@ -4415,6 +4434,45 @@ end module result_parent
         assert_eq!(result.name, "actual_result");
         assert!(!result.attrs.parameter);
         assert!(function_scope.symbols.contains_key("decoy"));
+    }
+
+    #[test]
+    fn implicit_dummy_arguments_receive_scope_types() {
+        let st = resolve_source(
+            "subroutine defaults(the_sum, n)\n\
+               end subroutine defaults\n\
+               subroutine remapped(alpha, index)\n\
+                 implicit integer (a-a)\n\
+                 implicit real (i-i)\n\
+               end subroutine remapped\n",
+        );
+        let defaults = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "defaults"))
+            .unwrap();
+        assert_eq!(
+            defaults.symbols["the_sum"].type_info,
+            Some(TypeInfo::Real { kind: None })
+        );
+        assert_eq!(
+            defaults.symbols["n"].type_info,
+            Some(TypeInfo::Integer { kind: None })
+        );
+
+        let remapped = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "remapped"))
+            .unwrap();
+        assert_eq!(
+            remapped.symbols["alpha"].type_info,
+            Some(TypeInfo::Integer { kind: None })
+        );
+        assert_eq!(
+            remapped.symbols["index"].type_info,
+            Some(TypeInfo::Real { kind: None })
+        );
     }
 
     #[test]

@@ -23352,6 +23352,12 @@ pub(super) fn procedure_dummy_arg_ir_type(
     {
         return procedure_code_ptr_ir_type();
     }
+    if let Some(type_info) = proc_scope_id
+        .and_then(|scope_id| st.lookup_in(scope_id, &key))
+        .and_then(|symbol| symbol.type_info.as_ref())
+    {
+        return type_info_to_ir_type(type_info);
+    }
     arg_type_from_decls(arg_name, decls, Some(st))
 }
 

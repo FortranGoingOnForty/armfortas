@@ -26672,6 +26672,57 @@ fn fopenmp_default_private_enforces_data_environment_rules() {
 }
 
 #[test]
+fn implicit_real_dummy_uses_real_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=implicit_real_dummy_uses_real_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "subroutine set_real(the_sum)
+  the_sum = 100.0
+end subroutine set_real
+
+program p
+  real :: value
+  value = 0.0
+  call set_real(value)
+  if (abs(value - 100.0) > 1.0e-6) error stop 1
+  print *, 'ok'
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("implicit_real_dummy_abi", "bin");
+        let runtime_cache = unique_dir("implicit_real_dummy_abi_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([opt, src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "implicit REAL dummy should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "implicit REAL dummy ABI failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_module_threadprivate_storage_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
