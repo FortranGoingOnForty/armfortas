@@ -3409,8 +3409,7 @@ fn validate_structured_block_with_cycle_targets(
             {
                 reject_external_branch(ctx, stmt.span, "arithmetic IF")
             }
-            Stmt::Exit { .. } => reject_transfer(ctx, stmt.span, "EXIT"),
-            Stmt::Cycle { name } => {
+            Stmt::Exit { name } | Stmt::Cycle { name } => {
                 let target_is_internal = match name {
                     Some(name) => cycle_targets.iter().rev().any(|target| {
                         target
@@ -3420,7 +3419,15 @@ fn validate_structured_block_with_cycle_targets(
                     None => !cycle_targets.is_empty(),
                 };
                 if !target_is_internal {
-                    reject_transfer(ctx, stmt.span, "CYCLE");
+                    reject_transfer(
+                        ctx,
+                        stmt.span,
+                        if matches!(&stmt.node, Stmt::Exit { .. }) {
+                            "EXIT"
+                        } else {
+                            "CYCLE"
+                        },
+                    );
                 }
             }
             Stmt::Write { controls, .. } | Stmt::Read { controls, .. } => {
