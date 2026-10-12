@@ -100,12 +100,23 @@ depth, preprocessing constants inside directive lines, and completion
 synchronization. Their license, manifest, adapter, and harness live under
 `tests/fixtures/openmp-vv/` and `tests/openmp_vv.rs`.
 
+NASA NPB 3.4.4 EP Class S also builds from unchanged benchmark sources and
+verifies successfully through the owned runtime. A clean `-O0` build passes
+with four threads, and a clean `-O3` build passes with one, two, four, and eight
+threads. Every run reports the reference histogram
+`6140517, 5865300, 1100361, 68546, 1648, 17, 0, 0, 0, 0`; the floating-point
+reduction sums differ only in their expected final digits as the team size
+changes. The sweep preserved focused regressions for implicit-external runtime
+queries, module `threadprivate`, numeric atomic updates, OpenMP `master`,
+external-procedure capture classification, and the mixed fixed/assumed
+CHARACTER calling convention exercised by NPB's report routine.
+
 ## Next milestones
 
-1. Run NPB EP Class S through the owned runtime and preserve minimized compiler
-   edges as focused regressions.
-2. Audit the remaining OpenMP 5.0 `loop` semantic obligations, beginning with
+1. Audit the remaining OpenMP 5.0 `loop` semantic obligations, beginning with
    the predetermined data-sharing attributes of associated loop iterators.
+2. Take NPB CG as the next application-scale benchmark only after its required
+   directive and runtime surface has been inventoried and bounded.
 3. Extend array reductions beyond constant-shape rank one only with a truthful
    descriptor and partial-storage mapping design.
 4. Add guided/runtime scheduling only after each worksharing construct owns an
