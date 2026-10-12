@@ -4536,6 +4536,9 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
                     collect_name_refs_expr(expr, out);
                 }
             }
+            for expr in construct.standalone_expressions() {
+                collect_name_refs_expr(expr, out);
+            }
             if let Some(body) = construct.region_body() {
                 for stmt in body {
                     collect_name_refs_stmt(stmt, out);
@@ -8634,6 +8637,9 @@ pub(super) fn check_filtered_in_stmt(
                 if let Some(expr) = clause.expression() {
                     check_filtered_in_expr(expr, filtered);
                 }
+            }
+            for expr in construct.standalone_expressions() {
+                check_filtered_in_expr(expr, filtered);
             }
             if let Some(body) = construct.region_body() {
                 check_no_filtered_refs(body, filtered);

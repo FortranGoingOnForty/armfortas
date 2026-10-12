@@ -23575,6 +23575,110 @@ end program p
 }
 
 #[test]
+fn fopenmp_doacross_orders_two_dimensional_dependencies() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_doacross_orders_two_dimensional_dependencies count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer(kind=8) :: ascending(12,9,4), descending(12,9,4), expected
+  integer :: k, j, round
+
+  ascending = 0
+  descending = 0
+!$omp parallel default(none) num_threads(4) &
+!$omp& shared(ascending,descending) private(k,j,round)
+  do round = 1, 4
+!$omp do schedule(static,1) ordered(2)
+    do k = 1, 12
+      do j = 1, 9
+!$omp ordered depend(sink: k-1,j) depend(sink: k,j-1)
+        ascending(k,j,round) = 1
+        if (k > 1) ascending(k,j,round) = ascending(k,j,round) + ascending(k-1,j,round)
+        if (j > 1) ascending(k,j,round) = ascending(k,j,round) + ascending(k,j-1,round)
+!$omp ordered depend(source)
+      end do
+    end do
+!$omp end do
+!$omp do schedule(static,1) ordered(2)
+    do k = 12, 1, -1
+      do j = 9, 1, -1
+!$omp ordered doacross(sink: k+1,j) doacross(sink: k,j+1)
+        descending(k,j,round) = 1
+        if (k < 12) descending(k,j,round) = descending(k,j,round) + descending(k+1,j,round)
+        if (j < 9) descending(k,j,round) = descending(k,j,round) + descending(k,j+1,round)
+!$omp ordered doacross(source: omp_cur_iteration)
+      end do
+    end do
+!$omp end do
+  end do
+!$omp end parallel
+
+  do round = 1, 4
+    do k = 1, 12
+      do j = 1, 9
+        expected = 1
+        if (k > 1) expected = expected + ascending(k-1,j,round)
+        if (j > 1) expected = expected + ascending(k,j-1,round)
+        if (ascending(k,j,round) /= expected) error stop 1
+      end do
+    end do
+    do k = 12, 1, -1
+      do j = 9, 1, -1
+        expected = 1
+        if (k < 12) expected = expected + descending(k+1,j,round)
+        if (j < 9) expected = expected + descending(k,j+1,round)
+        if (descending(k,j,round) /= expected) error stop 2
+      end do
+    end do
+  end do
+  print *, 'ok'
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_doacross", "bin");
+        let runtime_cache = unique_dir("openmp_doacross_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP doacross compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP doacross should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..4 {
+            let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+                .expect("OpenMP doacross binary timed out");
+            assert!(
+                run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+                "OpenMP doacross failed at {opt}, iteration {iteration}: status={:?} stdout={} stderr={}",
+                run.status,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr),
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_explicit_and_orphaned_barriers_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -24497,6 +24601,26 @@ fn fopenmp_worksharing_rejects_unsupported_forms() {
         (
             "program p\ninteger :: i,j\n!$omp parallel do ordered collapse(2)\ndo i=1,4\ndo j=1,4\n!$omp ordered\ncontinue\n!$omp end ordered\nend do\nend do\n!$omp end parallel do\nend program\n",
             "OpenMP ORDERED with COLLAPSE is recognized but not yet implemented",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do ordered(3)\ndo i=1,4\ndo j=1,4\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "only two-dimensional doacross loops are implemented",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do ordered(2)\ndo i=1,4\ndo j=1,i\n!$omp ordered depend(sink:i-1,j)\n!$omp ordered depend(source)\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "currently requires a rectangular associated loop nest",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do ordered(2)\ndo i=1,4\ndo j=1,4\n!$omp ordered depend(sink:i-1,i)\n!$omp ordered depend(source)\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "sink coordinate must have the form j",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do ordered(2)\ndo i=1,4\ndo j=1,4\n!$omp ordered depend(sink:i,j)\n!$omp ordered depend(source)\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "sink vector must identify a lexicographically earlier logical iteration",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do ordered(2)\ndo i=1,4\ndo j=1,4\n!$omp ordered depend(sink:i-1,j)\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "requires directly nested sink dependencies followed by exactly one source dependency",
         ),
         (
             "program p\n!$omp parallel\n!$omp ordered\ncontinue\n!$omp end ordered\n!$omp end parallel\nend program\n",

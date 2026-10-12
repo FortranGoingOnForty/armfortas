@@ -314,6 +314,9 @@ pub(super) struct LowerCtx<'a> {
     /// Runtime values needed while lowering the single block-associated
     /// ORDERED region admitted inside a worksharing loop.
     pub(super) openmp_ordered_loop: Option<OpenMpOrderedLoopState>,
+    /// Runtime bounds and private iteration variables for the currently
+    /// lowered two-dimensional doacross loop nest.
+    pub(super) openmp_doacross_loop: Option<OpenMpDoacrossLoopState>,
     /// Shared originals retained alongside per-task private bindings when one
     /// name is both a sequential-loop iterator and a standalone worksharing
     /// LASTPRIVATE item in the same outlined parallel region.
@@ -423,6 +426,7 @@ impl<'a> LowerCtx<'a> {
             next_openmp_region: 0,
             openmp_team: None,
             openmp_ordered_loop: None,
+            openmp_doacross_loop: None,
             openmp_lastprivate_originals: HashMap::new(),
             st,
             globals,
@@ -608,4 +612,10 @@ pub(super) struct OpenMpOrderedLoopState {
     pub(super) lower: ValueId,
     pub(super) step: ValueId,
     pub(super) iteration: LocalInfo,
+}
+
+#[derive(Clone)]
+pub(super) struct OpenMpDoacrossLoopState {
+    pub(super) outer_iteration: LocalInfo,
+    pub(super) inner_iteration: LocalInfo,
 }

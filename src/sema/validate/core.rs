@@ -164,6 +164,9 @@ pub(super) struct Ctx<'a> {
     /// Number of enclosing worksharing loops that carry a bare ORDERED clause.
     /// The construct stack separately enforces close nesting.
     pub(super) openmp_ordered_binding_depth: usize,
+    /// Number of enclosing worksharing loops that carry a parameterized
+    /// ORDERED clause and therefore bind stand-alone doacross directives.
+    pub(super) openmp_doacross_binding_depth: usize,
     /// Explicitly private data-sharing attributes on each enclosing OpenMP
     /// PARALLEL region. LASTPRIVATE on a bound worksharing loop may not name
     /// an object that is private in that parallel region.
@@ -263,6 +266,7 @@ impl<'a> Ctx<'a> {
             openmp_parallel_depth: 0,
             openmp_construct_stack: Vec::new(),
             openmp_ordered_binding_depth: 0,
+            openmp_doacross_binding_depth: 0,
             openmp_parallel_private_frames: Vec::new(),
             finalizer_capture_host_scopes: HashSet::new(),
             reported_finalizer_captures: HashSet::new(),
@@ -2410,6 +2414,9 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                     validate_const_int_expr_tree(ctx, expr);
                 }
             }
+            for expr in construct.standalone_expressions() {
+                validate_const_int_expr_tree(ctx, expr);
+            }
         }
         Stmt::Block { .. }
         | Stmt::Declaration(_)
@@ -3458,6 +3465,9 @@ fn collect_reference_stmt(
                 if let Some(expr) = clause.expression() {
                     collect_reference_expr(expr, shadowed, facts);
                 }
+            }
+            for expr in construct.standalone_expressions() {
+                collect_reference_expr(expr, shadowed, facts);
             }
             if let Some(body) = construct.region_body() {
                 collect_reference_stmts(body, shadowed, facts);
@@ -6173,16 +6183,24 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 }
             }
             if let Some(loop_stmt) = construct.loop_stmt() {
-                let enters_ordered_binding = construct
-                    .clauses()
-                    .iter()
-                    .any(|clause| matches!(clause, crate::ast::openmp::OpenMpClause::Ordered));
+                let enters_ordered_binding = construct.clauses().iter().any(|clause| {
+                    matches!(clause, crate::ast::openmp::OpenMpClause::Ordered(None))
+                });
+                let enters_doacross_binding = construct.clauses().iter().any(|clause| {
+                    matches!(clause, crate::ast::openmp::OpenMpClause::Ordered(Some(_)))
+                });
                 if enters_ordered_binding {
                     ctx.openmp_ordered_binding_depth += 1;
+                }
+                if enters_doacross_binding {
+                    ctx.openmp_doacross_binding_depth += 1;
                 }
                 ctx.openmp_construct_stack.push(construct.name());
                 validate_stmt(ctx, loop_stmt);
                 ctx.openmp_construct_stack.pop();
+                if enters_doacross_binding {
+                    ctx.openmp_doacross_binding_depth -= 1;
+                }
                 if enters_ordered_binding {
                     ctx.openmp_ordered_binding_depth -= 1;
                 }

@@ -39,6 +39,9 @@ pub enum OpenMpConstruct {
     Ordered {
         body: Vec<SpannedStmt>,
     },
+    OrderedDoacross {
+        dependence: OpenMpDoacrossDependence,
+    },
     Barrier,
     Flush {
         variables: Vec<String>,
@@ -65,6 +68,7 @@ impl OpenMpConstruct {
             Self::Master { .. } => "MASTER",
             Self::Single { .. } => "SINGLE",
             Self::Ordered { .. } => "ORDERED",
+            Self::OrderedDoacross { .. } => "ORDERED DOACROSS",
             Self::Barrier => "BARRIER",
             Self::Flush { .. } => "FLUSH",
             Self::AtomicRead { .. } => "ATOMIC READ",
@@ -83,6 +87,7 @@ impl OpenMpConstruct {
             Self::Critical { .. }
             | Self::Master { .. }
             | Self::Ordered { .. }
+            | Self::OrderedDoacross { .. }
             | Self::Barrier
             | Self::Flush { .. }
             | Self::AtomicRead { .. }
@@ -104,6 +109,7 @@ impl OpenMpConstruct {
             Self::Do { .. }
             | Self::Loop { .. }
             | Self::ParallelDo { .. }
+            | Self::OrderedDoacross { .. }
             | Self::Barrier
             | Self::Flush { .. } => None,
         }
@@ -119,11 +125,19 @@ impl OpenMpConstruct {
             | Self::Master { .. }
             | Self::Single { .. }
             | Self::Ordered { .. }
+            | Self::OrderedDoacross { .. }
             | Self::Barrier
             | Self::Flush { .. }
             | Self::AtomicRead { .. }
             | Self::AtomicWrite { .. }
             | Self::AtomicUpdate { .. } => None,
+        }
+    }
+
+    pub fn standalone_expressions(&self) -> Vec<&SpannedExpr> {
+        match self {
+            Self::OrderedDoacross { dependence } => dependence.vectors().iter().flatten().collect(),
+            _ => Vec::new(),
         }
     }
 }
@@ -148,7 +162,7 @@ pub enum OpenMpClause {
         chunk_size: Option<SpannedExpr>,
     },
     Collapse(SpannedExpr),
-    Ordered,
+    Ordered(Option<SpannedExpr>),
     Nowait,
     Reduction {
         operator: OpenMpReductionOperator,
@@ -162,13 +176,14 @@ impl OpenMpClause {
             Self::If { condition, .. }
             | Self::NumThreads(condition)
             | Self::Collapse(condition) => Some(condition),
+            Self::Ordered(Some(parameter)) => Some(parameter),
             Self::Schedule { chunk_size, .. } => chunk_size.as_ref(),
             Self::Private(_)
             | Self::FirstPrivate(_)
             | Self::LastPrivate { .. }
             | Self::Shared(_)
             | Self::Default(_)
-            | Self::Ordered
+            | Self::Ordered(None)
             | Self::Nowait
             | Self::Reduction { .. } => None,
         }
@@ -188,7 +203,7 @@ impl OpenMpClause {
             | Self::NumThreads(_)
             | Self::Schedule { .. }
             | Self::Collapse(_)
-            | Self::Ordered
+            | Self::Ordered(_)
             | Self::Nowait => Vec::new(),
         }
     }
@@ -197,6 +212,21 @@ impl OpenMpClause {
         match self {
             Self::Reduction { items, .. } => Some(items),
             _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OpenMpDoacrossDependence {
+    Source,
+    Sink { vectors: Vec<Vec<SpannedExpr>> },
+}
+
+impl OpenMpDoacrossDependence {
+    pub fn vectors(&self) -> &[Vec<SpannedExpr>] {
+        match self {
+            Self::Source => &[],
+            Self::Sink { vectors } => vectors,
         }
     }
 }
