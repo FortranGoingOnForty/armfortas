@@ -23352,6 +23352,12 @@ pub(super) fn procedure_dummy_arg_ir_type(
     {
         return procedure_code_ptr_ir_type();
     }
+    // Keep explicit declarations authoritative: their source TypeSpec carries
+    // ABI details (notably CHARACTER length expressions) that the resolved
+    // symbol's canonical TypeInfo intentionally cannot always represent.
+    if declared_type_spec_for_name(arg_name, decls).is_some() {
+        return arg_type_from_decls(arg_name, decls, Some(st));
+    }
     if let Some(type_info) = proc_scope_id
         .and_then(|scope_id| st.lookup_in(scope_id, &key))
         .and_then(|symbol| symbol.type_info.as_ref())
