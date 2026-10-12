@@ -24359,6 +24359,77 @@ fn fopenmp_private_and_firstprivate_scalars_run() {
 }
 
 #[test]
+fn fopenmp_private_and_firstprivate_scalar_dummies_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_and_firstprivate_scalar_dummies_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: private_arg, first_arg, results(0:3)
+  private_arg = 7
+  first_arg = 20
+  results = -1
+  call exercise(private_arg, first_arg, results)
+  if (private_arg /= 7 .or. first_arg /= 20) error stop 1
+  if (any(results /= [30, 32, 34, 36])) error stop 2
+  print *, 'ok'
+contains
+  subroutine exercise(private_arg, first_arg, results)
+    use omp_lib, only: omp_get_thread_num
+    integer, intent(inout) :: private_arg, first_arg
+    integer, intent(out) :: results(0:3)
+    integer :: tid
+!$omp parallel default(none) num_threads(4) private(private_arg,tid) &
+!$omp& firstprivate(first_arg) shared(results)
+    tid = omp_get_thread_num()
+    private_arg = 10 + tid
+    first_arg = first_arg + tid
+    results(tid) = private_arg + first_arg
+!$omp end parallel
+  end subroutine
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_scalar_dummies", "bin");
+        let runtime_cache = unique_dir("openmp_private_scalar_dummies_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE scalar dummies should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE scalar dummies failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_private_and_firstprivate_fixed_shape_arrays_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

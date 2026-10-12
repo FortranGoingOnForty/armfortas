@@ -2430,7 +2430,7 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         }
         return;
     }
-    if is_dummy {
+    if is_dummy && !symbol.attrs.array_spec.is_empty() {
         ctx.error(
             span,
             format!(
