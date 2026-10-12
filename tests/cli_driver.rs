@@ -26232,6 +26232,95 @@ fn fopenmp_shared_fixed_shape_arrays_run() {
 }
 
 #[test]
+fn fopenmp_shared_complex_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_shared_complex_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_shared_complex_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  double complex, allocatable :: module_values(:)
+contains
+  subroutine fill_runtime_shape(n, values)
+    integer, intent(in) :: n
+    double complex, intent(inout) :: values(-n:n-1,2:3)
+    integer :: tid
+!$omp parallel default(none) num_threads(4) private(tid) shared(values)
+    tid = omp_get_thread_num()
+    values(tid-2,2) = cmplx(300.0_8 + tid, -300.0_8 - tid, kind=8)
+    values(tid-2,3) = cmplx(400.0_8 + tid, -400.0_8 - tid, kind=8)
+!$omp end parallel
+  end subroutine
+end module
+program p
+  use omp_shared_complex_state, only: module_values, fill_runtime_shape
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  complex(kind=4) :: fixed(0:3)
+  complex(kind=8) :: runtime_values(-2:1,2:3)
+  integer :: tid
+  allocate(module_values(-1:2))
+  fixed = cmplx(-1.0_4, -1.0_4, kind=4)
+  module_values = cmplx(-1.0_8, -1.0_8, kind=8)
+  runtime_values = cmplx(-1.0_8, -1.0_8, kind=8)
+!$omp parallel default(none) num_threads(4) private(tid) shared(fixed,module_values)
+  tid = omp_get_thread_num()
+  fixed(tid) = cmplx(100.0_4 + tid, -100.0_4 - tid, kind=4)
+  module_values(tid-1) = cmplx(200.0_8 + tid, -200.0_8 - tid, kind=8)
+!$omp end parallel
+  if (fixed(0) /= cmplx(100.0_4, -100.0_4, kind=4)) error stop 1
+  if (fixed(3) /= cmplx(103.0_4, -103.0_4, kind=4)) error stop 2
+  if (module_values(-1) /= cmplx(200.0_8, -200.0_8, kind=8)) error stop 3
+  if (module_values(2) /= cmplx(203.0_8, -203.0_8, kind=8)) error stop 4
+  call fill_runtime_shape(2, runtime_values)
+  if (runtime_values(-2,2) /= cmplx(300.0_8, -300.0_8, kind=8)) error stop 5
+  if (runtime_values(1,2) /= cmplx(303.0_8, -303.0_8, kind=8)) error stop 6
+  if (runtime_values(-2,3) /= cmplx(400.0_8, -400.0_8, kind=8)) error stop 7
+  if (runtime_values(1,3) /= cmplx(403.0_8, -403.0_8, kind=8)) error stop 8
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_shared_complex_arrays", "bin");
+        let runtime_cache = unique_dir("openmp_shared_complex_arrays_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP shared COMPLEX arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP shared COMPLEX arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_shared_fixed_character_arrays_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -27013,8 +27102,8 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
-            && stderr.contains("shared array 'assumed_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
+        stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, COMPLEX, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
+            && stderr.contains("shared array 'assumed_words' must currently have INTEGER, REAL, DOUBLE PRECISION, COMPLEX, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
             && stderr.contains("shared variable 'assumed_text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, COMPLEX, LOGICAL, fixed-length default-kind CHARACTER, or default-kind CHARACTER allocatable")
             && stderr.contains("shared array 'assumed_rank' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy")
             && stderr.contains("shared OPTIONAL dummy 'optional_values' is recognized but not yet implemented")

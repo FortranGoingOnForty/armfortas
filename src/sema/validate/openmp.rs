@@ -2188,6 +2188,10 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
                 | Some(TypeInfo::Real { .. })
                 | Some(TypeInfo::DoublePrecision)
                 | Some(TypeInfo::Logical { .. })
+        ) || matches!(
+            symbol.type_info.as_ref(),
+            Some(TypeInfo::Complex { kind })
+                if matches!(kind.unwrap_or_else(crate::driver::defaults::default_real_kind), 4 | 8)
         );
         let supported_character = matches!(
             symbol.type_info.as_ref(),
@@ -2201,7 +2205,7 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
             ctx.error(
                 span,
                 format!(
-                    "OpenMP PARALLEL shared array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements",
+                    "OpenMP PARALLEL shared array '{}' must currently have INTEGER, REAL, DOUBLE PRECISION, COMPLEX, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements",
                     name
                 ),
             );
