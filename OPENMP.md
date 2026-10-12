@@ -185,14 +185,23 @@ runtime, diagnostic, and native O0/O3 tests preserve those boundaries. The
 lock representation is the public eight-byte `omp_lock_kind` object itself;
 initialization and destruction do not allocate hidden process state.
 
+The unchanged default NASA NPB 3.4.4 UA Class S path also builds and verifies
+at `-O0` and `-O3` with one, two, four, and eight threads. It replaces AU's
+atomic-heavy transfer implementation with extensive per-mortar simple-lock
+updates and therefore validates distinct lock-object identity under sustained
+contention. Every run matches the same reference temperature integral. On the
+validation Apple Silicon host, the O3 benchmark time falls from 4.29 seconds
+with one thread to 1.36 seconds with eight threads; this timing is evidence for
+the bounded lock implementation, not a portable performance guarantee.
+
 ## Next milestones
 
-1. Probe unchanged default NPB UA Class S. It uses the newly supported simple
-   lock routines far more heavily than `VERSION=AU` and is the strongest
-   validation of their application-scale identity and contention behavior.
-2. Treat UA's `VERSION=RD` path as a separate array-reduction frontier with
-   focused storage-mapping and runtime tests before claiming application
-   support.
+1. Take UA's `VERSION=RD` path as the next separate frontier. Its manual array
+   reduction depends on rank-one REAL(8) pointer descriptors in a mixed
+   `threadprivate` list and on an orphaned `do nowait` combination routine.
+2. Extend module pointer `threadprivate` only with descriptor-safe per-thread
+   association, truthful `.amod` propagation, cleanup semantics, and focused
+   native tests before probing unchanged UA/RD.
 3. Extend array reductions beyond constant-shape rank one only with a truthful
    descriptor and partial-storage mapping design.
 4. Add guided/runtime scheduling only after each worksharing construct owns an
