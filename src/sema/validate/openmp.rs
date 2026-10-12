@@ -486,24 +486,41 @@ fn validate_atomic_update(ctx: &mut Ctx<'_>, _span: Span, assignment: &SpannedSt
         );
         return;
     };
-    if !target.to_sexpr().eq_ignore_ascii_case(&left.to_sexpr()) {
-        ctx.error(
-            left.span,
-            "OpenMP ATOMIC UPDATE left operand must match the assignment target",
-        );
-        return;
+    let target_sexpr = target.to_sexpr();
+    let mut update_left = left.as_ref();
+    let mut update_terms = vec![right.as_ref()];
+    while !target_sexpr.eq_ignore_ascii_case(&update_left.to_sexpr()) {
+        let Expr::BinaryOp {
+            op: crate::ast::expr::BinaryOp::Add,
+            left,
+            right,
+        } = &update_left.node
+        else {
+            ctx.error(
+                update_left.span,
+                "OpenMP ATOMIC UPDATE left operand must match the assignment target",
+            );
+            return;
+        };
+        update_terms.push(right.as_ref());
+        update_left = left.as_ref();
     }
-    let mut facts = ProcedureReferenceFacts::default();
-    collect_reference_expr(right, &HashSet::new(), &mut facts);
-    if facts
-        .references
-        .iter()
-        .any(|reference| reference.name.eq_ignore_ascii_case(base_name))
-    {
-        ctx.error(
-            right.span,
-            format!("OpenMP ATOMIC UPDATE expression may not otherwise reference '{base_name}'"),
-        );
+    for update_term in update_terms {
+        let mut facts = ProcedureReferenceFacts::default();
+        collect_reference_expr(update_term, &HashSet::new(), &mut facts);
+        if facts
+            .references
+            .iter()
+            .any(|reference| reference.name.eq_ignore_ascii_case(base_name))
+        {
+            ctx.error(
+                update_term.span,
+                format!(
+                    "OpenMP ATOMIC UPDATE expression may not otherwise reference '{base_name}'"
+                ),
+            );
+            return;
+        }
     }
 }
 

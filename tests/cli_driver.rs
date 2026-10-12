@@ -23991,7 +23991,7 @@ fn fopenmp_atomic_numeric_add_updates_run() {
     integer_total = integer_total + 1
     slot = mod(iteration - 1, 4)
 !$omp atomic update
-    totals(slot) = totals(slot) + 1.d0
+    totals(slot) = totals(slot) + 0.25d0 + 0.75d0
   end do
 !$omp end parallel
   if (integer_total /= 4000) error stop 1
@@ -24132,6 +24132,10 @@ fn fopenmp_atomic_rejects_unsupported_forms() {
         (
             "program p\ninteger :: left,right\n!$omp atomic\nleft=right+1\nend program p\n",
             "OpenMP ATOMIC UPDATE left operand must match the assignment target",
+        ),
+        (
+            "program p\ninteger :: value\n!$omp atomic\nvalue=value+1+value\nend program p\n",
+            "OpenMP ATOMIC UPDATE expression may not otherwise reference 'value'",
         ),
     ];
     for (source, expected) in cases {
