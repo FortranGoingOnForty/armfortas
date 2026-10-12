@@ -23183,6 +23183,67 @@ fn fopenmp_master_region_runs_only_on_primary_thread() {
 }
 
 #[test]
+fn fopenmp_io_stars_are_not_data_environment_captures() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_io_stars_are_not_data_environment_captures count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: value
+  value = 7
+!$omp parallel default(none) num_threads(2) shared(value)
+!$omp master
+  if (.false.) read(*,*) value
+  write(*,*) value
+  print *, value
+!$omp end master
+!$omp end parallel
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_io_stars", "bin");
+        let runtime_cache = unique_dir("openmp_io_stars_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP I/O-star compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP I/O stars should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("OpenMP I/O-star binary failed to run");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success() && stdout.matches('7').count() == 2,
+            "OpenMP I/O stars failed at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            stdout,
+            String::from_utf8_lossy(&run.stderr),
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_master_requires_close_parallel_nesting() {
     for source in [
         "program p\n!$omp master\ncontinue\n!$omp end master\nend program p\n",

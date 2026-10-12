@@ -3084,6 +3084,19 @@ fn collect_reference_stmt(
     shadowed: &HashSet<String>,
     facts: &mut ProcedureReferenceFacts,
 ) {
+    fn collect_io_control_reference(
+        control: &crate::ast::stmt::IoControl,
+        shadowed: &HashSet<String>,
+        facts: &mut ProcedureReferenceFacts,
+    ) {
+        // The parser represents the list-directed/default-unit `*` token as a
+        // name expression. It is I/O syntax, not a data object to capture or
+        // resolve through host association.
+        if !matches!(&control.value.node, Expr::Name { name } if name == "*") {
+            collect_reference_expr(&control.value, shadowed, facts);
+        }
+    }
+
     match &stmt.node {
         Stmt::Assignment { target, value } | Stmt::PointerAssignment { target, value } => {
             collect_reference_expr(target, shadowed, facts);
@@ -3341,7 +3354,7 @@ fn collect_reference_stmt(
             items,
         } => {
             for control in controls {
-                collect_reference_expr(&control.value, shadowed, facts);
+                collect_io_control_reference(control, shadowed, facts);
             }
             for item in items {
                 collect_reference_expr(item, shadowed, facts);
@@ -3406,7 +3419,9 @@ fn collect_reference_stmt(
             }
         }
         Stmt::Print { format, items } => {
-            collect_reference_expr(format, shadowed, facts);
+            if !matches!(&format.node, Expr::Name { name } if name == "*") {
+                collect_reference_expr(format, shadowed, facts);
+            }
             for item in items {
                 collect_reference_expr(item, shadowed, facts);
             }
