@@ -1246,7 +1246,7 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     }
     if opts.openmp {
         opts.cli_warnings.push(
-            "-fopenmp enables preview OpenMP support; PARALLEL data environments, module THREADPRIVATE storage, static and combined dynamic DO worksharing, bounded SINGLE, block ORDERED, and two-dimensional doacross regions, nested LOOP PRIVATE, scalar INTEGER + REDUCTION, rectangular COLLAPSE(1/2), DO COLLAPSE(2), scalar LASTPRIVATE, scalar intrinsic reductions, explicit MASTER and BARRIER regions, numeric ATOMIC read/write/addition, sequentially consistent FLUSH, named/unnamed CRITICAL regions, and simple blocking locks are implemented and unsupported constructs or clauses are errors"
+            "-fopenmp enables preview OpenMP support; PARALLEL data environments, module THREADPRIVATE storage, static and combined dynamic DO worksharing, bounded SINGLE and SECTIONS, block ORDERED, and two-dimensional doacross regions, nested LOOP PRIVATE, scalar INTEGER + REDUCTION, rectangular COLLAPSE(1/2), DO COLLAPSE(2), scalar LASTPRIVATE, scalar intrinsic reductions, explicit MASTER and BARRIER regions, numeric ATOMIC read/write/addition, sequentially consistent FLUSH, named/unnamed CRITICAL regions, and simple blocking locks are implemented and unsupported constructs or clauses are errors"
                 .into(),
         );
     } else if opts.openmp_simd {
@@ -1357,7 +1357,7 @@ LANGUAGE:
   -fdefault-real-8            Make default real kind 8 bytes
   -fimplicit-none             Force implicit none in all scopes
   -frecursive                 Make all procedures recursive by default
-  -fopenmp                    Enable preview OpenMP PARALLEL and DO support
+  -fopenmp                    Enable preview OpenMP host execution support
   -fno-openmp                 Disable full OpenMP compilation
   -fopenmp-simd               Enable OpenMP SIMD syntax without the thread runtime
   -fbackslash                 Interpret backslash in strings as escape
