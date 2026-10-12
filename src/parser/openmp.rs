@@ -24,6 +24,8 @@ enum OpenMpHeader {
     Single(Vec<OpenMpClause>),
     Ordered,
     Barrier,
+    AtomicRead,
+    AtomicWrite,
     AtomicUpdate,
     EndParallel,
     EndDo { nowait: bool },
@@ -206,20 +208,40 @@ impl<'a> Parser<'a> {
                 Stmt::OpenMp(OpenMpConstruct::Barrier),
                 directive.span,
             )),
-            OpenMpHeader::AtomicUpdate => {
+            atomic @ (OpenMpHeader::AtomicRead
+            | OpenMpHeader::AtomicWrite
+            | OpenMpHeader::AtomicUpdate) => {
                 self.skip_newlines();
                 let assignment = self.parse_stmt()?;
                 if !matches!(assignment.node, Stmt::Assignment { .. }) {
                     return Err(ParseError {
                         span: assignment.span,
-                        msg: "OpenMP ATOMIC UPDATE must be followed by an assignment".into(),
+                        msg: format!(
+                            "OpenMP {} must be followed by an assignment",
+                            match atomic {
+                                OpenMpHeader::AtomicRead => "ATOMIC READ",
+                                OpenMpHeader::AtomicWrite => "ATOMIC WRITE",
+                                OpenMpHeader::AtomicUpdate => "ATOMIC UPDATE",
+                                _ => unreachable!(),
+                            }
+                        ),
                     });
                 }
                 let end_span = assignment.span;
-                Ok(Spanned::new(
-                    Stmt::OpenMp(OpenMpConstruct::AtomicUpdate {
+                let construct = match atomic {
+                    OpenMpHeader::AtomicRead => OpenMpConstruct::AtomicRead {
                         assignment: Box::new(assignment),
-                    }),
+                    },
+                    OpenMpHeader::AtomicWrite => OpenMpConstruct::AtomicWrite {
+                        assignment: Box::new(assignment),
+                    },
+                    OpenMpHeader::AtomicUpdate => OpenMpConstruct::AtomicUpdate {
+                        assignment: Box::new(assignment),
+                    },
+                    _ => unreachable!(),
+                };
+                Ok(Spanned::new(
+                    Stmt::OpenMp(construct),
                     span_through(directive.span, end_span),
                 ))
             }
@@ -418,15 +440,24 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
         }
         "atomic" => {
             if !cursor.finished() {
-                let kind = cursor.identifier("OpenMP ATOMIC operation")?;
-                if !kind.eq_ignore_ascii_case("update") {
-                    return Err(cursor.error(format!(
-                        "OpenMP ATOMIC {kind} is recognized but not yet implemented"
-                    )));
-                }
+                let kind = cursor
+                    .identifier("OpenMP ATOMIC operation")?
+                    .to_ascii_lowercase();
+                let header = match kind.as_str() {
+                    "read" => OpenMpHeader::AtomicRead,
+                    "write" => OpenMpHeader::AtomicWrite,
+                    "update" => OpenMpHeader::AtomicUpdate,
+                    _ => {
+                        return Err(cursor.error(format!(
+                            "OpenMP ATOMIC {kind} is recognized but not yet implemented"
+                        )))
+                    }
+                };
+                cursor.finish()?;
+                header
+            } else {
+                OpenMpHeader::AtomicUpdate
             }
-            cursor.finish()?;
-            OpenMpHeader::AtomicUpdate
         }
         "enddo" => OpenMpHeader::EndDo {
             nowait: parse_end_loop_clause(&mut cursor)?,
@@ -1292,17 +1323,30 @@ mod tests {
     }
 
     #[test]
-    fn parses_implicit_and_explicit_atomic_updates() {
-        for source in [
-            "!$omp atomic\nvalue = value + 1\n",
-            "!$omp atomic update\nvalues(i) = values(i) + delta\n",
+    fn parses_atomic_read_write_and_update_forms() {
+        for (source, expected) in [
+            ("!$omp atomic read\nvalue = values(i)\n", "read"),
+            ("!$omp atomic write\nvalues(i) = value\n", "write"),
+            ("!$omp atomic\nvalue = value + 1\n", "update"),
+            (
+                "!$omp atomic update\nvalues(i) = values(i) + delta\n",
+                "update",
+            ),
         ] {
             let stmt = parse(source, SourceForm::FreeForm).unwrap();
-            assert!(matches!(
-                stmt.node,
-                Stmt::OpenMp(OpenMpConstruct::AtomicUpdate { assignment })
-                    if matches!(assignment.node, Stmt::Assignment { .. })
-            ));
+            let matches = match stmt.node {
+                Stmt::OpenMp(OpenMpConstruct::AtomicRead { assignment }) => {
+                    expected == "read" && matches!(assignment.node, Stmt::Assignment { .. })
+                }
+                Stmt::OpenMp(OpenMpConstruct::AtomicWrite { assignment }) => {
+                    expected == "write" && matches!(assignment.node, Stmt::Assignment { .. })
+                }
+                Stmt::OpenMp(OpenMpConstruct::AtomicUpdate { assignment }) => {
+                    expected == "update" && matches!(assignment.node, Stmt::Assignment { .. })
+                }
+                _ => false,
+            };
+            assert!(matches, "unexpected parse for {source}");
         }
     }
 

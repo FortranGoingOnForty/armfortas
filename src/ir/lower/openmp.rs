@@ -610,20 +610,30 @@ pub(super) fn lower_construct(
                 IrType::Int(IntWidth::I32),
             );
         }
-        OpenMpConstruct::AtomicUpdate { assignment } => {
-            b.call(
-                FuncRef::External("afs_omp_atomic_enter".into()),
-                vec![],
-                IrType::Int(IntWidth::I32),
-            );
-            super::stmt::lower_stmt(b, ctx, assignment);
-            b.call(
-                FuncRef::External("afs_omp_atomic_exit".into()),
-                vec![],
-                IrType::Int(IntWidth::I32),
-            );
+        OpenMpConstruct::AtomicRead { assignment }
+        | OpenMpConstruct::AtomicWrite { assignment }
+        | OpenMpConstruct::AtomicUpdate { assignment } => {
+            lower_atomic_assignment(b, ctx, assignment)
         }
     }
+}
+
+fn lower_atomic_assignment(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    assignment: &SpannedStmt,
+) {
+    b.call(
+        FuncRef::External("afs_omp_atomic_enter".into()),
+        vec![],
+        IrType::Int(IntWidth::I32),
+    );
+    super::stmt::lower_stmt(b, ctx, assignment);
+    b.call(
+        FuncRef::External("afs_omp_atomic_exit".into()),
+        vec![],
+        IrType::Int(IntWidth::I32),
+    );
 }
 
 fn lower_master_region(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, body: &[SpannedStmt]) {

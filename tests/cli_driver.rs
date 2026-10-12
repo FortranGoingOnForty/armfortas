@@ -23829,11 +23829,92 @@ end program p
 }
 
 #[test]
+fn fopenmp_atomic_read_and_write_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_atomic_read_and_write_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: flags(0:3), failures
+  integer :: tid, i, local
+  flags = -1
+  failures = 0
+!$omp parallel default(none) num_threads(4) private(tid,i,local) shared(flags,failures)
+  tid = omp_get_thread_num()
+!$omp atomic write
+  flags(tid) = tid
+!$omp barrier
+  do i = 0, 3
+!$omp atomic read
+    local = flags(i)
+    if (local /= i) then
+!$omp atomic update
+      failures = failures + 1
+    end if
+  end do
+!$omp end parallel
+  if (failures /= 0) error stop 1
+  print *, 'ok'
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_atomic_read_write", "bin");
+        let runtime_cache = unique_dir("openmp_atomic_read_write_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP ATOMIC READ/WRITE compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP ATOMIC READ/WRITE should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..8 {
+            let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+                .expect("OpenMP ATOMIC READ/WRITE binary timed out");
+            assert!(
+                run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+                "OpenMP ATOMIC READ/WRITE failed at {opt}, iteration {iteration}: status={:?} stdout={} stderr={}",
+                run.status,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr),
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_atomic_rejects_unsupported_forms() {
     let cases = [
         (
             "program p\ninteger :: value\n!$omp atomic read\nvalue=value\nend program p\n",
-            "OpenMP ATOMIC read is recognized but not yet implemented",
+            "OpenMP ATOMIC READ source and destination must designate distinct storage locations",
+        ),
+        (
+            "program p\ninteger :: left,right\n!$omp atomic read\nleft=right+1\nend program p\n",
+            "OpenMP ATOMIC READ source must be a scalar variable or side-effect-free array element",
+        ),
+        (
+            "program p\ninteger :: value\n!$omp atomic write\nvalue=value+1\nend program p\n",
+            "OpenMP ATOMIC WRITE expression may not reference its target 'value'",
         ),
         (
             "program p\ninteger :: value\n!$omp atomic\nvalue=value-1\nend program p\n",
