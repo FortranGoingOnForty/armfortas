@@ -24018,26 +24018,26 @@ pub(super) fn arg_char_kind_from_decls(
         {
             for entity in entities {
                 if entity.name.to_lowercase() == key {
-                    match type_spec {
-                        TypeSpec::Character(Some(sel)) => {
-                            if matches!(sel.len, Some(crate::ast::decl::LenSpec::Colon))
-                                && arg_uses_string_descriptor_from_decls(arg_name, decls)
+                    if !matches!(type_spec, TypeSpec::Character(_)) {
+                        return CharKind::None;
+                    }
+                    match effective_decl_char_len_spec(type_spec, entity.char_len.as_ref()) {
+                        Some(crate::ast::decl::LenSpec::Colon)
+                            if arg_uses_string_descriptor_from_decls(arg_name, decls) =>
+                        {
+                            return CharKind::Deferred;
+                        }
+                        Some(crate::ast::decl::LenSpec::Expr(e)) => {
+                            if let Some(n) =
+                                eval_const_int_in_scope_or_any_scope(e, &HashMap::new(), st)
                             {
-                                return CharKind::Deferred;
-                            }
-                            if let Some(crate::ast::decl::LenSpec::Expr(e)) = &sel.len {
-                                if let Some(n) =
-                                    eval_const_int_in_scope_or_any_scope(e, &HashMap::new(), st)
-                                {
-                                    return CharKind::Fixed(n);
-                                }
-                            }
-                            if sel.len.is_none() {
-                                return CharKind::Fixed(1);
+                                return CharKind::Fixed(n);
                             }
                         }
-                        TypeSpec::Character(None) => return CharKind::Fixed(1),
-                        _ => {}
+                        None => return CharKind::Fixed(1),
+                        Some(
+                            crate::ast::decl::LenSpec::Star | crate::ast::decl::LenSpec::Colon,
+                        ) => {}
                     }
                     return CharKind::None;
                 }
@@ -24062,8 +24062,10 @@ pub(super) fn arg_runtime_char_len_expr_from_decls(
         {
             for entity in entities {
                 if entity.name.to_lowercase() == key {
-                    if let TypeSpec::Character(Some(sel)) = type_spec {
-                        if let Some(crate::ast::decl::LenSpec::Expr(e)) = &sel.len {
+                    if matches!(type_spec, TypeSpec::Character(_)) {
+                        if let Some(crate::ast::decl::LenSpec::Expr(e)) =
+                            effective_decl_char_len_spec(type_spec, entity.char_len.as_ref())
+                        {
                             if eval_const_int_in_scope_or_any_scope(e, &HashMap::new(), st)
                                 .is_none()
                             {

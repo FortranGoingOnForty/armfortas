@@ -6988,6 +6988,54 @@ fn implicit_interface_mixed_character_dummies_keep_hidden_length_order() {
 }
 
 #[test]
+fn legacy_fixed_character_dummy_preserves_entity_length() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=legacy_fixed_character_dummy_preserves_entity_length count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // NPB declares its report operation as `character optype*24`. The
+    // entity-specific length must govern LEN, comparisons, and I/O inside
+    // the callee just like `character(len=24) :: optype`.
+    let src = write_program(
+        "subroutine inspect_legacy(value, observed, ok)\n  implicit none\n  character value*24\n  integer, intent(out) :: observed\n  logical, intent(out) :: ok\n  observed = len(value)\n  ok = value == 'Random numbers generated'\nend subroutine inspect_legacy\n\nprogram p\n  implicit none\n  integer :: observed\n  logical :: ok\n  call inspect_legacy('Random numbers generated', observed, ok)\n  if (observed /= 24 .or. .not. ok) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path(
+            &format!("legacy_fixed_character_dummy_{}", &opt[1..]),
+            "bin",
+        );
+        let compile = Command::new(compiler("armfortas"))
+            .args([opt, src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("legacy fixed-character dummy compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "legacy fixed-character dummy should compile at {}: {}",
+            opt,
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("legacy fixed-character dummy run failed");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "legacy fixed-character dummy run failed at {}: status={:?} stdout={} stderr={}",
+            opt,
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_file(out);
+    }
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
 fn implicit_interface_heap_backed_array_actual_passes_data_across_objects() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
