@@ -75,18 +75,22 @@ interface
   end function omp_get_wtick
 
   subroutine omp_init_lock(lock) bind(C, name="afs_omp_init_lock")
+    import :: omp_lock_kind
     integer(omp_lock_kind) :: lock
   end subroutine omp_init_lock
 
   subroutine omp_destroy_lock(lock) bind(C, name="afs_omp_destroy_lock")
+    import :: omp_lock_kind
     integer(omp_lock_kind) :: lock
   end subroutine omp_destroy_lock
 
   subroutine omp_set_lock(lock) bind(C, name="afs_omp_set_lock")
+    import :: omp_lock_kind
     integer(omp_lock_kind) :: lock
   end subroutine omp_set_lock
 
   subroutine omp_unset_lock(lock) bind(C, name="afs_omp_unset_lock")
+    import :: omp_lock_kind
     integer(omp_lock_kind) :: lock
   end subroutine omp_unset_lock
 end interface
