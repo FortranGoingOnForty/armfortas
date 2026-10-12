@@ -4,7 +4,8 @@
 //! support selected intrinsic/derived storage, while canonical worksharing
 //! `DO` and combined `PARALLEL DO` support the implemented schedules and
 //! scalar LASTPRIVATE copy-out and predefined scalar/fixed-rank-one reductions.
-//! Named and unnamed `CRITICAL` regions retain process-wide lock identity.
+//! Named and unnamed `CRITICAL` regions retain process-wide lock identity,
+//! and the initial `ATOMIC UPDATE` slice covers scalar numeric addition.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
 //! regions without pretending later schedules, loop clauses, or wider object
 //! ownership cases are already implemented.
@@ -118,6 +119,128 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             reject_in_pure(ctx, span, "CRITICAL");
             validate_structured_block(ctx, body);
         }
+        OpenMpConstruct::AtomicUpdate { assignment } => {
+            reject_in_pure(ctx, span, "ATOMIC UPDATE");
+            validate_atomic_update(ctx, span, assignment);
+        }
+    }
+}
+
+fn validate_atomic_update(ctx: &mut Ctx<'_>, _span: Span, assignment: &SpannedStmt) {
+    let Stmt::Assignment { target, value } = &assignment.node else {
+        ctx.error(
+            assignment.span,
+            "OpenMP ATOMIC UPDATE must be followed by an assignment",
+        );
+        return;
+    };
+    let Some(base_name) = atomic_target_base_name(target) else {
+        ctx.error(
+            target.span,
+            "OpenMP ATOMIC UPDATE target must be a scalar variable or side-effect-free array element",
+        );
+        return;
+    };
+    let Some(symbol) = ctx.lookup_lexical(base_name) else {
+        ctx.error(
+            target.span,
+            format!("OpenMP ATOMIC UPDATE target '{base_name}' is not declared"),
+        );
+        return;
+    };
+    if symbol.kind != SymbolKind::Variable || validation_expr_rank(ctx, target) != Some(0) {
+        ctx.error(
+            target.span,
+            "OpenMP ATOMIC UPDATE target must designate one scalar storage location",
+        );
+        return;
+    }
+    let supported_type = match validation_expr_type_info(ctx, target) {
+        Some(TypeInfo::Integer { kind }) => matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8),
+        Some(TypeInfo::Real { kind }) => matches!(
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
+            4 | 8
+        ),
+        Some(TypeInfo::DoublePrecision) => true,
+        Some(TypeInfo::Complex { kind }) => matches!(
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
+            4 | 8
+        ),
+        _ => false,
+    };
+    if !supported_type {
+        ctx.error(
+            target.span,
+            "OpenMP ATOMIC UPDATE addition currently requires a scalar INTEGER, REAL, DOUBLE PRECISION, or COMPLEX storage location",
+        );
+        return;
+    }
+    let Expr::BinaryOp {
+        op: crate::ast::expr::BinaryOp::Add,
+        left,
+        right,
+    } = &value.node
+    else {
+        ctx.error(
+            value.span,
+            "OpenMP ATOMIC UPDATE currently supports only 'x = x + expr' addition",
+        );
+        return;
+    };
+    if !target.to_sexpr().eq_ignore_ascii_case(&left.to_sexpr()) {
+        ctx.error(
+            left.span,
+            "OpenMP ATOMIC UPDATE left operand must match the assignment target",
+        );
+        return;
+    }
+    let mut facts = ProcedureReferenceFacts::default();
+    collect_reference_expr(right, &HashSet::new(), &mut facts);
+    if facts
+        .references
+        .iter()
+        .any(|reference| reference.name.eq_ignore_ascii_case(base_name))
+    {
+        ctx.error(
+            right.span,
+            format!("OpenMP ATOMIC UPDATE expression may not otherwise reference '{base_name}'"),
+        );
+    }
+}
+
+fn atomic_target_base_name(target: &crate::ast::expr::SpannedExpr) -> Option<&str> {
+    match &target.node {
+        Expr::Name { name } => Some(name),
+        Expr::FunctionCall { callee, args }
+            if !args.is_empty()
+                && args.iter().all(|argument| {
+                    argument.keyword.is_none()
+                        && matches!(
+                            &argument.value,
+                            SectionSubscript::Element(expr)
+                                if atomic_subscript_is_side_effect_free(expr)
+                        )
+                }) =>
+        {
+            match &callee.node {
+                Expr::Name { name } => Some(name),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn atomic_subscript_is_side_effect_free(expr: &crate::ast::expr::SpannedExpr) -> bool {
+    match &expr.node {
+        Expr::IntegerLiteral { .. } | Expr::Name { .. } => true,
+        Expr::UnaryOp { operand, .. } => atomic_subscript_is_side_effect_free(operand),
+        Expr::BinaryOp { left, right, .. } => {
+            atomic_subscript_is_side_effect_free(left)
+                && atomic_subscript_is_side_effect_free(right)
+        }
+        Expr::ParenExpr { inner } => atomic_subscript_is_side_effect_free(inner),
+        _ => false,
     }
 }
 

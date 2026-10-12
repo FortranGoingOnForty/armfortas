@@ -676,6 +676,31 @@ pub extern "C" fn afs_omp_critical_exit(name: *const u8, name_len: i64) -> i32 {
     AFS_OMP_SUCCESS
 }
 
+const ATOMIC_LOCK_NAME: &[u8] = b"\0afs-openmp-atomic";
+
+/// Enter the runtime's process-wide OpenMP atomic-update domain.
+///
+/// A single lock is intentionally conservative: OpenMP permits an
+/// implementation to enforce exclusive access between atomic regions that
+/// designate different storage locations. The non-Fortran lock name cannot
+/// collide with a user-named CRITICAL region.
+#[no_mangle]
+pub extern "C" fn afs_omp_atomic_enter() -> i32 {
+    afs_omp_critical_enter(
+        ATOMIC_LOCK_NAME.as_ptr(),
+        i64::try_from(ATOMIC_LOCK_NAME.len()).unwrap(),
+    )
+}
+
+/// Leave the process-wide OpenMP atomic-update domain.
+#[no_mangle]
+pub extern "C" fn afs_omp_atomic_exit() -> i32 {
+    afs_omp_critical_exit(
+        ATOMIC_LOCK_NAME.as_ptr(),
+        i64::try_from(ATOMIC_LOCK_NAME.len()).unwrap(),
+    )
+}
+
 fn combine_i64_reduction(operator: i32, left: i64, right: i64) -> Option<i64> {
     match operator {
         AFS_OMP_REDUCTION_ADD => Some(left.wrapping_add(right)),

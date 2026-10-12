@@ -20,6 +20,7 @@ enum OpenMpHeader {
     Loop(Vec<OpenMpClause>),
     ParallelDo(Vec<OpenMpClause>),
     Critical(Option<String>),
+    AtomicUpdate,
     EndParallel,
     EndDo { nowait: bool },
     EndLoop,
@@ -155,6 +156,23 @@ impl<'a> Parser<'a> {
                     self.parse_openmp_region_end(OpenMpEnd::Critical, name.as_deref())?;
                 Ok(Spanned::new(
                     Stmt::OpenMp(OpenMpConstruct::Critical { name, body }),
+                    span_through(directive.span, end_span),
+                ))
+            }
+            OpenMpHeader::AtomicUpdate => {
+                self.skip_newlines();
+                let assignment = self.parse_stmt()?;
+                if !matches!(assignment.node, Stmt::Assignment { .. }) {
+                    return Err(ParseError {
+                        span: assignment.span,
+                        msg: "OpenMP ATOMIC UPDATE must be followed by an assignment".into(),
+                    });
+                }
+                let end_span = assignment.span;
+                Ok(Spanned::new(
+                    Stmt::OpenMp(OpenMpConstruct::AtomicUpdate {
+                        assignment: Box::new(assignment),
+                    }),
                     span_through(directive.span, end_span),
                 ))
             }
@@ -322,6 +340,18 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
             };
             cursor.finish()?;
             OpenMpHeader::Critical(name)
+        }
+        "atomic" => {
+            if !cursor.finished() {
+                let kind = cursor.identifier("OpenMP ATOMIC operation")?;
+                if !kind.eq_ignore_ascii_case("update") {
+                    return Err(cursor.error(format!(
+                        "OpenMP ATOMIC {kind} is recognized but not yet implemented"
+                    )));
+                }
+            }
+            cursor.finish()?;
+            OpenMpHeader::AtomicUpdate
         }
         "enddo" => OpenMpHeader::EndDo {
             nowait: parse_end_loop_clause(&mut cursor)?,
@@ -1026,6 +1056,21 @@ mod tests {
                 ref body,
             }) if name.eq_ignore_ascii_case("error_output") && body.len() == 1
         ));
+    }
+
+    #[test]
+    fn parses_implicit_and_explicit_atomic_updates() {
+        for source in [
+            "!$omp atomic\nvalue = value + 1\n",
+            "!$omp atomic update\nvalues(i) = values(i) + delta\n",
+        ] {
+            let stmt = parse(source, SourceForm::FreeForm).unwrap();
+            assert!(matches!(
+                stmt.node,
+                Stmt::OpenMp(OpenMpConstruct::AtomicUpdate { assignment })
+                    if matches!(assignment.node, Stmt::Assignment { .. })
+            ));
+        }
     }
 
     #[test]

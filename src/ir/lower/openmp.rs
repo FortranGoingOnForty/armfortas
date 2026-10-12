@@ -563,6 +563,19 @@ pub(super) fn lower_construct(
         OpenMpConstruct::Critical { name, body } => {
             lower_critical_region(b, ctx, name.as_deref(), body)
         }
+        OpenMpConstruct::AtomicUpdate { assignment } => {
+            b.call(
+                FuncRef::External("afs_omp_atomic_enter".into()),
+                vec![],
+                IrType::Int(IntWidth::I32),
+            );
+            super::stmt::lower_stmt(b, ctx, assignment);
+            b.call(
+                FuncRef::External("afs_omp_atomic_exit".into()),
+                vec![],
+                IrType::Int(IntWidth::I32),
+            );
+        }
     }
 }
 

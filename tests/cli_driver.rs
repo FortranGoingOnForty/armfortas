@@ -22886,6 +22886,103 @@ end program
 }
 
 #[test]
+fn fopenmp_atomic_numeric_add_updates_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_atomic_numeric_add_updates_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: iteration, slot, integer_total
+  double precision :: totals(0:3)
+  integer_total = 0
+  totals = 0.d0
+!$omp parallel default(none) num_threads(4) private(iteration,slot) shared(integer_total,totals)
+  do iteration = 1, 1000
+!$omp atomic
+    integer_total = integer_total + 1
+    slot = mod(iteration - 1, 4)
+!$omp atomic update
+    totals(slot) = totals(slot) + 1.d0
+  end do
+!$omp end parallel
+  if (integer_total /= 4000) error stop 1
+  if (any(totals /= 1000.d0)) error stop 2
+  print *, 'ok'
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_atomic_update", "bin");
+        let runtime_cache = unique_dir("openmp_atomic_update_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP ATOMIC UPDATE should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..4 {
+            let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+                .expect("OpenMP ATOMIC UPDATE binary timed out");
+            assert!(
+                run.status.success(),
+                "OpenMP ATOMIC UPDATE failed at {opt}, iteration {iteration}:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_atomic_rejects_unsupported_forms() {
+    let cases = [
+        (
+            "program p\ninteger :: value\n!$omp atomic read\nvalue=value\nend program p\n",
+            "OpenMP ATOMIC read is recognized but not yet implemented",
+        ),
+        (
+            "program p\ninteger :: value\n!$omp atomic\nvalue=value-1\nend program p\n",
+            "OpenMP ATOMIC UPDATE currently supports only 'x = x + expr' addition",
+        ),
+        (
+            "program p\ninteger :: left,right\n!$omp atomic\nleft=right+1\nend program p\n",
+            "OpenMP ATOMIC UPDATE left operand must match the assignment target",
+        ),
+    ];
+    for (source, expected) in cases {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &["-fopenmp"]);
+        assert!(
+            !result.status.success(),
+            "unsupported OpenMP ATOMIC compiled"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(expected), "unexpected diagnostic: {stderr}");
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
 fn fopenmp_named_critical_identity_crosses_translation_units() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
