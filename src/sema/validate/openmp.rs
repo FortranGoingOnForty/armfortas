@@ -145,12 +145,38 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             }
             validate_structured_block(ctx, body);
         }
-        OpenMpConstruct::Single { body, .. } => {
+        OpenMpConstruct::Single { clauses, body } => {
             reject_in_pure(ctx, span, "SINGLE");
-            ctx.error(
-                span,
-                "OpenMP SINGLE execution is recognized but not yet implemented",
-            );
+            if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
+                if matches!(
+                    enclosing,
+                    "DO" | "LOOP"
+                        | "PARALLEL DO"
+                        | "CRITICAL"
+                        | "MASTER"
+                        | "SINGLE"
+                        | "ORDERED"
+                        | "ATOMIC UPDATE"
+                ) {
+                    ctx.error(
+                        span,
+                        format!(
+                            "OpenMP SINGLE may not be closely nested inside an OpenMP {enclosing} region"
+                        ),
+                    );
+                }
+            }
+            for clause in clauses {
+                if !matches!(clause, OpenMpClause::Nowait) {
+                    ctx.error(
+                        span,
+                        format!(
+                            "OpenMP {} clause on SINGLE is recognized but not yet implemented",
+                            clause_name(clause)
+                        ),
+                    );
+                }
+            }
             validate_structured_block(ctx, body);
         }
         OpenMpConstruct::Ordered { body } => {
