@@ -23484,6 +23484,182 @@ fn fopenmp_single_rejects_unsupported_clauses_and_close_nesting() {
 }
 
 #[test]
+fn fopenmp_sections_execute_once_and_synchronize() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_sections_execute_once_and_synchronize count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: hits(7), owners(7), observations(4), failures, tid
+  hits = 0
+  owners = -1
+  observations = -1
+  failures = 0
+!$omp parallel default(none) num_threads(4) &
+!$omp& shared(hits,owners,observations,failures) private(tid)
+  call fill_sections(hits, owners)
+  if (hits(1) /= 1 .or. hits(2) /= 1 .or. hits(3) /= 1 .or. hits(4) /= 1 &
+      .or. hits(5) /= 1 .or. hits(6) /= 1 .or. hits(7) /= 1) then
+!$omp atomic update
+    failures = failures + 1
+  end if
+!$omp barrier
+  call fill_sections(hits, owners)
+  if (hits(1) /= 2 .or. hits(2) /= 2 .or. hits(3) /= 2 .or. hits(4) /= 2 &
+      .or. hits(5) /= 2 .or. hits(6) /= 2 .or. hits(7) /= 2) then
+!$omp atomic update
+    failures = failures + 1
+  end if
+!$omp barrier
+  call fill_sections_nowait(hits, owners)
+!$omp barrier
+  tid = omp_get_thread_num()
+  observations(tid + 1) = sum(hits)
+!$omp end parallel
+  if (failures /= 0) error stop 1
+  if (any(hits /= 3)) error stop 2
+  if (any(observations /= 21)) error stop 3
+
+  call fill_sections(hits, owners)
+  if (any(hits /= 4)) error stop 4
+  if (any(owners /= 0)) error stop 5
+  print *, 'ok'
+end program p
+
+subroutine fill_sections(hits, owners)
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: hits(7), owners(7), tid
+  tid = omp_get_thread_num()
+!$omp sections
+!$omp section
+  hits(1) = hits(1) + 1
+  owners(1) = tid
+!$omp section
+  hits(2) = hits(2) + 1
+  owners(2) = tid
+!$omp section
+  hits(3) = hits(3) + 1
+  owners(3) = tid
+!$omp section
+  hits(4) = hits(4) + 1
+  owners(4) = tid
+!$omp section
+  hits(5) = hits(5) + 1
+  owners(5) = tid
+!$omp section
+  hits(6) = hits(6) + 1
+  owners(6) = tid
+!$omp section
+  hits(7) = hits(7) + 1
+  owners(7) = tid
+!$omp end sections
+end subroutine fill_sections
+
+subroutine fill_sections_nowait(hits, owners)
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: hits(7), owners(7), tid
+  tid = omp_get_thread_num()
+!$omp sections
+  hits(1) = hits(1) + 1
+  owners(1) = tid
+!$omp section
+  hits(2) = hits(2) + 1
+  owners(2) = tid
+!$omp section
+  hits(3) = hits(3) + 1
+  owners(3) = tid
+!$omp section
+  hits(4) = hits(4) + 1
+  owners(4) = tid
+!$omp section
+  hits(5) = hits(5) + 1
+  owners(5) = tid
+!$omp section
+  hits(6) = hits(6) + 1
+  owners(6) = tid
+!$omp section
+  hits(7) = hits(7) + 1
+  owners(7) = tid
+!$omp end sections nowait
+end subroutine fill_sections_nowait
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_sections", "bin");
+        let runtime_cache = unique_dir("openmp_sections_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP SECTIONS compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP SECTIONS should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..8 {
+            let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+                .expect("OpenMP SECTIONS binary timed out");
+            assert!(
+                run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+                "OpenMP SECTIONS failed at {opt}, iteration {iteration}: status={:?} stdout={} stderr={}",
+                run.status,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr),
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_sections_reject_unsupported_clauses_and_close_nesting() {
+    let cases = [
+        (
+            "program p\n  integer :: value\n!$omp sections private(value)\n!$omp section\n  value = 1\n!$omp end sections\nend program p\n",
+            "OpenMP PRIVATE clause on SECTIONS is recognized but not yet implemented",
+        ),
+        (
+            "program p\n!$omp parallel\n!$omp sections\n!$omp section\n!$omp barrier\n!$omp end sections\n!$omp end parallel\nend program p\n",
+            "OpenMP BARRIER may not be closely nested inside an OpenMP SECTIONS region",
+        ),
+        (
+            "program p\n!$omp parallel\n!$omp single\n!$omp sections\n!$omp section\n  continue\n!$omp end sections\n!$omp end single\n!$omp end parallel\nend program p\n",
+            "OpenMP SECTIONS may not be closely nested inside an OpenMP SINGLE region",
+        ),
+        (
+            "pure subroutine p\n!$omp sections\n!$omp section\n  continue\n!$omp end sections\nend subroutine p\n",
+            "OpenMP SECTIONS is not allowed in a PURE procedure",
+        ),
+    ];
+    for (source, expected) in cases {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &["-fopenmp"]);
+        assert!(!result.status.success(), "invalid OpenMP SECTIONS compiled");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(expected), "unexpected diagnostic: {stderr}");
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
 fn fopenmp_ordered_regions_follow_logical_iteration_order() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

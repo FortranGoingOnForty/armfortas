@@ -135,7 +135,10 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
         OpenMpConstruct::Master { body } => {
             reject_in_pure(ctx, span, "MASTER");
             if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
-                if matches!(enclosing, "DO" | "LOOP" | "PARALLEL DO" | "ATOMIC UPDATE") {
+                if matches!(
+                    enclosing,
+                    "DO" | "LOOP" | "PARALLEL DO" | "SECTIONS" | "ATOMIC UPDATE"
+                ) {
                     ctx.error(
                         span,
                         format!(
@@ -156,6 +159,7 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
                         | "CRITICAL"
                         | "MASTER"
                         | "SINGLE"
+                        | "SECTIONS"
                         | "ORDERED"
                         | "ATOMIC UPDATE"
                 ) {
@@ -180,21 +184,47 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             }
             validate_structured_block(ctx, body);
         }
-        OpenMpConstruct::Sections { clauses, .. } => {
+        OpenMpConstruct::Sections {
+            clauses,
+            body,
+            section_starts,
+        } => {
             reject_in_pure(ctx, span, "SECTIONS");
-            for clause in clauses {
-                ctx.error(
-                    span,
-                    format!(
-                        "OpenMP {} clause on SECTIONS is recognized but not yet implemented",
-                        clause_name(clause)
-                    ),
-                );
+            if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
+                if matches!(
+                    enclosing,
+                    "DO" | "LOOP"
+                        | "PARALLEL DO"
+                        | "CRITICAL"
+                        | "MASTER"
+                        | "SINGLE"
+                        | "SECTIONS"
+                        | "ORDERED"
+                        | "ATOMIC UPDATE"
+                ) {
+                    ctx.error(
+                        span,
+                        format!(
+                            "OpenMP SECTIONS may not be closely nested inside an OpenMP {enclosing} region"
+                        ),
+                    );
+                }
             }
-            ctx.error(
-                span,
-                "OpenMP SECTIONS execution is recognized but not yet implemented",
-            );
+            for clause in clauses {
+                if !matches!(clause, OpenMpClause::Nowait) {
+                    ctx.error(
+                        span,
+                        format!(
+                            "OpenMP {} clause on SECTIONS is recognized but not yet implemented",
+                            clause_name(clause)
+                        ),
+                    );
+                }
+            }
+            for (index, start) in section_starts.iter().copied().enumerate() {
+                let end = section_starts.get(index + 1).copied().unwrap_or(body.len());
+                validate_structured_block(ctx, &body[start..end]);
+            }
         }
         OpenMpConstruct::Ordered { body } => {
             reject_in_pure(ctx, span, "ORDERED");
@@ -249,7 +279,12 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
                 if matches!(
                     enclosing,
-                    "DO" | "LOOP" | "PARALLEL DO" | "CRITICAL" | "MASTER" | "ATOMIC UPDATE"
+                    "DO" | "LOOP"
+                        | "PARALLEL DO"
+                        | "CRITICAL"
+                        | "MASTER"
+                        | "SECTIONS"
+                        | "ATOMIC UPDATE"
                 ) {
                     ctx.error(
                         span,
