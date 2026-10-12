@@ -24039,6 +24039,26 @@ fn fopenmp_worksharing_rejects_unsupported_forms() {
             "program p\ninteger :: i\n!$omp parallel do\ndo i=1,4\nend do\n!$omp end parallel do nowait\nend program\n",
             "OpenMP PARALLEL DO may not specify NOWAIT",
         ),
+        (
+            "program p\ninteger :: i\n!$omp parallel\n!$omp do\ndo i=1,4\n!$omp ordered\ncontinue\n!$omp end ordered\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
+            "the binding OpenMP worksharing loop must specify the ORDERED clause",
+        ),
+        (
+            "program p\ninteger :: i,value\n!$omp parallel\n!$omp do ordered\ndo i=1,4\nvalue=i\n!$omp ordered\nvalue=i\n!$omp end ordered\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
+            "OpenMP DO ORDERED currently requires exactly one directly nested unconditional ORDERED region per logical iteration",
+        ),
+        (
+            "program p\ninteger :: i\n!$omp parallel do ordered schedule(dynamic)\ndo i=1,4\n!$omp ordered\ncontinue\n!$omp end ordered\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP ORDERED currently supports only the default or STATIC schedule",
+        ),
+        (
+            "program p\ninteger :: i,j\n!$omp parallel do ordered collapse(2)\ndo i=1,4\ndo j=1,4\n!$omp ordered\ncontinue\n!$omp end ordered\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP ORDERED with COLLAPSE is recognized but not yet implemented",
+        ),
+        (
+            "program p\n!$omp parallel\n!$omp ordered\ncontinue\n!$omp end ordered\n!$omp end parallel\nend program\n",
+            "OpenMP ORDERED must be closely nested inside an OpenMP DO or PARALLEL DO region",
+        ),
     ];
     for (source, expected) in cases {
         let src = write_program(source, "f90");
