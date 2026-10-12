@@ -46,6 +46,12 @@ The compiler also rejects otherwise supported constructs when their bodies use
 operations whose outlined-procedure ABI or thread safety has not been secured.
 Those diagnostics are part of the preview contract.
 
+Branches whose targets are wholly inside the same OpenMP structured block are
+preserved when the region is outlined. A `GOTO`, computed `GOTO`, or arithmetic
+`IF` with any target outside that block remains a hard error; ordinary Fortran
+structured-control checks independently reject branches into nested or sibling
+constructs.
+
 ## Conformance policy
 
 OpenMP conformance is broader than accepting directives. It includes directive

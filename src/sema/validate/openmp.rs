@@ -1087,7 +1087,14 @@ fn validate_worksharing_loop(
     if collapse_depth == 1 {
         cycle_targets.push(outer_loop.name.map(str::to_ascii_lowercase));
     }
-    validate_structured_block_with_cycle_targets(ctx, outer_loop.body, &mut cycle_targets);
+    let mut internal_labels = HashSet::new();
+    collect_structured_block_labels(outer_loop.body, &mut internal_labels);
+    validate_structured_block_with_cycle_targets(
+        ctx,
+        outer_loop.body,
+        &mut cycle_targets,
+        &internal_labels,
+    );
 }
 
 fn validate_lastprivate_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
@@ -2373,20 +2380,35 @@ fn derived_layout_has_polymorphic_allocatable_components(
 }
 
 fn validate_structured_block(ctx: &mut Ctx<'_>, stmts: &[SpannedStmt]) {
-    validate_structured_block_with_cycle_targets(ctx, stmts, &mut Vec::new());
+    let mut internal_labels = HashSet::new();
+    collect_structured_block_labels(stmts, &mut internal_labels);
+    validate_structured_block_with_cycle_targets(ctx, stmts, &mut Vec::new(), &internal_labels);
 }
 
 fn validate_structured_block_with_cycle_targets(
     ctx: &mut Ctx<'_>,
     stmts: &[SpannedStmt],
     cycle_targets: &mut Vec<Option<String>>,
+    internal_labels: &HashSet<u64>,
 ) {
     for stmt in stmts {
         match &stmt.node {
             Stmt::Return { .. } => reject_transfer(ctx, stmt.span, "RETURN"),
-            Stmt::Goto { .. } => reject_transfer(ctx, stmt.span, "GOTO"),
-            Stmt::ComputedGoto { .. } => reject_transfer(ctx, stmt.span, "computed GOTO"),
-            Stmt::ArithmeticIf { .. } => reject_transfer(ctx, stmt.span, "arithmetic IF"),
+            Stmt::Goto { label } if !internal_labels.contains(label) => {
+                reject_external_branch(ctx, stmt.span, "GOTO")
+            }
+            Stmt::ComputedGoto { labels, .. }
+                if labels.iter().any(|label| !internal_labels.contains(label)) =>
+            {
+                reject_external_branch(ctx, stmt.span, "computed GOTO")
+            }
+            Stmt::ArithmeticIf { neg, zero, pos, .. }
+                if [neg, zero, pos]
+                    .into_iter()
+                    .any(|label| !internal_labels.contains(label)) =>
+            {
+                reject_external_branch(ctx, stmt.span, "arithmetic IF")
+            }
             Stmt::Exit { .. } => reject_transfer(ctx, stmt.span, "EXIT"),
             Stmt::Cycle { name } => {
                 let target_is_internal = match name {
@@ -2418,12 +2440,27 @@ fn validate_structured_block_with_cycle_targets(
                 else_body,
                 ..
             } => {
-                validate_structured_block_with_cycle_targets(ctx, then_body, cycle_targets);
+                validate_structured_block_with_cycle_targets(
+                    ctx,
+                    then_body,
+                    cycle_targets,
+                    internal_labels,
+                );
                 for (_, body) in else_ifs {
-                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                    validate_structured_block_with_cycle_targets(
+                        ctx,
+                        body,
+                        cycle_targets,
+                        internal_labels,
+                    );
                 }
                 if let Some(body) = else_body {
-                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                    validate_structured_block_with_cycle_targets(
+                        ctx,
+                        body,
+                        cycle_targets,
+                        internal_labels,
+                    );
                 }
             }
             Stmt::IfStmt { action, .. }
@@ -2434,23 +2471,37 @@ fn validate_structured_block_with_cycle_targets(
                     ctx,
                     std::slice::from_ref(action.as_ref()),
                     cycle_targets,
+                    internal_labels,
                 );
             }
             Stmt::DoLoop { name, body, .. }
             | Stmt::DoWhile { name, body, .. }
             | Stmt::DoConcurrent { name, body, .. } => {
                 cycle_targets.push(name.as_deref().map(str::to_ascii_lowercase));
-                validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                validate_structured_block_with_cycle_targets(
+                    ctx,
+                    body,
+                    cycle_targets,
+                    internal_labels,
+                );
                 cycle_targets.pop();
             }
             Stmt::Block { body, .. }
             | Stmt::Associate { body, .. }
-            | Stmt::ForallConstruct { body, .. } => {
-                validate_structured_block_with_cycle_targets(ctx, body, cycle_targets)
-            }
+            | Stmt::ForallConstruct { body, .. } => validate_structured_block_with_cycle_targets(
+                ctx,
+                body,
+                cycle_targets,
+                internal_labels,
+            ),
             Stmt::SelectCase { cases, .. } => {
                 for case in cases {
-                    validate_structured_block_with_cycle_targets(ctx, &case.body, cycle_targets);
+                    validate_structured_block_with_cycle_targets(
+                        ctx,
+                        &case.body,
+                        cycle_targets,
+                        internal_labels,
+                    );
                 }
             }
             Stmt::SelectType { guards, .. } => {
@@ -2460,7 +2511,12 @@ fn validate_structured_block_with_cycle_targets(
                         | TypeGuard::ClassIs { body, .. }
                         | TypeGuard::ClassDefault { body } => body,
                     };
-                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                    validate_structured_block_with_cycle_targets(
+                        ctx,
+                        body,
+                        cycle_targets,
+                        internal_labels,
+                    );
                 }
             }
             Stmt::SelectRank { guards, .. } => {
@@ -2470,20 +2526,110 @@ fn validate_structured_block_with_cycle_targets(
                         | RankGuard::RankStar { body }
                         | RankGuard::RankDefault { body } => body,
                     };
-                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                    validate_structured_block_with_cycle_targets(
+                        ctx,
+                        body,
+                        cycle_targets,
+                        internal_labels,
+                    );
                 }
             }
             Stmt::WhereConstruct {
                 body, elsewhere, ..
             } => {
-                validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                validate_structured_block_with_cycle_targets(
+                    ctx,
+                    body,
+                    cycle_targets,
+                    internal_labels,
+                );
                 for (_, body) in elsewhere {
-                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                    validate_structured_block_with_cycle_targets(
+                        ctx,
+                        body,
+                        cycle_targets,
+                        internal_labels,
+                    );
                 }
             }
             // A nested OpenMP region is a distinct structured block. It is
             // validated independently when normal statement validation
             // reaches it.
+            Stmt::OpenMp(_) => {}
+            _ => {}
+        }
+    }
+}
+
+fn collect_structured_block_labels(stmts: &[SpannedStmt], labels: &mut HashSet<u64>) {
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::Continue { label: Some(label) } => {
+                labels.insert(*label);
+            }
+            Stmt::Labeled { label, stmt } => {
+                labels.insert(*label);
+                collect_structured_block_labels(std::slice::from_ref(stmt.as_ref()), labels);
+            }
+            Stmt::IfConstruct {
+                then_body,
+                else_ifs,
+                else_body,
+                ..
+            } => {
+                collect_structured_block_labels(then_body, labels);
+                for (_, body) in else_ifs {
+                    collect_structured_block_labels(body, labels);
+                }
+                if let Some(body) = else_body {
+                    collect_structured_block_labels(body, labels);
+                }
+            }
+            Stmt::IfStmt { action, .. }
+            | Stmt::WhereStmt { stmt: action, .. }
+            | Stmt::ForallStmt { stmt: action, .. } => {
+                collect_structured_block_labels(std::slice::from_ref(action.as_ref()), labels)
+            }
+            Stmt::DoLoop { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::DoConcurrent { body, .. }
+            | Stmt::Block { body, .. }
+            | Stmt::Associate { body, .. }
+            | Stmt::ForallConstruct { body, .. } => collect_structured_block_labels(body, labels),
+            Stmt::SelectCase { cases, .. } => {
+                for case in cases {
+                    collect_structured_block_labels(&case.body, labels);
+                }
+            }
+            Stmt::SelectType { guards, .. } => {
+                for guard in guards {
+                    let body = match guard {
+                        TypeGuard::TypeIs { body, .. }
+                        | TypeGuard::ClassIs { body, .. }
+                        | TypeGuard::ClassDefault { body } => body,
+                    };
+                    collect_structured_block_labels(body, labels);
+                }
+            }
+            Stmt::SelectRank { guards, .. } => {
+                for guard in guards {
+                    let body = match guard {
+                        RankGuard::Rank { body, .. }
+                        | RankGuard::RankStar { body }
+                        | RankGuard::RankDefault { body } => body,
+                    };
+                    collect_structured_block_labels(body, labels);
+                }
+            }
+            Stmt::WhereConstruct {
+                body, elsewhere, ..
+            } => {
+                collect_structured_block_labels(body, labels);
+                for (_, body) in elsewhere {
+                    collect_structured_block_labels(body, labels);
+                }
+            }
+            // A nested OpenMP construct owns a distinct structured block.
             Stmt::OpenMp(_) => {}
             _ => {}
         }
@@ -2497,6 +2643,13 @@ fn reject_transfer(ctx: &mut Ctx<'_>, span: Span, statement: &str) {
             "{} is not yet supported inside an OpenMP structured block",
             statement
         ),
+    );
+}
+
+fn reject_external_branch(ctx: &mut Ctx<'_>, span: Span, statement: &str) {
+    ctx.error(
+        span,
+        format!("{statement} may not leave an OpenMP structured block"),
     );
 }
 

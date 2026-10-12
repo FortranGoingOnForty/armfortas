@@ -22983,6 +22983,92 @@ fn fopenmp_atomic_rejects_unsupported_forms() {
 }
 
 #[test]
+fn fopenmp_internal_goto_stays_within_structured_block() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_internal_goto_stays_within_structured_block count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: outer, inner, tid
+  integer :: counts(0:3)
+  counts = 0
+!$omp parallel default(none) num_threads(4) private(outer,inner,tid) shared(counts)
+  tid = omp_get_thread_num()
+  do outer = 1, 2
+    do inner = 1, 5
+      if (inner == 3) goto 130
+      counts(tid) = counts(tid) + 1
+    end do
+130 continue
+  end do
+!$omp end parallel
+  if (any(counts /= 4)) error stop 1
+  print *, 'ok'
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_internal_goto", "bin");
+        let runtime_cache = unique_dir("openmp_internal_goto_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "internal GOTO in OpenMP structured block should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("internal OpenMP GOTO binary failed to run");
+        assert!(
+            run.status.success(),
+            "internal GOTO in OpenMP structured block failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_goto_cannot_leave_structured_block() {
+    let src = write_program(
+        "program p\n!$omp parallel if(.false.)\ngoto 200\n!$omp end parallel\n200 continue\nend program p\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-fopenmp"]);
+    assert!(
+        !result.status.success(),
+        "GOTO out of an OpenMP structured block compiled"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("GOTO may not leave an OpenMP structured block"),
+        "unexpected diagnostic: {stderr}"
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_named_critical_identity_crosses_translation_units() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
