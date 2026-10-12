@@ -24208,11 +24208,11 @@ pub(super) fn install_runtime_dim_bounds(
                     runtime.push(None);
                     continue;
                 }
-                // Only emit runtime bounds when the referenced name
-                // is a dummy already in `locals`. Anything else (host
-                // globals, uninstalled host_param_consts, unresolved
-                // names) would lower to const_i32(0) here and poison
-                // the bounds check.
+                // Only emit runtime bounds when a simple referenced name is
+                // available in the entry environment. Dummies, host objects,
+                // and use-associated module variables have all been installed
+                // before this pass; an unresolved name would lower to zero and
+                // poison the descriptor shape.
                 let resolvable = match &upper_expr.node {
                     Expr::Name { name } => locals.contains_key(&name.to_lowercase()),
                     _ => true, // arithmetic on dummies — best-effort
@@ -59650,7 +59650,8 @@ pub(super) fn lower_array_intrinsic(
     // foldable intrinsic would otherwise trigger via the always-Some
     // `materialize_array_descriptor_for_info` branch in that helper.
     if let Some(info) = first_arg_info.as_ref() {
-        if !local_uses_array_descriptor(info) {
+        if !local_uses_array_descriptor(info) && !info.runtime_dim_upper.iter().any(Option::is_some)
+        {
             let dim_arg_const = || -> Option<i64> {
                 let dim_expr = match name {
                     "size" => {

@@ -1933,6 +1933,44 @@ end program contextual_name
     }
 
     #[test]
+    fn class_is_an_identifier_without_a_parenthesized_type_spec() {
+        let free = parse_unit(
+            "\
+subroutine verify(class)
+  character :: class
+  class = 'S'
+end subroutine verify
+",
+        );
+        let fixed = parse_fixed_unit(concat!(
+            "      SUBROUTINE VERIFY(CLASS)\n",
+            "      CHARACTER CLASS\n",
+            "      CLASS = 'S'\n",
+            "      END\n",
+        ));
+
+        for unit in [free, fixed] {
+            let ProgramUnit::Subroutine { body, .. } = unit.node else {
+                panic!("not Subroutine");
+            };
+            assert!(matches!(
+                body.as_slice(),
+                [stmt]
+                    if matches!(
+                        &stmt.node,
+                        Stmt::Assignment {
+                            target,
+                            value: _,
+                        } if matches!(
+                            &target.node,
+                            Expr::Name { name } if name.eq_ignore_ascii_case("class")
+                        )
+                    )
+            ));
+        }
+    }
+
+    #[test]
     fn bare_double_declaration_is_rejected() {
         parse_error(
             "\

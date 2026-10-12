@@ -24359,6 +24359,164 @@ fn fopenmp_private_and_firstprivate_scalars_run() {
 }
 
 #[test]
+fn fopenmp_private_and_firstprivate_scalar_dummies_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_and_firstprivate_scalar_dummies_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: private_arg, first_arg, results(0:3)
+  private_arg = 7
+  first_arg = 20
+  results = -1
+  call exercise(private_arg, first_arg, results)
+  if (private_arg /= 7 .or. first_arg /= 20) error stop 1
+  if (any(results /= [30, 32, 34, 36])) error stop 2
+  print *, 'ok'
+contains
+  subroutine exercise(private_arg, first_arg, results)
+    use omp_lib, only: omp_get_thread_num
+    integer, intent(inout) :: private_arg, first_arg
+    integer, intent(out) :: results(0:3)
+    integer :: tid
+!$omp parallel default(none) num_threads(4) private(private_arg,tid) &
+!$omp& firstprivate(first_arg) shared(results)
+    tid = omp_get_thread_num()
+    private_arg = 10 + tid
+    first_arg = first_arg + tid
+    results(tid) = private_arg + first_arg
+!$omp end parallel
+  end subroutine
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_scalar_dummies", "bin");
+        let runtime_cache = unique_dir("openmp_private_scalar_dummies_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE scalar dummies should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PRIVATE/FIRSTPRIVATE scalar dummies failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_private_runtime_shape_complex_dummy_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_private_runtime_shape_complex_dummy_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_private_runtime_shape_state
+  implicit none
+  integer :: block = 4
+contains
+  subroutine exercise(n, module_scratch, dummy_scratch, results)
+    integer, intent(in) :: n
+    double complex, intent(inout) :: module_scratch(block,n)
+    double complex, intent(inout) :: dummy_scratch(-n:n-1,2:3)
+    double complex, intent(out) :: results(0:3)
+    integer :: i
+!$omp parallel do default(none) num_threads(4) schedule(static,1) &
+!$omp& private(module_scratch,dummy_scratch) shared(block,n,results)
+    do i = 0, 3
+      module_scratch(1,1) = cmplx(100.0_8 + i, -100.0_8 - i, kind=8)
+      module_scratch(block,n) = cmplx(200.0_8 + i, -200.0_8 - i, kind=8)
+      dummy_scratch(-n,2) = cmplx(300.0_8 + i, -300.0_8 - i, kind=8)
+      dummy_scratch(n-1,3) = cmplx(400.0_8 + i, -400.0_8 - i, kind=8)
+      results(i) = module_scratch(1,1) + module_scratch(block,n) &
+     &           + dummy_scratch(-n,2) + dummy_scratch(n-1,3)
+    end do
+!$omp end parallel do
+  end subroutine
+end module
+program p
+  use omp_private_runtime_shape_state, only: exercise
+  implicit none
+  double complex :: module_scratch(4,2), dummy_scratch(-2:1,2:3), results(0:3)
+  module_scratch = cmplx(-1.0_8, -1.0_8, kind=8)
+  dummy_scratch = cmplx(-1.0_8, -1.0_8, kind=8)
+  results = cmplx(-1.0_8, -1.0_8, kind=8)
+  call exercise(2, module_scratch, dummy_scratch, results)
+  if (module_scratch(1,1) /= cmplx(-1.0_8, -1.0_8, kind=8)) error stop 1
+  if (module_scratch(4,2) /= cmplx(-1.0_8, -1.0_8, kind=8)) error stop 2
+  if (dummy_scratch(-2,2) /= cmplx(-1.0_8, -1.0_8, kind=8)) error stop 3
+  if (dummy_scratch(1,3) /= cmplx(-1.0_8, -1.0_8, kind=8)) error stop 4
+  if (results(0) /= cmplx(1000.0_8, -1000.0_8, kind=8)) error stop 5
+  if (results(1) /= cmplx(1004.0_8, -1004.0_8, kind=8)) error stop 6
+  if (results(2) /= cmplx(1008.0_8, -1008.0_8, kind=8)) error stop 7
+  if (results(3) /= cmplx(1012.0_8, -1012.0_8, kind=8)) error stop 8
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_private_runtime_shape_complex_dummy", "bin");
+        let runtime_cache = unique_dir("openmp_private_runtime_shape_complex_dummy_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP PRIVATE runtime-shape COMPLEX dummy arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP PRIVATE runtime-shape COMPLEX dummy arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_private_and_firstprivate_fixed_shape_arrays_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -25901,8 +26059,8 @@ fn fopenmp_default_private_enforces_data_environment_rules() {
             "duplicate OpenMP default clause",
         ),
         (
-            "subroutine s(value)\ninteger :: value\n!$omp parallel default(private)\nvalue=1\n!$omp end parallel\nend subroutine\n",
-            "OpenMP DEFAULT(PRIVATE) dummy argument 'value' is recognized but not yet implemented",
+            "subroutine s(value)\ninteger, optional :: value\n!$omp parallel default(private)\nvalue=1\n!$omp end parallel\nend subroutine\n",
+            "OpenMP DEFAULT(PRIVATE) OPTIONAL dummy 'value' is recognized but not yet implemented",
         ),
         (
             "program p\ninteger :: i,total\ntotal=0\n!$omp parallel default(private)\n!$omp do reduction(+:total)\ndo i=1,4\ntotal=total+i\nend do\n!$omp end do\n!$omp end parallel\nend program\n",
@@ -26229,6 +26387,95 @@ fn fopenmp_shared_fixed_shape_arrays_run() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_dir_all(&runtime_cache);
+}
+
+#[test]
+fn fopenmp_shared_complex_arrays_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_shared_complex_arrays_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module omp_shared_complex_state
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  double complex, allocatable :: module_values(:)
+contains
+  subroutine fill_runtime_shape(n, values)
+    integer, intent(in) :: n
+    double complex, intent(inout) :: values(-n:n-1,2:3)
+    integer :: tid
+!$omp parallel default(none) num_threads(4) private(tid) shared(values)
+    tid = omp_get_thread_num()
+    values(tid-2,2) = cmplx(300.0_8 + tid, -300.0_8 - tid, kind=8)
+    values(tid-2,3) = cmplx(400.0_8 + tid, -400.0_8 - tid, kind=8)
+!$omp end parallel
+  end subroutine
+end module
+program p
+  use omp_shared_complex_state, only: module_values, fill_runtime_shape
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  complex(kind=4) :: fixed(0:3)
+  complex(kind=8) :: runtime_values(-2:1,2:3)
+  integer :: tid
+  allocate(module_values(-1:2))
+  fixed = cmplx(-1.0_4, -1.0_4, kind=4)
+  module_values = cmplx(-1.0_8, -1.0_8, kind=8)
+  runtime_values = cmplx(-1.0_8, -1.0_8, kind=8)
+!$omp parallel default(none) num_threads(4) private(tid) shared(fixed,module_values)
+  tid = omp_get_thread_num()
+  fixed(tid) = cmplx(100.0_4 + tid, -100.0_4 - tid, kind=4)
+  module_values(tid-1) = cmplx(200.0_8 + tid, -200.0_8 - tid, kind=8)
+!$omp end parallel
+  if (fixed(0) /= cmplx(100.0_4, -100.0_4, kind=4)) error stop 1
+  if (fixed(3) /= cmplx(103.0_4, -103.0_4, kind=4)) error stop 2
+  if (module_values(-1) /= cmplx(200.0_8, -200.0_8, kind=8)) error stop 3
+  if (module_values(2) /= cmplx(203.0_8, -203.0_8, kind=8)) error stop 4
+  call fill_runtime_shape(2, runtime_values)
+  if (runtime_values(-2,2) /= cmplx(300.0_8, -300.0_8, kind=8)) error stop 5
+  if (runtime_values(1,2) /= cmplx(303.0_8, -303.0_8, kind=8)) error stop 6
+  if (runtime_values(-2,3) /= cmplx(400.0_8, -400.0_8, kind=8)) error stop 7
+  if (runtime_values(1,3) /= cmplx(403.0_8, -403.0_8, kind=8)) error stop 8
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_shared_complex_arrays", "bin");
+        let runtime_cache = unique_dir("openmp_shared_complex_arrays_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP shared COMPLEX arrays should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "OpenMP shared COMPLEX arrays failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -27003,7 +27250,7 @@ end program
 #[test]
 fn fopenmp_rejects_unsupported_shared_data_shapes() {
     let src = write_program(
-        "program p\n  implicit none\n  character(len=3) :: text, words(2)\n  character(len=:), allocatable :: dynamic_words(:)\n  integer, allocatable :: scalar, values(:)\n  integer, pointer :: scalar_pointer\n  integer, target :: target_values(2)\n  integer, volatile :: volatile_values(2)\n  text = 'abc'\n  allocate(scalar, values(2))\n  allocate(character(len=3) :: dynamic_words(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(scalar, scalar_pointer)\n  scalar = 1\n!$omp end parallel\n!$omp parallel shared(dynamic_words)\n  dynamic_words(1) = 'abc'\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\n!$omp parallel firstprivate(words)\n  continue\n!$omp end parallel\n!$omp parallel private(values)\n  continue\n!$omp end parallel\n!$omp parallel private(target_values)\n  continue\n!$omp end parallel\n!$omp parallel private(volatile_values)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_character(assumed_words)\n    character(len=*), intent(inout) :: assumed_words(:)\n!$omp parallel shared(assumed_words)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_assumed_character_scalar(assumed_text)\n    character(len=*), intent(inout) :: assumed_text\n!$omp parallel shared(assumed_text)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_private_dummy(dummy_values)\n    integer, intent(inout) :: dummy_values(2)\n!$omp parallel private(dummy_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_automatic(n)\n    integer, intent(in) :: n\n    integer :: automatic_values(n)\n!$omp parallel firstprivate(automatic_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
+        "program p\n  implicit none\n  character(len=3) :: text, words(2)\n  character(len=:), allocatable :: dynamic_words(:)\n  integer, allocatable :: scalar, values(:)\n  integer, pointer :: scalar_pointer\n  integer, target :: target_values(2)\n  integer, volatile :: volatile_values(2)\n  text = 'abc'\n  allocate(scalar, values(2))\n  allocate(character(len=3) :: dynamic_words(2))\n!$omp parallel shared(text)\n  print *, text\n!$omp end parallel\n!$omp parallel shared(scalar, scalar_pointer)\n  scalar = 1\n!$omp end parallel\n!$omp parallel shared(dynamic_words)\n  dynamic_words(1) = 'abc'\n!$omp end parallel\n!$omp parallel private(text)\n  continue\n!$omp end parallel\n!$omp parallel firstprivate(words)\n  continue\n!$omp end parallel\n!$omp parallel private(values)\n  continue\n!$omp end parallel\n!$omp parallel private(target_values)\n  continue\n!$omp end parallel\n!$omp parallel private(volatile_values)\n  continue\n!$omp end parallel\ncontains\n  subroutine use_assumed_character(assumed_words)\n    character(len=*), intent(inout) :: assumed_words(:)\n!$omp parallel shared(assumed_words)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_assumed_character_scalar(assumed_text)\n    character(len=*), intent(inout) :: assumed_text\n!$omp parallel shared(assumed_text)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_assumed_rank(assumed_rank)\n    integer, intent(inout) :: assumed_rank(..)\n!$omp parallel shared(assumed_rank)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_optional(optional_values)\n    integer, intent(inout), optional :: optional_values(:)\n!$omp parallel shared(optional_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_private_dummy(dummy_values)\n    integer, intent(inout) :: dummy_values(:)\n!$omp parallel private(dummy_values)\n    continue\n!$omp end parallel\n  end subroutine\n  subroutine use_automatic(n)\n    integer, intent(in) :: n\n    integer :: automatic_values(n)\n!$omp parallel firstprivate(automatic_values)\n    continue\n!$omp end parallel\n  end subroutine\nend program\n",
         "f90",
     );
     let result = diagnostic_output(&src, &["-fopenmp"]);
@@ -27013,8 +27260,8 @@ fn fopenmp_rejects_unsupported_shared_data_shapes() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
-            && stderr.contains("shared array 'assumed_words' must currently have INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
+        stderr.contains("shared array 'dynamic_words' must currently have INTEGER, REAL, DOUBLE PRECISION, COMPLEX, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
+            && stderr.contains("shared array 'assumed_words' must currently have INTEGER, REAL, DOUBLE PRECISION, COMPLEX, LOGICAL, fixed-length default-kind CHARACTER, or nonpolymorphic derived-type elements")
             && stderr.contains("shared variable 'assumed_text' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, COMPLEX, LOGICAL, fixed-length default-kind CHARACTER, or default-kind CHARACTER allocatable")
             && stderr.contains("shared array 'assumed_rank' must currently have constant explicit shape or be a non-optional explicit-shape, assumed-shape, or assumed-size dummy")
             && stderr.contains("shared OPTIONAL dummy 'optional_values' is recognized but not yet implemented")
@@ -42350,6 +42597,75 @@ fn explicit_shape_dummy_runtime_bound_materializes_descriptor_extent() {
     assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
 
     let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn explicit_shape_dummy_runtime_bound_reads_module_variable() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=explicit_shape_dummy_runtime_bound_reads_module_variable count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module shape_state
+  implicit none
+  integer :: width = 3
+end module
+module kernels
+  use shape_state, only: width
+  implicit none
+contains
+  subroutine fill(values)
+    integer, intent(inout) :: values(width,2)
+    if (size(values,1) /= width) error stop 1
+    values(width,2) = 42
+  end subroutine
+  integer function corner(values)
+    integer, intent(in) :: values(width,2)
+    if (size(values,1) /= width) error stop 2
+    corner = values(width,2)
+  end function
+end module
+program p
+  use kernels, only: fill, corner
+  implicit none
+  integer :: values(3,2)
+  values = -1
+  call fill(values)
+  if (values(1,2) /= -1 .or. values(3,2) /= 42) error stop 3
+  if (corner(values) /= 42) error stop 4
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("explicit_shape_module_bound", "bin");
+        let compile = Command::new(compiler("armfortas"))
+            .args([opt, src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("module-bound explicit-shape compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "module-bound explicit-shape dummy should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("module-bound explicit-shape run failed");
+        assert!(
+            run.status.success(),
+            "module-bound explicit-shape dummy should pass at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+    }
     let _ = std::fs::remove_file(&src);
 }
 

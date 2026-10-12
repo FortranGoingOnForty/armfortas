@@ -30,8 +30,8 @@ toward [OpenMP 6.0][omp-60] without silently changing existing behavior.
 | Unsupported syntax handling | Supported | Malformed directives are errors; recognized but unimplemented execution is rejected before IR lowering. |
 | `parallel` | Preview | Owned synchronous fork/join runtime, implicit join, nested serialized regions, `if`, and `num_threads`. |
 | Data sharing | Partial | `shared`, `private`, `firstprivate`, `lastprivate`, `default(shared)`, `default(private)`, and `default(none)` for the scalar and array forms accepted by semantic validation. Predetermined named constants and assumed-size arrays remain shared under `default(private)`; explicit clauses retain precedence. OpenMP 5.0 `loop` associated iterators are predetermined `lastprivate`, with `private` and `lastprivate` accepted as explicit overrides. Other `lastprivate` support is currently limited to supported intrinsic scalars on worksharing loops. |
-| Scalar data | Partial | INTEGER, REAL, DOUBLE PRECISION, LOGICAL, fixed-length default-kind CHARACTER, selected allocatable/pointer forms, and nonpolymorphic derived-type privatization. Unsupported ownership, dynamic-length, optional, volatile, and asynchronous cases are diagnosed. |
-| Array data | Partial | Numeric, logical, and fixed-length default-kind CHARACTER constant-shape storage plus selected descriptor-backed dummy, allocatable, pointer, section, and shared derived-type views. Unsupported ownership or lifetime cases are diagnosed. |
+| Scalar data | Partial | INTEGER, REAL, DOUBLE PRECISION, COMPLEX, LOGICAL, fixed-length default-kind CHARACTER, selected allocatable/pointer forms, and nonpolymorphic derived-type privatization. Ordinary scalar dummies may be `private` or `firstprivate`; unsupported ownership, dynamic-length, optional, volatile, and asynchronous cases are diagnosed. |
+| Array data | Partial | Numeric, complex, logical, and fixed-length default-kind CHARACTER constant-shape storage plus selected descriptor-backed dummy, allocatable, pointer, section, and shared derived-type views. A nonoptional explicit-shape dummy with runtime bounds may be `private`; its encounter-time shape is snapshotted and each implicit task receives independent storage. `firstprivate` and assumed-shape dummy arrays remain outside that boundary. Unsupported ownership or lifetime cases are diagnosed. |
 | `threadprivate` | Partial | Module INTEGER, REAL, DOUBLE PRECISION, COMPLEX, and LOGICAL scalars and constant-explicit-shape arrays use runtime-owned per-host-thread storage. The attribute survives separate compilation through `.amod`; allocatable, pointer, derived, character, COMMON-block, and `copyin` forms remain diagnosed or unsupported. |
 | Worksharing loops | Preview | Canonical `do` and combined `parallel do`, positive/negative strides, static contiguous and chunked schedules, combined dynamic schedules, rectangular and direct-bound nonrectangular `collapse(2)`, implicit barriers, standalone `nowait`, scalar `private` and `lastprivate`, and predefined scalar/fixed-rank-one reductions. OpenMP 5.0 `loop` supports scalar `private`, associated-iterator `lastprivate`, scalar INTEGER `reduction(+:...)`, and rectangular `collapse(1)`/`collapse(2)` when it binds implicitly to an enclosing `parallel` region. Predetermined iterator copy-out follows the sequential termination value; `private(iterator)` suppresses it, and an explicit `lastprivate` list item must be associated with the construct. Other `loop` clauses and reduction forms, explicit `bind`, nonrectangular `loop collapse`, general affine nonrectangular bounds, and nonrectangular `lastprivate` remain diagnosed; standalone dynamic scheduling remains rejected. |
 | Reductions and synchronization | Partial | Scalar objects and constant-explicit-shape rank-one arrays of INTEGER support `+`, `*`, `max`, `min`, `iand`, `ior`, and `ieor`; REAL/DOUBLE PRECISION support `+`, `*`, `max`, and `min`; COMPLEX supports `+` and `*`; and LOGICAL supports `.and.`, `.or.`, `.eqv.`, and `.neqv.` on `parallel`, combined `parallel do`, and standalone worksharing `do`. OpenMP 5.0 `loop` currently supports only scalar INTEGER addition reductions. Whole arrays, constant contiguous unit-stride sections, and constant elements are accepted on the broader constructs. Partial selections reject whole-array and provably out-of-selection references within the region; dynamic element references retain bounds enforcement. Narrow integers combine at their storage width, and REAL(4)/REAL(8) and COMPLEX(4)/COMPLEX(8) combine at their declared precision. Standalone `do reduction` supports result publication at its implicit barrier and barrier-free `nowait` completion. Explicit `barrier` synchronizes the current team, including from an orphaned procedure; the initial one-thread team completes immediately, and prohibited close nesting is diagnosed. Explicit and orphaned `master` regions bind to the current team, execute only on thread zero, and have no implicit barrier; serial calls bind to the initial one-thread team. `atomic update` supports `x = x + expr` for scalar INTEGER, REAL, DOUBLE PRECISION, and COMPLEX variables and side-effect-free array elements through a conservative process-wide lock. Atomic read/write/capture/compare, memory-order clauses, flush, locks, ordered regions, `single`, `masked`, the `sections` construct, higher-rank/runtime-shaped reductions, and user-defined reductions remain unimplemented. |
@@ -127,13 +127,22 @@ lexically nested and orphaned `master` regions. Focused regressions preserve
 the two final frontend fixes: I/O `*` syntax is not a data-environment capture,
 and an orphaned `master` binds dynamically to the current team.
 
+NASA NPB 3.4.4 FT Class S builds from unchanged benchmark sources and verifies
+successfully through the owned runtime. Independent clean `-O0` and `-O3`
+builds each pass with one, two, four, and eight threads, and every run matches
+all six reference complex checksums. The sweep exercises shared COMPLEX(4) and
+COMPLEX(8) arrays, scalar complex reduction, `collapse(2)`, and private complex
+explicit-shape dummy arrays whose bounds include module and dummy values.
+Focused regressions preserve contextual use of the identifier `class`, scalar
+dummy privatization, encounter-time shape capture, independent private storage,
+and cleanup that never deallocates the caller's descriptor.
+
 ## Next milestones
 
-1. Inventory the remaining NPB 3.4.4 OpenMP applications and select the
-   smallest high-yield benchmark whose unchanged source reaches a new compiler
-   or runtime edge.
-2. Turn every newly exposed edge into an independently tested compiler tranche
-   before claiming another benchmark.
+1. Implement the bounded `ordered` loop-region semantics needed by NPB 3.4.4
+   MG, then use an unchanged Class S build as the next application-scale probe.
+2. Turn every newly exposed MG edge into an independently tested compiler
+   tranche before claiming the benchmark.
 3. Extend array reductions beyond constant-shape rank one only with a truthful
    descriptor and partial-storage mapping design.
 4. Add guided/runtime scheduling only after each worksharing construct owns an

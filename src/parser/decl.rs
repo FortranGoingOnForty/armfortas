@@ -72,8 +72,13 @@ impl<'a> Parser<'a> {
                 }
             }
             "class" => {
-                self.advance();
-                Some(self.parse_type_or_class_spec(true))
+                let next_pos = self.pos + 1;
+                if next_pos < self.tokens.len() && self.tokens[next_pos].kind == TokenKind::LParen {
+                    self.advance();
+                    Some(self.parse_type_or_class_spec(true))
+                } else {
+                    None
+                }
             }
             // F2023 TYPEOF(entity) / CLASSOF(entity): the parenthesized
             // name references a previously declared ENTITY, not a type.
