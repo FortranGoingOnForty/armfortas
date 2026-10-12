@@ -563,6 +563,7 @@ pub(super) fn lower_construct(
         OpenMpConstruct::Critical { name, body } => {
             lower_critical_region(b, ctx, name.as_deref(), body)
         }
+        OpenMpConstruct::Master { body } => lower_master_region(b, ctx, body),
         OpenMpConstruct::AtomicUpdate { assignment } => {
             b.call(
                 FuncRef::External("afs_omp_atomic_enter".into()),
@@ -577,6 +578,33 @@ pub(super) fn lower_construct(
             );
         }
     }
+}
+
+fn lower_master_region(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, body: &[SpannedStmt]) {
+    let thread_num = if let Some((thread_num, _)) = ctx.openmp_team {
+        thread_num
+    } else {
+        // Semantic validation requires close nesting in PARALLEL. Keep the
+        // runtime query as a defensive lowering fallback for recovered ASTs.
+        b.call(
+            FuncRef::External("afs_omp_get_thread_num".into()),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        )
+    };
+    let zero = b.const_i32(0);
+    let is_primary = b.icmp(CmpOp::Eq, thread_num, zero);
+    let body_bb = b.create_block("omp_master_body");
+    let done_bb = b.create_block("omp_master_done");
+    b.cond_branch(is_primary, body_bb, vec![], done_bb, vec![]);
+
+    b.set_block(body_bb);
+    super::stmt::lower_stmts(b, ctx, body);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(done_bb, vec![]);
+    }
+    // MASTER has no implicit barrier; non-primary threads continue directly.
+    b.set_block(done_bb);
 }
 
 fn lower_critical_region(

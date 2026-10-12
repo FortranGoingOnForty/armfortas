@@ -5,7 +5,8 @@
 //! `DO` and combined `PARALLEL DO` support the implemented schedules and
 //! scalar LASTPRIVATE copy-out and predefined scalar/fixed-rank-one reductions.
 //! Named and unnamed `CRITICAL` regions retain process-wide lock identity,
-//! and the initial `ATOMIC UPDATE` slice covers scalar numeric addition.
+//! `MASTER` regions execute only on the primary thread without an implicit
+//! barrier, and the initial `ATOMIC UPDATE` slice covers scalar numeric addition.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
 //! regions without pretending later schedules, loop clauses, or wider object
 //! ownership cases are already implemented.
@@ -117,6 +118,16 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
         }
         OpenMpConstruct::Critical { body, .. } => {
             reject_in_pure(ctx, span, "CRITICAL");
+            validate_structured_block(ctx, body);
+        }
+        OpenMpConstruct::Master { body } => {
+            reject_in_pure(ctx, span, "MASTER");
+            if ctx.openmp_construct_stack.last().copied() != Some("PARALLEL") {
+                ctx.error(
+                    span,
+                    "OpenMP MASTER must be closely nested inside an OpenMP PARALLEL region",
+                );
+            }
             validate_structured_block(ctx, body);
         }
         OpenMpConstruct::AtomicUpdate { assignment } => {

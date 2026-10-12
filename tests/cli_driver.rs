@@ -22886,6 +22886,74 @@ end program
 }
 
 #[test]
+fn fopenmp_master_region_runs_only_on_primary_thread() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_master_region_runs_only_on_primary_thread count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  use omp_lib, only: omp_get_thread_num\n  implicit none\n  integer :: count, primary_thread\n  count = 0\n  primary_thread = -1\n!$omp parallel default(none) num_threads(4) shared(count,primary_thread)\n!$omp master\n  count = count + 1\n  primary_thread = omp_get_thread_num()\n!$omp end master\n!$omp end parallel\n  if (count /= 1) error stop 1\n  if (primary_thread /= 0) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_master", "bin");
+        let runtime_cache = unique_dir("openmp_master_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP MASTER compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP MASTER should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("OpenMP MASTER binary failed to run");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "OpenMP MASTER failed at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_master_requires_close_parallel_nesting() {
+    for source in [
+        "program p\n!$omp master\ncontinue\n!$omp end master\nend program p\n",
+        "program p\n!$omp parallel\n!$omp critical\n!$omp master\ncontinue\n!$omp end master\n!$omp end critical\n!$omp end parallel\nend program p\n",
+    ] {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &["-fopenmp"]);
+        assert!(!result.status.success(), "misnested OpenMP MASTER compiled");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(
+                "OpenMP MASTER must be closely nested inside an OpenMP PARALLEL region"
+            ),
+            "unexpected diagnostic: {stderr}"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
 fn fopenmp_atomic_numeric_add_updates_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -157,6 +157,10 @@ pub(super) struct Ctx<'a> {
     /// worksharing constructs bind dynamically, so this tracks only the data
     /// environment that semantic validation can prove from the source tree.
     pub(super) openmp_parallel_depth: usize,
+    /// Nearest enclosing OpenMP regions, used for close-nesting rules such as
+    /// MASTER being directly bound to a PARALLEL region. Ordinary Fortran
+    /// control constructs do not alter this stack.
+    pub(super) openmp_construct_stack: Vec<&'static str>,
     /// Explicitly private data-sharing attributes on each enclosing OpenMP
     /// PARALLEL region. LASTPRIVATE on a bound worksharing loop may not name
     /// an object that is private in that parallel region.
@@ -254,6 +258,7 @@ impl<'a> Ctx<'a> {
             in_bind_c_unit: false,
             openmp_full: false,
             openmp_parallel_depth: 0,
+            openmp_construct_stack: Vec::new(),
             openmp_parallel_private_frames: Vec::new(),
             finalizer_capture_host_scopes: HashSet::new(),
             reported_finalizer_captures: HashSet::new(),
@@ -6140,14 +6145,18 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                     ctx.openmp_parallel_depth += 1;
                     ctx.openmp_parallel_private_frames.push(frame);
                 }
+                ctx.openmp_construct_stack.push(construct.name());
                 validate_stmts(ctx, body);
+                ctx.openmp_construct_stack.pop();
                 if enters_parallel {
                     ctx.openmp_parallel_private_frames.pop();
                     ctx.openmp_parallel_depth -= 1;
                 }
             }
             if let Some(loop_stmt) = construct.loop_stmt() {
+                ctx.openmp_construct_stack.push(construct.name());
                 validate_stmt(ctx, loop_stmt);
+                ctx.openmp_construct_stack.pop();
             }
         }
 

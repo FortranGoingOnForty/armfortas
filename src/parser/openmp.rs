@@ -20,12 +20,14 @@ enum OpenMpHeader {
     Loop(Vec<OpenMpClause>),
     ParallelDo(Vec<OpenMpClause>),
     Critical(Option<String>),
+    Master,
     AtomicUpdate,
     EndParallel,
     EndDo { nowait: bool },
     EndLoop,
     EndParallelDo { nowait: bool },
     EndCritical(Option<String>),
+    EndMaster,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +161,13 @@ impl<'a> Parser<'a> {
                     span_through(directive.span, end_span),
                 ))
             }
+            OpenMpHeader::Master => {
+                let (body, end_span) = self.parse_openmp_region_end(OpenMpEnd::Master, None)?;
+                Ok(Spanned::new(
+                    Stmt::OpenMp(OpenMpConstruct::Master { body }),
+                    span_through(directive.span, end_span),
+                ))
+            }
             OpenMpHeader::AtomicUpdate => {
                 self.skip_newlines();
                 let assignment = self.parse_stmt()?;
@@ -180,7 +189,8 @@ impl<'a> Parser<'a> {
             | OpenMpHeader::EndDo { .. }
             | OpenMpHeader::EndLoop
             | OpenMpHeader::EndParallelDo { .. }
-            | OpenMpHeader::EndCritical(_) => Err(ParseError {
+            | OpenMpHeader::EndCritical(_)
+            | OpenMpHeader::EndMaster => Err(ParseError {
                 span: directive.span,
                 msg: format!("unexpected OpenMP end directive '!$omp {}'", directive.text),
             }),
@@ -260,6 +270,7 @@ impl<'a> Parser<'a> {
                         }
                         true
                     }
+                    (OpenMpEnd::Master, OpenMpHeader::EndMaster) => true,
                     _ => false,
                 };
                 if matches {
@@ -273,6 +284,7 @@ impl<'a> Parser<'a> {
                         | OpenMpHeader::EndLoop
                         | OpenMpHeader::EndParallelDo { .. }
                         | OpenMpHeader::EndCritical(_)
+                        | OpenMpHeader::EndMaster
                 ) {
                     return Err(ParseError {
                         span: directive.span,
@@ -293,6 +305,7 @@ impl<'a> Parser<'a> {
 enum OpenMpEnd {
     Parallel,
     Critical,
+    Master,
 }
 
 impl OpenMpEnd {
@@ -300,6 +313,7 @@ impl OpenMpEnd {
         match self {
             Self::Parallel => "parallel",
             Self::Critical => "critical",
+            Self::Master => "master",
         }
     }
 }
@@ -340,6 +354,10 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
             };
             cursor.finish()?;
             OpenMpHeader::Critical(name)
+        }
+        "master" => {
+            cursor.finish()?;
+            OpenMpHeader::Master
         }
         "atomic" => {
             if !cursor.finished() {
@@ -405,6 +423,10 @@ fn parse_openmp_end_header(cursor: &mut DirectiveCursor<'_>) -> Result<OpenMpHea
             };
             cursor.finish()?;
             Ok(OpenMpHeader::EndCritical(name))
+        }
+        "master" => {
+            cursor.finish()?;
+            Ok(OpenMpHeader::EndMaster)
         }
         other => Err(cursor.error(format!("unsupported OpenMP END directive 'end {other}'"))),
     }
@@ -1055,6 +1077,29 @@ mod tests {
                 name: Some(ref name),
                 ref body,
             }) if name.eq_ignore_ascii_case("error_output") && body.len() == 1
+        ));
+    }
+
+    #[test]
+    fn parses_master_region_nested_in_parallel() {
+        let stmt = parse(
+            "!$omp parallel shared(value)\n\
+             !$omp master\n\
+             value = 1\n\
+             !$omp end master\n\
+             !$omp end parallel\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::Parallel { body, .. }) = stmt.node else {
+            panic!("expected parallel construct");
+        };
+        assert!(matches!(
+            body.as_slice(),
+            [Spanned {
+                node: Stmt::OpenMp(OpenMpConstruct::Master { body }),
+                ..
+            }] if body.len() == 1
         ));
     }
 

@@ -29,6 +29,9 @@ pub enum OpenMpConstruct {
         name: Option<String>,
         body: Vec<SpannedStmt>,
     },
+    Master {
+        body: Vec<SpannedStmt>,
+    },
     AtomicUpdate {
         assignment: Box<SpannedStmt>,
     },
@@ -42,6 +45,7 @@ impl OpenMpConstruct {
             Self::Loop { .. } => "LOOP",
             Self::ParallelDo { .. } => "PARALLEL DO",
             Self::Critical { .. } => "CRITICAL",
+            Self::Master { .. } => "MASTER",
             Self::AtomicUpdate { .. } => "ATOMIC UPDATE",
         }
     }
@@ -52,13 +56,15 @@ impl OpenMpConstruct {
             | Self::Do { clauses, .. }
             | Self::Loop { clauses, .. }
             | Self::ParallelDo { clauses, .. } => clauses,
-            Self::Critical { .. } | Self::AtomicUpdate { .. } => &[],
+            Self::Critical { .. } | Self::Master { .. } | Self::AtomicUpdate { .. } => &[],
         }
     }
 
     pub fn region_body(&self) -> Option<&[SpannedStmt]> {
         match self {
-            Self::Parallel { body, .. } | Self::Critical { body, .. } => Some(body),
+            Self::Parallel { body, .. } | Self::Critical { body, .. } | Self::Master { body } => {
+                Some(body)
+            }
             Self::AtomicUpdate { assignment } => Some(std::slice::from_ref(assignment.as_ref())),
             Self::Do { .. } | Self::Loop { .. } | Self::ParallelDo { .. } => None,
         }
@@ -69,7 +75,10 @@ impl OpenMpConstruct {
             Self::Do { loop_stmt, .. }
             | Self::Loop { loop_stmt, .. }
             | Self::ParallelDo { loop_stmt, .. } => Some(loop_stmt),
-            Self::Parallel { .. } | Self::Critical { .. } | Self::AtomicUpdate { .. } => None,
+            Self::Parallel { .. }
+            | Self::Critical { .. }
+            | Self::Master { .. }
+            | Self::AtomicUpdate { .. } => None,
         }
     }
 }
