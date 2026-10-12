@@ -720,6 +720,11 @@ fn parse_clauses(
                 span,
                 "FIRSTPRIVATE list",
             )?),
+            "copyin" => OpenMpClause::CopyIn(parse_name_list(
+                cursor.parenthesized("COPYIN list")?,
+                span,
+                "COPYIN list",
+            )?),
             "lastprivate" => {
                 let value = cursor.parenthesized("LASTPRIVATE list")?;
                 let (conditional, variables) =
@@ -850,6 +855,7 @@ fn validate_clause_for_construct(
             clause,
             OpenMpClause::Private(_)
                 | OpenMpClause::FirstPrivate(_)
+                | OpenMpClause::CopyIn(_)
                 | OpenMpClause::Shared(_)
                 | OpenMpClause::Default(_)
                 | OpenMpClause::If { .. }
@@ -1214,6 +1220,41 @@ mod tests {
         };
         assert_eq!(clauses.len(), 4);
         assert_eq!(body.len(), 1);
+    }
+
+    #[test]
+    fn parses_parallel_copyin_clause() {
+        let stmt = parse(
+            "!$omp parallel copyin(scalar, values)\n\
+             scalar = values(1)\n\
+             !$omp end parallel\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::Parallel { clauses, .. }) = stmt.node else {
+            panic!("expected parallel construct");
+        };
+        assert!(matches!(
+            clauses.as_slice(),
+            [OpenMpClause::CopyIn(names)] if names == &["scalar", "values"]
+        ));
+    }
+
+    #[test]
+    fn rejects_copyin_on_standalone_do() {
+        let error = parse(
+            "!$omp do copyin(value)\n\
+             do i = 1, 4\n\
+             end do\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .msg
+                .contains("OpenMP clause is not valid on this construct"),
+            "{error}"
+        );
     }
 
     #[test]

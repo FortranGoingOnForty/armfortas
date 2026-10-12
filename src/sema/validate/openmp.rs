@@ -872,6 +872,13 @@ fn validate_parallel_clauses(
                     validate_private_object(ctx, name, span, "FIRSTPRIVATE");
                 }
             }
+            OpenMpClause::CopyIn(names) => {
+                for name in names {
+                    let key = name.to_ascii_lowercase();
+                    register_data_attribute(ctx, span, &mut data_attributes, &key, "COPYIN");
+                    validate_copyin_object(ctx, name, span);
+                }
+            }
             OpenMpClause::LastPrivate {
                 conditional,
                 variables,
@@ -1329,6 +1336,7 @@ fn validate_worksharing_loop(
                         ),
             OpenMpClause::Private(_)
             | OpenMpClause::FirstPrivate(_)
+            | OpenMpClause::CopyIn(_)
             | OpenMpClause::LastPrivate { .. }
             | OpenMpClause::Shared(_)
             | OpenMpClause::Default(_)
@@ -1424,7 +1432,9 @@ fn validate_worksharing_loop(
             | OpenMpClause::NumThreads(_) => unreachable!(
                 "parser admitted a parallel-only clause on standalone OpenMP {directive_name}"
             ),
-            OpenMpClause::Private(_) | OpenMpClause::FirstPrivate(_) => {
+            OpenMpClause::Private(_)
+            | OpenMpClause::FirstPrivate(_)
+            | OpenMpClause::CopyIn(_) => {
                 unreachable!(
                     "OpenMP {directive_name} data clause escaped construct-specific validation"
                 )
@@ -2230,6 +2240,7 @@ fn clause_name(clause: &OpenMpClause) -> &'static str {
     match clause {
         OpenMpClause::Private(_) => "PRIVATE",
         OpenMpClause::FirstPrivate(_) => "FIRSTPRIVATE",
+        OpenMpClause::CopyIn(_) => "COPYIN",
         OpenMpClause::LastPrivate { .. } => "LASTPRIVATE",
         OpenMpClause::Shared(_) => "SHARED",
         OpenMpClause::Default(_) => "DEFAULT",
@@ -2825,6 +2836,56 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
             format!(
                 "OpenMP PARALLEL shared variable '{}' must currently be a scalar INTEGER, REAL, DOUBLE PRECISION, COMPLEX, LOGICAL, fixed-length default-kind CHARACTER, or default-kind CHARACTER allocatable",
                 name
+            ),
+        );
+    }
+}
+
+fn validate_copyin_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
+    let Some(symbol) = ctx.lookup_lexical(name) else {
+        ctx.error(
+            span,
+            format!("OpenMP COPYIN variable '{name}' does not resolve to a visible data object"),
+        );
+        return;
+    };
+    if symbol.kind != SymbolKind::Variable {
+        ctx.error(
+            span,
+            format!("OpenMP COPYIN list item '{name}' must be a variable"),
+        );
+        return;
+    }
+    if !symbol.attrs.openmp_threadprivate {
+        ctx.error(
+            span,
+            format!("OpenMP COPYIN variable '{name}' must be THREADPRIVATE"),
+        );
+        return;
+    }
+    if symbol.attrs.pointer {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP COPYIN pointer variable '{name}' is recognized but not yet implemented"
+            ),
+        );
+        return;
+    }
+    if symbol.attrs.allocatable
+        || !matches!(
+            symbol.type_info.as_ref(),
+            Some(TypeInfo::Integer { .. })
+                | Some(TypeInfo::Real { .. })
+                | Some(TypeInfo::DoublePrecision)
+                | Some(TypeInfo::Complex { .. })
+                | Some(TypeInfo::Logical { .. })
+        )
+    {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP COPYIN variable '{name}' currently requires a nonallocatable, nonpointer intrinsic numeric or LOGICAL THREADPRIVATE variable"
             ),
         );
     }
