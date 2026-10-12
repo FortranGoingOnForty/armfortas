@@ -23991,7 +23991,7 @@ fn fopenmp_atomic_numeric_add_updates_run() {
     integer_total = integer_total + 1
     slot = mod(iteration - 1, 4)
 !$omp atomic update
-    totals(slot) = totals(slot) + 1.d0
+    totals(slot) = totals(slot) + 0.25d0 + 0.75d0
   end do
 !$omp end parallel
   if (integer_total /= 4000) error stop 1
@@ -24132,6 +24132,10 @@ fn fopenmp_atomic_rejects_unsupported_forms() {
         (
             "program p\ninteger :: left,right\n!$omp atomic\nleft=right+1\nend program p\n",
             "OpenMP ATOMIC UPDATE left operand must match the assignment target",
+        ),
+        (
+            "program p\ninteger :: value\n!$omp atomic\nvalue=value+1+value\nend program p\n",
+            "OpenMP ATOMIC UPDATE expression may not otherwise reference 'value'",
         ),
     ];
     for (source, expected) in cases {
@@ -28040,6 +28044,96 @@ fn omp_lib_initial_runtime_surface_runs_in_serial_context() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_dir_all(&runtime_cache);
+}
+
+#[test]
+fn fopenmp_simple_lock_routines_serialize_updates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_simple_lock_routines_serialize_updates count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_lock_kind, omp_init_lock, omp_destroy_lock, &
+    omp_set_lock, omp_unset_lock
+  implicit none
+  integer(omp_lock_kind) :: lock
+  integer :: counter, i
+  counter = 0
+  call omp_init_lock(lock=lock)
+!$omp parallel do default(none) num_threads(4) schedule(static,1) &
+!$omp& shared(lock,counter) private(i)
+  do i = 1, 2000
+    call omp_set_lock(lock)
+    counter = counter + 1
+    call omp_unset_lock(lock)
+  end do
+!$omp end parallel do
+  call omp_destroy_lock(lock)
+  if (counter /= 2000) error stop 1
+  print *, 'ok'
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_simple_locks", "bin");
+        let runtime_cache = unique_dir("openmp_simple_locks_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP simple-lock compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP simple locks should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..4 {
+            let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+                .expect("OpenMP simple-lock binary timed out");
+            assert!(
+                run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+                "OpenMP simple locks failed at {opt}, iteration {iteration}: status={:?} stdout={} stderr={}",
+                run.status,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr),
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn omp_lib_simple_lock_actuals_require_lock_kind() {
+    let src = write_program(
+        "program p\n  use omp_lib, only: omp_init_lock\n  implicit none\n  integer :: lock\n  call omp_init_lock(lock)\nend program p\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-fopenmp"]);
+    assert!(
+        !result.status.success(),
+        "invalid simple-lock actual compiled"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(
+            "OMP_INIT_LOCK LOCK must be a definable scalar INTEGER(omp_lock_kind) variable"
+        ),
+        "unexpected diagnostics: {stderr}"
+    );
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]

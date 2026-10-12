@@ -420,6 +420,9 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
                 OpenMpHeader::Parallel(parse_clauses(&mut cursor, span, BeginKind::Parallel)?)
             }
         }
+        "paralleldo" => {
+            OpenMpHeader::ParallelDo(parse_clauses(&mut cursor, span, BeginKind::ParallelDo)?)
+        }
         "do" => OpenMpHeader::Do(parse_clauses(&mut cursor, span, BeginKind::Do)?),
         "loop" => OpenMpHeader::Loop(parse_clauses(&mut cursor, span, BeginKind::Loop)?),
         "critical" => {
@@ -494,6 +497,19 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
         "enddo" => OpenMpHeader::EndDo {
             nowait: parse_end_loop_clause(&mut cursor)?,
         },
+        "endparallel" if cursor.peek_identifier_is("do") => {
+            cursor.identifier("DO")?;
+            OpenMpHeader::EndParallelDo {
+                nowait: parse_end_loop_clause(&mut cursor)?,
+            }
+        }
+        "endparallel" => {
+            cursor.finish()?;
+            OpenMpHeader::EndParallel
+        }
+        "endparalleldo" => OpenMpHeader::EndParallelDo {
+            nowait: parse_end_loop_clause(&mut cursor)?,
+        },
         "endloop" => {
             cursor.finish()?;
             OpenMpHeader::EndLoop
@@ -523,6 +539,9 @@ fn parse_openmp_end_header(cursor: &mut DirectiveCursor<'_>) -> Result<OpenMpHea
             cursor.finish()?;
             Ok(OpenMpHeader::EndParallel)
         }
+        "paralleldo" => Ok(OpenMpHeader::EndParallelDo {
+            nowait: parse_end_loop_clause(cursor)?,
+        }),
         "do" => {
             let nowait = parse_end_loop_clause(cursor)?;
             Ok(OpenMpHeader::EndDo { nowait })
@@ -1226,6 +1245,28 @@ mod tests {
         assert!(clauses
             .iter()
             .any(|clause| matches!(clause, OpenMpClause::Nowait)));
+    }
+
+    #[test]
+    fn parses_compact_parallel_do_spellings() {
+        for (begin, end) in [
+            ("parallel do", "end paralleldo"),
+            ("parallel do", "endparallel do"),
+            ("parallel do", "endparalleldo"),
+            ("paralleldo", "end parallel do"),
+        ] {
+            let source = format!(
+                "!$omp {begin}\n\
+                 do i = 1, 4\n\
+                 end do\n\
+                 !$omp {end}\n"
+            );
+            let stmt = parse(&source, SourceForm::FreeForm).unwrap();
+            assert!(matches!(
+                stmt.node,
+                Stmt::OpenMp(OpenMpConstruct::ParallelDo { .. })
+            ));
+        }
     }
 
     #[test]

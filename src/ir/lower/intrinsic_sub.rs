@@ -323,6 +323,15 @@ pub(crate) fn lower_intrinsic_subroutine(
     }
 
     match name {
+        "omp_init_lock" | "omp_destroy_lock" | "omp_set_lock" | "omp_unset_lock" => {
+            let lock = nth_arg_ref(b, ctx, args, 0);
+            b.call(
+                FuncRef::External(format!("afs_{name}")),
+                vec![lock],
+                IrType::Void,
+            );
+            true
+        }
         "omp_set_num_threads" => {
             let count = nth_arg_val(b, ctx, args, 0, 0);
             let count = coerce_to_type(b, count, &IrType::Int(IntWidth::I32));

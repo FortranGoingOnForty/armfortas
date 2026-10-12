@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
-use std::sync::atomic::{fence, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -2570,12 +2570,65 @@ pub extern "C" fn afs_omp_get_wtick() -> f64 {
     1.0e-9
 }
 
-// No-argument OpenMP inquiry and timing routines have the same ABI in C and
-// in ARMFORTAS's legacy Fortran EXTERNAL convention.  Export their standard
-// spellings as well as the compiler-private `afs_` entry points so unchanged
-// OpenMP sources such as NPB can link against the owned runtime.  Routines
-// with arguments stay on the typed `omp_lib` lowering path until their
-// language-binding ABI is specified separately.
+fn simple_lock_storage<'a>(lock: *mut i64) -> Option<&'a AtomicI64> {
+    if lock.is_null() {
+        return None;
+    }
+    // OpenMP lock storage is opaque to Fortran. ARMFORTAS defines
+    // `omp_lock_kind=8`, so every conforming actual has the size and alignment
+    // required by AtomicI64 and is accessed atomically between init/destroy.
+    Some(unsafe { AtomicI64::from_ptr(lock) })
+}
+
+#[no_mangle]
+pub extern "C" fn afs_omp_init_lock(lock: *mut i64) {
+    if let Some(lock) = simple_lock_storage(lock) {
+        lock.store(0, Ordering::Relaxed);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_omp_destroy_lock(lock: *mut i64) {
+    if let Some(lock) = simple_lock_storage(lock) {
+        lock.store(0, Ordering::Relaxed);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_omp_set_lock(lock: *mut i64) {
+    let Some(lock) = simple_lock_storage(lock) else {
+        return;
+    };
+    let mut attempts = 0_usize;
+    loop {
+        if lock
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+        if attempts < 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+        attempts = attempts.saturating_add(1);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_omp_unset_lock(lock: *mut i64) {
+    if let Some(lock) = simple_lock_storage(lock) {
+        lock.store(0, Ordering::Release);
+    }
+}
+
+// No-argument inquiry/timing routines and reference-passed simple lock
+// routines have the same ABI in C and ARMFORTAS's legacy Fortran EXTERNAL
+// convention. Export their standard spellings as well as the compiler-private
+// `afs_` entry points so unchanged OpenMP sources such as NPB can link against
+// the owned runtime. Other argument-bearing routines stay on the typed
+// `omp_lib` lowering path until their language-binding ABI is specified.
 #[no_mangle]
 pub extern "C" fn omp_get_thread_num() -> i32 {
     afs_omp_get_thread_num()
@@ -2619,6 +2672,26 @@ pub extern "C" fn omp_get_wtime() -> f64 {
 #[no_mangle]
 pub extern "C" fn omp_get_wtick() -> f64 {
     afs_omp_get_wtick()
+}
+
+#[no_mangle]
+pub extern "C" fn omp_init_lock(lock: *mut i64) {
+    afs_omp_init_lock(lock);
+}
+
+#[no_mangle]
+pub extern "C" fn omp_destroy_lock(lock: *mut i64) {
+    afs_omp_destroy_lock(lock);
+}
+
+#[no_mangle]
+pub extern "C" fn omp_set_lock(lock: *mut i64) {
+    afs_omp_set_lock(lock);
+}
+
+#[no_mangle]
+pub extern "C" fn omp_unset_lock(lock: *mut i64) {
+    afs_omp_unset_lock(lock);
 }
 
 #[cfg(test)]
@@ -2678,6 +2751,56 @@ mod tests {
         assert_eq!(omp_get_active_level(), afs_omp_get_active_level());
         assert!(omp_get_wtime() >= 0.0);
         assert!(omp_get_wtick() > 0.0);
+    }
+
+    struct SimpleLockObservations {
+        lock: i64,
+        counter: std::cell::UnsafeCell<usize>,
+    }
+
+    unsafe impl Sync for SimpleLockObservations {}
+
+    unsafe extern "C" fn simple_lock_task(
+        environment: *mut c_void,
+        _thread_num: i32,
+        _team_size: i32,
+    ) {
+        let observations = unsafe { &*(environment as *const SimpleLockObservations) };
+        let lock = std::ptr::addr_of!(observations.lock).cast_mut();
+        for _ in 0..500 {
+            omp_set_lock(lock);
+            let counter = observations.counter.get();
+            let value = unsafe { *counter };
+            std::thread::yield_now();
+            unsafe {
+                *counter = value + 1;
+            }
+            omp_unset_lock(lock);
+        }
+    }
+
+    #[test]
+    fn simple_lock_runtime_serializes_contending_tasks() {
+        reset_thread_state();
+        let mut observations = SimpleLockObservations {
+            lock: -1,
+            counter: std::cell::UnsafeCell::new(0),
+        };
+        omp_init_lock(&mut observations.lock);
+        assert_eq!(observations.lock, 0);
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(simple_lock_task),
+                &observations as *const SimpleLockObservations as *mut c_void,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(unsafe { *observations.counter.get() }, 2_000);
+        omp_destroy_lock(&mut observations.lock);
+        assert_eq!(observations.lock, 0);
     }
 
     #[test]

@@ -11,7 +11,7 @@ const ISO_C_BINDING: &str = "iso_c_binding";
 const ISO_FORTRAN_ENV: &str = "iso_fortran_env";
 const IEEE_MODULES: [&str; 3] = ["ieee_arithmetic", "ieee_exceptions", "ieee_features"];
 const OMP_MODULES: [&str; 2] = ["omp_lib", "omp_lib_kinds"];
-const OMP_RUNTIME_PROCEDURES: [&str; 7] = [
+const OMP_RUNTIME_PROCEDURES: [&str; 11] = [
     "omp_get_thread_num",
     "omp_get_num_threads",
     "omp_get_max_threads",
@@ -19,6 +19,10 @@ const OMP_RUNTIME_PROCEDURES: [&str; 7] = [
     "omp_set_num_threads",
     "omp_get_wtime",
     "omp_get_wtick",
+    "omp_init_lock",
+    "omp_destroy_lock",
+    "omp_set_lock",
+    "omp_unset_lock",
 ];
 
 pub(crate) fn is_openmp_runtime_procedure(name: &str) -> bool {
@@ -556,7 +560,8 @@ mod tests {
             symbols["omp_get_thread_num"].kind,
             SymbolKind::IntrinsicProc
         );
-        assert!(!symbols.contains_key("omp_init_lock"));
+        assert_eq!(symbols["omp_init_lock"].kind, SymbolKind::IntrinsicProc);
+        assert!(!symbols.contains_key("omp_test_lock"));
 
         let kinds = st
             .find_intrinsic_module_scope("omp_lib_kinds")
