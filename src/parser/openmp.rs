@@ -21,8 +21,12 @@ enum OpenMpHeader {
     ParallelDo(Vec<OpenMpClause>),
     Critical(Option<String>),
     Master,
+    Single(Vec<OpenMpClause>),
     Ordered,
     Barrier,
+    Flush(Vec<String>),
+    AtomicRead,
+    AtomicWrite,
     AtomicUpdate,
     EndParallel,
     EndDo { nowait: bool },
@@ -30,6 +34,7 @@ enum OpenMpHeader {
     EndParallelDo { nowait: bool },
     EndCritical(Option<String>),
     EndMaster,
+    EndSingle { nowait: bool },
     EndOrdered,
 }
 
@@ -39,6 +44,7 @@ enum BeginKind {
     Do,
     Loop,
     ParallelDo,
+    Single,
 }
 
 impl<'a> Parser<'a> {
@@ -96,7 +102,8 @@ impl<'a> Parser<'a> {
 
         match header {
             OpenMpHeader::Parallel(clauses) => {
-                let (body, end_span) = self.parse_openmp_region_end(OpenMpEnd::Parallel, None)?;
+                let (body, end_span, _) =
+                    self.parse_openmp_region_end(OpenMpEnd::Parallel, None)?;
                 Ok(Spanned::new(
                     Stmt::OpenMp(OpenMpConstruct::Parallel { clauses, body }),
                     span_through(directive.span, end_span),
@@ -157,7 +164,7 @@ impl<'a> Parser<'a> {
                 ))
             }
             OpenMpHeader::Critical(name) => {
-                let (body, end_span) =
+                let (body, end_span, _) =
                     self.parse_openmp_region_end(OpenMpEnd::Critical, name.as_deref())?;
                 Ok(Spanned::new(
                     Stmt::OpenMp(OpenMpConstruct::Critical { name, body }),
@@ -165,14 +172,34 @@ impl<'a> Parser<'a> {
                 ))
             }
             OpenMpHeader::Master => {
-                let (body, end_span) = self.parse_openmp_region_end(OpenMpEnd::Master, None)?;
+                let (body, end_span, _) = self.parse_openmp_region_end(OpenMpEnd::Master, None)?;
                 Ok(Spanned::new(
                     Stmt::OpenMp(OpenMpConstruct::Master { body }),
                     span_through(directive.span, end_span),
                 ))
             }
+            OpenMpHeader::Single(mut clauses) => {
+                let (body, end_span, end_nowait) =
+                    self.parse_openmp_region_end(OpenMpEnd::Single, None)?;
+                if end_nowait {
+                    if clauses
+                        .iter()
+                        .any(|clause| matches!(clause, OpenMpClause::Nowait))
+                    {
+                        return Err(ParseError {
+                            span: end_span,
+                            msg: "duplicate OpenMP nowait clause".into(),
+                        });
+                    }
+                    clauses.push(OpenMpClause::Nowait);
+                }
+                Ok(Spanned::new(
+                    Stmt::OpenMp(OpenMpConstruct::Single { clauses, body }),
+                    span_through(directive.span, end_span),
+                ))
+            }
             OpenMpHeader::Ordered => {
-                let (body, end_span) = self.parse_openmp_region_end(OpenMpEnd::Ordered, None)?;
+                let (body, end_span, _) = self.parse_openmp_region_end(OpenMpEnd::Ordered, None)?;
                 Ok(Spanned::new(
                     Stmt::OpenMp(OpenMpConstruct::Ordered { body }),
                     span_through(directive.span, end_span),
@@ -182,20 +209,44 @@ impl<'a> Parser<'a> {
                 Stmt::OpenMp(OpenMpConstruct::Barrier),
                 directive.span,
             )),
-            OpenMpHeader::AtomicUpdate => {
+            OpenMpHeader::Flush(variables) => Ok(Spanned::new(
+                Stmt::OpenMp(OpenMpConstruct::Flush { variables }),
+                directive.span,
+            )),
+            atomic @ (OpenMpHeader::AtomicRead
+            | OpenMpHeader::AtomicWrite
+            | OpenMpHeader::AtomicUpdate) => {
                 self.skip_newlines();
                 let assignment = self.parse_stmt()?;
                 if !matches!(assignment.node, Stmt::Assignment { .. }) {
                     return Err(ParseError {
                         span: assignment.span,
-                        msg: "OpenMP ATOMIC UPDATE must be followed by an assignment".into(),
+                        msg: format!(
+                            "OpenMP {} must be followed by an assignment",
+                            match atomic {
+                                OpenMpHeader::AtomicRead => "ATOMIC READ",
+                                OpenMpHeader::AtomicWrite => "ATOMIC WRITE",
+                                OpenMpHeader::AtomicUpdate => "ATOMIC UPDATE",
+                                _ => unreachable!(),
+                            }
+                        ),
                     });
                 }
                 let end_span = assignment.span;
-                Ok(Spanned::new(
-                    Stmt::OpenMp(OpenMpConstruct::AtomicUpdate {
+                let construct = match atomic {
+                    OpenMpHeader::AtomicRead => OpenMpConstruct::AtomicRead {
                         assignment: Box::new(assignment),
-                    }),
+                    },
+                    OpenMpHeader::AtomicWrite => OpenMpConstruct::AtomicWrite {
+                        assignment: Box::new(assignment),
+                    },
+                    OpenMpHeader::AtomicUpdate => OpenMpConstruct::AtomicUpdate {
+                        assignment: Box::new(assignment),
+                    },
+                    _ => unreachable!(),
+                };
+                Ok(Spanned::new(
+                    Stmt::OpenMp(construct),
                     span_through(directive.span, end_span),
                 ))
             }
@@ -205,6 +256,7 @@ impl<'a> Parser<'a> {
             | OpenMpHeader::EndParallelDo { .. }
             | OpenMpHeader::EndCritical(_)
             | OpenMpHeader::EndMaster
+            | OpenMpHeader::EndSingle { .. }
             | OpenMpHeader::EndOrdered => Err(ParseError {
                 span: directive.span,
                 msg: format!("unexpected OpenMP end directive '!$omp {}'", directive.text),
@@ -251,7 +303,7 @@ impl<'a> Parser<'a> {
         &mut self,
         expected: OpenMpEnd,
         critical_name: Option<&str>,
-    ) -> Result<(Vec<SpannedStmt>, Span), ParseError> {
+    ) -> Result<(Vec<SpannedStmt>, Span, bool), ParseError> {
         let mut body = Vec::new();
         loop {
             self.skip_newlines();
@@ -265,8 +317,8 @@ impl<'a> Parser<'a> {
             if self.peek() == &TokenKind::OmpDirective {
                 let directive = self.current().clone();
                 let header = parse_openmp_header(&directive.text, directive.span)?;
-                let matches = match (&expected, &header) {
-                    (OpenMpEnd::Parallel, OpenMpHeader::EndParallel) => true,
+                let end_nowait = match (&expected, &header) {
+                    (OpenMpEnd::Parallel, OpenMpHeader::EndParallel) => Some(false),
                     (OpenMpEnd::Critical, OpenMpHeader::EndCritical(end_name)) => {
                         let names_match = match (critical_name, end_name.as_deref()) {
                             (None, None) => true,
@@ -283,15 +335,16 @@ impl<'a> Parser<'a> {
                                 ),
                             });
                         }
-                        true
+                        Some(false)
                     }
-                    (OpenMpEnd::Master, OpenMpHeader::EndMaster) => true,
-                    (OpenMpEnd::Ordered, OpenMpHeader::EndOrdered) => true,
-                    _ => false,
+                    (OpenMpEnd::Master, OpenMpHeader::EndMaster) => Some(false),
+                    (OpenMpEnd::Single, OpenMpHeader::EndSingle { nowait }) => Some(*nowait),
+                    (OpenMpEnd::Ordered, OpenMpHeader::EndOrdered) => Some(false),
+                    _ => None,
                 };
-                if matches {
+                if let Some(end_nowait) = end_nowait {
                     self.advance();
-                    return Ok((body, directive.span));
+                    return Ok((body, directive.span, end_nowait));
                 }
                 if matches!(
                     header,
@@ -301,6 +354,7 @@ impl<'a> Parser<'a> {
                         | OpenMpHeader::EndParallelDo { .. }
                         | OpenMpHeader::EndCritical(_)
                         | OpenMpHeader::EndMaster
+                        | OpenMpHeader::EndSingle { .. }
                         | OpenMpHeader::EndOrdered
                 ) {
                     return Err(ParseError {
@@ -323,6 +377,7 @@ enum OpenMpEnd {
     Parallel,
     Critical,
     Master,
+    Single,
     Ordered,
 }
 
@@ -332,6 +387,7 @@ impl OpenMpEnd {
             Self::Parallel => "parallel",
             Self::Critical => "critical",
             Self::Master => "master",
+            Self::Single => "single",
             Self::Ordered => "ordered",
         }
     }
@@ -378,6 +434,7 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
             cursor.finish()?;
             OpenMpHeader::Master
         }
+        "single" => OpenMpHeader::Single(parse_clauses(&mut cursor, span, BeginKind::Single)?),
         "ordered" => {
             cursor.finish()?;
             OpenMpHeader::Ordered
@@ -386,17 +443,45 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
             cursor.finish()?;
             OpenMpHeader::Barrier
         }
-        "atomic" => {
-            if !cursor.finished() {
-                let kind = cursor.identifier("OpenMP ATOMIC operation")?;
-                if !kind.eq_ignore_ascii_case("update") {
+        "flush" => {
+            let variables = if cursor.peek_nonblank() == Some(b'(') {
+                parse_name_list(cursor.parenthesized("FLUSH list")?, span, "FLUSH list")?
+            } else if cursor.finished() {
+                Vec::new()
+            } else {
+                let order = cursor
+                    .identifier("OpenMP FLUSH memory-order clause")?
+                    .to_ascii_lowercase();
+                if order != "seq_cst" {
                     return Err(cursor.error(format!(
-                        "OpenMP ATOMIC {kind} is recognized but not yet implemented"
+                        "OpenMP FLUSH {order} is recognized but not yet implemented"
                     )));
                 }
-            }
+                Vec::new()
+            };
             cursor.finish()?;
-            OpenMpHeader::AtomicUpdate
+            OpenMpHeader::Flush(variables)
+        }
+        "atomic" => {
+            if !cursor.finished() {
+                let kind = cursor
+                    .identifier("OpenMP ATOMIC operation")?
+                    .to_ascii_lowercase();
+                let header = match kind.as_str() {
+                    "read" => OpenMpHeader::AtomicRead,
+                    "write" => OpenMpHeader::AtomicWrite,
+                    "update" => OpenMpHeader::AtomicUpdate,
+                    _ => {
+                        return Err(cursor.error(format!(
+                            "OpenMP ATOMIC {kind} is recognized but not yet implemented"
+                        )))
+                    }
+                };
+                cursor.finish()?;
+                header
+            } else {
+                OpenMpHeader::AtomicUpdate
+            }
         }
         "enddo" => OpenMpHeader::EndDo {
             nowait: parse_end_loop_clause(&mut cursor)?,
@@ -455,6 +540,9 @@ fn parse_openmp_end_header(cursor: &mut DirectiveCursor<'_>) -> Result<OpenMpHea
             cursor.finish()?;
             Ok(OpenMpHeader::EndMaster)
         }
+        "single" => Ok(OpenMpHeader::EndSingle {
+            nowait: parse_end_single_clause(cursor)?,
+        }),
         "ordered" => {
             cursor.finish()?;
             Ok(OpenMpHeader::EndOrdered)
@@ -471,6 +559,20 @@ fn parse_end_loop_clause(cursor: &mut DirectiveCursor<'_>) -> Result<bool, Parse
     if !clause.eq_ignore_ascii_case("nowait") {
         return Err(cursor.error(format!(
             "unsupported clause '{clause}' on OpenMP loop end directive; expected NOWAIT"
+        )));
+    }
+    cursor.finish()?;
+    Ok(true)
+}
+
+fn parse_end_single_clause(cursor: &mut DirectiveCursor<'_>) -> Result<bool, ParseError> {
+    if cursor.finished() {
+        return Ok(false);
+    }
+    let clause = cursor.identifier("clause after OpenMP END SINGLE")?;
+    if !clause.eq_ignore_ascii_case("nowait") {
+        return Err(cursor.error(format!(
+            "unsupported clause '{clause}' on OpenMP END SINGLE directive; expected NOWAIT"
         )));
     }
     cursor.finish()?;
@@ -612,6 +714,7 @@ fn parse_clauses(
                     items: parse_reduction_list(items, span)?,
                 }
             }
+            "nowait" if matches!(construct, BeginKind::Single) => OpenMpClause::Nowait,
             "nowait" => {
                 return Err(cursor.error(
                     "OpenMP NOWAIT belongs on the END DO or END PARALLEL DO directive".into(),
@@ -659,6 +762,10 @@ fn validate_clause_for_construct(
                 | OpenMpClause::Reduction { .. }
         ),
         BeginKind::ParallelDo => !matches!(clause, OpenMpClause::Nowait),
+        BeginKind::Single => matches!(
+            clause,
+            OpenMpClause::Private(_) | OpenMpClause::FirstPrivate(_) | OpenMpClause::Nowait
+        ),
     };
     if allowed {
         Ok(())
@@ -1144,6 +1251,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_single_regions_with_nowait_on_either_directive() {
+        for (source, form) in [
+            (
+                "!$omp single nowait\nvalue = 1\n!$omp end single\n",
+                SourceForm::FreeForm,
+            ),
+            (
+                "C$OMP SINGLE\n      VALUE = 1\nC$OMP END SINGLE NOWAIT\n",
+                SourceForm::FixedForm,
+            ),
+        ] {
+            let stmt = parse(source, form).unwrap();
+            assert!(matches!(
+                stmt.node,
+                Stmt::OpenMp(OpenMpConstruct::Single { clauses, body })
+                    if clauses == vec![OpenMpClause::Nowait] && body.len() == 1
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_single_nowait_clause() {
+        let error = parse(
+            "!$omp single nowait\nvalue = 1\n!$omp end single nowait\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap_err();
+        assert!(error.msg.contains("duplicate OpenMP nowait clause"));
+    }
+
+    #[test]
     fn parses_ordered_clause_and_region() {
         let stmt = parse(
             "!$omp do ordered schedule(static)\n\
@@ -1209,17 +1347,56 @@ mod tests {
     }
 
     #[test]
-    fn parses_implicit_and_explicit_atomic_updates() {
-        for source in [
-            "!$omp atomic\nvalue = value + 1\n",
-            "!$omp atomic update\nvalues(i) = values(i) + delta\n",
+    fn parses_bare_list_and_seq_cst_flush_directives() {
+        for (source, expected) in [
+            ("!$omp flush\n", Vec::<String>::new()),
+            ("!$omp flush seq_cst\n", Vec::<String>::new()),
+            (
+                "!$omp flush(first, second)\n",
+                vec!["first".into(), "second".into()],
+            ),
         ] {
             let stmt = parse(source, SourceForm::FreeForm).unwrap();
             assert!(matches!(
                 stmt.node,
-                Stmt::OpenMp(OpenMpConstruct::AtomicUpdate { assignment })
-                    if matches!(assignment.node, Stmt::Assignment { .. })
+                Stmt::OpenMp(OpenMpConstruct::Flush { variables }) if variables == expected
             ));
+        }
+
+        let error = parse("!$omp flush acquire\n", SourceForm::FreeForm).unwrap_err();
+        assert!(
+            error
+                .msg
+                .contains("OpenMP FLUSH acquire is recognized but not yet implemented"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parses_atomic_read_write_and_update_forms() {
+        for (source, expected) in [
+            ("!$omp atomic read\nvalue = values(i)\n", "read"),
+            ("!$omp atomic write\nvalues(i) = value\n", "write"),
+            ("!$omp atomic\nvalue = value + 1\n", "update"),
+            (
+                "!$omp atomic update\nvalues(i) = values(i) + delta\n",
+                "update",
+            ),
+        ] {
+            let stmt = parse(source, SourceForm::FreeForm).unwrap();
+            let matches = match stmt.node {
+                Stmt::OpenMp(OpenMpConstruct::AtomicRead { assignment }) => {
+                    expected == "read" && matches!(assignment.node, Stmt::Assignment { .. })
+                }
+                Stmt::OpenMp(OpenMpConstruct::AtomicWrite { assignment }) => {
+                    expected == "write" && matches!(assignment.node, Stmt::Assignment { .. })
+                }
+                Stmt::OpenMp(OpenMpConstruct::AtomicUpdate { assignment }) => {
+                    expected == "update" && matches!(assignment.node, Stmt::Assignment { .. })
+                }
+                _ => false,
+            };
+            assert!(matches, "unexpected parse for {source}");
         }
     }
 

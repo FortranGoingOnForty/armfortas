@@ -601,6 +601,7 @@ pub(super) fn lower_construct(
             lower_critical_region(b, ctx, name.as_deref(), body)
         }
         OpenMpConstruct::Master { body } => lower_master_region(b, ctx, body),
+        OpenMpConstruct::Single { clauses, body } => lower_single_region(b, ctx, clauses, body),
         OpenMpConstruct::Ordered { body } => lower_ordered_region(b, ctx, body),
         OpenMpConstruct::Barrier => {
             b.call(
@@ -609,20 +610,37 @@ pub(super) fn lower_construct(
                 IrType::Int(IntWidth::I32),
             );
         }
-        OpenMpConstruct::AtomicUpdate { assignment } => {
+        OpenMpConstruct::Flush { .. } => {
             b.call(
-                FuncRef::External("afs_omp_atomic_enter".into()),
-                vec![],
-                IrType::Int(IntWidth::I32),
-            );
-            super::stmt::lower_stmt(b, ctx, assignment);
-            b.call(
-                FuncRef::External("afs_omp_atomic_exit".into()),
+                FuncRef::External("afs_omp_flush".into()),
                 vec![],
                 IrType::Int(IntWidth::I32),
             );
         }
+        OpenMpConstruct::AtomicRead { assignment }
+        | OpenMpConstruct::AtomicWrite { assignment }
+        | OpenMpConstruct::AtomicUpdate { assignment } => {
+            lower_atomic_assignment(b, ctx, assignment)
+        }
     }
+}
+
+fn lower_atomic_assignment(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    assignment: &SpannedStmt,
+) {
+    b.call(
+        FuncRef::External("afs_omp_atomic_enter".into()),
+        vec![],
+        IrType::Int(IntWidth::I32),
+    );
+    super::stmt::lower_stmt(b, ctx, assignment);
+    b.call(
+        FuncRef::External("afs_omp_atomic_exit".into()),
+        vec![],
+        IrType::Int(IntWidth::I32),
+    );
 }
 
 fn lower_master_region(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, body: &[SpannedStmt]) {
@@ -650,6 +668,49 @@ fn lower_master_region(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, body: &[
     }
     // MASTER has no implicit barrier; non-primary threads continue directly.
     b.set_block(done_bb);
+}
+
+fn lower_single_region(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    clauses: &[OpenMpClause],
+    body: &[SpannedStmt],
+) {
+    // OpenMP leaves executor selection implementation defined. Choosing the
+    // primary thread keeps the initial implementation deterministic while
+    // retaining SINGLE's distinct default exit barrier.
+    let thread_num = if let Some((thread_num, _)) = ctx.openmp_team {
+        thread_num
+    } else {
+        b.call(
+            FuncRef::External("afs_omp_get_thread_num".into()),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        )
+    };
+    let zero = b.const_i32(0);
+    let is_executor = b.icmp(CmpOp::Eq, thread_num, zero);
+    let body_bb = b.create_block("omp_single_body");
+    let done_bb = b.create_block("omp_single_done");
+    b.cond_branch(is_executor, body_bb, vec![], done_bb, vec![]);
+
+    b.set_block(body_bb);
+    super::stmt::lower_stmts(b, ctx, body);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(done_bb, vec![]);
+    }
+
+    b.set_block(done_bb);
+    if !clauses
+        .iter()
+        .any(|clause| matches!(clause, OpenMpClause::Nowait))
+    {
+        b.call(
+            FuncRef::External("afs_omp_barrier".into()),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        );
+    }
 }
 
 fn lower_ordered_region(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, body: &[SpannedStmt]) {

@@ -23318,6 +23318,172 @@ fn fopenmp_master_rejects_illegal_close_nesting() {
 }
 
 #[test]
+fn fopenmp_single_regions_execute_once_and_synchronize() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_single_regions_execute_once_and_synchronize count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: executions, first_value, value, arrivals, failures
+
+  executions = 0
+  first_value = 0
+  value = 0
+  arrivals = 0
+  failures = 0
+!$omp parallel default(none) num_threads(4) &
+!$omp& shared(executions,first_value,value,arrivals,failures)
+!$omp single
+  executions = executions + 1
+  first_value = 17
+!$omp end single
+  if (first_value /= 17) then
+!$omp atomic update
+    failures = failures + 1
+  end if
+!$omp atomic update
+  arrivals = arrivals + 1
+!$omp single
+  executions = executions + 1
+  value = 23
+!$omp end single nowait
+!$omp barrier
+  if (value /= 23) then
+!$omp atomic update
+    failures = failures + 1
+  end if
+!$omp end parallel
+  if (executions /= 2 .or. arrivals /= 4 .or. failures /= 0) error stop 1
+
+  executions = 0
+  value = 0
+  failures = 0
+!$omp parallel default(none) num_threads(4) shared(executions,value,failures)
+  call set_once(executions, value)
+  if (value /= 41) then
+!$omp atomic update
+    failures = failures + 1
+  end if
+!$omp end parallel
+  if (executions /= 1 .or. value /= 41 .or. failures /= 0) error stop 2
+
+  executions = 0
+  value = 0
+  call set_once(executions, value)
+  if (executions /= 1 .or. value /= 41) error stop 3
+  print *, 'ok'
+end program p
+
+subroutine set_once(executions, value)
+  implicit none
+  integer :: executions, value
+!$omp single
+  executions = executions + 1
+  value = 41
+!$omp end single
+end subroutine set_once
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_single", "bin");
+        let runtime_cache = unique_dir("openmp_single_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP SINGLE compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP SINGLE should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..8 {
+            let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+                .expect("OpenMP SINGLE binary timed out");
+            assert!(
+                run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+                "OpenMP SINGLE failed at {opt}, iteration {iteration}: status={:?} stdout={} stderr={}",
+                run.status,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr),
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_single_rejects_unsupported_clauses_and_close_nesting() {
+    let src = write_program(
+        "program p\n  integer :: value\n!$omp single private(value)\n  value = 1\n!$omp end single\nend program p\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-fopenmp"]);
+    assert!(!result.status.success(), "OpenMP SINGLE PRIVATE compiled");
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("OpenMP PRIVATE clause on SINGLE is recognized but not yet implemented"));
+    let _ = std::fs::remove_file(&src);
+
+    for (source, enclosing) in [
+        (
+            "program p\n  integer :: i\n!$omp parallel\n!$omp do\n  do i = 1, 4\n!$omp single\n  continue\n!$omp end single\n  end do\n!$omp end do\n!$omp end parallel\nend program p\n",
+            "DO",
+        ),
+        (
+            "program p\n!$omp parallel\n!$omp critical\n!$omp single\n  continue\n!$omp end single\n!$omp end critical\n!$omp end parallel\nend program p\n",
+            "CRITICAL",
+        ),
+        (
+            "program p\n!$omp parallel\n!$omp master\n!$omp single\n  continue\n!$omp end single\n!$omp end master\n!$omp end parallel\nend program p\n",
+            "MASTER",
+        ),
+        (
+            "program p\n!$omp parallel\n!$omp single\n!$omp single\n  continue\n!$omp end single\n!$omp end single\n!$omp end parallel\nend program p\n",
+            "SINGLE",
+        ),
+    ] {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &["-fopenmp"]);
+        assert!(
+            !result.status.success(),
+            "OpenMP SINGLE closely nested in {enclosing} compiled"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "OpenMP SINGLE may not be closely nested inside an OpenMP {enclosing} region"
+            )),
+            "unexpected diagnostic for {enclosing}: {stderr}"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+
+    let src = write_program(
+        "pure subroutine p\n!$omp single\n  continue\n!$omp end single\nend subroutine p\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-fopenmp"]);
+    assert!(!result.status.success(), "OpenMP SINGLE compiled in PURE");
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("OpenMP SINGLE is not allowed in a PURE procedure"));
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_ordered_regions_follow_logical_iteration_order() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -23547,6 +23713,111 @@ fn fopenmp_barrier_rejects_illegal_close_nesting() {
 }
 
 #[test]
+fn fopenmp_flush_publishes_shared_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_flush_publishes_shared_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: payload, ready, seen, failures, tid
+  payload = 0
+  ready = 0
+  failures = 0
+!$omp parallel default(none) num_threads(2) private(tid,seen) shared(payload,ready,failures)
+  tid = omp_get_thread_num()
+  if (tid == 0) then
+    payload = 1234
+!$omp flush(payload)
+!$omp atomic write
+    ready = 1
+  else
+    seen = 0
+    do while (seen /= 1)
+!$omp atomic read
+      seen = ready
+    end do
+!$omp flush(payload)
+    if (payload /= 1234) then
+!$omp atomic update
+      failures = failures + 1
+    end if
+  end if
+!$omp end parallel
+!$omp flush seq_cst
+  if (failures /= 0 .or. payload /= 1234 .or. ready /= 1) error stop 1
+  print *, 'ok'
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_flush", "bin");
+        let runtime_cache = unique_dir("openmp_flush_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP FLUSH compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP FLUSH should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..8 {
+            let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+                .expect("OpenMP FLUSH binary timed out");
+            assert!(
+                run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+                "OpenMP FLUSH failed at {opt}, iteration {iteration}: status={:?} stdout={} stderr={}",
+                run.status,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr),
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_flush_rejects_invalid_lists_and_pure_procedures() {
+    for (source, expected) in [
+        (
+            "program p\n  integer :: value\n!$omp flush(value,value)\nend program p\n",
+            "OpenMP FLUSH list item 'value' appears more than once",
+        ),
+        (
+            "program p\n!$omp flush(missing)\nend program p\n",
+            "OpenMP FLUSH list item 'missing' is not declared",
+        ),
+        (
+            "pure subroutine p\n!$omp flush\nend subroutine p\n",
+            "OpenMP FLUSH is not allowed in a PURE procedure",
+        ),
+    ] {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &["-fopenmp"]);
+        assert!(!result.status.success(), "invalid OpenMP FLUSH compiled");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(expected), "unexpected diagnostic: {stderr}");
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
 fn fopenmp_legacy_external_runtime_queries_link_owned_runtime() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -23663,11 +23934,92 @@ end program p
 }
 
 #[test]
+fn fopenmp_atomic_read_and_write_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_atomic_read_and_write_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: flags(0:3), failures
+  integer :: tid, i, local
+  flags = -1
+  failures = 0
+!$omp parallel default(none) num_threads(4) private(tid,i,local) shared(flags,failures)
+  tid = omp_get_thread_num()
+!$omp atomic write
+  flags(tid) = tid
+!$omp barrier
+  do i = 0, 3
+!$omp atomic read
+    local = flags(i)
+    if (local /= i) then
+!$omp atomic update
+      failures = failures + 1
+    end if
+  end do
+!$omp end parallel
+  if (failures /= 0) error stop 1
+  print *, 'ok'
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_atomic_read_write", "bin");
+        let runtime_cache = unique_dir("openmp_atomic_read_write_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP ATOMIC READ/WRITE compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP ATOMIC READ/WRITE should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..8 {
+            let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+                .expect("OpenMP ATOMIC READ/WRITE binary timed out");
+            assert!(
+                run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+                "OpenMP ATOMIC READ/WRITE failed at {opt}, iteration {iteration}: status={:?} stdout={} stderr={}",
+                run.status,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr),
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_atomic_rejects_unsupported_forms() {
     let cases = [
         (
             "program p\ninteger :: value\n!$omp atomic read\nvalue=value\nend program p\n",
-            "OpenMP ATOMIC read is recognized but not yet implemented",
+            "OpenMP ATOMIC READ source and destination must designate distinct storage locations",
+        ),
+        (
+            "program p\ninteger :: left,right\n!$omp atomic read\nleft=right+1\nend program p\n",
+            "OpenMP ATOMIC READ source must be a scalar variable or side-effect-free array element",
+        ),
+        (
+            "program p\ninteger :: value\n!$omp atomic write\nvalue=value+1\nend program p\n",
+            "OpenMP ATOMIC WRITE expression may not reference its target 'value'",
         ),
         (
             "program p\ninteger :: value\n!$omp atomic\nvalue=value-1\nend program p\n",

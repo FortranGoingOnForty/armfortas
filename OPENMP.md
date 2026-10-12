@@ -26,7 +26,7 @@ toward [OpenMP 6.0][omp-60] without silently changing existing behavior.
 | Area | Status | Current boundary |
 |---|---|---|
 | Free- and fixed-form sentinels | Supported | Includes source-form-correct directive continuation and conditional compilation. |
-| Directive syntax model | Partial | `parallel`, `do`, `parallel do`, `loop`, block `ordered`, `barrier`, `master`, `critical`, `atomic update`, and the declarative `threadprivate` directive plus their implemented clauses have typed AST forms. |
+| Directive syntax model | Partial | `parallel`, `do`, `parallel do`, `loop`, `single`, block `ordered`, `barrier`, `flush`, `master`, `critical`, `atomic read`, `atomic write`, `atomic update`, and the declarative `threadprivate` directive plus their implemented clauses have typed AST forms. |
 | Unsupported syntax handling | Supported | Malformed directives are errors; recognized but unimplemented execution is rejected before IR lowering. |
 | `parallel` | Preview | Owned synchronous fork/join runtime, implicit join, nested serialized regions, `if`, and `num_threads`. |
 | Data sharing | Partial | `shared`, `private`, `firstprivate`, `lastprivate`, `default(shared)`, `default(private)`, and `default(none)` for the scalar and array forms accepted by semantic validation. Predetermined named constants and assumed-size arrays remain shared under `default(private)`; explicit clauses retain precedence. OpenMP 5.0 `loop` associated iterators are predetermined `lastprivate`, with `private` and `lastprivate` accepted as explicit overrides. Other `lastprivate` support is currently limited to supported intrinsic scalars on worksharing loops. |
@@ -34,8 +34,8 @@ toward [OpenMP 6.0][omp-60] without silently changing existing behavior.
 | Array data | Partial | Numeric, complex, logical, and fixed-length default-kind CHARACTER constant-shape storage plus selected descriptor-backed dummy, allocatable, pointer, section, and shared derived-type views. A nonoptional explicit-shape dummy with runtime bounds may be `private`; its encounter-time shape is snapshotted and each implicit task receives independent storage. `firstprivate` and assumed-shape dummy arrays remain outside that boundary. Unsupported ownership or lifetime cases are diagnosed. |
 | `threadprivate` | Partial | Module INTEGER, REAL, DOUBLE PRECISION, COMPLEX, and LOGICAL scalars and constant-explicit-shape arrays use runtime-owned per-host-thread storage. The attribute survives separate compilation through `.amod`; allocatable, pointer, derived, character, COMMON-block, and `copyin` forms remain diagnosed or unsupported. |
 | Worksharing loops | Preview | Canonical `do` and combined `parallel do`, positive/negative strides, static contiguous and chunked schedules, combined dynamic schedules, rectangular and direct-bound nonrectangular `collapse(2)`, implicit barriers, standalone `nowait`, scalar `private` and `lastprivate`, predefined scalar/fixed-rank-one reductions, and one directly nested unconditional block `ordered` region per logical iteration under the default or static schedule. Parameterized/doacross `ordered`, `ordered` with `collapse`, conditional or multiple ordered regions, and ordered SIMD remain diagnosed. OpenMP 5.0 `loop` supports scalar `private`, associated-iterator `lastprivate`, scalar INTEGER `reduction(+:...)`, and rectangular `collapse(1)`/`collapse(2)` when it binds implicitly to an enclosing `parallel` region. Predetermined iterator copy-out follows the sequential termination value; `private(iterator)` suppresses it, and an explicit `lastprivate` list item must be associated with the construct. Other `loop` clauses and reduction forms, explicit `bind`, nonrectangular `loop collapse`, general affine nonrectangular bounds, and nonrectangular `lastprivate` remain diagnosed; standalone dynamic scheduling remains rejected. |
-| Reductions and synchronization | Partial | Scalar objects and constant-explicit-shape rank-one arrays of INTEGER support `+`, `*`, `max`, `min`, `iand`, `ior`, and `ieor`; REAL/DOUBLE PRECISION support `+`, `*`, `max`, and `min`; COMPLEX supports `+` and `*`; and LOGICAL supports `.and.`, `.or.`, `.eqv.`, and `.neqv.` on `parallel`, combined `parallel do`, and standalone worksharing `do`. OpenMP 5.0 `loop` currently supports only scalar INTEGER addition reductions. Whole arrays, constant contiguous unit-stride sections, and constant elements are accepted on the broader constructs. Partial selections reject whole-array and provably out-of-selection references within the region; dynamic element references retain bounds enforcement. Narrow integers combine at their storage width, and REAL(4)/REAL(8) and COMPLEX(4)/COMPLEX(8) combine at their declared precision. Standalone `do reduction` supports result publication at its implicit barrier and barrier-free `nowait` completion. Block `ordered` regions serialize in logical iteration order across repeated worksharing generations. Explicit `barrier` synchronizes the current team, including from an orphaned procedure; the initial one-thread team completes immediately, and prohibited close nesting is diagnosed. Explicit and orphaned `master` regions bind to the current team, execute only on thread zero, and have no implicit barrier; serial calls bind to the initial one-thread team. `atomic update` supports `x = x + expr` for scalar INTEGER, REAL, DOUBLE PRECISION, and COMPLEX variables and side-effect-free array elements through a conservative process-wide lock. Atomic read/write/capture/compare, memory-order clauses, flush, locks, doacross ordered regions, `single`, `masked`, the `sections` construct, higher-rank/runtime-shaped reductions, and user-defined reductions remain unimplemented. |
-| Runtime library | Partial | Initial `omp_lib` queries, setters, timing routines, team execution, barriers, work dispatch, ordered-loop generations, reductions, critical locks, and module `threadprivate` storage. Implemented no-argument inquiry and timing routines also export their standard C symbol spellings for legacy `EXTERNAL` declarations; argument-bearing routines remain on the typed module lowering path. Unsupported API names are not published as implemented procedures. |
+| Reductions and synchronization | Partial | Scalar objects and constant-explicit-shape rank-one arrays of INTEGER support `+`, `*`, `max`, `min`, `iand`, `ior`, and `ieor`; REAL/DOUBLE PRECISION support `+`, `*`, `max`, and `min`; COMPLEX supports `+` and `*`; and LOGICAL supports `.and.`, `.or.`, `.eqv.`, and `.neqv.` on `parallel`, combined `parallel do`, and standalone worksharing `do`. OpenMP 5.0 `loop` currently supports only scalar INTEGER addition reductions. Whole arrays, constant contiguous unit-stride sections, and constant elements are accepted on the broader constructs. Partial selections reject whole-array and provably out-of-selection references within the region; dynamic element references retain bounds enforcement. Narrow integers combine at their storage width, and REAL(4)/REAL(8) and COMPLEX(4)/COMPLEX(8) combine at their declared precision. Standalone `do reduction` supports result publication at its implicit barrier and barrier-free `nowait` completion. Block `ordered` regions serialize in logical iteration order across repeated worksharing generations. `single` selects the primary thread as its implementation-defined executor, has the required default exit barrier, and supports `nowait`; `private`, `firstprivate`, `copyprivate`, and `allocate` remain outside the bounded slice. Explicit `barrier` synchronizes the current team, including from an orphaned procedure; the initial one-thread team completes immediately, and prohibited close nesting is diagnosed. Explicit and orphaned `master` regions bind to the current team, execute only on thread zero, and have no implicit barrier; serial calls bind to the initial one-thread team. `atomic read` and `atomic write` support scalar non-CHARACTER intrinsic variables and side-effect-free array elements; `atomic update` supports `x = x + expr` for scalar INTEGER, REAL, DOUBLE PRECISION, and COMPLEX storage. All three use a conservative process-wide lock. Bare `flush`, `flush(list)`, and explicit `flush seq_cst` use a whole-memory sequentially consistent fence; the standard permits the list form to be strengthened this way. Atomic capture/compare, weaker memory-order clauses, locks, doacross ordered regions, `masked`, the `sections` construct, higher-rank/runtime-shaped reductions, and user-defined reductions remain unimplemented. |
+| Runtime library | Partial | Initial `omp_lib` queries, setters, timing routines, team execution, barriers, sequentially consistent flush fences, work dispatch, ordered-loop generations, reductions, critical/atomic locks, and module `threadprivate` storage. Implemented no-argument inquiry and timing routines also export their standard C symbol spellings for legacy `EXTERNAL` declarations; argument-bearing routines remain on the typed module lowering path. Unsupported API names are not published as implemented procedures. |
 | Environment variables | Partial | Initial handling for `OMP_NUM_THREADS`, `OMP_DYNAMIC`, `OMP_THREAD_LIMIT`, `OMP_MAX_ACTIVE_LEVELS`, and `OMP_SCHEDULE`. |
 | SIMD semantics | Not implemented | `-fopenmp-simd` does not yet change loop vectorization or accept a SIMD construct as executable support. |
 | Tasking | Not implemented | Tasks, dependences, task groups, and task loops are future work. |
@@ -147,19 +147,39 @@ negative worksharing elsewhere in the application. Focused parser, semantic,
 runtime, and native O0/O3 regressions preserve logical-iteration sequencing
 across repeated ordered generations.
 
+NASA NPB 3.4.4 BT and SP Class S also build from unchanged benchmark sources
+and verify successfully through the owned runtime. Independent clean `-O0`
+and `-O3` builds of each application pass at one, two, four, and eight threads.
+Neither probe required a compiler change: together they broaden the validated
+surface to two sustained array-heavy alternating-direction implicit solvers
+using static worksharing, rectangular collapse, reductions, `master`, and
+module `threadprivate` storage.
+
+NASA NPB 3.4.4 LU Class S now builds from unchanged benchmark sources and
+verifies successfully through the owned runtime. Independent clean `-O0` and
+`-O3` builds pass at one, two, four, and eight threads; the reference surface
+integral is `0.7841892886594E+01`. LU introduced three bounded synchronization
+frontiers. Its three bare `single` regions now execute once with the required
+implicit barrier. Scalar intrinsic `atomic read` and `atomic write` use the
+same process-wide identity as atomic updates. Bare and list-form `flush`
+directives lower to the standard-permitted stronger whole-memory `seq_cst`
+fence. Focused parser, semantic, runtime, diagnostic, and native O0/O3 tests
+preserve those boundaries; atomic capture/compare, weaker memory orders,
+SINGLE data clauses, and LU's alternate doacross source remain diagnosed.
+
 ## Next milestones
 
-1. Probe unchanged NPB 3.4.4 BT Class S next: its directive inventory stays
-   closest to the now-verified EP/CG/FT/MG surface while broadening sustained
-   array-heavy worksharing.
-2. Turn every newly exposed BT edge into an independently tested compiler
-   tranche before claiming the benchmark.
+1. Inventory and probe NPB LU's alternate doacross build, then bound the
+   `ordered(2)` plus `depend(source/sink: ...)` protocol before implementation.
+2. Keep that multidimensional dependency engine separate from the already
+   verified block-ordered generation protocol.
 3. Extend array reductions beyond constant-shape rank one only with a truthful
    descriptor and partial-storage mapping design.
 4. Add guided/runtime scheduling only after each worksharing construct owns an
    explicit dispatch-generation protocol.
-5. Build the durable memory-model primitives needed for wider atomics, flush,
-   locks, and the broader worksharing surface.
+5. Extend atomic capture/compare and acquire/release flush semantics only with
+   explicit memory-order tests; the current conservative lock and `seq_cst`
+   fence are truthful but intentionally stronger than those future forms.
 
 [omp-52]: https://www.openmp.org/spec-html/5.2/openmp.html
 [omp-60]: https://www.openmp.org/wp-content/uploads/OpenMP-API-Specification-6-0.pdf

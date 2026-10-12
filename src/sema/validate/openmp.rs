@@ -7,7 +7,8 @@
 //! Named and unnamed `CRITICAL` regions retain process-wide lock identity,
 //! `MASTER` regions execute only on the primary thread without an implicit
 //! barrier, explicit `BARRIER` directives synchronize the current team, and
-//! the initial `ATOMIC UPDATE` slice covers scalar numeric addition.
+//! `ATOMIC READ` and `ATOMIC WRITE` cover scalar intrinsic assignments, while
+//! `ATOMIC UPDATE` covers scalar numeric addition.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
 //! regions without pretending later schedules, loop clauses, or wider object
 //! ownership cases are already implemented.
@@ -145,6 +146,40 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             }
             validate_structured_block(ctx, body);
         }
+        OpenMpConstruct::Single { clauses, body } => {
+            reject_in_pure(ctx, span, "SINGLE");
+            if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
+                if matches!(
+                    enclosing,
+                    "DO" | "LOOP"
+                        | "PARALLEL DO"
+                        | "CRITICAL"
+                        | "MASTER"
+                        | "SINGLE"
+                        | "ORDERED"
+                        | "ATOMIC UPDATE"
+                ) {
+                    ctx.error(
+                        span,
+                        format!(
+                            "OpenMP SINGLE may not be closely nested inside an OpenMP {enclosing} region"
+                        ),
+                    );
+                }
+            }
+            for clause in clauses {
+                if !matches!(clause, OpenMpClause::Nowait) {
+                    ctx.error(
+                        span,
+                        format!(
+                            "OpenMP {} clause on SINGLE is recognized but not yet implemented",
+                            clause_name(clause)
+                        ),
+                    );
+                }
+            }
+            validate_structured_block(ctx, body);
+        }
         OpenMpConstruct::Ordered { body } => {
             reject_in_pure(ctx, span, "ORDERED");
             if !matches!(
@@ -179,11 +214,185 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
                 }
             }
         }
+        OpenMpConstruct::Flush { variables } => {
+            reject_in_pure(ctx, span, "FLUSH");
+            let mut seen = HashSet::new();
+            for variable in variables {
+                let key = variable.to_ascii_lowercase();
+                if !seen.insert(key) {
+                    ctx.error(
+                        span,
+                        format!("OpenMP FLUSH list item '{variable}' appears more than once"),
+                    );
+                    continue;
+                }
+                let Some(symbol) = ctx.lookup_lexical(variable) else {
+                    ctx.error(
+                        span,
+                        format!("OpenMP FLUSH list item '{variable}' is not declared"),
+                    );
+                    continue;
+                };
+                if symbol.kind != SymbolKind::Variable {
+                    ctx.error(
+                        span,
+                        format!("OpenMP FLUSH list item '{variable}' must name a variable"),
+                    );
+                }
+            }
+        }
+        OpenMpConstruct::AtomicRead { assignment } => {
+            reject_in_pure(ctx, span, "ATOMIC READ");
+            validate_atomic_read(ctx, assignment);
+        }
+        OpenMpConstruct::AtomicWrite { assignment } => {
+            reject_in_pure(ctx, span, "ATOMIC WRITE");
+            validate_atomic_write(ctx, assignment);
+        }
         OpenMpConstruct::AtomicUpdate { assignment } => {
             reject_in_pure(ctx, span, "ATOMIC UPDATE");
             validate_atomic_update(ctx, span, assignment);
         }
     }
+}
+
+fn validate_atomic_read(ctx: &mut Ctx<'_>, assignment: &SpannedStmt) {
+    let Stmt::Assignment { target, value } = &assignment.node else {
+        ctx.error(
+            assignment.span,
+            "OpenMP ATOMIC READ must be followed by an assignment",
+        );
+        return;
+    };
+    let Some(destination) =
+        validate_atomic_storage_designator(ctx, "READ", "destination", target, true)
+    else {
+        return;
+    };
+    let Some(source) = validate_atomic_storage_designator(ctx, "READ", "source", value, true)
+    else {
+        return;
+    };
+    if target.to_sexpr().eq_ignore_ascii_case(&value.to_sexpr()) {
+        ctx.error(
+            assignment.span,
+            "OpenMP ATOMIC READ source and destination must designate distinct storage locations",
+        );
+        return;
+    }
+    if !destination.eq_ignore_ascii_case(&source)
+        && (atomic_expr_references_name(value, &destination)
+            || atomic_expr_references_name(target, &source))
+    {
+        ctx.error(
+            assignment.span,
+            "OpenMP ATOMIC READ source and destination designators may not reference each other",
+        );
+    }
+}
+
+fn validate_atomic_write(ctx: &mut Ctx<'_>, assignment: &SpannedStmt) {
+    let Stmt::Assignment { target, value } = &assignment.node else {
+        ctx.error(
+            assignment.span,
+            "OpenMP ATOMIC WRITE must be followed by an assignment",
+        );
+        return;
+    };
+    let Some(target_name) =
+        validate_atomic_storage_designator(ctx, "WRITE", "target", target, true)
+    else {
+        return;
+    };
+    if validation_expr_rank(ctx, value) != Some(0)
+        || !atomic_scalar_type_supported(ctx, value, true)
+    {
+        ctx.error(
+            value.span,
+            "OpenMP ATOMIC WRITE expression must be a scalar non-CHARACTER intrinsic value",
+        );
+        return;
+    }
+    if atomic_expr_references_name(value, &target_name) {
+        ctx.error(
+            value.span,
+            format!("OpenMP ATOMIC WRITE expression may not reference its target '{target_name}'"),
+        );
+    }
+}
+
+fn validate_atomic_storage_designator(
+    ctx: &mut Ctx<'_>,
+    operation: &str,
+    role: &str,
+    expr: &crate::ast::expr::SpannedExpr,
+    allow_logical: bool,
+) -> Option<String> {
+    let Some(base_name) = atomic_target_base_name(expr) else {
+        ctx.error(
+            expr.span,
+            format!(
+                "OpenMP ATOMIC {operation} {role} must be a scalar variable or side-effect-free array element"
+            ),
+        );
+        return None;
+    };
+    let Some(symbol) = ctx.lookup_lexical(base_name) else {
+        ctx.error(
+            expr.span,
+            format!("OpenMP ATOMIC {operation} {role} '{base_name}' is not declared"),
+        );
+        return None;
+    };
+    if symbol.kind != SymbolKind::Variable || validation_expr_rank(ctx, expr) != Some(0) {
+        ctx.error(
+            expr.span,
+            format!("OpenMP ATOMIC {operation} {role} must designate one scalar storage location"),
+        );
+        return None;
+    }
+    if !atomic_scalar_type_supported(ctx, expr, allow_logical) {
+        ctx.error(
+            expr.span,
+            format!(
+                "OpenMP ATOMIC {operation} {role} must have a supported non-CHARACTER intrinsic type"
+            ),
+        );
+        return None;
+    }
+    Some(base_name.to_ascii_lowercase())
+}
+
+fn atomic_scalar_type_supported(
+    ctx: &Ctx<'_>,
+    expr: &crate::ast::expr::SpannedExpr,
+    allow_logical: bool,
+) -> bool {
+    match validation_expr_type_info(ctx, expr) {
+        Some(TypeInfo::Integer { kind }) => matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8),
+        Some(TypeInfo::Real { kind }) => matches!(
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
+            4 | 8
+        ),
+        Some(TypeInfo::DoublePrecision) => true,
+        Some(TypeInfo::Complex { kind }) => matches!(
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
+            4 | 8
+        ),
+        Some(TypeInfo::Logical { kind }) if allow_logical => {
+            matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8)
+        }
+        _ => false,
+    }
+}
+
+fn atomic_expr_references_name(expr: &crate::ast::expr::SpannedExpr, name: &str) -> bool {
+    let mut facts = ProcedureReferenceFacts::default();
+    collect_reference_expr(expr, &HashSet::new(), &mut facts);
+    facts
+        .references
+        .iter()
+        .any(|reference| reference.name.eq_ignore_ascii_case(name))
 }
 
 fn validate_atomic_update(ctx: &mut Ctx<'_>, _span: Span, assignment: &SpannedStmt) {
