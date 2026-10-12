@@ -17,7 +17,7 @@
 
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
@@ -285,6 +285,8 @@ struct TeamContext {
     ordered: Arc<OrderedWorkspace>,
     ordered_generation: u64,
     ordered_active_generation: Option<u64>,
+    doacross: Arc<DoacrossWorkspace>,
+    doacross_generation: u64,
 }
 
 #[derive(Debug, Default)]
@@ -320,6 +322,34 @@ struct OrderedWorkspaceState {
 struct OrderedGeneration {
     prepared_tasks: usize,
     next_ordinal: i128,
+}
+
+#[derive(Debug, Default)]
+struct DoacrossWorkspace {
+    state: Mutex<DoacrossWorkspaceState>,
+    available: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct DoacrossWorkspaceState {
+    generations: HashMap<u64, DoacrossGeneration>,
+}
+
+#[derive(Debug, Default)]
+struct DoacrossGeneration {
+    prepared_tasks: usize,
+    shape: Option<DoacrossShape>,
+    completed: HashSet<(i128, i128)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DoacrossShape {
+    outer_lower: i64,
+    outer_upper: i64,
+    outer_step: i64,
+    inner_lower: i64,
+    inner_upper: i64,
+    inner_step: i64,
 }
 
 #[derive(Debug, Default)]
@@ -502,6 +532,7 @@ fn run_implicit_task(
     reduction: Arc<Mutex<ReductionWorkspace>>,
     dynamic: Arc<Mutex<DynamicWorkspace>>,
     ordered: Arc<OrderedWorkspace>,
+    doacross: Arc<DoacrossWorkspace>,
 ) {
     let _guard = enter_team(
         TeamContext {
@@ -515,6 +546,8 @@ fn run_implicit_task(
             ordered,
             ordered_generation: 0,
             ordered_active_generation: None,
+            doacross,
+            doacross_generation: 0,
         },
         inherited_requested_threads,
     );
@@ -565,6 +598,7 @@ pub extern "C" fn afs_omp_parallel_region(
     let reduction = Arc::new(Mutex::new(ReductionWorkspace::default()));
     let dynamic = Arc::new(Mutex::new(DynamicWorkspace::default()));
     let ordered = Arc::new(OrderedWorkspace::default());
+    let doacross = Arc::new(DoacrossWorkspace::default());
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         std::thread::scope(|scope| {
@@ -574,6 +608,7 @@ pub extern "C" fn afs_omp_parallel_region(
                 let reduction = Arc::clone(&reduction);
                 let dynamic = Arc::clone(&dynamic);
                 let ordered = Arc::clone(&ordered);
+                let doacross = Arc::clone(&doacross);
                 scope.spawn(move || {
                     run_implicit_task(
                         entry,
@@ -586,6 +621,7 @@ pub extern "C" fn afs_omp_parallel_region(
                         reduction,
                         dynamic,
                         ordered,
+                        doacross,
                     );
                 });
             }
@@ -600,6 +636,7 @@ pub extern "C" fn afs_omp_parallel_region(
                 Arc::clone(&reduction),
                 Arc::clone(&dynamic),
                 Arc::clone(&ordered),
+                Arc::clone(&doacross),
             );
         });
     }));
@@ -778,6 +815,198 @@ pub extern "C" fn afs_omp_ordered_exit() -> i32 {
     entry.next_ordinal += 1;
     drop(workspace);
     ordered.available.notify_all();
+    AFS_OMP_SUCCESS
+}
+
+fn doacross_ordinal(value: i64, lower: i64, upper: i64, step: i64) -> Option<i128> {
+    if step == 0 {
+        return None;
+    }
+    let value = i128::from(value);
+    let lower = i128::from(lower);
+    let upper = i128::from(upper);
+    let step = i128::from(step);
+    let delta = value - lower;
+    if delta % step != 0 {
+        return None;
+    }
+    let ordinal = delta / step;
+    (ordinal >= 0 && ordinal < loop_iteration_count(lower, upper, step)).then_some(ordinal)
+}
+
+/// Begin the next two-dimensional doacross worksharing loop encountered by
+/// the current implicit task.
+///
+/// This protocol deliberately owns a workspace separate from block ORDERED.
+/// Each task advances the generation in encounter order, while logical
+/// ordinals normalize positive and negative Fortran loop increments.
+#[no_mangle]
+pub extern "C" fn afs_omp_doacross_prepare(
+    outer_lower: i64,
+    outer_upper: i64,
+    outer_step: i64,
+    inner_lower: i64,
+    inner_upper: i64,
+    inner_step: i64,
+) -> i32 {
+    if outer_step == 0 || inner_step == 0 {
+        return AFS_OMP_ERROR_INVALID_ORDERED;
+    }
+    let shape = DoacrossShape {
+        outer_lower,
+        outer_upper,
+        outer_step,
+        inner_lower,
+        inner_upper,
+        inner_step,
+    };
+    THREAD_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(team) = state.teams.last_mut() else {
+            return AFS_OMP_SUCCESS;
+        };
+        team.doacross_generation = team.doacross_generation.wrapping_add(1);
+        if team.doacross_generation == 0 {
+            return AFS_OMP_ERROR_INVALID_ORDERED;
+        }
+        let generation = team.doacross_generation;
+        let team_size = usize::try_from(team.team_size).unwrap_or(0);
+        let mut workspace = team
+            .doacross
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = workspace.generations.entry(generation).or_default();
+        if entry.shape.is_some_and(|existing| existing != shape) {
+            return AFS_OMP_ERROR_INVALID_ORDERED;
+        }
+        entry.shape = Some(shape);
+        entry.prepared_tasks += 1;
+        if entry.prepared_tasks > team_size {
+            return AFS_OMP_ERROR_INVALID_ORDERED;
+        }
+        if entry.prepared_tasks == team_size && generation > 1 {
+            workspace.generations.remove(&(generation - 1));
+        }
+        AFS_OMP_SUCCESS
+    })
+}
+
+/// Wait until a source event completes the requested two-dimensional logical
+/// iteration. A vector outside either associated loop's iteration space is
+/// ignored as required for an OpenMP doacross sink dependence.
+#[no_mangle]
+pub extern "C" fn afs_omp_doacross_wait(outer: i64, inner: i64) -> i32 {
+    let context = THREAD_STATE.with(|state| {
+        let state = state.borrow();
+        let team = state.teams.last()?;
+        if team.doacross_generation == 0 {
+            return None;
+        }
+        Some((team.doacross_generation, Arc::clone(&team.doacross)))
+    });
+    let Some((generation, doacross)) = context else {
+        return if afs_omp_get_level() == 0 {
+            AFS_OMP_SUCCESS
+        } else {
+            AFS_OMP_ERROR_INVALID_ORDERED
+        };
+    };
+    let mut workspace = doacross
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(shape) = workspace
+        .generations
+        .get(&generation)
+        .and_then(|entry| entry.shape)
+    else {
+        return AFS_OMP_ERROR_INVALID_ORDERED;
+    };
+    let Some(outer) = doacross_ordinal(
+        outer,
+        shape.outer_lower,
+        shape.outer_upper,
+        shape.outer_step,
+    ) else {
+        return AFS_OMP_SUCCESS;
+    };
+    let Some(inner) = doacross_ordinal(
+        inner,
+        shape.inner_lower,
+        shape.inner_upper,
+        shape.inner_step,
+    ) else {
+        return AFS_OMP_SUCCESS;
+    };
+    loop {
+        let Some(entry) = workspace.generations.get(&generation) else {
+            return AFS_OMP_ERROR_INVALID_ORDERED;
+        };
+        if entry.completed.contains(&(outer, inner)) {
+            return AFS_OMP_SUCCESS;
+        }
+        workspace = doacross
+            .available
+            .wait(workspace)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+/// Publish completion of the current two-dimensional logical iteration and
+/// wake tasks whose sink dependences may now be satisfied.
+#[no_mangle]
+pub extern "C" fn afs_omp_doacross_post(outer: i64, inner: i64) -> i32 {
+    let context = THREAD_STATE.with(|state| {
+        let state = state.borrow();
+        let team = state.teams.last()?;
+        if team.doacross_generation == 0 {
+            return None;
+        }
+        Some((team.doacross_generation, Arc::clone(&team.doacross)))
+    });
+    let Some((generation, doacross)) = context else {
+        return if afs_omp_get_level() == 0 {
+            AFS_OMP_SUCCESS
+        } else {
+            AFS_OMP_ERROR_INVALID_ORDERED
+        };
+    };
+    let mut workspace = doacross
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(shape) = workspace
+        .generations
+        .get(&generation)
+        .and_then(|entry| entry.shape)
+    else {
+        return AFS_OMP_ERROR_INVALID_ORDERED;
+    };
+    let Some(outer) = doacross_ordinal(
+        outer,
+        shape.outer_lower,
+        shape.outer_upper,
+        shape.outer_step,
+    ) else {
+        return AFS_OMP_ERROR_INVALID_ORDERED;
+    };
+    let Some(inner) = doacross_ordinal(
+        inner,
+        shape.inner_lower,
+        shape.inner_upper,
+        shape.inner_step,
+    ) else {
+        return AFS_OMP_ERROR_INVALID_ORDERED;
+    };
+    let Some(entry) = workspace.generations.get_mut(&generation) else {
+        return AFS_OMP_ERROR_INVALID_ORDERED;
+    };
+    if !entry.completed.insert((outer, inner)) {
+        return AFS_OMP_ERROR_INVALID_ORDERED;
+    }
+    drop(workspace);
+    doacross.available.notify_all();
     AFS_OMP_SUCCESS
 }
 
@@ -2654,6 +2883,161 @@ mod tests {
             afs_omp_ordered_enter(1, 1, 0),
             AFS_OMP_ERROR_INVALID_ORDERED
         );
+    }
+
+    struct DoacrossObservations {
+        ascending: Vec<AtomicUsize>,
+        descending: Vec<AtomicUsize>,
+    }
+
+    unsafe extern "C" fn doacross_task(environment: *mut c_void, thread_num: i32, team_size: i32) {
+        let observations = unsafe { &*(environment as *const DoacrossObservations) };
+        for (outer_lower, outer_upper, outer_step, inner_lower, inner_upper, inner_step, cells) in [
+            (
+                1_i64,
+                12_i64,
+                1_i64,
+                1_i64,
+                9_i64,
+                1_i64,
+                &observations.ascending,
+            ),
+            (
+                12_i64,
+                1_i64,
+                -1_i64,
+                9_i64,
+                1_i64,
+                -1_i64,
+                &observations.descending,
+            ),
+        ] {
+            assert_eq!(
+                afs_omp_doacross_prepare(
+                    outer_lower,
+                    outer_upper,
+                    outer_step,
+                    inner_lower,
+                    inner_upper,
+                    inner_step,
+                ),
+                AFS_OMP_SUCCESS
+            );
+            let mut chunk_index = 0;
+            loop {
+                let mut first = 0;
+                let mut last = 0;
+                let status = afs_omp_static_chunk_bounds(
+                    outer_lower,
+                    outer_upper,
+                    outer_step,
+                    1,
+                    thread_num,
+                    team_size,
+                    chunk_index,
+                    &mut first,
+                    &mut last,
+                );
+                assert!(status >= 0);
+                if status == 0 {
+                    break;
+                }
+                let mut outer = first;
+                loop {
+                    let outer_ordinal = ((outer - outer_lower) / outer_step) as usize;
+                    let mut inner = inner_lower;
+                    loop {
+                        let inner_ordinal = ((inner - inner_lower) / inner_step) as usize;
+                        assert_eq!(
+                            afs_omp_doacross_wait(outer - outer_step, inner),
+                            AFS_OMP_SUCCESS
+                        );
+                        assert_eq!(
+                            afs_omp_doacross_wait(outer, inner - inner_step),
+                            AFS_OMP_SUCCESS
+                        );
+                        let above = if outer_ordinal > 0 {
+                            cells[(outer_ordinal - 1) * 9 + inner_ordinal].load(Ordering::SeqCst)
+                        } else {
+                            0
+                        };
+                        let left = if inner_ordinal > 0 {
+                            cells[outer_ordinal * 9 + inner_ordinal - 1].load(Ordering::SeqCst)
+                        } else {
+                            0
+                        };
+                        cells[outer_ordinal * 9 + inner_ordinal]
+                            .store(above + left + 1, Ordering::SeqCst);
+                        assert_eq!(afs_omp_doacross_post(outer, inner), AFS_OMP_SUCCESS);
+                        if inner == inner_upper {
+                            break;
+                        }
+                        inner += inner_step;
+                    }
+                    if outer == last {
+                        break;
+                    }
+                    outer += outer_step;
+                }
+                chunk_index += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn doacross_runtime_orders_two_dimensional_dependencies_across_generations() {
+        reset_thread_state();
+        let observations = DoacrossObservations {
+            ascending: (0..108).map(|_| AtomicUsize::new(0)).collect(),
+            descending: (0..108).map(|_| AtomicUsize::new(0)).collect(),
+        };
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(doacross_task),
+                &observations as *const DoacrossObservations as *mut c_void,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        let mut expected = vec![0_usize; 108];
+        for outer in 0..12 {
+            for inner in 0..9 {
+                let above = if outer > 0 {
+                    expected[(outer - 1) * 9 + inner]
+                } else {
+                    0
+                };
+                let left = if inner > 0 {
+                    expected[outer * 9 + inner - 1]
+                } else {
+                    0
+                };
+                expected[outer * 9 + inner] = above + left + 1;
+            }
+        }
+        for cells in [&observations.ascending, &observations.descending] {
+            assert_eq!(
+                cells
+                    .iter()
+                    .map(|value| value.load(Ordering::SeqCst))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn doacross_runtime_handles_the_serial_initial_team_and_rejects_bad_steps() {
+        reset_thread_state();
+        assert_eq!(
+            afs_omp_doacross_prepare(1, 2, 0, 1, 2, 1),
+            AFS_OMP_ERROR_INVALID_ORDERED
+        );
+        assert_eq!(afs_omp_doacross_prepare(1, 2, 1, 1, 2, 1), AFS_OMP_SUCCESS);
+        assert_eq!(afs_omp_doacross_wait(0, 1), AFS_OMP_SUCCESS);
+        assert_eq!(afs_omp_doacross_post(1, 1), AFS_OMP_SUCCESS);
     }
 
     struct CriticalObservations {
