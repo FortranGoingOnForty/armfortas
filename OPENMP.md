@@ -118,13 +118,22 @@ queries, module `threadprivate`, numeric atomic updates, OpenMP `master`,
 external-procedure capture classification, and the mixed fixed/assumed
 CHARACTER calling convention exercised by NPB's report routine.
 
+NASA NPB 3.4.4 CG Class S now also builds from unchanged benchmark sources and
+verifies successfully through the owned runtime. Independent clean `-O0` and
+`-O3` builds each pass with one, two, four, and eight threads, reporting the
+reference zeta `8.5971775078648`. This exercises static worksharing, scalar
+reductions, eight explicit barriers (six in orphaned procedures), and both
+lexically nested and orphaned `master` regions. Focused regressions preserve
+the two final frontend fixes: I/O `*` syntax is not a data-environment capture,
+and an orphaned `master` binds dynamically to the current team.
+
 ## Next milestones
 
-1. Re-enter NASA NPB CG from a clean `-O0` build, now that its direct and
-   orphaned explicit barriers are modeled, and isolate the first remaining
-   compiler or runtime edge.
-2. Complete the NPB CG directive/runtime inventory and turn each remaining gap
-   into an independently tested compiler tranche before claiming the benchmark.
+1. Inventory the remaining NPB 3.4.4 OpenMP applications and select the
+   smallest high-yield benchmark whose unchanged source reaches a new compiler
+   or runtime edge.
+2. Turn every newly exposed edge into an independently tested compiler tranche
+   before claiming another benchmark.
 3. Extend array reductions beyond constant-shape rank one only with a truthful
    descriptor and partial-storage mapping design.
 4. Add guided/runtime scheduling only after each worksharing construct owns an
