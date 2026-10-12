@@ -612,6 +612,9 @@ pub(super) fn lower_construct(
         }
         OpenMpConstruct::Master { body } => lower_master_region(b, ctx, body),
         OpenMpConstruct::Single { clauses, body } => lower_single_region(b, ctx, clauses, body),
+        OpenMpConstruct::Sections { .. } => {
+            unreachable!("validated OpenMP SECTIONS reached lowering before implementation")
+        }
         OpenMpConstruct::Ordered { body } => lower_ordered_region(b, ctx, body),
         OpenMpConstruct::OrderedDoacross { dependence } => {
             lower_doacross_directive(b, ctx, dependence)

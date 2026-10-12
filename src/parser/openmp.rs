@@ -22,6 +22,8 @@ enum OpenMpHeader {
     Critical(Option<String>),
     Master,
     Single(Vec<OpenMpClause>),
+    Sections(Vec<OpenMpClause>),
+    Section,
     Ordered,
     OrderedDoacross(OpenMpDoacrossDependence),
     Barrier,
@@ -36,6 +38,7 @@ enum OpenMpHeader {
     EndCritical(Option<String>),
     EndMaster,
     EndSingle { nowait: bool },
+    EndSections { nowait: bool },
     EndOrdered,
 }
 
@@ -46,6 +49,7 @@ enum BeginKind {
     Loop,
     ParallelDo,
     Single,
+    Sections,
 }
 
 impl<'a> Parser<'a> {
@@ -199,6 +203,9 @@ impl<'a> Parser<'a> {
                     span_through(directive.span, end_span),
                 ))
             }
+            OpenMpHeader::Sections(clauses) => {
+                self.parse_openmp_sections(directive.span, clauses)
+            }
             OpenMpHeader::Ordered => {
                 let (body, end_span, _) = self.parse_openmp_region_end(OpenMpEnd::Ordered, None)?;
                 Ok(Spanned::new(
@@ -262,10 +269,99 @@ impl<'a> Parser<'a> {
             | OpenMpHeader::EndCritical(_)
             | OpenMpHeader::EndMaster
             | OpenMpHeader::EndSingle { .. }
+            | OpenMpHeader::EndSections { .. }
             | OpenMpHeader::EndOrdered => Err(ParseError {
                 span: directive.span,
                 msg: format!("unexpected OpenMP end directive '!$omp {}'", directive.text),
             }),
+            OpenMpHeader::Section => Err(ParseError {
+                span: directive.span,
+                msg: "OpenMP SECTION directive must be lexically nested inside an OpenMP SECTIONS construct".into(),
+            }),
+        }
+    }
+
+    fn parse_openmp_sections(
+        &mut self,
+        begin_span: Span,
+        mut clauses: Vec<OpenMpClause>,
+    ) -> Result<SpannedStmt, ParseError> {
+        let mut body = Vec::new();
+        let mut section_starts = vec![0];
+        let mut saw_explicit_section = false;
+        loop {
+            self.skip_newlines();
+            if self.peek() == &TokenKind::Eof {
+                return Err(self.error(
+                    "unterminated OpenMP sections construct; expected '!$omp end sections'".into(),
+                ));
+            }
+            if self.peek() == &TokenKind::OmpDirective {
+                let directive = self.current().clone();
+                match parse_openmp_header(&directive.text, directive.span)? {
+                    OpenMpHeader::Section => {
+                        self.advance();
+                        let current_start = *section_starts.last().unwrap();
+                        if body.len() == current_start {
+                            if saw_explicit_section {
+                                return Err(ParseError {
+                                    span: directive.span,
+                                    msg: "OpenMP SECTION directive must be followed by a nonempty structured block".into(),
+                                });
+                            }
+                        } else {
+                            section_starts.push(body.len());
+                        }
+                        saw_explicit_section = true;
+                        continue;
+                    }
+                    OpenMpHeader::EndSections { nowait } => {
+                        if body.len() == *section_starts.last().unwrap() {
+                            return Err(ParseError {
+                                span: directive.span,
+                                msg:
+                                    "OpenMP SECTIONS construct requires a nonempty structured block"
+                                        .into(),
+                            });
+                        }
+                        if nowait {
+                            clauses.push(OpenMpClause::Nowait);
+                        }
+                        self.advance();
+                        return Ok(Spanned::new(
+                            Stmt::OpenMp(OpenMpConstruct::Sections {
+                                clauses,
+                                body,
+                                section_starts,
+                            }),
+                            span_through(begin_span, directive.span),
+                        ));
+                    }
+                    header
+                        if matches!(
+                            header,
+                            OpenMpHeader::EndParallel
+                                | OpenMpHeader::EndDo { .. }
+                                | OpenMpHeader::EndLoop
+                                | OpenMpHeader::EndParallelDo { .. }
+                                | OpenMpHeader::EndCritical(_)
+                                | OpenMpHeader::EndMaster
+                                | OpenMpHeader::EndSingle { .. }
+                                | OpenMpHeader::EndOrdered
+                        ) =>
+                    {
+                        return Err(ParseError {
+                            span: directive.span,
+                            msg: format!(
+                                "mismatched OpenMP end directive '!$omp {}'; expected END SECTIONS",
+                                directive.text
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            body.push(self.parse_stmt()?);
         }
     }
 
@@ -360,6 +456,7 @@ impl<'a> Parser<'a> {
                         | OpenMpHeader::EndCritical(_)
                         | OpenMpHeader::EndMaster
                         | OpenMpHeader::EndSingle { .. }
+                        | OpenMpHeader::EndSections { .. }
                         | OpenMpHeader::EndOrdered
                 ) {
                     return Err(ParseError {
@@ -416,6 +513,10 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
             if cursor.peek_identifier_is("do") {
                 cursor.identifier("DO")?;
                 OpenMpHeader::ParallelDo(parse_clauses(&mut cursor, span, BeginKind::ParallelDo)?)
+            } else if cursor.peek_identifier_is("sections") {
+                return Err(cursor.error(
+                    "OpenMP PARALLEL SECTIONS is recognized but not yet implemented".into(),
+                ));
             } else {
                 OpenMpHeader::Parallel(parse_clauses(&mut cursor, span, BeginKind::Parallel)?)
             }
@@ -443,6 +544,13 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
             OpenMpHeader::Master
         }
         "single" => OpenMpHeader::Single(parse_clauses(&mut cursor, span, BeginKind::Single)?),
+        "sections" => {
+            OpenMpHeader::Sections(parse_clauses(&mut cursor, span, BeginKind::Sections)?)
+        }
+        "section" => {
+            cursor.finish()?;
+            OpenMpHeader::Section
+        }
         "ordered" => {
             if cursor.finished() {
                 OpenMpHeader::Ordered
@@ -514,6 +622,13 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
             cursor.finish()?;
             OpenMpHeader::EndLoop
         }
+        "endsections" => OpenMpHeader::EndSections {
+            nowait: parse_end_sections_clause(&mut cursor)?,
+        },
+        "parallelsections" => {
+            return Err(cursor
+                .error("OpenMP PARALLEL SECTIONS is recognized but not yet implemented".into()))
+        }
         "end" => parse_openmp_end_header(&mut cursor)?,
         other => {
             return Err(ParseError {
@@ -569,6 +684,9 @@ fn parse_openmp_end_header(cursor: &mut DirectiveCursor<'_>) -> Result<OpenMpHea
         }
         "single" => Ok(OpenMpHeader::EndSingle {
             nowait: parse_end_single_clause(cursor)?,
+        }),
+        "sections" => Ok(OpenMpHeader::EndSections {
+            nowait: parse_end_sections_clause(cursor)?,
         }),
         "ordered" => {
             cursor.finish()?;
@@ -687,6 +805,20 @@ fn parse_end_single_clause(cursor: &mut DirectiveCursor<'_>) -> Result<bool, Par
     Ok(true)
 }
 
+fn parse_end_sections_clause(cursor: &mut DirectiveCursor<'_>) -> Result<bool, ParseError> {
+    if cursor.finished() {
+        return Ok(false);
+    }
+    let clause = cursor.identifier("clause after OpenMP END SECTIONS")?;
+    if !clause.eq_ignore_ascii_case("nowait") {
+        return Err(cursor.error(format!(
+            "unsupported clause '{clause}' on OpenMP END SECTIONS directive; expected NOWAIT"
+        )));
+    }
+    cursor.finish()?;
+    Ok(true)
+}
+
 fn parse_clauses(
     cursor: &mut DirectiveCursor<'_>,
     span: Span,
@@ -709,136 +841,135 @@ fn parse_clauses(
         if lower != "reduction" && !seen.insert(lower.clone()) {
             return Err(cursor.error(format!("duplicate OpenMP {lower} clause")));
         }
-        let clause = match lower.as_str() {
-            "private" => OpenMpClause::Private(parse_name_list(
-                cursor.parenthesized("PRIVATE list")?,
-                span,
-                "PRIVATE list",
-            )?),
-            "firstprivate" => OpenMpClause::FirstPrivate(parse_name_list(
-                cursor.parenthesized("FIRSTPRIVATE list")?,
-                span,
-                "FIRSTPRIVATE list",
-            )?),
-            "copyin" => OpenMpClause::CopyIn(parse_name_list(
-                cursor.parenthesized("COPYIN list")?,
-                span,
-                "COPYIN list",
-            )?),
-            "lastprivate" => {
-                let value = cursor.parenthesized("LASTPRIVATE list")?;
-                let (conditional, variables) =
-                    if let Some((modifier, variables)) = split_top_level_once(value, ':') {
-                        if !modifier.trim().eq_ignore_ascii_case("conditional") {
-                            return Err(cursor.error(format!(
-                                "unsupported OpenMP LASTPRIVATE modifier '{}'",
-                                modifier.trim()
-                            )));
+        let clause =
+            match lower.as_str() {
+                "private" => OpenMpClause::Private(parse_name_list(
+                    cursor.parenthesized("PRIVATE list")?,
+                    span,
+                    "PRIVATE list",
+                )?),
+                "firstprivate" => OpenMpClause::FirstPrivate(parse_name_list(
+                    cursor.parenthesized("FIRSTPRIVATE list")?,
+                    span,
+                    "FIRSTPRIVATE list",
+                )?),
+                "copyin" => OpenMpClause::CopyIn(parse_name_list(
+                    cursor.parenthesized("COPYIN list")?,
+                    span,
+                    "COPYIN list",
+                )?),
+                "lastprivate" => {
+                    let value = cursor.parenthesized("LASTPRIVATE list")?;
+                    let (conditional, variables) =
+                        if let Some((modifier, variables)) = split_top_level_once(value, ':') {
+                            if !modifier.trim().eq_ignore_ascii_case("conditional") {
+                                return Err(cursor.error(format!(
+                                    "unsupported OpenMP LASTPRIVATE modifier '{}'",
+                                    modifier.trim()
+                                )));
+                            }
+                            (true, variables)
+                        } else {
+                            (false, value)
+                        };
+                    OpenMpClause::LastPrivate {
+                        conditional,
+                        variables: parse_name_list(variables, span, "LASTPRIVATE list")?,
+                    }
+                }
+                "shared" => OpenMpClause::Shared(parse_name_list(
+                    cursor.parenthesized("SHARED list")?,
+                    span,
+                    "SHARED list",
+                )?),
+                "default" => {
+                    let value = cursor.parenthesized("DEFAULT clause")?.trim();
+                    let value = match value.to_ascii_lowercase().as_str() {
+                        "shared" => OpenMpDefault::Shared,
+                        "private" => OpenMpDefault::Private,
+                        "firstprivate" => OpenMpDefault::FirstPrivate,
+                        "none" => OpenMpDefault::None,
+                        _ => {
+                            return Err(
+                                cursor.error(format!("invalid OpenMP DEFAULT value '{value}'"))
+                            )
                         }
-                        (true, variables)
-                    } else {
-                        (false, value)
                     };
-                OpenMpClause::LastPrivate {
-                    conditional,
-                    variables: parse_name_list(variables, span, "LASTPRIVATE list")?,
+                    OpenMpClause::Default(value)
                 }
-            }
-            "shared" => OpenMpClause::Shared(parse_name_list(
-                cursor.parenthesized("SHARED list")?,
-                span,
-                "SHARED list",
-            )?),
-            "default" => {
-                let value = cursor.parenthesized("DEFAULT clause")?.trim();
-                let value = match value.to_ascii_lowercase().as_str() {
-                    "shared" => OpenMpDefault::Shared,
-                    "private" => OpenMpDefault::Private,
-                    "firstprivate" => OpenMpDefault::FirstPrivate,
-                    "none" => OpenMpDefault::None,
-                    _ => {
-                        return Err(cursor.error(format!("invalid OpenMP DEFAULT value '{value}'")))
+                "if" => {
+                    let value = cursor.parenthesized("IF clause")?;
+                    let (modifier, expression) = split_if_modifier(value);
+                    OpenMpClause::If {
+                        modifier,
+                        condition: parse_clause_expr(expression, span, "IF clause")?,
                     }
-                };
-                OpenMpClause::Default(value)
-            }
-            "if" => {
-                let value = cursor.parenthesized("IF clause")?;
-                let (modifier, expression) = split_if_modifier(value);
-                OpenMpClause::If {
-                    modifier,
-                    condition: parse_clause_expr(expression, span, "IF clause")?,
                 }
-            }
-            "num_threads" => OpenMpClause::NumThreads(parse_clause_expr(
-                cursor.parenthesized("NUM_THREADS clause")?,
-                span,
-                "NUM_THREADS clause",
-            )?),
-            "schedule" => {
-                let value = cursor.parenthesized("SCHEDULE clause")?;
-                let parts = split_top_level(value, ',');
-                if parts.is_empty() || parts.len() > 2 {
-                    return Err(
-                        cursor.error("SCHEDULE requires a kind and at most one chunk size".into())
-                    );
-                }
-                let kind_text = parts[0].trim();
-                let kind = match kind_text.to_ascii_lowercase().as_str() {
-                    "static" => OpenMpScheduleKind::Static,
-                    "dynamic" => OpenMpScheduleKind::Dynamic,
-                    "guided" => OpenMpScheduleKind::Guided,
-                    "runtime" => OpenMpScheduleKind::Runtime,
-                    "auto" => OpenMpScheduleKind::Auto,
-                    _ => {
-                        return Err(
-                            cursor.error(format!("unsupported OpenMP schedule kind '{kind_text}'"))
-                        )
+                "num_threads" => OpenMpClause::NumThreads(parse_clause_expr(
+                    cursor.parenthesized("NUM_THREADS clause")?,
+                    span,
+                    "NUM_THREADS clause",
+                )?),
+                "schedule" => {
+                    let value = cursor.parenthesized("SCHEDULE clause")?;
+                    let parts = split_top_level(value, ',');
+                    if parts.is_empty() || parts.len() > 2 {
+                        return Err(cursor
+                            .error("SCHEDULE requires a kind and at most one chunk size".into()));
                     }
-                };
-                let chunk_size = parts
-                    .get(1)
-                    .map(|value| parse_clause_expr(value, span, "SCHEDULE chunk size"))
-                    .transpose()?;
-                OpenMpClause::Schedule { kind, chunk_size }
-            }
-            "collapse" => OpenMpClause::Collapse(parse_clause_expr(
-                cursor.parenthesized("COLLAPSE clause")?,
-                span,
-                "COLLAPSE clause",
-            )?),
-            "ordered" => {
-                let parameter = if cursor.peek_nonblank() == Some(b'(') {
-                    Some(parse_clause_expr(
-                        cursor.parenthesized("ORDERED clause")?,
-                        span,
-                        "ORDERED clause",
-                    )?)
-                } else {
-                    None
-                };
-                OpenMpClause::Ordered(parameter)
-            }
-            "reduction" => {
-                let value = cursor.parenthesized("REDUCTION clause")?;
-                let Some((operator, items)) = split_top_level_once(value, ':') else {
-                    return Err(
-                        cursor.error("OpenMP REDUCTION requires 'operator: variable-list'".into())
-                    );
-                };
-                OpenMpClause::Reduction {
-                    operator: parse_reduction_operator(operator, cursor)?,
-                    items: parse_reduction_list(items, span)?,
+                    let kind_text = parts[0].trim();
+                    let kind = match kind_text.to_ascii_lowercase().as_str() {
+                        "static" => OpenMpScheduleKind::Static,
+                        "dynamic" => OpenMpScheduleKind::Dynamic,
+                        "guided" => OpenMpScheduleKind::Guided,
+                        "runtime" => OpenMpScheduleKind::Runtime,
+                        "auto" => OpenMpScheduleKind::Auto,
+                        _ => {
+                            return Err(cursor
+                                .error(format!("unsupported OpenMP schedule kind '{kind_text}'")))
+                        }
+                    };
+                    let chunk_size = parts
+                        .get(1)
+                        .map(|value| parse_clause_expr(value, span, "SCHEDULE chunk size"))
+                        .transpose()?;
+                    OpenMpClause::Schedule { kind, chunk_size }
                 }
-            }
-            "nowait" if matches!(construct, BeginKind::Single) => OpenMpClause::Nowait,
-            "nowait" => {
-                return Err(cursor.error(
-                    "OpenMP NOWAIT belongs on the END DO or END PARALLEL DO directive".into(),
-                ))
-            }
-            _ => return Err(cursor.error(format!("unsupported OpenMP clause '{name}'"))),
-        };
+                "collapse" => OpenMpClause::Collapse(parse_clause_expr(
+                    cursor.parenthesized("COLLAPSE clause")?,
+                    span,
+                    "COLLAPSE clause",
+                )?),
+                "ordered" => {
+                    let parameter = if cursor.peek_nonblank() == Some(b'(') {
+                        Some(parse_clause_expr(
+                            cursor.parenthesized("ORDERED clause")?,
+                            span,
+                            "ORDERED clause",
+                        )?)
+                    } else {
+                        None
+                    };
+                    OpenMpClause::Ordered(parameter)
+                }
+                "reduction" => {
+                    let value = cursor.parenthesized("REDUCTION clause")?;
+                    let Some((operator, items)) = split_top_level_once(value, ':') else {
+                        return Err(cursor
+                            .error("OpenMP REDUCTION requires 'operator: variable-list'".into()));
+                    };
+                    OpenMpClause::Reduction {
+                        operator: parse_reduction_operator(operator, cursor)?,
+                        items: parse_reduction_list(items, span)?,
+                    }
+                }
+                "nowait" if matches!(construct, BeginKind::Single) => OpenMpClause::Nowait,
+                "nowait" => {
+                    return Err(cursor
+                        .error("OpenMP NOWAIT belongs on the applicable END directive".into()))
+                }
+                _ => return Err(cursor.error(format!("unsupported OpenMP clause '{name}'"))),
+            };
         validate_clause_for_construct(&clause, construct, cursor)?;
         clauses.push(clause);
     }
@@ -883,6 +1014,13 @@ fn validate_clause_for_construct(
         BeginKind::Single => matches!(
             clause,
             OpenMpClause::Private(_) | OpenMpClause::FirstPrivate(_) | OpenMpClause::Nowait
+        ),
+        BeginKind::Sections => matches!(
+            clause,
+            OpenMpClause::Private(_)
+                | OpenMpClause::FirstPrivate(_)
+                | OpenMpClause::LastPrivate { .. }
+                | OpenMpClause::Reduction { .. }
         ),
     };
     if allowed {
@@ -1454,6 +1592,95 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.msg.contains("duplicate OpenMP nowait clause"));
+    }
+
+    #[test]
+    fn parses_sections_with_explicit_markers_and_end_nowait() {
+        let stmt = parse(
+            "!$omp sections private(scratch)\n\
+             !$omp section\n\
+             first = 1\n\
+             !$omp section\n\
+             second = 2\n\
+             !$omp end sections nowait\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::Sections {
+            clauses,
+            body,
+            section_starts,
+        }) = stmt.node
+        else {
+            panic!("expected sections construct");
+        };
+        assert_eq!(body.len(), 2);
+        assert_eq!(section_starts, [0, 1]);
+        assert!(matches!(
+            clauses.as_slice(),
+            [OpenMpClause::Private(names), OpenMpClause::Nowait]
+                if names == &["scratch"]
+        ));
+    }
+
+    #[test]
+    fn parses_sections_with_implicit_first_section_in_fixed_form() {
+        let stmt = parse(
+            concat!(
+                "C$OMP SECTIONS\n",
+                "      FIRST = 1\n",
+                "C$OMP SECTION\n",
+                "      SECOND = 2\n",
+                "C$OMP ENDSECTIONS NOWAIT\n",
+            ),
+            SourceForm::FixedForm,
+        )
+        .unwrap();
+        assert!(matches!(
+            stmt.node,
+            Stmt::OpenMp(OpenMpConstruct::Sections {
+                clauses,
+                body,
+                section_starts,
+            }) if clauses == vec![OpenMpClause::Nowait]
+                && body.len() == 2
+                && section_starts == vec![0, 1]
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_and_orphan_section_markers() {
+        let empty = parse(
+            "!$omp sections\n\
+             !$omp section\n\
+             !$omp section\n\
+             value = 1\n\
+             !$omp end sections\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap_err();
+        assert!(empty.msg.contains("nonempty structured block"), "{empty}");
+
+        let orphan = parse("!$omp section\n", SourceForm::FreeForm).unwrap_err();
+        assert!(
+            orphan
+                .msg
+                .contains("lexically nested inside an OpenMP SECTIONS"),
+            "{orphan}"
+        );
+    }
+
+    #[test]
+    fn diagnoses_combined_parallel_sections_as_a_future_slice() {
+        for source in ["!$omp parallel sections\n", "!$omp parallelsections\n"] {
+            let error = parse(source, SourceForm::FreeForm).unwrap_err();
+            assert!(
+                error
+                    .msg
+                    .contains("PARALLEL SECTIONS is recognized but not yet implemented"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

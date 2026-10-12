@@ -36,6 +36,11 @@ pub enum OpenMpConstruct {
         clauses: Vec<OpenMpClause>,
         body: Vec<SpannedStmt>,
     },
+    Sections {
+        clauses: Vec<OpenMpClause>,
+        body: Vec<SpannedStmt>,
+        section_starts: Vec<usize>,
+    },
     Ordered {
         body: Vec<SpannedStmt>,
     },
@@ -67,6 +72,7 @@ impl OpenMpConstruct {
             Self::Critical { .. } => "CRITICAL",
             Self::Master { .. } => "MASTER",
             Self::Single { .. } => "SINGLE",
+            Self::Sections { .. } => "SECTIONS",
             Self::Ordered { .. } => "ORDERED",
             Self::OrderedDoacross { .. } => "ORDERED DOACROSS",
             Self::Barrier => "BARRIER",
@@ -83,7 +89,8 @@ impl OpenMpConstruct {
             | Self::Do { clauses, .. }
             | Self::Loop { clauses, .. }
             | Self::ParallelDo { clauses, .. }
-            | Self::Single { clauses, .. } => clauses,
+            | Self::Single { clauses, .. }
+            | Self::Sections { clauses, .. } => clauses,
             Self::Critical { .. }
             | Self::Master { .. }
             | Self::Ordered { .. }
@@ -102,6 +109,7 @@ impl OpenMpConstruct {
             | Self::Critical { body, .. }
             | Self::Master { body }
             | Self::Single { body, .. }
+            | Self::Sections { body, .. }
             | Self::Ordered { body } => Some(body),
             Self::AtomicRead { assignment }
             | Self::AtomicWrite { assignment }
@@ -124,6 +132,7 @@ impl OpenMpConstruct {
             | Self::Critical { .. }
             | Self::Master { .. }
             | Self::Single { .. }
+            | Self::Sections { .. }
             | Self::Ordered { .. }
             | Self::OrderedDoacross { .. }
             | Self::Barrier

@@ -180,6 +180,22 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             }
             validate_structured_block(ctx, body);
         }
+        OpenMpConstruct::Sections { clauses, .. } => {
+            reject_in_pure(ctx, span, "SECTIONS");
+            for clause in clauses {
+                ctx.error(
+                    span,
+                    format!(
+                        "OpenMP {} clause on SECTIONS is recognized but not yet implemented",
+                        clause_name(clause)
+                    ),
+                );
+            }
+            ctx.error(
+                span,
+                "OpenMP SECTIONS execution is recognized but not yet implemented",
+            );
+        }
         OpenMpConstruct::Ordered { body } => {
             reject_in_pure(ctx, span, "ORDERED");
             if !matches!(
