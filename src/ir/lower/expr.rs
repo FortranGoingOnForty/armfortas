@@ -2810,7 +2810,7 @@ pub(crate) fn lower_expr_full(
                     });
                 let callee_char_len_star_args =
                     first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
-                        callee_char_len_star_mask(st, k)
+                        callee_character_abi_mask(st, k)
                     })
                     .or_else(|| {
                         implicit_interface_character_arg_mask(
@@ -3469,7 +3469,7 @@ pub(crate) fn lower_expr_full(
                                         });
                                     let callee_char_len_star_args =
                                         first_procedure_lookup(&abi_lookup_keys, |k| {
-                                            callee_char_len_star_mask(st, k)
+                                            callee_character_abi_mask(st, k)
                                         });
                                     let abi_primary_key = abi_lookup_keys
                                         .first()

@@ -6909,6 +6909,85 @@ fn implicit_interface_character_actuals_keep_hidden_lengths_across_objects() {
 }
 
 #[test]
+fn implicit_interface_mixed_character_dummies_keep_hidden_length_order() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=implicit_interface_mixed_character_dummies_keep_hidden_length_order count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // Legacy external interfaces append one trailing length for every
+    // CHARACTER actual, including fixed-length dummies. If the callee only
+    // reserves slots for CHARACTER(*), fixed dummies shift all later
+    // assumed-length values. NPB EP's print_results call has this ABI shape.
+    let dir = unique_dir("implicit_interface_mixed_character_lengths");
+    let callee = write_program_in(
+        &dir,
+        "callee.f90",
+        "subroutine inspect_report(name, bench_class, marker, operation, ok, version, stamp)\n  implicit none\n  character(len=*), intent(in) :: name\n  character, intent(in) :: bench_class\n  integer, intent(in) :: marker\n  character(len=24), intent(in) :: operation\n  logical, intent(out) :: ok\n  character(len=*), intent(in) :: version, stamp\n  ok = len(name) == 2 .and. name == 'EP'\n  ok = ok .and. bench_class == 'S' .and. marker == 17\n  ok = ok .and. len(operation) == 24\n  ok = ok .and. operation == 'Random numbers generated'\n  ok = ok .and. len(version) == 5 .and. version == '3.4.4'\n  ok = ok .and. len(stamp) == 11 .and. stamp == '11 Oct 2026'\nend subroutine inspect_report\n",
+    );
+    let caller = write_program_in(
+        &dir,
+        "caller.f90",
+        "program p\n  implicit none\n  character :: bench_class\n  character(len=5), parameter :: version = '3.4.4'\n  character(len=11), parameter :: stamp = '11 Oct 2026'\n  logical :: ok\n  bench_class = 'S'\n  ok = .false.\n  call inspect_report('EP', bench_class, 17, 'Random numbers generated', ok, version, stamp)\n  if (.not. ok) error stop 1\n  print *, 'ok'\nend program p\n",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let callee_obj = dir.join(format!("callee-{}.o", &opt[1..]));
+        let caller_obj = dir.join(format!("caller-{}.o", &opt[1..]));
+        let out = dir.join(format!("mixed-character-{}", &opt[1..]));
+        for (src, obj) in [(&callee, &callee_obj), (&caller, &caller_obj)] {
+            let compile = Command::new(compiler("armfortas"))
+                .args([
+                    opt,
+                    "-c",
+                    src.to_str().unwrap(),
+                    "-o",
+                    obj.to_str().unwrap(),
+                ])
+                .output()
+                .expect("mixed-character implicit-interface compile failed to spawn");
+            assert!(
+                compile.status.success(),
+                "mixed-character implicit-interface compile failed for {} at {}: {}",
+                src.display(),
+                opt,
+                String::from_utf8_lossy(&compile.stderr)
+            );
+        }
+        let link = Command::new(compiler("armfortas"))
+            .args([
+                caller_obj.to_str().unwrap(),
+                callee_obj.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("mixed-character implicit-interface link failed to spawn");
+        assert!(
+            link.status.success(),
+            "mixed-character implicit-interface link failed at {}: {}",
+            opt,
+            String::from_utf8_lossy(&link.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("mixed-character implicit-interface run failed");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "mixed-character implicit-interface run failed at {}: status={:?} stdout={} stderr={}",
+            opt,
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn implicit_interface_heap_backed_array_actual_passes_data_across_objects() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

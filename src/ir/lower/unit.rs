@@ -414,6 +414,9 @@ pub(crate) fn lower_unit(
             };
             let proc_scope_id =
                 procedure_scope_for_dummy_args_with_host(st, name, args, host_scope_id);
+            let is_bind_c = proc_scope_id
+                .map(|scope_id| st.scope(scope_id).bind_c)
+                .unwrap_or_else(|| bind.is_some());
             // Signature construction resolves named kinds in dummy declarations.
             // Install the lexical scope before building the ABI, not only later
             // while lowering the body: sibling procedures may each rename a
@@ -484,8 +487,10 @@ pub(crate) fn lower_unit(
                 });
                 hidden_presence_params.push((n.to_lowercase(), pid));
             }
-            // Append hidden-length i64 params for character(len=*) dummies.
-            // Per the standard Fortran ABI, these trail the normal params.
+            // Append hidden-length i64 params for every CHARACTER dummy in
+            // the conventional non-BIND(C) Fortran ABI. Fixed-length slots
+            // are intentionally present but unused: an implicit-interface
+            // caller cannot know which callee dummies are CHARACTER(*).
             //
             // Compute flags from this procedure's own decls — a bare-name
             // lookup against `char_len_star_params` collides when several
@@ -500,22 +505,24 @@ pub(crate) fn lower_unit(
             // sort).
             let mut hidden_len_params: Vec<(String, ValueId)> = Vec::new();
             let own_cls_flags = compute_char_len_star_flags(args, decls);
-            if own_cls_flags.iter().any(|f| *f) {
-                let normal_count = params.len();
-                for (i, (flag, arg)) in own_cls_flags.iter().zip(args.iter()).enumerate() {
+            let own_character_abi_flags = compute_character_abi_flags(args, decls, is_bind_c);
+            if own_character_abi_flags.iter().any(|flag| *flag) {
+                for (i, (flag, arg)) in own_character_abi_flags.iter().zip(args.iter()).enumerate()
+                {
                     if *flag {
                         if let DummyArg::Name(n) = arg {
-                            let hid_id = ValueId((normal_count + hidden_len_params.len()) as u32);
+                            let hid_id = ValueId(params.len() as u32);
                             params.push(Param {
                                 name: format!("__len_{}", n.to_lowercase()),
                                 ty: IrType::Int(IntWidth::I64),
                                 id: hid_id,
                                 fortran_noalias: false,
                             });
-                            hidden_len_params.push((n.to_lowercase(), hid_id));
+                            if own_cls_flags.get(i).copied().unwrap_or(false) {
+                                hidden_len_params.push((n.to_lowercase(), hid_id));
+                            }
                         }
                     }
-                    let _ = i;
                 }
             }
 
@@ -1127,19 +1134,22 @@ pub(crate) fn lower_unit(
             // See sister site above for why we compute from decls
             // instead of looking up the bare-name map.
             let own_cls_flags = compute_char_len_star_flags(args, decls);
-            if own_cls_flags.iter().any(|f| *f) {
-                let normal_count = func_params.len();
-                for (flag, arg) in own_cls_flags.iter().zip(args.iter()) {
+            let own_character_abi_flags = compute_character_abi_flags(args, decls, is_bind_c);
+            if own_character_abi_flags.iter().any(|flag| *flag) {
+                for (i, (flag, arg)) in own_character_abi_flags.iter().zip(args.iter()).enumerate()
+                {
                     if *flag {
                         if let DummyArg::Name(n) = arg {
-                            let hid_id = ValueId((normal_count + hidden_len_params.len()) as u32);
+                            let hid_id = ValueId(func_params.len() as u32);
                             func_params.push(Param {
                                 name: format!("__len_{}", n.to_lowercase()),
                                 ty: IrType::Int(IntWidth::I64),
                                 id: hid_id,
                                 fortran_noalias: false,
                             });
-                            hidden_len_params.push((n.to_lowercase(), hid_id));
+                            if own_cls_flags.get(i).copied().unwrap_or(false) {
+                                hidden_len_params.push((n.to_lowercase(), hid_id));
+                            }
                         }
                     }
                 }

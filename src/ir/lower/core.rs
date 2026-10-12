@@ -1542,6 +1542,53 @@ fn entity_is_assumed_len_character(
     }
 }
 
+/// Compute the trailing CHARACTER-length ABI bitmap for a procedure.
+///
+/// The conventional Fortran ABI appends a length for every non-descriptor
+/// CHARACTER dummy, including dummies whose declared length is fixed.  A
+/// callee only *uses* the value for CHARACTER(*), but it must still reserve
+/// the fixed-length slots so callers with an implicit interface agree on the
+/// position of later lengths.  Keep this separate from
+/// `compute_char_len_star_flags`, which describes language semantics rather
+/// than the full calling convention.
+pub(super) fn compute_character_abi_flags(
+    args: &[crate::ast::unit::DummyArg],
+    decls: &[crate::ast::decl::SpannedDecl],
+    is_bind_c: bool,
+) -> Vec<bool> {
+    use crate::ast::decl::Attribute;
+    use crate::ast::unit::DummyArg;
+
+    args.iter()
+        .filter_map(|arg| match arg {
+            DummyArg::Name(name) => Some(name.to_lowercase()),
+            _ => None,
+        })
+        .map(|pname| {
+            if is_bind_c {
+                return false;
+            }
+            decls.iter().any(|decl| {
+                let Decl::TypeDecl {
+                    type_spec,
+                    attrs,
+                    entities,
+                } = &decl.node
+                else {
+                    return false;
+                };
+                matches!(type_spec, TypeSpec::Character(_))
+                    && !attrs
+                        .iter()
+                        .any(|attr| matches!(attr, Attribute::Allocatable | Attribute::Pointer))
+                    && entities
+                        .iter()
+                        .any(|entity| entity.name.eq_ignore_ascii_case(&pname))
+            })
+        })
+        .collect()
+}
+
 pub(super) fn compute_char_len_star_flags(
     args: &[crate::ast::unit::DummyArg],
     decls: &[crate::ast::decl::SpannedDecl],
@@ -18499,7 +18546,8 @@ fn try_defined_array_constructor_assignment(
     };
 
     let rk = resolved.name.to_lowercase();
-    let mask = cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk);
+    let mask = callee_character_abi_mask(ctx.st, &rk)
+        .or_else(|| cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk));
     if !mask
         .as_ref()
         .and_then(|m| m.get(1).copied())
@@ -18840,7 +18888,8 @@ pub(super) fn try_defined_assignment_for_array_element(
         rhs_val
     };
 
-    let mask = cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk);
+    let mask = callee_character_abi_mask(ctx.st, &rk)
+        .or_else(|| cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk));
     let rhs_is_char_star = mask
         .as_ref()
         .and_then(|m| m.get(1).copied())
@@ -19149,7 +19198,8 @@ pub(super) fn try_defined_assignment(
     // bypasses the slot indirection and the callee's first load of
     // the slot returns the literal byte pattern instead of the real
     // data address.
-    let mask = cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk);
+    let mask = callee_character_abi_mask(ctx.st, &rk)
+        .or_else(|| cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk));
     let rhs_is_char_star = mask
         .as_ref()
         .and_then(|m| m.get(1).copied())
@@ -19676,7 +19726,7 @@ pub(super) fn emit_resolved_operator_call(
         first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
     let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
     let callee_char_len_star_args =
-        first_procedure_lookup(&abi_lookup_keys, |k| callee_char_len_star_mask(st, k));
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_character_abi_mask(st, k));
     let hidden_result = hidden_abi.and_then(|abi| {
         let bytes = hidden_result_temp_bytes_for_callee(st, type_layouts, &abi_lookup_keys, abi)?;
         let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes));
@@ -21815,7 +21865,7 @@ pub(super) fn emit_named_function_call(
     );
 
     if let Some(cls_flags) =
-        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| callee_char_len_star_mask(st, k))
+        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| callee_character_abi_mask(st, k))
     {
         for (i, flag) in cls_flags.iter().enumerate() {
             if !*flag || i >= arg_slots.len() {
@@ -22044,9 +22094,8 @@ pub(super) fn emit_resolved_bound_proc_call(
     })
     .filter(|mask| mask.len() <= arg_slots.len());
     let callee_char_len_star_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-        char_len_star_params
-            .and_then(|m| cached_param_mask_for_lookup(st, m, k))
-            .or_else(|| callee_char_len_star_mask(st, k))
+        callee_character_abi_mask(st, k)
+            .or_else(|| char_len_star_params.and_then(|m| cached_param_mask_for_lookup(st, m, k)))
     });
     let callee_sequence_array_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_sequence_array_arg_mask(st, k));
@@ -23195,7 +23244,8 @@ pub(super) fn lower_alloc_return_call_into_desc(
     );
 
     if let Some(cls_flags) = first_procedure_lookup(&abi_lookup_keys, |k| {
-        cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)
+        callee_character_abi_mask(ctx.st, k)
+            .or_else(|| cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k))
     }) {
         for (i, flag) in cls_flags.iter().enumerate() {
             if !*flag || i >= arg_slots.len() {
@@ -26226,9 +26276,11 @@ pub(super) fn callee_is_bind_c(st: &SymbolTable, callee_name: &str) -> bool {
     false
 }
 
-/// Check if a callee has `character(len=*)` dummies via its scope in the
-/// symbol table. Returns a positional bitmap for the visible arguments.
-pub(super) fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
+/// Return the trailing CHARACTER-length ABI bitmap for a resolved procedure.
+/// Fixed-length character dummies participate in the ABI even though their
+/// hidden values are unused by the callee; implicit-interface callers cannot
+/// distinguish them from CHARACTER(*) dummies.
+pub(super) fn callee_character_abi_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
     let callee_scope = callee_scope_for_lookup(st, callee_name)?;
     let mask: Vec<bool> = callee_scope
         .arg_order
@@ -26238,8 +26290,10 @@ pub(super) fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> 
                 .symbols
                 .get(arg_name)
                 .map(|sym| {
-                    sym.attrs.assumed_length_character
-                        && !callee_is_bind_c(st, callee_name)
+                    matches!(
+                        sym.type_info,
+                        Some(crate::sema::symtab::TypeInfo::Character { .. })
+                    ) && !callee_is_bind_c(st, callee_name)
                         && !sym.attrs.allocatable
                         && !sym.attrs.pointer
                 })
@@ -36839,8 +36893,8 @@ fn emit_defined_io_call(
         vec![false, false, false, true]
     };
     let char_len_mask = first_procedure_lookup(&abi_lookup_keys, |key| {
-        cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, key)
-            .or_else(|| callee_char_len_star_mask(ctx.st, key))
+        callee_character_abi_mask(ctx.st, key)
+            .or_else(|| cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, key))
     })
     .unwrap_or(default_char_len_mask);
     let iotype_len = formatted
