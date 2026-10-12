@@ -26783,6 +26783,136 @@ end program p
 }
 
 #[test]
+fn fopenmp_module_pointer_threadprivate_persists_across_regions() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_module_pointer_threadprivate_persists_across_regions count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    for opt in ["-O0", "-O3"] {
+        let dir = unique_dir("openmp_pointer_threadprivate");
+        let module_src = write_program_in(
+            &dir,
+            "pointer_threadprivate_m.f90",
+            "module pointer_threadprivate_m
+  use omp_lib, only: omp_get_thread_num, omp_get_num_threads
+  implicit none
+  real(8), pointer :: view(:)
+  integer :: saved_id = -1
+  integer :: saved_team = -1
+!$omp threadprivate(view, saved_id, saved_team)
+contains
+  subroutine initialize_ids()
+!$omp parallel num_threads(4)
+    saved_id = omp_get_thread_num()
+    saved_team = omp_get_num_threads()
+!$omp end parallel
+  end subroutine initialize_ids
+
+  subroutine fill_views(primary, work, observed)
+    real(8), target, intent(inout) :: primary(3), work(3, 3)
+    integer, intent(out) :: observed(4)
+!$omp parallel default(shared) num_threads(4)
+    if (saved_team /= 4) error stop 1
+    if (saved_id == 0) then
+      view => primary(1:3)
+    else
+      view => work(:, saved_id)
+    end if
+!$omp barrier
+    if (.not. associated(view)) error stop 2
+    view = 10.0d0 + dble(saved_id)
+    observed(saved_id + 1) = int(view(1))
+!$omp end parallel
+  end subroutine fill_views
+end module pointer_threadprivate_m
+",
+        );
+        let program_src = write_program_in(
+            &dir,
+            "pointer_threadprivate_main.f90",
+            "program p
+  use pointer_threadprivate_m, only: initialize_ids, fill_views
+  implicit none
+  real(8) :: primary(3), work(3, 3)
+  integer :: observed(4), i
+  primary = -1.0d0
+  work = -2.0d0
+  observed = -99
+  call initialize_ids()
+  call fill_views(primary, work, observed)
+  if (any(abs(primary - 10.0d0) > 1.0d-12)) error stop 3
+  do i = 1, 3
+    if (any(abs(work(:, i) - dble(10 + i)) > 1.0d-12)) error stop 4
+  end do
+  if (any(observed /= [10, 11, 12, 13])) error stop 5
+  print *, 'ok'
+end program p
+",
+        );
+        let module_object = dir.join("pointer_threadprivate_m.o");
+        let compile_module = Command::new(compiler("armfortas"))
+            .args(["-fopenmp", opt, "-c", "-J"])
+            .arg(&dir)
+            .arg(&module_src)
+            .args(["-o"])
+            .arg(&module_object)
+            .output()
+            .expect("pointer THREADPRIVATE module compile failed to spawn");
+        assert!(
+            compile_module.status.success(),
+            "OpenMP pointer THREADPRIVATE module should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile_module.stderr)
+        );
+        let amod = std::fs::read_to_string(dir.join("pointer_threadprivate_m.amod"))
+            .expect("pointer THREADPRIVATE module did not publish .amod");
+        let view_decl = amod
+            .lines()
+            .find(|line| line.starts_with("@var view "))
+            .unwrap_or_else(|| panic!("pointer THREADPRIVATE variable missing from .amod: {amod}"));
+        assert!(
+            view_decl.contains("pointer")
+                && view_decl.contains("threadprivate")
+                && view_decl.contains("@rank 1"),
+            "pointer THREADPRIVATE attributes were not serialized: {view_decl}"
+        );
+
+        let executable = dir.join("pointer_threadprivate_main");
+        let runtime_cache = dir.join("runtime-cache");
+        std::fs::create_dir_all(&runtime_cache).expect("cannot create runtime cache");
+        let compile_program = Command::new(compiler("armfortas"))
+            .args(["-fopenmp", opt, "-I"])
+            .arg(&dir)
+            .arg(&program_src)
+            .arg(&module_object)
+            .args(["-o"])
+            .arg(&executable)
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("pointer THREADPRIVATE consumer compile failed to spawn");
+        assert!(
+            compile_program.status.success(),
+            "OpenMP pointer THREADPRIVATE consumer should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile_program.stderr)
+        );
+        let run = Command::new(&executable)
+            .output()
+            .expect("pointer THREADPRIVATE executable failed to run");
+        assert!(
+            run.status.success(),
+            "OpenMP pointer THREADPRIVATE executable failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
 fn fopenmp_threadprivate_rejects_unsupported_entities() {
     let cases = [
         (
@@ -26792,6 +26922,10 @@ fn fopenmp_threadprivate_rejects_unsupported_entities() {
         (
             "module m\ninteger, allocatable :: values(:)\n!$omp threadprivate(values)\nend module m\n",
             "OpenMP THREADPRIVATE currently requires a nonallocatable, nonpointer intrinsic numeric or LOGICAL module variable",
+        ),
+        (
+            "module m\ninteger, pointer :: values(:)\n!$omp threadprivate(values)\nend module m\n",
+            "OpenMP THREADPRIVATE pointer support currently requires a rank-one deferred-shape REAL module pointer without a non-NULL initializer",
         ),
         (
             "module m\ninteger :: value\n!$omp threadprivate(value)\ncontains\nsubroutine s\n!$omp parallel shared(value)\nvalue=1\n!$omp end parallel\nend subroutine s\nend module m\n",

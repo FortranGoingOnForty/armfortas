@@ -4962,53 +4962,73 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                 .iter()
                 .any(|a| matches!(a, Attribute::OpenMpThreadPrivate));
             if has_threadprivate {
+                let attr_shape = attrs.iter().find_map(|attr| match attr {
+                    Attribute::Dimension(specs) => Some(specs),
+                    _ => None,
+                });
+                let has_parameter = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
+                let is_intrinsic_numeric_or_logical = matches!(
+                    type_spec,
+                    TypeSpec::Integer(_)
+                        | TypeSpec::Real(_)
+                        | TypeSpec::DoublePrecision
+                        | TypeSpec::Complex(_)
+                        | TypeSpec::DoubleComplex
+                        | TypeSpec::Logical(_)
+                );
+                let is_supported_real_pointer = has_pointer
+                    && !has_alloc
+                    && !has_parameter
+                    && matches!(type_spec, TypeSpec::Real(_) | TypeSpec::DoublePrecision)
+                    && entities.iter().all(|entity| {
+                        entity.ptr_init.is_none()
+                            && entity
+                                .array_spec
+                                .as_ref()
+                                .or(attr_shape)
+                                .is_some_and(|specs| {
+                                    specs.len() == 1 && matches!(specs[0], ArraySpec::Deferred)
+                                })
+                    });
                 if !matches!(ctx.st.scope(ctx.scope_id).kind, ScopeKind::Module(_)) {
                     ctx.error(
                         decl.span,
                         "OpenMP THREADPRIVATE is currently supported only for module variables",
                     );
                 }
-                if has_alloc
-                    || has_pointer
-                    || attrs.iter().any(|a| matches!(a, Attribute::Parameter))
-                    || !matches!(
-                        type_spec,
-                        TypeSpec::Integer(_)
-                            | TypeSpec::Real(_)
-                            | TypeSpec::DoublePrecision
-                            | TypeSpec::Complex(_)
-                            | TypeSpec::DoubleComplex
-                            | TypeSpec::Logical(_)
-                    )
+                if has_pointer && !is_supported_real_pointer {
+                    ctx.error(
+                        decl.span,
+                        "OpenMP THREADPRIVATE pointer support currently requires a rank-one deferred-shape REAL module pointer without a non-NULL initializer",
+                    );
+                } else if !has_pointer
+                    && (has_alloc || has_parameter || !is_intrinsic_numeric_or_logical)
                 {
                     ctx.error(
                         decl.span,
                         "OpenMP THREADPRIVATE currently requires a nonallocatable, nonpointer intrinsic numeric or LOGICAL module variable",
                     );
                 }
-                let attr_shape = attrs.iter().find_map(|attr| match attr {
-                    Attribute::Dimension(specs) => Some(specs),
-                    _ => None,
-                });
-                for entity in entities {
-                    if let Some(specs) = entity.array_spec.as_ref().or(attr_shape) {
-                        for spec in specs {
-                            let ArraySpec::Explicit { lower, upper } = spec else {
-                                ctx.error(
-                                    decl.span,
-                                    "OpenMP THREADPRIVATE arrays currently require constant explicit shape",
-                                );
-                                continue;
-                            };
-                            if lower
-                                .as_ref()
-                                .is_some_and(|expr| validation_const_int_value(ctx, expr).is_none())
-                                || validation_const_int_value(ctx, upper).is_none()
-                            {
-                                ctx.error(
-                                    decl.span,
-                                    "OpenMP THREADPRIVATE arrays currently require constant explicit shape",
-                                );
+                if !has_pointer {
+                    for entity in entities {
+                        if let Some(specs) = entity.array_spec.as_ref().or(attr_shape) {
+                            for spec in specs {
+                                let ArraySpec::Explicit { lower, upper } = spec else {
+                                    ctx.error(
+                                        decl.span,
+                                        "OpenMP THREADPRIVATE arrays currently require constant explicit shape",
+                                    );
+                                    continue;
+                                };
+                                if lower.as_ref().is_some_and(|expr| {
+                                    validation_const_int_value(ctx, expr).is_none()
+                                }) || validation_const_int_value(ctx, upper).is_none()
+                                {
+                                    ctx.error(
+                                        decl.span,
+                                        "OpenMP THREADPRIVATE arrays currently require constant explicit shape",
+                                    );
+                                }
                             }
                         }
                     }
