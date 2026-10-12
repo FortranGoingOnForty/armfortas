@@ -4021,6 +4021,9 @@ pub(super) fn eval_const_int_expr_in_scope(
                 crate::ast::expr::BinaryOp::Sub => Some(l - r),
                 crate::ast::expr::BinaryOp::Mul => Some(l * r),
                 crate::ast::expr::BinaryOp::Div if r != 0 => Some(l / r),
+                crate::ast::expr::BinaryOp::Pow => u32::try_from(r)
+                    .ok()
+                    .and_then(|exponent| l.checked_pow(exponent)),
                 _ => None,
             }
         }
@@ -4357,6 +4360,32 @@ mod tests {
         assert!(prog_scope.symbols.contains_key("x"));
         assert!(prog_scope.symbols.contains_key("y"));
         assert!(prog_scope.symbols.contains_key("z"));
+    }
+
+    #[test]
+    fn standalone_parameter_exponent_dependencies_fold() {
+        let st = resolve_source(
+            "module parameters\n\
+               integer :: m, mk, mm, nn, nk\n\
+               parameter (m=24)\n\
+               parameter (mk=16, mm=m-mk, nn=2**mm, nk=2**mk)\n\
+             end module parameters\n",
+        );
+        let scope = st.find_module_scope("parameters").unwrap();
+        for (name, expected) in [
+            ("m", 24),
+            ("mk", 16),
+            ("mm", 8),
+            ("nn", 256),
+            ("nk", 65_536),
+        ] {
+            assert_eq!(
+                st.lookup_in(scope, name)
+                    .and_then(|symbol| symbol.const_value),
+                Some(expected),
+                "standalone PARAMETER {name} did not fold"
+            );
+        }
     }
 
     #[test]
