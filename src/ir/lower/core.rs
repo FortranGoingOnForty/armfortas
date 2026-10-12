@@ -4164,11 +4164,11 @@ pub(super) fn collect_implicit_locals(
         // layer (e.g. module procedures, use-associated symbols whose
         // globals we don't synthesise, interface generics) are
         // skipped so we don't shadow them with a bogus implicit alloca.
-        if ctx
-            .st
-            .lookup_local_then_any(ctx.proc_scope_id, &key)
-            .is_some()
-        {
+        let resolves_in_scope = match ctx.proc_scope_id {
+            Some(scope_id) => ctx.st.lookup_in(scope_id, &key).is_some(),
+            None => ctx.st.find_symbol_any_scope(&key).is_some(),
+        };
+        if resolves_in_scope {
             continue;
         }
 
@@ -23351,6 +23351,18 @@ pub(super) fn procedure_dummy_arg_ir_type(
         .is_some()
     {
         return procedure_code_ptr_ir_type();
+    }
+    // Keep explicit declarations authoritative: their source TypeSpec carries
+    // ABI details (notably CHARACTER length expressions) that the resolved
+    // symbol's canonical TypeInfo intentionally cannot always represent.
+    if declared_type_spec_for_name(arg_name, decls).is_some() {
+        return arg_type_from_decls(arg_name, decls, Some(st));
+    }
+    if let Some(type_info) = proc_scope_id
+        .and_then(|scope_id| st.lookup_in(scope_id, &key))
+        .and_then(|symbol| symbol.type_info.as_ref())
+    {
+        return type_info_to_ir_type(type_info);
     }
     arg_type_from_decls(arg_name, decls, Some(st))
 }

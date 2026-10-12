@@ -927,7 +927,7 @@ fn split_fixed_keyword_prefix(
     prior_tokens: &[Token],
 ) -> Option<usize> {
     let at_action_start = at_fixed_action_statement_start(prior_tokens);
-    if run.len() <= 4 {
+    if run.len() <= 3 {
         return None;
     }
 
@@ -946,6 +946,10 @@ fn split_fixed_keyword_prefix(
     // not become broadly ambiguous, but expose USE at statement start.
     if at_action_start && run[..3].eq_ignore_ascii_case("use") {
         return Some(3);
+    }
+
+    if run.len() <= 4 {
+        return None;
     }
 
     for prefix_len in (4..run.len()).rev() {
@@ -2322,7 +2326,15 @@ C     Hello World
                 "got different tokens for {source:?}"
             );
         }
+        for source in ["      USE M\n", "      USEM\n"] {
+            assert_eq!(
+                fixed_texts(source),
+                vec!["USE", "M"],
+                "got different tokens for {source:?}"
+            );
+        }
         assert_eq!(fixed_texts("      USEFUL=1\n"), vec!["USEFUL", "=", "1"]);
+        assert_eq!(fixed_texts("      USEM=1\n"), vec!["USEM", "=", "1"]);
     }
 
     #[test]
