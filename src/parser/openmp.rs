@@ -6,8 +6,8 @@ use super::{ParseError, Parser};
 use crate::ast::decl::{Attribute, Decl, SpannedDecl};
 use crate::ast::expr::Expr;
 use crate::ast::openmp::{
-    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionItem, OpenMpReductionOperator,
-    OpenMpScheduleKind,
+    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpDoacrossDependence, OpenMpReductionItem,
+    OpenMpReductionOperator, OpenMpScheduleKind,
 };
 use crate::ast::stmt::{SpannedStmt, Stmt};
 use crate::ast::Spanned;
@@ -23,6 +23,7 @@ enum OpenMpHeader {
     Master,
     Single(Vec<OpenMpClause>),
     Ordered,
+    OrderedDoacross(OpenMpDoacrossDependence),
     Barrier,
     Flush(Vec<String>),
     AtomicRead,
@@ -205,6 +206,10 @@ impl<'a> Parser<'a> {
                     span_through(directive.span, end_span),
                 ))
             }
+            OpenMpHeader::OrderedDoacross(dependence) => Ok(Spanned::new(
+                Stmt::OpenMp(OpenMpConstruct::OrderedDoacross { dependence }),
+                directive.span,
+            )),
             OpenMpHeader::Barrier => Ok(Spanned::new(
                 Stmt::OpenMp(OpenMpConstruct::Barrier),
                 directive.span,
@@ -436,8 +441,11 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
         }
         "single" => OpenMpHeader::Single(parse_clauses(&mut cursor, span, BeginKind::Single)?),
         "ordered" => {
-            cursor.finish()?;
-            OpenMpHeader::Ordered
+            if cursor.finished() {
+                OpenMpHeader::Ordered
+            } else {
+                OpenMpHeader::OrderedDoacross(parse_ordered_doacross(&mut cursor, span)?)
+            }
         }
         "barrier" => {
             cursor.finish()?;
@@ -548,6 +556,87 @@ fn parse_openmp_end_header(cursor: &mut DirectiveCursor<'_>) -> Result<OpenMpHea
             Ok(OpenMpHeader::EndOrdered)
         }
         other => Err(cursor.error(format!("unsupported OpenMP END directive 'end {other}'"))),
+    }
+}
+
+fn parse_ordered_doacross(
+    cursor: &mut DirectiveCursor<'_>,
+    span: Span,
+) -> Result<OpenMpDoacrossDependence, ParseError> {
+    let mut source = false;
+    let mut sink_vectors = Vec::new();
+    while !cursor.finished() {
+        let clause_name = cursor
+            .identifier("DEPEND or DOACROSS clause")?
+            .to_ascii_lowercase();
+        if clause_name != "depend" && clause_name != "doacross" {
+            return Err(cursor.error(format!("unsupported OpenMP ORDERED clause '{clause_name}'")));
+        }
+        let argument = cursor.parenthesized("ORDERED dependency clause")?;
+        let (kind, vector) = split_top_level_once(argument, ':')
+            .map_or((argument.trim(), None), |(kind, vector)| {
+                (kind.trim(), Some(vector.trim()))
+            });
+        match kind.to_ascii_lowercase().as_str() {
+            "source" => {
+                if source {
+                    return Err(
+                        cursor.error("OpenMP ORDERED may not repeat a source dependency".into())
+                    );
+                }
+                if !sink_vectors.is_empty() {
+                    return Err(cursor
+                        .error("OpenMP ORDERED may not mix source and sink dependencies".into()));
+                }
+                if vector.is_some_and(|value| !value.eq_ignore_ascii_case("omp_cur_iteration")) {
+                    return Err(cursor
+                        .error("OpenMP ORDERED source vector must be OMP_CUR_ITERATION".into()));
+                }
+                source = true;
+            }
+            "sink" => {
+                if source {
+                    return Err(cursor
+                        .error("OpenMP ORDERED may not mix source and sink dependencies".into()));
+                }
+                let Some(vector) = vector else {
+                    return Err(cursor.error(
+                        "OpenMP ORDERED sink dependency requires an iteration vector".into(),
+                    ));
+                };
+                let coordinates = split_top_level(vector, ',');
+                if coordinates.is_empty()
+                    || coordinates
+                        .iter()
+                        .any(|coordinate| coordinate.trim().is_empty())
+                {
+                    return Err(cursor
+                        .error("OpenMP ORDERED sink iteration vector must not be empty".into()));
+                }
+                sink_vectors.push(
+                    coordinates
+                        .into_iter()
+                        .map(|coordinate| {
+                            parse_clause_expr(coordinate, span, "ORDERED sink coordinate")
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            other => {
+                return Err(cursor.error(format!(
+                    "unsupported OpenMP ORDERED dependency type '{other}'"
+                )))
+            }
+        }
+    }
+    if source {
+        Ok(OpenMpDoacrossDependence::Source)
+    } else if sink_vectors.is_empty() {
+        Err(cursor.error("OpenMP ORDERED requires a source or sink dependency".into()))
+    } else {
+        Ok(OpenMpDoacrossDependence::Sink {
+            vectors: sink_vectors,
+        })
     }
 }
 
@@ -695,12 +784,16 @@ fn parse_clauses(
                 "COLLAPSE clause",
             )?),
             "ordered" => {
-                if cursor.peek_nonblank() == Some(b'(') {
-                    return Err(cursor.error(
-                        "parameterized OpenMP ORDERED clauses are not yet implemented".into(),
-                    ));
-                }
-                OpenMpClause::Ordered
+                let parameter = if cursor.peek_nonblank() == Some(b'(') {
+                    Some(parse_clause_expr(
+                        cursor.parenthesized("ORDERED clause")?,
+                        span,
+                        "ORDERED clause",
+                    )?)
+                } else {
+                    None
+                };
+                OpenMpClause::Ordered(parameter)
             }
             "reduction" => {
                 let value = cursor.parenthesized("REDUCTION clause")?;
@@ -751,7 +844,7 @@ fn validate_clause_for_construct(
                 | OpenMpClause::LastPrivate { .. }
                 | OpenMpClause::Schedule { .. }
                 | OpenMpClause::Collapse(_)
-                | OpenMpClause::Ordered
+                | OpenMpClause::Ordered(_)
                 | OpenMpClause::Reduction { .. }
         ),
         BeginKind::Loop => matches!(
@@ -1299,7 +1392,7 @@ mod tests {
         };
         assert!(clauses
             .iter()
-            .any(|clause| matches!(clause, OpenMpClause::Ordered)));
+            .any(|clause| matches!(clause, OpenMpClause::Ordered(None))));
         let Stmt::DoLoop { body, .. } = loop_stmt.node else {
             panic!("expected controlled DO loop");
         };
@@ -1313,20 +1406,61 @@ mod tests {
     }
 
     #[test]
-    fn rejects_parameterized_ordered_clause() {
-        let error = parse(
+    fn parses_parameterized_ordered_clause() {
+        let stmt = parse(
             "!$omp do ordered(2)\n\
              do i = 1, n\n\
              end do\n",
             SourceForm::FreeForm,
         )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::Do { clauses, .. }) = stmt.node else {
+            panic!("expected worksharing-do construct");
+        };
+        assert!(matches!(
+            clauses.as_slice(),
+            [OpenMpClause::Ordered(Some(Spanned {
+                node: Expr::IntegerLiteral { text, .. },
+                ..
+            }))] if text == "2"
+        ));
+    }
+
+    #[test]
+    fn parses_legacy_and_modern_ordered_doacross_directives() {
+        let sink = parse(
+            "!$omp ordered depend(sink: k-1,j) depend(sink: k,j-1)\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        assert!(matches!(
+            sink.node,
+            Stmt::OpenMp(OpenMpConstruct::OrderedDoacross {
+                dependence: OpenMpDoacrossDependence::Sink { vectors }
+            }) if vectors.len() == 2 && vectors.iter().all(|vector| vector.len() == 2)
+        ));
+
+        let source = parse(
+            "C$OMP ORDERED DOACROSS(SOURCE: OMP_CUR_ITERATION)\n",
+            SourceForm::FixedForm,
+        )
+        .unwrap();
+        assert!(matches!(
+            source.node,
+            Stmt::OpenMp(OpenMpConstruct::OrderedDoacross {
+                dependence: OpenMpDoacrossDependence::Source
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_mixed_ordered_doacross_dependencies() {
+        let error = parse(
+            "!$omp ordered depend(sink: k-1,j) depend(source)\n",
+            SourceForm::FreeForm,
+        )
         .unwrap_err();
-        assert!(
-            error
-                .msg
-                .contains("parameterized OpenMP ORDERED clauses are not yet implemented"),
-            "{error}"
-        );
+        assert!(error.msg.contains("may not mix source and sink"), "{error}");
     }
 
     #[test]

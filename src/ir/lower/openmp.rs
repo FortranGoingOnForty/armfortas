@@ -603,6 +603,9 @@ pub(super) fn lower_construct(
         OpenMpConstruct::Master { body } => lower_master_region(b, ctx, body),
         OpenMpConstruct::Single { clauses, body } => lower_single_region(b, ctx, clauses, body),
         OpenMpConstruct::Ordered { body } => lower_ordered_region(b, ctx, body),
+        OpenMpConstruct::OrderedDoacross { .. } => {
+            unreachable!("unsupported OpenMP ORDERED doacross escaped semantic validation")
+        }
         OpenMpConstruct::Barrier => {
             b.call(
                 FuncRef::External("afs_omp_barrier".into()),
@@ -824,7 +827,7 @@ fn lower_parallel_region(
             | OpenMpClause::Default(_)
             | OpenMpClause::Schedule { .. }
             | OpenMpClause::Collapse(_)
-            | OpenMpClause::Ordered
+            | OpenMpClause::Ordered(_)
             | OpenMpClause::Reduction { .. } => {}
             _ => unreachable!("unsupported OpenMP PARALLEL clause passed semantic validation"),
         }
@@ -1955,7 +1958,7 @@ fn lower_worksharing_loop(
     };
     let ordered = clauses
         .iter()
-        .any(|clause| matches!(clause, OpenMpClause::Ordered));
+        .any(|clause| matches!(clause, OpenMpClause::Ordered(None)));
     if ordered {
         let status = b.call(
             FuncRef::External("afs_omp_ordered_prepare".into()),

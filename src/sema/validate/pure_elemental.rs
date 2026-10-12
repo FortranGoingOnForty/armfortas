@@ -255,6 +255,9 @@ pub(super) fn check_pure_stmt_expr_calls(ctx: &mut Ctx, stmt: &SpannedStmt) {
                     check_pure_expr_calls(ctx, expr);
                 }
             }
+            for expr in construct.standalone_expressions() {
+                check_pure_expr_calls(ctx, expr);
+            }
         }
         Stmt::Block { .. }
         | Stmt::Declaration(_)

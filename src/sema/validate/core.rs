@@ -2410,6 +2410,9 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                     validate_const_int_expr_tree(ctx, expr);
                 }
             }
+            for expr in construct.standalone_expressions() {
+                validate_const_int_expr_tree(ctx, expr);
+            }
         }
         Stmt::Block { .. }
         | Stmt::Declaration(_)
@@ -3458,6 +3461,9 @@ fn collect_reference_stmt(
                 if let Some(expr) = clause.expression() {
                     collect_reference_expr(expr, shadowed, facts);
                 }
+            }
+            for expr in construct.standalone_expressions() {
+                collect_reference_expr(expr, shadowed, facts);
             }
             if let Some(body) = construct.region_body() {
                 collect_reference_stmts(body, shadowed, facts);
@@ -6176,7 +6182,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 let enters_ordered_binding = construct
                     .clauses()
                     .iter()
-                    .any(|clause| matches!(clause, crate::ast::openmp::OpenMpClause::Ordered));
+                    .any(|clause| matches!(clause, crate::ast::openmp::OpenMpClause::Ordered(_)));
                 if enters_ordered_binding {
                     ctx.openmp_ordered_binding_depth += 1;
                 }

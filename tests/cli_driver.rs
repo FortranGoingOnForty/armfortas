@@ -24499,6 +24499,10 @@ fn fopenmp_worksharing_rejects_unsupported_forms() {
             "OpenMP ORDERED with COLLAPSE is recognized but not yet implemented",
         ),
         (
+            "program p\ninteger :: i,j\n!$omp parallel do ordered(2)\ndo i=1,4\ndo j=1,4\n!$omp ordered depend(sink:i-1,j)\ncontinue\n!$omp ordered depend(source)\nend do\nend do\n!$omp end parallel do\nend program\n",
+            "OpenMP ORDERED source/sink dependencies are recognized but not yet implemented",
+        ),
+        (
             "program p\n!$omp parallel\n!$omp ordered\ncontinue\n!$omp end ordered\n!$omp end parallel\nend program\n",
             "OpenMP ORDERED must be closely nested inside an OpenMP DO or PARALLEL DO region",
         ),

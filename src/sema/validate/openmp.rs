@@ -198,6 +198,13 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             }
             validate_structured_block(ctx, body);
         }
+        OpenMpConstruct::OrderedDoacross { .. } => {
+            reject_in_pure(ctx, span, "ORDERED DOACROSS");
+            ctx.error(
+                span,
+                "OpenMP ORDERED source/sink dependencies are recognized but not yet implemented",
+            );
+        }
         OpenMpConstruct::Barrier => {
             reject_in_pure(ctx, span, "BARRIER");
             if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
@@ -865,7 +872,7 @@ fn validate_parallel_clauses(
             }
             OpenMpClause::Schedule { .. } if combined_do => {}
             OpenMpClause::Collapse(_) if combined_do => {}
-            OpenMpClause::Ordered if combined_do => {}
+            OpenMpClause::Ordered(_) if combined_do => {}
             OpenMpClause::Nowait if combined_do => {
                 ctx.error(span, "OpenMP PARALLEL DO may not specify NOWAIT")
             }
@@ -1326,7 +1333,7 @@ fn validate_worksharing_loop(
                 }
             }
             OpenMpClause::Collapse(_) => {}
-            OpenMpClause::Ordered => {}
+            OpenMpClause::Ordered(_) => {}
             OpenMpClause::Reduction { items, .. } if items
                 .iter()
                 .any(|item| associated_loop_keys.contains(&item.base_name().to_ascii_lowercase())) =>
@@ -1407,7 +1414,7 @@ fn validate_ordered_worksharing_shape(
 ) {
     if !clauses
         .iter()
-        .any(|clause| matches!(clause, OpenMpClause::Ordered))
+        .any(|clause| matches!(clause, OpenMpClause::Ordered(None)))
     {
         return;
     }
@@ -1934,7 +1941,7 @@ fn clause_name(clause: &OpenMpClause) -> &'static str {
         OpenMpClause::NumThreads(_) => "NUM_THREADS",
         OpenMpClause::Schedule { .. } => "SCHEDULE",
         OpenMpClause::Collapse(_) => "COLLAPSE",
-        OpenMpClause::Ordered => "ORDERED",
+        OpenMpClause::Ordered(_) => "ORDERED",
         OpenMpClause::Nowait => "NOWAIT",
         OpenMpClause::Reduction { .. } => "REDUCTION",
     }
