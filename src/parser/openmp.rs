@@ -337,19 +337,14 @@ impl<'a> Parser<'a> {
                             span_through(begin_span, directive.span),
                         ));
                     }
-                    header
-                        if matches!(
-                            header,
-                            OpenMpHeader::EndParallel
-                                | OpenMpHeader::EndDo { .. }
-                                | OpenMpHeader::EndLoop
-                                | OpenMpHeader::EndParallelDo { .. }
-                                | OpenMpHeader::EndCritical(_)
-                                | OpenMpHeader::EndMaster
-                                | OpenMpHeader::EndSingle { .. }
-                                | OpenMpHeader::EndOrdered
-                        ) =>
-                    {
+                    OpenMpHeader::EndParallel
+                    | OpenMpHeader::EndDo { .. }
+                    | OpenMpHeader::EndLoop
+                    | OpenMpHeader::EndParallelDo { .. }
+                    | OpenMpHeader::EndCritical(_)
+                    | OpenMpHeader::EndMaster
+                    | OpenMpHeader::EndSingle { .. }
+                    | OpenMpHeader::EndOrdered => {
                         return Err(ParseError {
                             span: directive.span,
                             msg: format!(
