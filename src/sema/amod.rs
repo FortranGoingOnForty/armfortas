@@ -3201,7 +3201,11 @@ pub fn extract_module_globals(
                     ty: ir_ty,
                     dims: var.dims.clone(),
                     declared_rank,
-                    allocatable: var.allocatable,
+                    // Pointer arrays use the same 392-byte descriptor
+                    // representation as allocatable arrays. Preserve that
+                    // representation across the .amod boundary just as
+                    // collect_module_globals does in the defining unit.
+                    allocatable: var.allocatable || (var.pointer && declared_rank > 0),
                     is_pointer: var.pointer,
                     volatile: var.volatile,
                     openmp_threadprivate: var.openmp_threadprivate,
