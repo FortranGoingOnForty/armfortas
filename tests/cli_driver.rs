@@ -26835,7 +26835,7 @@ end module copyin_m
   phase = (3.25d0, -4.5d0)
   values = [1.0d0, 2.0d0, 3.0d0]
   large = 5.0d0
-!$omp parallel default(shared) private(id) num_threads(4) copyin(scalar, flag, phase, values, large)
+!$omp parallel default(private) private(id) shared(copied) num_threads(4) copyin(scalar, flag, phase, values, large)
   id = omp_get_thread_num()
   if (scalar /= 41) error stop 1
   if (.not. flag) error stop 14

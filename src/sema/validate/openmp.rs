@@ -741,9 +741,8 @@ pub(super) fn parallel_private_names(
         .flat_map(|clause| match clause {
             OpenMpClause::Shared(names)
             | OpenMpClause::Private(names)
-            | OpenMpClause::FirstPrivate(names) => {
-                names.iter().map(String::as_str).collect::<Vec<_>>()
-            }
+            | OpenMpClause::FirstPrivate(names)
+            | OpenMpClause::CopyIn(names) => names.iter().map(String::as_str).collect::<Vec<_>>(),
             OpenMpClause::LastPrivate { variables, .. } => {
                 variables.iter().map(String::as_str).collect()
             }
@@ -777,6 +776,9 @@ pub(super) fn parallel_private_names(
         let Some(symbol) = ctx.lookup_lexical(&name) else {
             continue;
         };
+        if symbol.attrs.openmp_threadprivate {
+            continue;
+        }
         let predetermined_shared = symbol.kind == SymbolKind::Parameter
             || symbol
                 .attrs
