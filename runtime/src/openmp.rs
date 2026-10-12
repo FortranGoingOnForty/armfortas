@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -630,6 +630,18 @@ pub extern "C" fn afs_omp_barrier() -> i32 {
     if let Some(barrier) = barrier {
         barrier.wait();
     }
+    AFS_OMP_SUCCESS
+}
+
+/// Make the encountering thread's view of host memory sequentially
+/// consistent with a full OpenMP flush operation.
+///
+/// The compiler deliberately lowers both bare FLUSH and FLUSH(list) here.
+/// OpenMP permits an implementation to ignore the list and perform the
+/// stronger whole-thread-visible-data SEQ_CST operation instead.
+#[no_mangle]
+pub extern "C" fn afs_omp_flush() -> i32 {
+    fence(Ordering::SeqCst);
     AFS_OMP_SUCCESS
 }
 
@@ -2522,6 +2534,12 @@ mod tests {
     fn barrier_outside_explicit_team_completes_initial_team() {
         reset_thread_state();
         assert_eq!(afs_omp_barrier(), AFS_OMP_SUCCESS);
+    }
+
+    #[test]
+    fn flush_fence_is_available_without_an_explicit_team() {
+        reset_thread_state();
+        assert_eq!(afs_omp_flush(), AFS_OMP_SUCCESS);
     }
 
     unsafe extern "C" fn synchronize_task(

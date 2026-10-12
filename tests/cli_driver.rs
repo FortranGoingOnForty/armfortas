@@ -23713,6 +23713,111 @@ fn fopenmp_barrier_rejects_illegal_close_nesting() {
 }
 
 #[test]
+fn fopenmp_flush_publishes_shared_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_flush_publishes_shared_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: payload, ready, seen, failures, tid
+  payload = 0
+  ready = 0
+  failures = 0
+!$omp parallel default(none) num_threads(2) private(tid,seen) shared(payload,ready,failures)
+  tid = omp_get_thread_num()
+  if (tid == 0) then
+    payload = 1234
+!$omp flush(payload)
+!$omp atomic write
+    ready = 1
+  else
+    seen = 0
+    do while (seen /= 1)
+!$omp atomic read
+      seen = ready
+    end do
+!$omp flush(payload)
+    if (payload /= 1234) then
+!$omp atomic update
+      failures = failures + 1
+    end if
+  end if
+!$omp end parallel
+!$omp flush seq_cst
+  if (failures /= 0 .or. payload /= 1234 .or. ready /= 1) error stop 1
+  print *, 'ok'
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_flush", "bin");
+        let runtime_cache = unique_dir("openmp_flush_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP FLUSH compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP FLUSH should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..8 {
+            let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+                .expect("OpenMP FLUSH binary timed out");
+            assert!(
+                run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+                "OpenMP FLUSH failed at {opt}, iteration {iteration}: status={:?} stdout={} stderr={}",
+                run.status,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr),
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_flush_rejects_invalid_lists_and_pure_procedures() {
+    for (source, expected) in [
+        (
+            "program p\n  integer :: value\n!$omp flush(value,value)\nend program p\n",
+            "OpenMP FLUSH list item 'value' appears more than once",
+        ),
+        (
+            "program p\n!$omp flush(missing)\nend program p\n",
+            "OpenMP FLUSH list item 'missing' is not declared",
+        ),
+        (
+            "pure subroutine p\n!$omp flush\nend subroutine p\n",
+            "OpenMP FLUSH is not allowed in a PURE procedure",
+        ),
+    ] {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &["-fopenmp"]);
+        assert!(!result.status.success(), "invalid OpenMP FLUSH compiled");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(expected), "unexpected diagnostic: {stderr}");
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
 fn fopenmp_legacy_external_runtime_queries_link_owned_runtime() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

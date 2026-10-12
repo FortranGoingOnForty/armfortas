@@ -610,6 +610,13 @@ pub(super) fn lower_construct(
                 IrType::Int(IntWidth::I32),
             );
         }
+        OpenMpConstruct::Flush { .. } => {
+            b.call(
+                FuncRef::External("afs_omp_flush".into()),
+                vec![],
+                IrType::Int(IntWidth::I32),
+            );
+        }
         OpenMpConstruct::AtomicRead { assignment }
         | OpenMpConstruct::AtomicWrite { assignment }
         | OpenMpConstruct::AtomicUpdate { assignment } => {

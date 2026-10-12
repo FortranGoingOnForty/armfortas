@@ -214,6 +214,33 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
                 }
             }
         }
+        OpenMpConstruct::Flush { variables } => {
+            reject_in_pure(ctx, span, "FLUSH");
+            let mut seen = HashSet::new();
+            for variable in variables {
+                let key = variable.to_ascii_lowercase();
+                if !seen.insert(key) {
+                    ctx.error(
+                        span,
+                        format!("OpenMP FLUSH list item '{variable}' appears more than once"),
+                    );
+                    continue;
+                }
+                let Some(symbol) = ctx.lookup_lexical(variable) else {
+                    ctx.error(
+                        span,
+                        format!("OpenMP FLUSH list item '{variable}' is not declared"),
+                    );
+                    continue;
+                };
+                if symbol.kind != SymbolKind::Variable {
+                    ctx.error(
+                        span,
+                        format!("OpenMP FLUSH list item '{variable}' must name a variable"),
+                    );
+                }
+            }
+        }
         OpenMpConstruct::AtomicRead { assignment } => {
             reject_in_pure(ctx, span, "ATOMIC READ");
             validate_atomic_read(ctx, assignment);

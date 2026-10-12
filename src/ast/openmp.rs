@@ -40,6 +40,9 @@ pub enum OpenMpConstruct {
         body: Vec<SpannedStmt>,
     },
     Barrier,
+    Flush {
+        variables: Vec<String>,
+    },
     AtomicRead {
         assignment: Box<SpannedStmt>,
     },
@@ -63,6 +66,7 @@ impl OpenMpConstruct {
             Self::Single { .. } => "SINGLE",
             Self::Ordered { .. } => "ORDERED",
             Self::Barrier => "BARRIER",
+            Self::Flush { .. } => "FLUSH",
             Self::AtomicRead { .. } => "ATOMIC READ",
             Self::AtomicWrite { .. } => "ATOMIC WRITE",
             Self::AtomicUpdate { .. } => "ATOMIC UPDATE",
@@ -80,6 +84,7 @@ impl OpenMpConstruct {
             | Self::Master { .. }
             | Self::Ordered { .. }
             | Self::Barrier
+            | Self::Flush { .. }
             | Self::AtomicRead { .. }
             | Self::AtomicWrite { .. }
             | Self::AtomicUpdate { .. } => &[],
@@ -96,7 +101,11 @@ impl OpenMpConstruct {
             Self::AtomicRead { assignment }
             | Self::AtomicWrite { assignment }
             | Self::AtomicUpdate { assignment } => Some(std::slice::from_ref(assignment.as_ref())),
-            Self::Do { .. } | Self::Loop { .. } | Self::ParallelDo { .. } | Self::Barrier => None,
+            Self::Do { .. }
+            | Self::Loop { .. }
+            | Self::ParallelDo { .. }
+            | Self::Barrier
+            | Self::Flush { .. } => None,
         }
     }
 
@@ -111,6 +120,7 @@ impl OpenMpConstruct {
             | Self::Single { .. }
             | Self::Ordered { .. }
             | Self::Barrier
+            | Self::Flush { .. }
             | Self::AtomicRead { .. }
             | Self::AtomicWrite { .. }
             | Self::AtomicUpdate { .. } => None,

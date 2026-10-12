@@ -24,6 +24,7 @@ enum OpenMpHeader {
     Single(Vec<OpenMpClause>),
     Ordered,
     Barrier,
+    Flush(Vec<String>),
     AtomicRead,
     AtomicWrite,
     AtomicUpdate,
@@ -206,6 +207,10 @@ impl<'a> Parser<'a> {
             }
             OpenMpHeader::Barrier => Ok(Spanned::new(
                 Stmt::OpenMp(OpenMpConstruct::Barrier),
+                directive.span,
+            )),
+            OpenMpHeader::Flush(variables) => Ok(Spanned::new(
+                Stmt::OpenMp(OpenMpConstruct::Flush { variables }),
                 directive.span,
             )),
             atomic @ (OpenMpHeader::AtomicRead
@@ -437,6 +442,25 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
         "barrier" => {
             cursor.finish()?;
             OpenMpHeader::Barrier
+        }
+        "flush" => {
+            let variables = if cursor.peek_nonblank() == Some(b'(') {
+                parse_name_list(cursor.parenthesized("FLUSH list")?, span, "FLUSH list")?
+            } else if cursor.finished() {
+                Vec::new()
+            } else {
+                let order = cursor
+                    .identifier("OpenMP FLUSH memory-order clause")?
+                    .to_ascii_lowercase();
+                if order != "seq_cst" {
+                    return Err(cursor.error(format!(
+                        "OpenMP FLUSH {order} is recognized but not yet implemented"
+                    )));
+                }
+                Vec::new()
+            };
+            cursor.finish()?;
+            OpenMpHeader::Flush(variables)
         }
         "atomic" => {
             if !cursor.finished() {
@@ -1320,6 +1344,32 @@ mod tests {
     fn rejects_clauses_on_barrier_directive() {
         let error = parse("!$omp barrier nowait\n", SourceForm::FreeForm).unwrap_err();
         assert!(error.msg.contains("unexpected text 'nowait'"), "{error}");
+    }
+
+    #[test]
+    fn parses_bare_list_and_seq_cst_flush_directives() {
+        for (source, expected) in [
+            ("!$omp flush\n", Vec::<String>::new()),
+            ("!$omp flush seq_cst\n", Vec::<String>::new()),
+            (
+                "!$omp flush(first, second)\n",
+                vec!["first".into(), "second".into()],
+            ),
+        ] {
+            let stmt = parse(source, SourceForm::FreeForm).unwrap();
+            assert!(matches!(
+                stmt.node,
+                Stmt::OpenMp(OpenMpConstruct::Flush { variables }) if variables == expected
+            ));
+        }
+
+        let error = parse("!$omp flush acquire\n", SourceForm::FreeForm).unwrap_err();
+        assert!(
+            error
+                .msg
+                .contains("OpenMP FLUSH acquire is recognized but not yet implemented"),
+            "{error}"
+        );
     }
 
     #[test]
