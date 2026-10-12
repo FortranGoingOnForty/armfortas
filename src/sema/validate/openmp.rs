@@ -17,8 +17,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::expr::{Expr, SectionSubscript};
 use crate::ast::openmp::{
-    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionItem, OpenMpReductionOperator,
-    OpenMpScheduleKind,
+    OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpDoacrossDependence, OpenMpReductionItem,
+    OpenMpReductionOperator, OpenMpScheduleKind,
 };
 use crate::ast::stmt::{IoControl, RankGuard, SpannedStmt, Stmt, TypeGuard};
 use crate::lexer::Span;
@@ -198,12 +198,35 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             }
             validate_structured_block(ctx, body);
         }
-        OpenMpConstruct::OrderedDoacross { .. } => {
+        OpenMpConstruct::OrderedDoacross { dependence } => {
             reject_in_pure(ctx, span, "ORDERED DOACROSS");
-            ctx.error(
-                span,
-                "OpenMP ORDERED source/sink dependencies are recognized but not yet implemented",
-            );
+            if !matches!(
+                ctx.openmp_construct_stack.last().copied(),
+                Some("DO" | "PARALLEL DO")
+            ) {
+                ctx.error(
+                    span,
+                    "OpenMP ORDERED DOACROSS must be closely nested inside an OpenMP DO or PARALLEL DO region",
+                );
+            } else if ctx.openmp_doacross_binding_depth == 0 {
+                ctx.error(
+                    span,
+                    "the binding OpenMP worksharing loop must specify a parameterized ORDERED clause",
+                );
+            }
+            for coordinate in dependence.vectors().iter().flatten() {
+                if validation_expr_rank(ctx, coordinate) != Some(0)
+                    || !matches!(
+                        validation_expr_type_info(ctx, coordinate),
+                        Some(TypeInfo::Integer { .. })
+                    )
+                {
+                    ctx.error(
+                        coordinate.span,
+                        "OpenMP ORDERED sink coordinates must be scalar INTEGER expressions",
+                    );
+                }
+            }
         }
         OpenMpConstruct::Barrier => {
             reject_in_pure(ctx, span, "BARRIER");
@@ -1079,6 +1102,7 @@ fn validate_worksharing_loop(
     };
     let collapse_depth = validate_collapse_depth(ctx, span, clauses, kind);
     validate_ordered_worksharing_shape(ctx, span, clauses, &outer_loop, kind, collapse_depth);
+    validate_doacross_worksharing_shape(ctx, span, clauses, &outer_loop, kind, collapse_depth);
     let mut associated_loop_keys = HashSet::from([outer_loop.var.to_ascii_lowercase()]);
     if collapse_depth == 2 {
         let inner_stmt = if outer_loop.body.len() == 1 {
@@ -1451,6 +1475,265 @@ fn validate_ordered_worksharing_shape(
                 "OpenMP {} ORDERED currently requires exactly one directly nested unconditional ORDERED region per logical iteration",
                 kind.directive_name()
             ),
+        );
+    }
+}
+
+fn validate_doacross_worksharing_shape(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    clauses: &[OpenMpClause],
+    outer_loop: &AssociatedLoop<'_>,
+    kind: WorksharingLoopKind,
+    collapse_depth: usize,
+) {
+    let parameters = clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            OpenMpClause::Ordered(Some(parameter)) => Some(parameter),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(parameter) = parameters.first().copied() else {
+        return;
+    };
+    if parameters.len() > 1 {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP {} may not repeat the ORDERED clause",
+                kind.directive_name()
+            ),
+        );
+    }
+    if validation_expr_rank(ctx, parameter) != Some(0)
+        || !matches!(
+            validation_expr_type_info(ctx, parameter),
+            Some(TypeInfo::Integer { .. })
+        )
+    {
+        ctx.error(
+            parameter.span,
+            "OpenMP ORDERED parameter must be a scalar INTEGER constant expression",
+        );
+        return;
+    }
+    match validation_const_int_value(ctx, parameter) {
+        Some(2) => {}
+        Some(value) if value <= 0 => {
+            ctx.error(parameter.span, "OpenMP ORDERED parameter must be positive");
+            return;
+        }
+        Some(value) => {
+            ctx.error(
+                parameter.span,
+                format!(
+                    "OpenMP ORDERED({value}) is recognized but only two-dimensional doacross loops are implemented"
+                ),
+            );
+            return;
+        }
+        None => {
+            ctx.error(
+                parameter.span,
+                "OpenMP ORDERED parameter must be a constant expression",
+            );
+            return;
+        }
+    }
+    if collapse_depth != 1 {
+        ctx.error(
+            span,
+            "OpenMP ORDERED(2) with COLLAPSE is recognized but not yet implemented",
+        );
+    }
+    if clauses.iter().any(|clause| {
+        matches!(
+            clause,
+            OpenMpClause::Schedule {
+                kind,
+                ..
+            } if *kind != OpenMpScheduleKind::Static
+        )
+    }) {
+        ctx.error(
+            span,
+            "OpenMP ORDERED(2) currently supports only the default or STATIC schedule",
+        );
+    }
+    let [inner_stmt] = outer_loop.body else {
+        ctx.error(
+            span,
+            "OpenMP ORDERED(2) requires a perfectly nested second counted DO loop",
+        );
+        return;
+    };
+    let Some(inner_loop) =
+        validate_associated_loop(ctx, span, inner_stmt, "ORDERED(2) associated loop")
+    else {
+        return;
+    };
+    if inner_loop.var.eq_ignore_ascii_case(outer_loop.var) {
+        ctx.error(
+            inner_stmt.span,
+            "OpenMP ORDERED(2) associated loops must use distinct iteration variables",
+        );
+    }
+    if expression_references_name(inner_loop.start, outer_loop.var)
+        || expression_references_name(inner_loop.end, outer_loop.var)
+        || inner_loop
+            .step
+            .is_some_and(|step| expression_references_name(step, outer_loop.var))
+    {
+        ctx.error(
+            inner_stmt.span,
+            "OpenMP ORDERED(2) currently requires a rectangular associated loop nest",
+        );
+    }
+    let Some(outer_step) = doacross_constant_step(ctx, outer_loop) else {
+        ctx.error(
+            outer_loop.step.map_or(span, |step| step.span),
+            "OpenMP ORDERED(2) outer increment must currently be a nonzero constant expression",
+        );
+        return;
+    };
+    let Some(inner_step) = doacross_constant_step(ctx, &inner_loop) else {
+        ctx.error(
+            inner_loop.step.map_or(inner_stmt.span, |step| step.span),
+            "OpenMP ORDERED(2) inner increment must currently be a nonzero constant expression",
+        );
+        return;
+    };
+
+    let mut sink_directives = 0usize;
+    let mut source_directives = 0usize;
+    let mut saw_source = false;
+    for statement in inner_loop.body {
+        match &statement.node {
+            Stmt::OpenMp(OpenMpConstruct::OrderedDoacross {
+                dependence: OpenMpDoacrossDependence::Sink { vectors },
+            }) => {
+                sink_directives += 1;
+                if saw_source {
+                    ctx.error(
+                        statement.span,
+                        "OpenMP ORDERED sink dependencies must precede the source dependency in the implemented doacross form",
+                    );
+                }
+                for vector in vectors {
+                    validate_doacross_sink_vector(
+                        ctx,
+                        statement.span,
+                        vector,
+                        [outer_loop.var, inner_loop.var],
+                        [outer_step, inner_step],
+                    );
+                }
+            }
+            Stmt::OpenMp(OpenMpConstruct::OrderedDoacross {
+                dependence: OpenMpDoacrossDependence::Source,
+            }) => {
+                source_directives += 1;
+                saw_source = true;
+            }
+            Stmt::OpenMp(OpenMpConstruct::Ordered { .. }) => ctx.error(
+                statement.span,
+                "a parameterized OpenMP ORDERED loop must use stand-alone source/sink dependencies",
+            ),
+            _ => {}
+        }
+    }
+    if sink_directives == 0 || source_directives != 1 {
+        ctx.error(
+            span,
+            "OpenMP ORDERED(2) currently requires directly nested sink dependencies followed by exactly one source dependency in every inner iteration",
+        );
+    }
+    ctx.error(
+        span,
+        "OpenMP ORDERED source/sink dependencies are recognized but not yet implemented",
+    );
+}
+
+fn doacross_constant_step(ctx: &Ctx<'_>, associated: &AssociatedLoop<'_>) -> Option<i128> {
+    let step = associated
+        .step
+        .map_or(Some(1), |step| validation_const_int_value(ctx, step))?;
+    (step != 0).then_some(step)
+}
+
+fn doacross_coordinate_offset(
+    ctx: &Ctx<'_>,
+    coordinate: &crate::ast::expr::SpannedExpr,
+    variable: &str,
+) -> Option<i128> {
+    match &coordinate.node {
+        Expr::Name { name } if name.eq_ignore_ascii_case(variable) => Some(0),
+        Expr::ParenExpr { inner } => doacross_coordinate_offset(ctx, inner, variable),
+        Expr::BinaryOp { op, left, right }
+            if expression_is_name(left, variable)
+                && matches!(
+                    op,
+                    crate::ast::expr::BinaryOp::Add | crate::ast::expr::BinaryOp::Sub
+                ) =>
+        {
+            let offset = validation_const_int_value(ctx, right)?;
+            Some(if matches!(op, crate::ast::expr::BinaryOp::Sub) {
+                -offset
+            } else {
+                offset
+            })
+        }
+        _ => None,
+    }
+}
+
+fn validate_doacross_sink_vector(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    vector: &[crate::ast::expr::SpannedExpr],
+    variables: [&str; 2],
+    steps: [i128; 2],
+) {
+    if vector.len() != 2 {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP ORDERED(2) sink vectors must contain exactly two coordinates, found {}",
+                vector.len()
+            ),
+        );
+        return;
+    }
+    let mut first_logical_offset = None;
+    for ((coordinate, variable), step) in vector.iter().zip(variables).zip(steps) {
+        let Some(offset) = doacross_coordinate_offset(ctx, coordinate, variable) else {
+            ctx.error(
+                coordinate.span,
+                format!(
+                    "OpenMP ORDERED sink coordinate must have the form {variable}, {variable}+constant, or {variable}-constant"
+                ),
+            );
+            continue;
+        };
+        if offset % step != 0 {
+            ctx.error(
+                coordinate.span,
+                format!(
+                    "OpenMP ORDERED sink offset for '{variable}' must align with its loop increment"
+                ),
+            );
+            continue;
+        }
+        let logical_offset = offset / step;
+        if first_logical_offset.is_none() && logical_offset != 0 {
+            first_logical_offset = Some(logical_offset);
+        }
+    }
+    if first_logical_offset.is_none_or(|offset| offset >= 0) {
+        ctx.error(
+            span,
+            "OpenMP ORDERED sink vector must identify a lexicographically earlier logical iteration",
         );
     }
 }
