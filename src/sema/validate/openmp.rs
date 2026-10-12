@@ -443,12 +443,9 @@ pub(super) fn parallel_private_names(
     for (name, _, role) in capture_references(ctx.st, body) {
         let is_data_reference = role == ReferenceRole::Value
             || (role == ReferenceRole::Callable
-                && ctx.lookup_lexical(&name).is_some_and(|symbol| {
-                    matches!(
-                        symbol.kind,
-                        SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::ProcedurePointer
-                    )
-                }));
+                && ctx
+                    .lookup_lexical(&name)
+                    .is_some_and(|symbol| callable_reference_needs_capture(ctx.st, symbol, &name)));
         if !is_data_reference || explicitly_scoped.contains(&name) {
             continue;
         }
@@ -1607,6 +1604,32 @@ pub(crate) fn capture_references(
         .collect()
 }
 
+/// Decide whether an ambiguous callable reference carries runtime storage
+/// into an outlined region.  Array references, procedure pointers, and dummy
+/// procedures do; a named external procedure does not.  Typed EXTERNAL
+/// functions are represented as `Variable + attrs.external`, so checking the
+/// symbol kind alone would incorrectly capture names such as NPB's `randlc`.
+pub(crate) fn callable_reference_needs_capture(
+    st: &SymbolTable,
+    symbol: &crate::sema::symtab::Symbol,
+    name: &str,
+) -> bool {
+    match symbol.kind {
+        SymbolKind::ProcedurePointer => true,
+        SymbolKind::Variable | SymbolKind::Parameter => {
+            if !symbol.attrs.external {
+                return true;
+            }
+            let key = name.to_ascii_lowercase();
+            st.scope(symbol.scope)
+                .arg_order
+                .iter()
+                .any(|argument| argument == &key)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn predetermined_private_names(
     st: &SymbolTable,
     body: &[SpannedStmt],
@@ -1814,12 +1837,9 @@ fn validate_data_environment(
     for (name, span, role) in capture_references(ctx.st, body) {
         let is_data_reference = role == ReferenceRole::Value
             || (role == ReferenceRole::Callable
-                && ctx.lookup_lexical(&name).is_some_and(|symbol| {
-                    matches!(
-                        symbol.kind,
-                        SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::ProcedurePointer
-                    )
-                }));
+                && ctx
+                    .lookup_lexical(&name)
+                    .is_some_and(|symbol| callable_reference_needs_capture(ctx.st, symbol, &name)));
         if !is_data_reference
             || !seen.insert(name.clone())
             || clause_info.explicitly_scoped.contains(&name)

@@ -708,11 +708,8 @@ fn lower_parallel_region(
                             .st
                             .lookup_local_then_any(ctx.proc_scope_id, &name)
                             .is_some_and(|symbol| {
-                                matches!(
-                                    symbol.kind,
-                                    crate::sema::symtab::SymbolKind::Variable
-                                        | crate::sema::symtab::SymbolKind::Parameter
-                                        | crate::sema::symtab::SymbolKind::ProcedurePointer
+                                crate::sema::validate::openmp::callable_reference_needs_capture(
+                                    ctx.st, symbol, &name,
                                 )
                             }));
                 (is_data_reference
@@ -738,11 +735,8 @@ fn lower_parallel_region(
                             .st
                             .lookup_local_then_any(ctx.proc_scope_id, name)
                             .is_some_and(|symbol| {
-                                matches!(
-                                    symbol.kind,
-                                    crate::sema::symtab::SymbolKind::Variable
-                                        | crate::sema::symtab::SymbolKind::Parameter
-                                        | crate::sema::symtab::SymbolKind::ProcedurePointer
+                                crate::sema::validate::openmp::callable_reference_needs_capture(
+                                    ctx.st, symbol, name,
                                 )
                             })))
                     && !threadprivate_name_set.contains(name)

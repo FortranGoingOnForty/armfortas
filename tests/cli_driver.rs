@@ -75459,3 +75459,54 @@ fn implicit_external_subroutine_can_share_function_intrinsic_name() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn fopenmp_typed_external_function_is_not_captured_as_data() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_typed_external_function_is_not_captured_as_data count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "double precision function randlc(x, a)\n  implicit none\n  double precision, intent(in) :: x, a\n  randlc = x + a\nend function randlc\n\nprogram p\n  implicit none\n  external :: randlc\n  double precision :: randlc\n  double precision :: total\n  total = 0.0d0\n!$omp parallel default(shared) num_threads(4)\n!$omp critical(randlc_total)\n  total = total + randlc(1.0d0, 2.0d0)\n!$omp end critical(randlc_total)\n!$omp end parallel\n  if (total /= 12.0d0) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_typed_external_function", "bin");
+        let runtime_cache = unique_dir("openmp_typed_external_function_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("typed external OpenMP compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "typed external OpenMP compile failed at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&out)
+            .output()
+            .expect("typed external OpenMP binary failed to run");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "typed external OpenMP run failed at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+        let _ = fs::remove_file(&out);
+        let _ = fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = fs::remove_file(&src);
+}
