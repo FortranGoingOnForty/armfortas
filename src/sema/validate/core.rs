@@ -2378,8 +2378,10 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
         Stmt::Call { callee, args } => {
             validate_const_int_expr_tree(ctx, callee);
             if let Expr::Name { name } = &callee.node {
-                check_intrinsic_call_arity(ctx, stmt.span, name, args.len(), true);
-                check_intrinsic_call_types(ctx, stmt.span, name, args);
+                if intrinsic_call_resolves_to_intrinsic(ctx, name) {
+                    check_intrinsic_call_arity(ctx, stmt.span, name, args.len(), true);
+                    check_intrinsic_call_types(ctx, stmt.span, name, args);
+                }
             }
             let saved = ctx.in_call_arg;
             ctx.in_call_arg = true;
@@ -11550,6 +11552,23 @@ pub(super) fn resolved_intrinsic_name(ctx: &Ctx<'_>, name: &str) -> Option<Strin
     is_intrinsic_name(&key).then_some(key)
 }
 
+/// A function intrinsic name used as the target of an otherwise undeclared
+/// `CALL` establishes an implicit external subroutine, rather than an
+/// intrinsic reference.  This is how legacy code can call an external such as
+/// NPB's `verify` without an `EXTERNAL` statement.  Intrinsic subroutines and
+/// explicitly declared/imported intrinsic procedures still resolve to their
+/// intrinsic contracts.
+fn intrinsic_call_resolves_to_intrinsic(ctx: &Ctx<'_>, name: &str) -> bool {
+    let Some(key) = resolved_intrinsic_name(ctx, name) else {
+        return false;
+    };
+    intrinsic_is_subroutine(&key)
+        || ctx.lookup_lexical(name).is_some_and(|symbol| {
+            !symbol.attrs.external
+                && (symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc))
+        })
+}
+
 fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &[Argument]) {
     let Some(key) = resolved_intrinsic_name(ctx, name) else {
         return;
@@ -14336,6 +14355,44 @@ end program
             FortranStandard::F2008,
         );
         assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn call_context_treats_undeclared_function_intrinsic_names_as_externals() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: m
+  double precision :: sx, sy, gc(0:9)
+  logical :: verified
+  character :: class
+  call verify(m, sx, sy, gc, verified, class)
+  call abs(m)
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn explicitly_intrinsic_function_still_cannot_be_called_as_subroutine() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  intrinsic :: verify
+  integer :: position
+  call verify('abc', 'a', position)
+end program
+",
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("intrinsic 'verify' is a function") && err.contains("not a CALL")
+            }),
+            "{errs:?}"
+        );
     }
 
     #[test]

@@ -75370,3 +75370,92 @@ fn contained_character_and_complex_data_initialization_use_static_storage() {
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn implicit_external_subroutine_can_share_function_intrinsic_name() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=implicit_external_subroutine_can_share_function_intrinsic_name count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("external_verify_intrinsic_collision");
+    let provider = write_program_in(
+        &dir,
+        "verify.f90",
+        "subroutine verify(m, sx, sy, gc, verified, class)\n  implicit none\n  integer, intent(in) :: m\n  double precision, intent(in) :: sx, sy\n  double precision, intent(in) :: gc(0:9)\n  logical, intent(out) :: verified\n  character, intent(out) :: class\n  verified = m == 24 .and. sx == 1.25d0 .and. sy == 2.5d0 .and. gc(0) == 7.0d0\n  if (verified) then\n    class = 'S'\n  else\n    class = 'U'\n  end if\nend subroutine verify\n",
+    );
+    let caller = write_program_in(
+        &dir,
+        "caller.f90",
+        "program p\n  implicit none\n  integer :: m\n  double precision :: sx, sy, gc(0:9)\n  logical :: verified\n  character :: class\n  m = 24\n  sx = 1.25d0\n  sy = 2.5d0\n  gc = 0.0d0\n  gc(0) = 7.0d0\n  call verify(m, sx, sy, gc, verified, class)\n  if (.not. verified .or. class /= 'S') error stop 1\n  print *, 'ok'\nend program p\n",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let provider_obj = dir.join(format!("verify_{}.o", &opt[1..]));
+        let caller_obj = dir.join(format!("caller_{}.o", &opt[1..]));
+        let out = dir.join(format!("caller_{}.bin", &opt[1..]));
+
+        let compile_provider = Command::new(compiler("armfortas"))
+            .args([
+                opt,
+                "-c",
+                provider.to_str().unwrap(),
+                "-o",
+                provider_obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("external verify provider compile failed to spawn");
+        assert!(
+            compile_provider.status.success(),
+            "external verify provider compile failed at {opt}: {}",
+            String::from_utf8_lossy(&compile_provider.stderr)
+        );
+
+        let compile_caller = Command::new(compiler("armfortas"))
+            .args([
+                opt,
+                "-c",
+                caller.to_str().unwrap(),
+                "-o",
+                caller_obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("external verify caller compile failed to spawn");
+        assert!(
+            compile_caller.status.success(),
+            "external verify caller compile failed at {opt}: {}",
+            String::from_utf8_lossy(&compile_caller.stderr)
+        );
+
+        let link = Command::new(compiler("armfortas"))
+            .args([
+                provider_obj.to_str().unwrap(),
+                caller_obj.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("external verify link failed to spawn");
+        assert!(
+            link.status.success(),
+            "external verify link failed at {opt}: {}",
+            String::from_utf8_lossy(&link.stderr)
+        );
+
+        let run = Command::new(&out)
+            .output()
+            .expect("external verify binary failed to run");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "external verify run failed at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
