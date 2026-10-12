@@ -563,7 +563,48 @@ pub(super) fn lower_construct(
         OpenMpConstruct::Critical { name, body } => {
             lower_critical_region(b, ctx, name.as_deref(), body)
         }
+        OpenMpConstruct::Master { body } => lower_master_region(b, ctx, body),
+        OpenMpConstruct::AtomicUpdate { assignment } => {
+            b.call(
+                FuncRef::External("afs_omp_atomic_enter".into()),
+                vec![],
+                IrType::Int(IntWidth::I32),
+            );
+            super::stmt::lower_stmt(b, ctx, assignment);
+            b.call(
+                FuncRef::External("afs_omp_atomic_exit".into()),
+                vec![],
+                IrType::Int(IntWidth::I32),
+            );
+        }
     }
+}
+
+fn lower_master_region(b: &mut FuncBuilder<'_>, ctx: &mut LowerCtx<'_>, body: &[SpannedStmt]) {
+    let thread_num = if let Some((thread_num, _)) = ctx.openmp_team {
+        thread_num
+    } else {
+        // Semantic validation requires close nesting in PARALLEL. Keep the
+        // runtime query as a defensive lowering fallback for recovered ASTs.
+        b.call(
+            FuncRef::External("afs_omp_get_thread_num".into()),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        )
+    };
+    let zero = b.const_i32(0);
+    let is_primary = b.icmp(CmpOp::Eq, thread_num, zero);
+    let body_bb = b.create_block("omp_master_body");
+    let done_bb = b.create_block("omp_master_done");
+    b.cond_branch(is_primary, body_bb, vec![], done_bb, vec![]);
+
+    b.set_block(body_bb);
+    super::stmt::lower_stmts(b, ctx, body);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(done_bb, vec![]);
+    }
+    // MASTER has no implicit barrier; non-primary threads continue directly.
+    b.set_block(done_bb);
 }
 
 fn lower_critical_region(
@@ -685,6 +726,32 @@ fn lower_parallel_region(
         crate::sema::validate::openmp::predetermined_private_names(ctx.st, capture_body);
     let standalone_lastprivate =
         crate::sema::validate::openmp::standalone_worksharing_lastprivate_names(capture_body);
+    let mut threadprivate_names: Vec<_> =
+        crate::sema::validate::openmp::capture_references(ctx.st, capture_body)
+            .into_iter()
+            .filter_map(|(name, _, role)| {
+                let is_data_reference = role == crate::sema::validate::openmp::ReferenceRole::Value
+                    || (role == crate::sema::validate::openmp::ReferenceRole::Callable
+                        && ctx
+                            .st
+                            .lookup_local_then_any(ctx.proc_scope_id, &name)
+                            .is_some_and(|symbol| {
+                                crate::sema::validate::openmp::callable_reference_needs_capture(
+                                    ctx.st, symbol, &name,
+                                )
+                            }));
+                (is_data_reference
+                    && ctx
+                        .st
+                        .lookup_local_then_any(ctx.proc_scope_id, &name)
+                        .is_some_and(|symbol| symbol.attrs.openmp_threadprivate))
+                .then_some(name)
+            })
+            .collect();
+    threadprivate_names.sort_unstable();
+    threadprivate_names.dedup();
+    let threadprivate_name_set: std::collections::HashSet<_> =
+        threadprivate_names.iter().cloned().collect();
     let mut seen_captures = std::collections::HashSet::new();
     let mut captures: Vec<Capture> =
         crate::sema::validate::openmp::capture_references(ctx.st, capture_body)
@@ -696,13 +763,11 @@ fn lower_parallel_region(
                             .st
                             .lookup_local_then_any(ctx.proc_scope_id, name)
                             .is_some_and(|symbol| {
-                                matches!(
-                                    symbol.kind,
-                                    crate::sema::symtab::SymbolKind::Variable
-                                        | crate::sema::symtab::SymbolKind::Parameter
-                                        | crate::sema::symtab::SymbolKind::ProcedurePointer
+                                crate::sema::validate::openmp::callable_reference_needs_capture(
+                                    ctx.st, symbol, name,
                                 )
                             })))
+                    && !threadprivate_name_set.contains(name)
                     && seen_captures.insert(name.clone())
             })
             .map(|(name, _, _)| {
@@ -866,6 +931,19 @@ fn lower_parallel_region(
         {
             let mut outlined = FuncBuilder::new(&mut callback, ctx.layout);
             outlined.set_local_modules(local_modules);
+            for name in &threadprivate_names {
+                assert!(
+                    super::core::install_threadprivate_global(
+                        &mut outlined,
+                        &mut outlined_ctx.locals,
+                        outlined_ctx.globals,
+                        outlined_ctx.st,
+                        outlined_ctx.proc_scope_id,
+                        name,
+                    ),
+                    "validated OpenMP THREADPRIVATE variable '{name}' has no module global"
+                );
+            }
             let cleanup = install_shared_captures(&mut outlined, &mut outlined_ctx, &captures);
             let parallel_reductions = match region_body {
                 ParallelRegionBody::Statements(_) => {

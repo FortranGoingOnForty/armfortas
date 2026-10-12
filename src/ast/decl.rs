@@ -176,6 +176,9 @@ pub enum Attribute {
     Parameter,
     Value,
     Volatile,
+    /// OpenMP THREADPRIVATE storage for a module variable. This is produced
+    /// only from a `!$omp threadprivate(...)` declarative directive.
+    OpenMpThreadPrivate,
     Asynchronous,
     Protected,
     Contiguous,

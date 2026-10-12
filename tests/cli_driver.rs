@@ -3964,7 +3964,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 15\n", "#!amod 14\n", 1);
+        .replacen("#!amod 16\n", "#!amod 15\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -3991,7 +3991,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 14 (compiler requires 15)")
+        stderr.contains("incompatible .amod version 15 (compiler requires 16)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -6906,6 +6906,133 @@ fn implicit_interface_character_actuals_keep_hidden_lengths_across_objects() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn implicit_interface_mixed_character_dummies_keep_hidden_length_order() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=implicit_interface_mixed_character_dummies_keep_hidden_length_order count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // Legacy external interfaces append one trailing length for every
+    // CHARACTER actual, including fixed-length dummies. If the callee only
+    // reserves slots for CHARACTER(*), fixed dummies shift all later
+    // assumed-length values. NPB EP's print_results call has this ABI shape.
+    let dir = unique_dir("implicit_interface_mixed_character_lengths");
+    let callee = write_program_in(
+        &dir,
+        "callee.f90",
+        "subroutine inspect_report(name, bench_class, marker, operation, ok, version, stamp)\n  implicit none\n  character(len=*), intent(in) :: name\n  character, intent(in) :: bench_class\n  integer, intent(in) :: marker\n  character(len=24), intent(in) :: operation\n  logical, intent(out) :: ok\n  character(len=*), intent(in) :: version, stamp\n  ok = len(name) == 2 .and. name == 'EP'\n  ok = ok .and. bench_class == 'S' .and. marker == 17\n  ok = ok .and. len(operation) == 24\n  ok = ok .and. operation == 'Random numbers generated'\n  ok = ok .and. len(version) == 5 .and. version == '3.4.4'\n  ok = ok .and. len(stamp) == 11 .and. stamp == '11 Oct 2026'\nend subroutine inspect_report\n",
+    );
+    let caller = write_program_in(
+        &dir,
+        "caller.f90",
+        "program p\n  implicit none\n  character :: bench_class\n  character(len=5), parameter :: version = '3.4.4'\n  character(len=11), parameter :: stamp = '11 Oct 2026'\n  logical :: ok\n  bench_class = 'S'\n  ok = .false.\n  call inspect_report('EP', bench_class, 17, 'Random numbers generated', ok, version, stamp)\n  if (.not. ok) error stop 1\n  print *, 'ok'\nend program p\n",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let callee_obj = dir.join(format!("callee-{}.o", &opt[1..]));
+        let caller_obj = dir.join(format!("caller-{}.o", &opt[1..]));
+        let out = dir.join(format!("mixed-character-{}", &opt[1..]));
+        for (src, obj) in [(&callee, &callee_obj), (&caller, &caller_obj)] {
+            let compile = Command::new(compiler("armfortas"))
+                .args([
+                    opt,
+                    "-c",
+                    src.to_str().unwrap(),
+                    "-o",
+                    obj.to_str().unwrap(),
+                ])
+                .output()
+                .expect("mixed-character implicit-interface compile failed to spawn");
+            assert!(
+                compile.status.success(),
+                "mixed-character implicit-interface compile failed for {} at {}: {}",
+                src.display(),
+                opt,
+                String::from_utf8_lossy(&compile.stderr)
+            );
+        }
+        let link = Command::new(compiler("armfortas"))
+            .args([
+                caller_obj.to_str().unwrap(),
+                callee_obj.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("mixed-character implicit-interface link failed to spawn");
+        assert!(
+            link.status.success(),
+            "mixed-character implicit-interface link failed at {}: {}",
+            opt,
+            String::from_utf8_lossy(&link.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("mixed-character implicit-interface run failed");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "mixed-character implicit-interface run failed at {}: status={:?} stdout={} stderr={}",
+            opt,
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn legacy_fixed_character_dummy_preserves_entity_length() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=legacy_fixed_character_dummy_preserves_entity_length count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // NPB declares its report operation as `character optype*24`. The
+    // entity-specific length must govern LEN, comparisons, and I/O inside
+    // the callee just like `character(len=24) :: optype`.
+    let src = write_program(
+        "subroutine inspect_legacy(value, observed, ok)\n  implicit none\n  character value*24\n  integer, intent(out) :: observed\n  logical, intent(out) :: ok\n  observed = len(value)\n  ok = value == 'Random numbers generated'\nend subroutine inspect_legacy\n\nprogram p\n  implicit none\n  integer :: observed\n  logical :: ok\n  call inspect_legacy('Random numbers generated', observed, ok)\n  if (observed /= 24 .or. .not. ok) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path(
+            &format!("legacy_fixed_character_dummy_{}", &opt[1..]),
+            "bin",
+        );
+        let compile = Command::new(compiler("armfortas"))
+            .args([opt, src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("legacy fixed-character dummy compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "legacy fixed-character dummy should compile at {}: {}",
+            opt,
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("legacy fixed-character dummy run failed");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "legacy fixed-character dummy run failed at {}: status={:?} stdout={} stderr={}",
+            opt,
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_file(out);
+    }
+    let _ = std::fs::remove_file(src);
 }
 
 #[test]
@@ -22886,6 +23013,305 @@ end program
 }
 
 #[test]
+fn fopenmp_master_region_runs_only_on_primary_thread() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_master_region_runs_only_on_primary_thread count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  use omp_lib, only: omp_get_thread_num\n  implicit none\n  integer :: count, primary_thread\n  count = 0\n  primary_thread = -1\n!$omp parallel default(none) num_threads(4) shared(count,primary_thread)\n!$omp master\n  count = count + 1\n  primary_thread = omp_get_thread_num()\n!$omp end master\n!$omp end parallel\n  if (count /= 1) error stop 1\n  if (primary_thread /= 0) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_master", "bin");
+        let runtime_cache = unique_dir("openmp_master_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP MASTER compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP MASTER should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("OpenMP MASTER binary failed to run");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "OpenMP MASTER failed at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_master_requires_close_parallel_nesting() {
+    for source in [
+        "program p\n!$omp master\ncontinue\n!$omp end master\nend program p\n",
+        "program p\n!$omp parallel\n!$omp critical\n!$omp master\ncontinue\n!$omp end master\n!$omp end critical\n!$omp end parallel\nend program p\n",
+    ] {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &["-fopenmp"]);
+        assert!(!result.status.success(), "misnested OpenMP MASTER compiled");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(
+                "OpenMP MASTER must be closely nested inside an OpenMP PARALLEL region"
+            ),
+            "unexpected diagnostic: {stderr}"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
+fn fopenmp_legacy_external_runtime_queries_link_owned_runtime() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_legacy_external_runtime_queries_link_owned_runtime count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: threads, max_threads\n  double precision :: before, after\n!$ integer :: omp_get_num_threads, omp_get_max_threads\n!$ double precision :: omp_get_wtime\n!$ external :: omp_get_num_threads, omp_get_max_threads, omp_get_wtime\n  threads = 0\n  before = omp_get_wtime()\n!$omp parallel default(shared) num_threads(4)\n!$omp master\n  threads = omp_get_num_threads()\n!$omp end master\n!$omp end parallel\n  max_threads = omp_get_max_threads()\n  after = omp_get_wtime()\n  if (threads /= 4) error stop 1\n  if (max_threads < 1) error stop 2\n  if (after < before) error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_legacy_runtime_queries", "bin");
+        let runtime_cache = unique_dir("openmp_legacy_runtime_queries_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("legacy OpenMP runtime query compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "legacy OpenMP runtime queries should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("legacy OpenMP runtime query binary failed to run");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "legacy OpenMP runtime queries failed at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_atomic_numeric_add_updates_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_atomic_numeric_add_updates_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: iteration, slot, integer_total
+  double precision :: totals(0:3)
+  integer_total = 0
+  totals = 0.d0
+!$omp parallel default(none) num_threads(4) private(iteration,slot) shared(integer_total,totals)
+  do iteration = 1, 1000
+!$omp atomic
+    integer_total = integer_total + 1
+    slot = mod(iteration - 1, 4)
+!$omp atomic update
+    totals(slot) = totals(slot) + 1.d0
+  end do
+!$omp end parallel
+  if (integer_total /= 4000) error stop 1
+  if (any(totals /= 1000.d0)) error stop 2
+  print *, 'ok'
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_atomic_update", "bin");
+        let runtime_cache = unique_dir("openmp_atomic_update_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP ATOMIC UPDATE should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..4 {
+            let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+                .expect("OpenMP ATOMIC UPDATE binary timed out");
+            assert!(
+                run.status.success(),
+                "OpenMP ATOMIC UPDATE failed at {opt}, iteration {iteration}:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_atomic_rejects_unsupported_forms() {
+    let cases = [
+        (
+            "program p\ninteger :: value\n!$omp atomic read\nvalue=value\nend program p\n",
+            "OpenMP ATOMIC read is recognized but not yet implemented",
+        ),
+        (
+            "program p\ninteger :: value\n!$omp atomic\nvalue=value-1\nend program p\n",
+            "OpenMP ATOMIC UPDATE currently supports only 'x = x + expr' addition",
+        ),
+        (
+            "program p\ninteger :: left,right\n!$omp atomic\nleft=right+1\nend program p\n",
+            "OpenMP ATOMIC UPDATE left operand must match the assignment target",
+        ),
+    ];
+    for (source, expected) in cases {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &["-fopenmp"]);
+        assert!(
+            !result.status.success(),
+            "unsupported OpenMP ATOMIC compiled"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(expected), "unexpected diagnostic: {stderr}");
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
+fn fopenmp_internal_goto_stays_within_structured_block() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_internal_goto_stays_within_structured_block count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: outer, inner, tid
+  integer :: counts(0:3)
+  counts = 0
+!$omp parallel default(none) num_threads(4) private(outer,inner,tid) shared(counts)
+  tid = omp_get_thread_num()
+  do outer = 1, 2
+    do inner = 1, 5
+      if (inner == 3) goto 130
+      counts(tid) = counts(tid) + 1
+    end do
+130 continue
+  end do
+!$omp end parallel
+  if (any(counts /= 4)) error stop 1
+  print *, 'ok'
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_internal_goto", "bin");
+        let runtime_cache = unique_dir("openmp_internal_goto_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "internal GOTO in OpenMP structured block should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("internal OpenMP GOTO binary failed to run");
+        assert!(
+            run.status.success(),
+            "internal GOTO in OpenMP structured block failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_goto_cannot_leave_structured_block() {
+    let src = write_program(
+        "program p\n!$omp parallel if(.false.)\ngoto 200\n!$omp end parallel\n200 continue\nend program p\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-fopenmp"]);
+    assert!(
+        !result.status.success(),
+        "GOTO out of an OpenMP structured block compiled"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("GOTO may not leave an OpenMP structured block"),
+        "unexpected diagnostic: {stderr}"
+    );
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_named_critical_identity_crosses_translation_units() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -25118,6 +25544,146 @@ fn fopenmp_default_private_enforces_data_environment_rules() {
 }
 
 #[test]
+fn fopenmp_module_threadprivate_storage_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_module_threadprivate_storage_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    for opt in ["-O0", "-O3"] {
+        let dir = unique_dir("openmp_threadprivate");
+        let module_src = write_program_in(
+            &dir,
+            "threadprivate_m.f90",
+            "module threadprivate_m
+  implicit none
+  integer :: scalar = 7
+  integer :: values(2) = [11, 22]
+!$omp threadprivate(scalar, values)
+end module threadprivate_m
+",
+        );
+        let program_src = write_program_in(
+            &dir,
+            "threadprivate_main.f90",
+            "program p
+  use omp_lib, only: omp_get_thread_num
+  use threadprivate_m
+  implicit none
+  integer :: id
+  integer :: observed(4)
+  observed = -1
+  scalar = -1
+  values = [-2, -3]
+!$omp parallel default(shared) private(id) num_threads(4)
+  id = omp_get_thread_num()
+  if (id == 0) then
+    if (scalar /= -1 .or. values(1) /= -2) error stop 1
+  else
+    if (scalar /= 7 .or. values(1) /= 11) error stop 2
+  end if
+  scalar = 100 + id
+  values(1) = 200 + id
+  observed(id + 1) = scalar + values(1)
+!$omp end parallel
+  if (any(observed /= [300, 302, 304, 306])) error stop 3
+  if (scalar /= 100 .or. values(1) /= 200) error stop 4
+  print *, 'ok'
+end program p
+",
+        );
+        let module_object = dir.join("threadprivate_m.o");
+        let compile_module = Command::new(compiler("armfortas"))
+            .args(["-fopenmp", opt, "-c", "-J"])
+            .arg(&dir)
+            .arg(&module_src)
+            .args(["-o"])
+            .arg(&module_object)
+            .output()
+            .expect("THREADPRIVATE module compile failed to spawn");
+        assert!(
+            compile_module.status.success(),
+            "OpenMP THREADPRIVATE module should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile_module.stderr)
+        );
+        let amod = std::fs::read_to_string(dir.join("threadprivate_m.amod"))
+            .expect("THREADPRIVATE module did not publish .amod");
+        assert!(
+            amod.lines().any(|line| line.starts_with("@var scalar ")
+                && line
+                    .split(" @")
+                    .next()
+                    .is_some_and(|decl| decl.split(", ").any(|attr| attr == "threadprivate"))),
+            "THREADPRIVATE attribute was not serialized: {amod}"
+        );
+
+        let executable = dir.join("threadprivate_main");
+        let runtime_cache = dir.join("runtime-cache");
+        std::fs::create_dir_all(&runtime_cache).expect("cannot create runtime cache");
+        let compile_program = Command::new(compiler("armfortas"))
+            .args(["-fopenmp", opt, "-I"])
+            .arg(&dir)
+            .arg(&program_src)
+            .arg(&module_object)
+            .args(["-o"])
+            .arg(&executable)
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("THREADPRIVATE consumer compile failed to spawn");
+        assert!(
+            compile_program.status.success(),
+            "OpenMP THREADPRIVATE consumer should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile_program.stderr)
+        );
+        for _ in 0..3 {
+            let run = Command::new(&executable)
+                .output()
+                .expect("THREADPRIVATE executable failed to run");
+            assert!(
+                run.status.success(),
+                "OpenMP THREADPRIVATE executable failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn fopenmp_threadprivate_rejects_unsupported_entities() {
+    let cases = [
+        (
+            "program p\ninteger :: value\n!$omp threadprivate(value)\nend program p\n",
+            "OpenMP THREADPRIVATE is currently supported only for module variables",
+        ),
+        (
+            "module m\ninteger, allocatable :: values(:)\n!$omp threadprivate(values)\nend module m\n",
+            "OpenMP THREADPRIVATE currently requires a nonallocatable, nonpointer intrinsic numeric or LOGICAL module variable",
+        ),
+        (
+            "module m\ninteger :: value\n!$omp threadprivate(value)\ncontains\nsubroutine s\n!$omp parallel shared(value)\nvalue=1\n!$omp end parallel\nend subroutine s\nend module m\n",
+            "OpenMP THREADPRIVATE variable 'value' may not appear in a SHARED clause",
+        ),
+    ];
+    for (source, expected) in cases {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &["-fopenmp"]);
+        assert!(
+            !result.status.success(),
+            "unsupported OpenMP THREADPRIVATE entity compiled"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(expected), "unexpected diagnostic: {stderr}");
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
 fn fopenmp_shared_module_scalar_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -25159,6 +25725,87 @@ fn fopenmp_shared_module_scalar_runs() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_dir_all(&runtime_cache);
+}
+
+#[test]
+fn fopenmp_imported_fixed_array_shape_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_imported_fixed_array_shape_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    for opt in ["-O0", "-O3"] {
+        let dir = unique_dir("openmp_imported_fixed_array");
+        let provider = write_program_in(
+            &dir,
+            "fixed_array_m.f90",
+            "module fixed_array_m\n  implicit none\n  double precision :: values(0:3) = -1.d0\nend module fixed_array_m\n",
+        );
+        let consumer = write_program_in(
+            &dir,
+            "fixed_array_main.f90",
+            "program p
+  use omp_lib, only: omp_get_thread_num
+  use fixed_array_m, only: values
+  implicit none
+  integer :: tid
+!$omp parallel default(none) num_threads(4) private(tid) shared(values)
+  tid = omp_get_thread_num()
+  values(tid) = dble(tid + 1)
+!$omp end parallel
+  if (lbound(values, 1) /= 0 .or. ubound(values, 1) /= 3) error stop 1
+  if (any(values /= [1.d0, 2.d0, 3.d0, 4.d0])) error stop 2
+  print *, 'ok'
+end program p
+",
+        );
+        let provider_object = dir.join("fixed_array_m.o");
+        let compile_provider = Command::new(compiler("armfortas"))
+            .args([opt, "-c", "-J"])
+            .arg(&dir)
+            .arg(&provider)
+            .args(["-o"])
+            .arg(&provider_object)
+            .output()
+            .expect("fixed-array provider compile failed to spawn");
+        assert!(
+            compile_provider.status.success(),
+            "fixed-array provider should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile_provider.stderr)
+        );
+
+        let executable = dir.join("fixed_array_main");
+        let runtime_cache = dir.join("runtime-cache");
+        std::fs::create_dir_all(&runtime_cache).expect("cannot create runtime cache");
+        let compile_consumer = Command::new(compiler("armfortas"))
+            .args(["-fopenmp", opt, "-I"])
+            .arg(&dir)
+            .arg(&consumer)
+            .arg(&provider_object)
+            .args(["-o"])
+            .arg(&executable)
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("fixed-array consumer compile failed to spawn");
+        assert!(
+            compile_consumer.status.success(),
+            "imported fixed-array shape should survive .amod at {opt}: {}",
+            String::from_utf8_lossy(&compile_consumer.stderr)
+        );
+        let run = Command::new(&executable)
+            .output()
+            .expect("fixed-array consumer failed to run");
+        assert!(
+            run.status.success(),
+            "imported fixed-array consumer failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[test]
@@ -46752,7 +47399,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 15\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 16\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))
@@ -74964,5 +75611,145 @@ fn contained_character_and_complex_data_initialization_use_static_storage() {
     );
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn implicit_external_subroutine_can_share_function_intrinsic_name() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=implicit_external_subroutine_can_share_function_intrinsic_name count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("external_verify_intrinsic_collision");
+    let provider = write_program_in(
+        &dir,
+        "verify.f90",
+        "subroutine verify(m, sx, sy, gc, verified, class)\n  implicit none\n  integer, intent(in) :: m\n  double precision, intent(in) :: sx, sy\n  double precision, intent(in) :: gc(0:9)\n  logical, intent(out) :: verified\n  character, intent(out) :: class\n  verified = m == 24 .and. sx == 1.25d0 .and. sy == 2.5d0 .and. gc(0) == 7.0d0\n  if (verified) then\n    class = 'S'\n  else\n    class = 'U'\n  end if\nend subroutine verify\n",
+    );
+    let caller = write_program_in(
+        &dir,
+        "caller.f90",
+        "program p\n  implicit none\n  integer :: m\n  double precision :: sx, sy, gc(0:9)\n  logical :: verified\n  character :: class\n  m = 24\n  sx = 1.25d0\n  sy = 2.5d0\n  gc = 0.0d0\n  gc(0) = 7.0d0\n  call verify(m, sx, sy, gc, verified, class)\n  if (.not. verified .or. class /= 'S') error stop 1\n  print *, 'ok'\nend program p\n",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let provider_obj = dir.join(format!("verify_{}.o", &opt[1..]));
+        let caller_obj = dir.join(format!("caller_{}.o", &opt[1..]));
+        let out = dir.join(format!("caller_{}.bin", &opt[1..]));
+
+        let compile_provider = Command::new(compiler("armfortas"))
+            .args([
+                opt,
+                "-c",
+                provider.to_str().unwrap(),
+                "-o",
+                provider_obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("external verify provider compile failed to spawn");
+        assert!(
+            compile_provider.status.success(),
+            "external verify provider compile failed at {opt}: {}",
+            String::from_utf8_lossy(&compile_provider.stderr)
+        );
+
+        let compile_caller = Command::new(compiler("armfortas"))
+            .args([
+                opt,
+                "-c",
+                caller.to_str().unwrap(),
+                "-o",
+                caller_obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("external verify caller compile failed to spawn");
+        assert!(
+            compile_caller.status.success(),
+            "external verify caller compile failed at {opt}: {}",
+            String::from_utf8_lossy(&compile_caller.stderr)
+        );
+
+        let link = Command::new(compiler("armfortas"))
+            .args([
+                provider_obj.to_str().unwrap(),
+                caller_obj.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("external verify link failed to spawn");
+        assert!(
+            link.status.success(),
+            "external verify link failed at {opt}: {}",
+            String::from_utf8_lossy(&link.stderr)
+        );
+
+        let run = Command::new(&out)
+            .output()
+            .expect("external verify binary failed to run");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "external verify run failed at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fopenmp_typed_external_function_is_not_captured_as_data() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_typed_external_function_is_not_captured_as_data count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "double precision function randlc(x, a)\n  implicit none\n  double precision, intent(in) :: x, a\n  randlc = x + a\nend function randlc\n\nprogram p\n  implicit none\n  external :: randlc\n  double precision :: randlc\n  double precision :: total\n  total = 0.0d0\n!$omp parallel default(shared) num_threads(4)\n!$omp critical(randlc_total)\n  total = total + randlc(1.0d0, 2.0d0)\n!$omp end critical(randlc_total)\n!$omp end parallel\n  if (total /= 12.0d0) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_typed_external_function", "bin");
+        let runtime_cache = unique_dir("openmp_typed_external_function_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("typed external OpenMP compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "typed external OpenMP compile failed at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&out)
+            .output()
+            .expect("typed external OpenMP binary failed to run");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "typed external OpenMP run failed at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+        let _ = fs::remove_file(&out);
+        let _ = fs::remove_dir_all(&runtime_cache);
+    }
     let _ = fs::remove_file(&src);
 }

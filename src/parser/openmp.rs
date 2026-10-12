@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use super::{ParseError, Parser};
+use crate::ast::decl::{Attribute, Decl, SpannedDecl};
 use crate::ast::expr::Expr;
 use crate::ast::openmp::{
     OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionItem, OpenMpReductionOperator,
@@ -19,11 +20,14 @@ enum OpenMpHeader {
     Loop(Vec<OpenMpClause>),
     ParallelDo(Vec<OpenMpClause>),
     Critical(Option<String>),
+    Master,
+    AtomicUpdate,
     EndParallel,
     EndDo { nowait: bool },
     EndLoop,
     EndParallelDo { nowait: bool },
     EndCritical(Option<String>),
+    EndMaster,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +39,45 @@ enum BeginKind {
 }
 
 impl<'a> Parser<'a> {
+    pub(super) fn parse_openmp_declarative_directive(
+        &mut self,
+    ) -> Result<Option<SpannedDecl>, ParseError> {
+        if self.peek() != &TokenKind::OmpDirective {
+            return Ok(None);
+        }
+        let directive = self.current().clone();
+        let mut cursor = DirectiveCursor::new(&directive.text, directive.span);
+        let first = cursor
+            .identifier("OpenMP directive name")?
+            .to_ascii_lowercase();
+        if first != "threadprivate" {
+            return Ok(None);
+        }
+        let entities = parse_name_list(
+            cursor.parenthesized("THREADPRIVATE list")?,
+            directive.span,
+            "THREADPRIVATE list",
+        )?;
+        cursor.finish()?;
+        let mut seen = HashSet::new();
+        for entity in &entities {
+            if !seen.insert(entity.to_ascii_lowercase()) {
+                return Err(ParseError {
+                    span: directive.span,
+                    msg: format!("duplicate OpenMP THREADPRIVATE list item '{}'", entity),
+                });
+            }
+        }
+        self.advance();
+        Ok(Some(Spanned::new(
+            Decl::AttributeStmt {
+                attr: Attribute::OpenMpThreadPrivate,
+                entities,
+            },
+            directive.span,
+        )))
+    }
+
     pub(super) fn current_openmp_directive_starts_loop(&self) -> bool {
         let directive = self.current();
         directive.kind == TokenKind::OmpDirective
@@ -118,11 +161,36 @@ impl<'a> Parser<'a> {
                     span_through(directive.span, end_span),
                 ))
             }
+            OpenMpHeader::Master => {
+                let (body, end_span) = self.parse_openmp_region_end(OpenMpEnd::Master, None)?;
+                Ok(Spanned::new(
+                    Stmt::OpenMp(OpenMpConstruct::Master { body }),
+                    span_through(directive.span, end_span),
+                ))
+            }
+            OpenMpHeader::AtomicUpdate => {
+                self.skip_newlines();
+                let assignment = self.parse_stmt()?;
+                if !matches!(assignment.node, Stmt::Assignment { .. }) {
+                    return Err(ParseError {
+                        span: assignment.span,
+                        msg: "OpenMP ATOMIC UPDATE must be followed by an assignment".into(),
+                    });
+                }
+                let end_span = assignment.span;
+                Ok(Spanned::new(
+                    Stmt::OpenMp(OpenMpConstruct::AtomicUpdate {
+                        assignment: Box::new(assignment),
+                    }),
+                    span_through(directive.span, end_span),
+                ))
+            }
             OpenMpHeader::EndParallel
             | OpenMpHeader::EndDo { .. }
             | OpenMpHeader::EndLoop
             | OpenMpHeader::EndParallelDo { .. }
-            | OpenMpHeader::EndCritical(_) => Err(ParseError {
+            | OpenMpHeader::EndCritical(_)
+            | OpenMpHeader::EndMaster => Err(ParseError {
                 span: directive.span,
                 msg: format!("unexpected OpenMP end directive '!$omp {}'", directive.text),
             }),
@@ -202,6 +270,7 @@ impl<'a> Parser<'a> {
                         }
                         true
                     }
+                    (OpenMpEnd::Master, OpenMpHeader::EndMaster) => true,
                     _ => false,
                 };
                 if matches {
@@ -215,6 +284,7 @@ impl<'a> Parser<'a> {
                         | OpenMpHeader::EndLoop
                         | OpenMpHeader::EndParallelDo { .. }
                         | OpenMpHeader::EndCritical(_)
+                        | OpenMpHeader::EndMaster
                 ) {
                     return Err(ParseError {
                         span: directive.span,
@@ -235,6 +305,7 @@ impl<'a> Parser<'a> {
 enum OpenMpEnd {
     Parallel,
     Critical,
+    Master,
 }
 
 impl OpenMpEnd {
@@ -242,6 +313,7 @@ impl OpenMpEnd {
         match self {
             Self::Parallel => "parallel",
             Self::Critical => "critical",
+            Self::Master => "master",
         }
     }
 }
@@ -282,6 +354,22 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
             };
             cursor.finish()?;
             OpenMpHeader::Critical(name)
+        }
+        "master" => {
+            cursor.finish()?;
+            OpenMpHeader::Master
+        }
+        "atomic" => {
+            if !cursor.finished() {
+                let kind = cursor.identifier("OpenMP ATOMIC operation")?;
+                if !kind.eq_ignore_ascii_case("update") {
+                    return Err(cursor.error(format!(
+                        "OpenMP ATOMIC {kind} is recognized but not yet implemented"
+                    )));
+                }
+            }
+            cursor.finish()?;
+            OpenMpHeader::AtomicUpdate
         }
         "enddo" => OpenMpHeader::EndDo {
             nowait: parse_end_loop_clause(&mut cursor)?,
@@ -335,6 +423,10 @@ fn parse_openmp_end_header(cursor: &mut DirectiveCursor<'_>) -> Result<OpenMpHea
             };
             cursor.finish()?;
             Ok(OpenMpHeader::EndCritical(name))
+        }
+        "master" => {
+            cursor.finish()?;
+            Ok(OpenMpHeader::EndMaster)
         }
         other => Err(cursor.error(format!("unsupported OpenMP END directive 'end {other}'"))),
     }
@@ -989,6 +1081,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_master_region_nested_in_parallel() {
+        let stmt = parse(
+            "!$omp parallel shared(value)\n\
+             !$omp master\n\
+             value = 1\n\
+             !$omp end master\n\
+             !$omp end parallel\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::Parallel { body, .. }) = stmt.node else {
+            panic!("expected parallel construct");
+        };
+        assert!(matches!(
+            body.as_slice(),
+            [Spanned {
+                node: Stmt::OpenMp(OpenMpConstruct::Master { body }),
+                ..
+            }] if body.len() == 1
+        ));
+    }
+
+    #[test]
+    fn parses_implicit_and_explicit_atomic_updates() {
+        for source in [
+            "!$omp atomic\nvalue = value + 1\n",
+            "!$omp atomic update\nvalues(i) = values(i) + delta\n",
+        ] {
+            let stmt = parse(source, SourceForm::FreeForm).unwrap();
+            assert!(matches!(
+                stmt.node,
+                Stmt::OpenMp(OpenMpConstruct::AtomicUpdate { assignment })
+                    if matches!(assignment.node, Stmt::Assignment { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn parses_worksharing_do_clauses_and_end_nowait() {
         let stmt = parse(
             "!$omp do private(i), firstprivate(chunk) schedule(static, chunk) collapse(2)\n\
@@ -1097,6 +1227,43 @@ mod tests {
             [OpenMpClause::Collapse(argument)]
                 if matches!(&argument.node, Expr::IntegerLiteral { text, .. } if text == "2")
         ));
+    }
+
+    #[test]
+    fn parses_threadprivate_as_a_module_declaration() {
+        let tokens = tokenize_with_options(
+            "module m\n\
+             implicit none\n\
+             real(8) :: x(4), y(4)\n\
+             !$omp threadprivate(x, y)\n\
+             end module m\n",
+            0,
+            SourceForm::FreeForm,
+            LexerOptions { openmp: true },
+        )
+        .unwrap();
+        let units = Parser::new_for_form(&tokens, SourceForm::FreeForm)
+            .parse_file()
+            .unwrap();
+        let crate::ast::unit::ProgramUnit::Module { decls, .. } = &units[0].node else {
+            panic!("expected module");
+        };
+        let mut threadprivate_names: Vec<_> = decls
+            .iter()
+            .filter_map(|decl| match &decl.node {
+                Decl::TypeDecl {
+                    attrs, entities, ..
+                } if attrs
+                    .iter()
+                    .any(|attr| matches!(attr, Attribute::OpenMpThreadPrivate)) =>
+                {
+                    Some(entities[0].name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        threadprivate_names.sort_unstable();
+        assert_eq!(threadprivate_names, ["x", "y"]);
     }
 
     #[test]

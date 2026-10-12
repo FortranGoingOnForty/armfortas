@@ -1542,6 +1542,53 @@ fn entity_is_assumed_len_character(
     }
 }
 
+/// Compute the trailing CHARACTER-length ABI bitmap for a procedure.
+///
+/// The conventional Fortran ABI appends a length for every non-descriptor
+/// CHARACTER dummy, including dummies whose declared length is fixed.  A
+/// callee only *uses* the value for CHARACTER(*), but it must still reserve
+/// the fixed-length slots so callers with an implicit interface agree on the
+/// position of later lengths.  Keep this separate from
+/// `compute_char_len_star_flags`, which describes language semantics rather
+/// than the full calling convention.
+pub(super) fn compute_character_abi_flags(
+    args: &[crate::ast::unit::DummyArg],
+    decls: &[crate::ast::decl::SpannedDecl],
+    is_bind_c: bool,
+) -> Vec<bool> {
+    use crate::ast::decl::Attribute;
+    use crate::ast::unit::DummyArg;
+
+    args.iter()
+        .filter_map(|arg| match arg {
+            DummyArg::Name(name) => Some(name.to_lowercase()),
+            _ => None,
+        })
+        .map(|pname| {
+            if is_bind_c {
+                return false;
+            }
+            decls.iter().any(|decl| {
+                let Decl::TypeDecl {
+                    type_spec,
+                    attrs,
+                    entities,
+                } = &decl.node
+                else {
+                    return false;
+                };
+                matches!(type_spec, TypeSpec::Character(_))
+                    && !attrs
+                        .iter()
+                        .any(|attr| matches!(attr, Attribute::Allocatable | Attribute::Pointer))
+                    && entities
+                        .iter()
+                        .any(|entity| entity.name.eq_ignore_ascii_case(&pname))
+            })
+        })
+        .collect()
+}
+
 pub(super) fn compute_char_len_star_flags(
     args: &[crate::ast::unit::DummyArg],
     decls: &[crate::ast::decl::SpannedDecl],
@@ -3495,6 +3542,7 @@ pub struct ModuleGlobalInfo {
     pub allocatable: bool,
     pub is_pointer: bool,
     pub volatile: bool,
+    pub openmp_threadprivate: bool,
     pub deferred_char: bool,
     pub derived_type: Option<String>,
     pub(crate) char_kind: CharKind,
@@ -4946,6 +4994,9 @@ pub(super) fn collect_module_globals(
                     || module_scope_id
                         .and_then(|scope_id| st.lookup_in(scope_id, &key))
                         .is_some_and(|symbol| symbol.attrs.volatile);
+                let entity_is_threadprivate = module_scope_id
+                    .and_then(|scope_id| st.lookup_in(scope_id, &key))
+                    .is_some_and(|symbol| symbol.attrs.openmp_threadprivate);
                 let symbol = format!("afs_mod_{}_{}", mod_name.to_lowercase(), key);
                 let init_expr = entity
                     .init
@@ -5023,6 +5074,7 @@ pub(super) fn collect_module_globals(
                             allocatable: true,
                             is_pointer,
                             volatile: entity_is_volatile,
+                            openmp_threadprivate: entity_is_threadprivate,
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: array_char_kind,
@@ -5057,6 +5109,7 @@ pub(super) fn collect_module_globals(
                             allocatable: false,
                             is_pointer,
                             volatile: entity_is_volatile,
+                            openmp_threadprivate: entity_is_threadprivate,
                             deferred_char: true,
                             derived_type: None,
                             char_kind: CharKind::Deferred,
@@ -5106,6 +5159,7 @@ pub(super) fn collect_module_globals(
                             allocatable: true,
                             is_pointer: false,
                             volatile: entity_is_volatile,
+                            openmp_threadprivate: entity_is_threadprivate,
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: global_char_kind.clone(),
@@ -5308,6 +5362,7 @@ pub(super) fn collect_module_globals(
                             allocatable: false,
                             is_pointer,
                             volatile: entity_is_volatile,
+                            openmp_threadprivate: entity_is_threadprivate,
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: global_char_kind.clone(),
@@ -5337,6 +5392,7 @@ pub(super) fn collect_module_globals(
                                 allocatable: false,
                                 is_pointer: true,
                                 volatile: entity_is_volatile,
+                                openmp_threadprivate: entity_is_threadprivate,
                                 deferred_char: false,
                                 derived_type: derived_type_name.clone(),
                                 char_kind: global_char_kind.clone(),
@@ -5378,6 +5434,7 @@ pub(super) fn collect_module_globals(
                                     allocatable: false,
                                     is_pointer: false,
                                     volatile: entity_is_volatile,
+                                    openmp_threadprivate: entity_is_threadprivate,
                                     deferred_char: false,
                                     derived_type: None,
                                     char_kind: CharKind::Fixed(len),
@@ -5445,6 +5502,7 @@ pub(super) fn collect_module_globals(
                                     allocatable: false,
                                     is_pointer,
                                     volatile: entity_is_volatile,
+                                    openmp_threadprivate: entity_is_threadprivate,
                                     deferred_char: false,
                                     derived_type: Some(type_name.clone()),
                                     char_kind: CharKind::None,
@@ -5539,6 +5597,7 @@ pub(super) fn collect_module_globals(
                             allocatable: false,
                             is_pointer,
                             volatile: entity_is_volatile,
+                            openmp_threadprivate: entity_is_threadprivate,
                             deferred_char: false,
                             derived_type: None,
                             char_kind: global_char_kind.clone(),
@@ -8822,7 +8881,32 @@ pub(super) fn install_one_global(
     } else {
         info.ty.clone()
     };
-    let addr = b.global_addr(&info.symbol, addr_ty);
+    let template_addr = b.global_addr(&info.symbol, addr_ty.clone());
+    let addr = if info.openmp_threadprivate {
+        let element_count = info.dims.iter().fold(1_u64, |count, (_, extent)| {
+            count
+                .checked_mul(u64::try_from(*extent).expect("validated THREADPRIVATE extent"))
+                .expect("THREADPRIVATE array element count overflow")
+        });
+        let byte_count = addr_ty
+            .size_bytes(&b.layout)
+            .checked_mul(element_count)
+            .expect("THREADPRIVATE storage size overflow");
+        let byte_count = i64::try_from(byte_count).expect("THREADPRIVATE storage exceeds i64");
+        let alignment = u64::try_from(byte_count)
+            .unwrap_or(1)
+            .clamp(1, 16)
+            .next_power_of_two() as i64;
+        let byte_count_value = b.const_i64(byte_count);
+        let alignment_value = b.const_i64(alignment);
+        b.call(
+            FuncRef::External("afs_omp_threadprivate".into()),
+            vec![template_addr, byte_count_value, alignment_value],
+            IrType::Ptr(Box::new(addr_ty)),
+        )
+    } else {
+        template_addr
+    };
     if info.volatile {
         b.mark_volatile_address(addr);
     }
@@ -9141,6 +9225,42 @@ fn install_resolved_global_import(
         return;
     }
     install_one_global(b, locals, local_key, info, symbol.attrs.array_spec.len());
+}
+
+/// Install a THREADPRIVATE module variable directly in an outlined OpenMP
+/// callback. Unlike an ordinary capture, the callback must resolve the module
+/// template through the runtime on its own host thread; passing the
+/// encountering thread's resolved address through the environment would turn
+/// THREADPRIVATE storage back into shared storage.
+pub(super) fn install_threadprivate_global(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    st: &SymbolTable,
+    proc_scope_id: Option<crate::sema::symtab::ScopeId>,
+    local_key: &str,
+) -> bool {
+    let Some(symbol) = st.lookup_local_then_any(proc_scope_id, local_key) else {
+        return false;
+    };
+    if !symbol.attrs.openmp_threadprivate {
+        return false;
+    }
+    let Some(global_key) = defining_global_key(st, globals, symbol) else {
+        return false;
+    };
+    let info = &globals[&global_key];
+    if !info.openmp_threadprivate {
+        return false;
+    }
+    install_one_global(
+        b,
+        locals,
+        local_key.to_string(),
+        info,
+        symbol.attrs.array_spec.len(),
+    );
+    true
 }
 
 /// Install module globals imported by this function's USE
@@ -18426,7 +18546,8 @@ fn try_defined_array_constructor_assignment(
     };
 
     let rk = resolved.name.to_lowercase();
-    let mask = cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk);
+    let mask = callee_character_abi_mask(ctx.st, &rk)
+        .or_else(|| cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk));
     if !mask
         .as_ref()
         .and_then(|m| m.get(1).copied())
@@ -18767,7 +18888,8 @@ pub(super) fn try_defined_assignment_for_array_element(
         rhs_val
     };
 
-    let mask = cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk);
+    let mask = callee_character_abi_mask(ctx.st, &rk)
+        .or_else(|| cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk));
     let rhs_is_char_star = mask
         .as_ref()
         .and_then(|m| m.get(1).copied())
@@ -19076,7 +19198,8 @@ pub(super) fn try_defined_assignment(
     // bypasses the slot indirection and the callee's first load of
     // the slot returns the literal byte pattern instead of the real
     // data address.
-    let mask = cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk);
+    let mask = callee_character_abi_mask(ctx.st, &rk)
+        .or_else(|| cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, &rk));
     let rhs_is_char_star = mask
         .as_ref()
         .and_then(|m| m.get(1).copied())
@@ -19603,7 +19726,7 @@ pub(super) fn emit_resolved_operator_call(
         first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
     let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
     let callee_char_len_star_args =
-        first_procedure_lookup(&abi_lookup_keys, |k| callee_char_len_star_mask(st, k));
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_character_abi_mask(st, k));
     let hidden_result = hidden_abi.and_then(|abi| {
         let bytes = hidden_result_temp_bytes_for_callee(st, type_layouts, &abi_lookup_keys, abi)?;
         let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes));
@@ -21742,7 +21865,7 @@ pub(super) fn emit_named_function_call(
     );
 
     if let Some(cls_flags) =
-        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| callee_char_len_star_mask(st, k))
+        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| callee_character_abi_mask(st, k))
     {
         for (i, flag) in cls_flags.iter().enumerate() {
             if !*flag || i >= arg_slots.len() {
@@ -21971,9 +22094,8 @@ pub(super) fn emit_resolved_bound_proc_call(
     })
     .filter(|mask| mask.len() <= arg_slots.len());
     let callee_char_len_star_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-        char_len_star_params
-            .and_then(|m| cached_param_mask_for_lookup(st, m, k))
-            .or_else(|| callee_char_len_star_mask(st, k))
+        callee_character_abi_mask(st, k)
+            .or_else(|| char_len_star_params.and_then(|m| cached_param_mask_for_lookup(st, m, k)))
     });
     let callee_sequence_array_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_sequence_array_arg_mask(st, k));
@@ -23122,7 +23244,8 @@ pub(super) fn lower_alloc_return_call_into_desc(
     );
 
     if let Some(cls_flags) = first_procedure_lookup(&abi_lookup_keys, |k| {
-        cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)
+        callee_character_abi_mask(ctx.st, k)
+            .or_else(|| cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k))
     }) {
         for (i, flag) in cls_flags.iter().enumerate() {
             if !*flag || i >= arg_slots.len() {
@@ -23895,26 +24018,26 @@ pub(super) fn arg_char_kind_from_decls(
         {
             for entity in entities {
                 if entity.name.to_lowercase() == key {
-                    match type_spec {
-                        TypeSpec::Character(Some(sel)) => {
-                            if matches!(sel.len, Some(crate::ast::decl::LenSpec::Colon))
-                                && arg_uses_string_descriptor_from_decls(arg_name, decls)
+                    if !matches!(type_spec, TypeSpec::Character(_)) {
+                        return CharKind::None;
+                    }
+                    match effective_decl_char_len_spec(type_spec, entity.char_len.as_ref()) {
+                        Some(crate::ast::decl::LenSpec::Colon)
+                            if arg_uses_string_descriptor_from_decls(arg_name, decls) =>
+                        {
+                            return CharKind::Deferred;
+                        }
+                        Some(crate::ast::decl::LenSpec::Expr(e)) => {
+                            if let Some(n) =
+                                eval_const_int_in_scope_or_any_scope(e, &HashMap::new(), st)
                             {
-                                return CharKind::Deferred;
-                            }
-                            if let Some(crate::ast::decl::LenSpec::Expr(e)) = &sel.len {
-                                if let Some(n) =
-                                    eval_const_int_in_scope_or_any_scope(e, &HashMap::new(), st)
-                                {
-                                    return CharKind::Fixed(n);
-                                }
-                            }
-                            if sel.len.is_none() {
-                                return CharKind::Fixed(1);
+                                return CharKind::Fixed(n);
                             }
                         }
-                        TypeSpec::Character(None) => return CharKind::Fixed(1),
-                        _ => {}
+                        None => return CharKind::Fixed(1),
+                        Some(
+                            crate::ast::decl::LenSpec::Star | crate::ast::decl::LenSpec::Colon,
+                        ) => {}
                     }
                     return CharKind::None;
                 }
@@ -23939,8 +24062,10 @@ pub(super) fn arg_runtime_char_len_expr_from_decls(
         {
             for entity in entities {
                 if entity.name.to_lowercase() == key {
-                    if let TypeSpec::Character(Some(sel)) = type_spec {
-                        if let Some(crate::ast::decl::LenSpec::Expr(e)) = &sel.len {
+                    if matches!(type_spec, TypeSpec::Character(_)) {
+                        if let Some(crate::ast::decl::LenSpec::Expr(e)) =
+                            effective_decl_char_len_spec(type_spec, entity.char_len.as_ref())
+                        {
                             if eval_const_int_in_scope_or_any_scope(e, &HashMap::new(), st)
                                 .is_none()
                             {
@@ -26153,9 +26278,11 @@ pub(super) fn callee_is_bind_c(st: &SymbolTable, callee_name: &str) -> bool {
     false
 }
 
-/// Check if a callee has `character(len=*)` dummies via its scope in the
-/// symbol table. Returns a positional bitmap for the visible arguments.
-pub(super) fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
+/// Return the trailing CHARACTER-length ABI bitmap for a resolved procedure.
+/// Fixed-length character dummies participate in the ABI even though their
+/// hidden values are unused by the callee; implicit-interface callers cannot
+/// distinguish them from CHARACTER(*) dummies.
+pub(super) fn callee_character_abi_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
     let callee_scope = callee_scope_for_lookup(st, callee_name)?;
     let mask: Vec<bool> = callee_scope
         .arg_order
@@ -26165,8 +26292,10 @@ pub(super) fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> 
                 .symbols
                 .get(arg_name)
                 .map(|sym| {
-                    sym.attrs.assumed_length_character
-                        && !callee_is_bind_c(st, callee_name)
+                    matches!(
+                        sym.type_info,
+                        Some(crate::sema::symtab::TypeInfo::Character { .. })
+                    ) && !callee_is_bind_c(st, callee_name)
                         && !sym.attrs.allocatable
                         && !sym.attrs.pointer
                 })
@@ -36766,8 +36895,8 @@ fn emit_defined_io_call(
         vec![false, false, false, true]
     };
     let char_len_mask = first_procedure_lookup(&abi_lookup_keys, |key| {
-        cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, key)
-            .or_else(|| callee_char_len_star_mask(ctx.st, key))
+        callee_character_abi_mask(ctx.st, key)
+            .or_else(|| cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, key))
     })
     .unwrap_or(default_char_len_mask);
     let iotype_len = formatted

@@ -818,6 +818,34 @@ fn install_external_interface(
         };
         let array_spec = if var.rank == 0 {
             Vec::new()
+        } else if !var.allocatable && !var.pointer && var.dims.len() == var.rank {
+            var.dims
+                .iter()
+                .map(|(lower, extent)| {
+                    let upper = lower
+                        .checked_add(*extent)
+                        .and_then(|bound| bound.checked_sub(1))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                ".amod: fixed array bounds overflow for variable '{}'",
+                                var.name
+                            )
+                        });
+                    let integer_expr = |value: i64| {
+                        crate::ast::Spanned::new(
+                            Expr::IntegerLiteral {
+                                text: value.to_string(),
+                                kind: None,
+                            },
+                            dummy_span,
+                        )
+                    };
+                    ArraySpec::Explicit {
+                        lower: Some(integer_expr(*lower)),
+                        upper: integer_expr(upper),
+                    }
+                })
+                .collect()
         } else {
             let template = if var.allocatable || var.pointer {
                 ArraySpec::Deferred
@@ -833,6 +861,7 @@ fn install_external_interface(
             pointer: var.pointer,
             target: var.target,
             volatile: var.volatile,
+            openmp_threadprivate: var.openmp_threadprivate,
             parameter: var.is_parameter,
             external: var.proc_pointer,
             array_spec,

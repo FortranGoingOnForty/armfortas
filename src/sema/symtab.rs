@@ -2455,6 +2455,8 @@ pub struct SymbolAttrs {
     pub asynchronous: bool,
     pub contiguous: bool,
     pub volatile: bool,
+    /// The module variable has OpenMP THREADPRIVATE storage duration.
+    pub openmp_threadprivate: bool,
     /// The entity is a `character(len=*)` dummy and therefore carries a
     /// trailing hidden length in the non-BIND(C) procedure ABI. This must
     /// remain distinct from other nonconstant character lengths such as
@@ -2524,6 +2526,7 @@ impl Default for SymbolAttrs {
             asynchronous: false,
             contiguous: false,
             volatile: false,
+            openmp_threadprivate: false,
             assumed_length_character: false,
             bind_c: false,
             binding_label: None,

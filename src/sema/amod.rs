@@ -21,7 +21,7 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::{TypeLayout, TypeLayoutRegistry};
 
-const AMOD_VERSION: u32 = 15;
+const AMOD_VERSION: u32 = 16;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
 const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
 const AMOD_FINAL_ELEMENTAL_VERSION: u32 = 12;
@@ -848,6 +848,9 @@ fn emit_variable(
     }
     if sym.attrs.volatile {
         attrs.push("volatile");
+    }
+    if sym.attrs.openmp_threadprivate {
+        attrs.push("threadprivate");
     }
     if sym.attrs.access == Access::Private {
         attrs.push("private");
@@ -1700,6 +1703,7 @@ pub struct AmodVar {
     pub proc_pointer: bool,
     pub target: bool,
     pub volatile: bool,
+    pub openmp_threadprivate: bool,
     pub ir_symbol: Option<String>,
     pub deferred_char: bool,
     pub rank: usize,
@@ -2273,13 +2277,18 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     };
 
     let type_info = parse_type_info(clean_type_str.trim());
-    let allocatable = attr_str.contains("allocatable");
-    let save = attr_str.contains("save");
-    let pointer = attr_str.contains("pointer");
-    let proc_pointer = attr_str.contains("procptr");
-    let target = attr_str.contains("target");
-    let volatile = attr_str.contains("volatile");
-    let access = if attr_str.contains("private") {
+    let attrs: HashSet<_> = attr_str
+        .split(", ")
+        .filter(|attr| !attr.is_empty())
+        .collect();
+    let allocatable = attrs.contains("allocatable");
+    let save = attrs.contains("save");
+    let pointer = attrs.contains("pointer");
+    let proc_pointer = attrs.contains("procptr");
+    let target = attrs.contains("target");
+    let volatile = attrs.contains("volatile");
+    let openmp_threadprivate = attrs.contains("threadprivate");
+    let access = if attrs.contains("private") {
         Access::Private
     } else {
         Access::Public
@@ -2352,6 +2361,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         proc_pointer,
         target,
         volatile,
+        openmp_threadprivate,
         ir_symbol,
         deferred_char,
         rank: rank.max(dims.len()),
@@ -3194,6 +3204,7 @@ pub fn extract_module_globals(
                     allocatable: var.allocatable,
                     is_pointer: var.pointer,
                     volatile: var.volatile,
+                    openmp_threadprivate: var.openmp_threadprivate,
                     deferred_char: var.deferred_char,
                     derived_type,
                     char_kind: match var.type_info.as_ref() {
@@ -3539,7 +3550,7 @@ mod tests {
 
     #[test]
     fn current_default_access_header_is_required_and_preserved() {
-        let private = r#"#!amod 15
+        let private = r#"#!amod 16
 # module: private_facade
 # default-access: private
 
@@ -3557,7 +3568,7 @@ mod tests {
             ]
         );
 
-        let missing = r#"#!amod 15
+        let missing = r#"#!amod 16
 # module: missing_default_access
 
 @uses provider
@@ -3582,7 +3593,7 @@ mod tests {
 
     #[test]
     fn dotted_relational_operator_interface_loads_with_canonical_name() {
-        let text = r#"#!amod 15
+        let text = r#"#!amod 16
 # module: operators
 # default-access: public
 
@@ -4026,7 +4037,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 15
+            r#"#!amod 16
 # module: cache_test
 # default-access: public
 # source: cache_test.f90
@@ -4059,7 +4070,7 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 15
+            r#"#!amod 16
 # module: cached_parent
 # default-access: public
 # source: cached_parent.f90
@@ -4073,7 +4084,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 15
+            r#"#!amod 16
 # module: supplied_parent
 # default-access: private
 # ancestor-module: supplied_root
@@ -4107,7 +4118,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 15
+            r#"#!amod 16
 # module: child
 # default-access: public
 # ancestor-module: root
@@ -4207,7 +4218,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 6 (compiler requires 15)")
+            err.contains("incompatible .amod version 6 (compiler requires 16)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

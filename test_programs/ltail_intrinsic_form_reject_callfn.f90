@@ -1,7 +1,8 @@
-! L-tail: CALLing a function intrinsic is a compile error.
+! L-tail: CALLing an explicitly declared function intrinsic is a compile error.
 ! ERROR_EXPECTED: intrinsic 'sqrt' is a function; reference it in an expression, not a CALL
 program ltail_intrinsic_form_reject_callfn
   implicit none
+  intrinsic :: sqrt
   real :: x
   x = 2.0
   call sqrt(x)

@@ -4,7 +4,9 @@
 //! support selected intrinsic/derived storage, while canonical worksharing
 //! `DO` and combined `PARALLEL DO` support the implemented schedules and
 //! scalar LASTPRIVATE copy-out and predefined scalar/fixed-rank-one reductions.
-//! Named and unnamed `CRITICAL` regions retain process-wide lock identity.
+//! Named and unnamed `CRITICAL` regions retain process-wide lock identity,
+//! `MASTER` regions execute only on the primary thread without an implicit
+//! barrier, and the initial `ATOMIC UPDATE` slice covers scalar numeric addition.
 //! Keeping that boundary explicit lets the outliner execute real concurrent
 //! regions without pretending later schedules, loop clauses, or wider object
 //! ownership cases are already implemented.
@@ -118,6 +120,138 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             reject_in_pure(ctx, span, "CRITICAL");
             validate_structured_block(ctx, body);
         }
+        OpenMpConstruct::Master { body } => {
+            reject_in_pure(ctx, span, "MASTER");
+            if ctx.openmp_construct_stack.last().copied() != Some("PARALLEL") {
+                ctx.error(
+                    span,
+                    "OpenMP MASTER must be closely nested inside an OpenMP PARALLEL region",
+                );
+            }
+            validate_structured_block(ctx, body);
+        }
+        OpenMpConstruct::AtomicUpdate { assignment } => {
+            reject_in_pure(ctx, span, "ATOMIC UPDATE");
+            validate_atomic_update(ctx, span, assignment);
+        }
+    }
+}
+
+fn validate_atomic_update(ctx: &mut Ctx<'_>, _span: Span, assignment: &SpannedStmt) {
+    let Stmt::Assignment { target, value } = &assignment.node else {
+        ctx.error(
+            assignment.span,
+            "OpenMP ATOMIC UPDATE must be followed by an assignment",
+        );
+        return;
+    };
+    let Some(base_name) = atomic_target_base_name(target) else {
+        ctx.error(
+            target.span,
+            "OpenMP ATOMIC UPDATE target must be a scalar variable or side-effect-free array element",
+        );
+        return;
+    };
+    let Some(symbol) = ctx.lookup_lexical(base_name) else {
+        ctx.error(
+            target.span,
+            format!("OpenMP ATOMIC UPDATE target '{base_name}' is not declared"),
+        );
+        return;
+    };
+    if symbol.kind != SymbolKind::Variable || validation_expr_rank(ctx, target) != Some(0) {
+        ctx.error(
+            target.span,
+            "OpenMP ATOMIC UPDATE target must designate one scalar storage location",
+        );
+        return;
+    }
+    let supported_type = match validation_expr_type_info(ctx, target) {
+        Some(TypeInfo::Integer { kind }) => matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8),
+        Some(TypeInfo::Real { kind }) => matches!(
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
+            4 | 8
+        ),
+        Some(TypeInfo::DoublePrecision) => true,
+        Some(TypeInfo::Complex { kind }) => matches!(
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
+            4 | 8
+        ),
+        _ => false,
+    };
+    if !supported_type {
+        ctx.error(
+            target.span,
+            "OpenMP ATOMIC UPDATE addition currently requires a scalar INTEGER, REAL, DOUBLE PRECISION, or COMPLEX storage location",
+        );
+        return;
+    }
+    let Expr::BinaryOp {
+        op: crate::ast::expr::BinaryOp::Add,
+        left,
+        right,
+    } = &value.node
+    else {
+        ctx.error(
+            value.span,
+            "OpenMP ATOMIC UPDATE currently supports only 'x = x + expr' addition",
+        );
+        return;
+    };
+    if !target.to_sexpr().eq_ignore_ascii_case(&left.to_sexpr()) {
+        ctx.error(
+            left.span,
+            "OpenMP ATOMIC UPDATE left operand must match the assignment target",
+        );
+        return;
+    }
+    let mut facts = ProcedureReferenceFacts::default();
+    collect_reference_expr(right, &HashSet::new(), &mut facts);
+    if facts
+        .references
+        .iter()
+        .any(|reference| reference.name.eq_ignore_ascii_case(base_name))
+    {
+        ctx.error(
+            right.span,
+            format!("OpenMP ATOMIC UPDATE expression may not otherwise reference '{base_name}'"),
+        );
+    }
+}
+
+fn atomic_target_base_name(target: &crate::ast::expr::SpannedExpr) -> Option<&str> {
+    match &target.node {
+        Expr::Name { name } => Some(name),
+        Expr::FunctionCall { callee, args }
+            if !args.is_empty()
+                && args.iter().all(|argument| {
+                    argument.keyword.is_none()
+                        && matches!(
+                            &argument.value,
+                            SectionSubscript::Element(expr)
+                                if atomic_subscript_is_side_effect_free(expr)
+                        )
+                }) =>
+        {
+            match &callee.node {
+                Expr::Name { name } => Some(name),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn atomic_subscript_is_side_effect_free(expr: &crate::ast::expr::SpannedExpr) -> bool {
+    match &expr.node {
+        Expr::IntegerLiteral { .. } | Expr::Name { .. } => true,
+        Expr::UnaryOp { operand, .. } => atomic_subscript_is_side_effect_free(operand),
+        Expr::BinaryOp { left, right, .. } => {
+            atomic_subscript_is_side_effect_free(left)
+                && atomic_subscript_is_side_effect_free(right)
+        }
+        Expr::ParenExpr { inner } => atomic_subscript_is_side_effect_free(inner),
+        _ => false,
     }
 }
 
@@ -320,12 +454,9 @@ pub(super) fn parallel_private_names(
     for (name, _, role) in capture_references(ctx.st, body) {
         let is_data_reference = role == ReferenceRole::Value
             || (role == ReferenceRole::Callable
-                && ctx.lookup_lexical(&name).is_some_and(|symbol| {
-                    matches!(
-                        symbol.kind,
-                        SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::ProcedurePointer
-                    )
-                }));
+                && ctx
+                    .lookup_lexical(&name)
+                    .is_some_and(|symbol| callable_reference_needs_capture(ctx.st, symbol, &name)));
         if !is_data_reference || explicitly_scoped.contains(&name) {
             continue;
         }
@@ -964,7 +1095,14 @@ fn validate_worksharing_loop(
     if collapse_depth == 1 {
         cycle_targets.push(outer_loop.name.map(str::to_ascii_lowercase));
     }
-    validate_structured_block_with_cycle_targets(ctx, outer_loop.body, &mut cycle_targets);
+    let mut internal_labels = HashSet::new();
+    collect_structured_block_labels(outer_loop.body, &mut internal_labels);
+    validate_structured_block_with_cycle_targets(
+        ctx,
+        outer_loop.body,
+        &mut cycle_targets,
+        &internal_labels,
+    );
 }
 
 fn validate_lastprivate_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
@@ -1077,6 +1215,13 @@ fn validate_reduction_object(
         ctx.error(
             span,
             format!("OpenMP REDUCTION list item '{name}' must be a variable"),
+        );
+        return;
+    }
+    if symbol.attrs.openmp_threadprivate {
+        ctx.error(
+            span,
+            format!("OpenMP THREADPRIVATE variable '{name}' may not appear in a REDUCTION clause"),
         );
         return;
     }
@@ -1470,6 +1615,32 @@ pub(crate) fn capture_references(
         .collect()
 }
 
+/// Decide whether an ambiguous callable reference carries runtime storage
+/// into an outlined region.  Array references, procedure pointers, and dummy
+/// procedures do; a named external procedure does not.  Typed EXTERNAL
+/// functions are represented as `Variable + attrs.external`, so checking the
+/// symbol kind alone would incorrectly capture names such as NPB's `randlc`.
+pub(crate) fn callable_reference_needs_capture(
+    st: &SymbolTable,
+    symbol: &crate::sema::symtab::Symbol,
+    name: &str,
+) -> bool {
+    match symbol.kind {
+        SymbolKind::ProcedurePointer => true,
+        SymbolKind::Variable | SymbolKind::Parameter => {
+            if !symbol.attrs.external {
+                return true;
+            }
+            let key = name.to_ascii_lowercase();
+            st.scope(symbol.scope)
+                .arg_order
+                .iter()
+                .any(|argument| argument == &key)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn predetermined_private_names(
     st: &SymbolTable,
     body: &[SpannedStmt],
@@ -1677,12 +1848,9 @@ fn validate_data_environment(
     for (name, span, role) in capture_references(ctx.st, body) {
         let is_data_reference = role == ReferenceRole::Value
             || (role == ReferenceRole::Callable
-                && ctx.lookup_lexical(&name).is_some_and(|symbol| {
-                    matches!(
-                        symbol.kind,
-                        SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::ProcedurePointer
-                    )
-                }));
+                && ctx
+                    .lookup_lexical(&name)
+                    .is_some_and(|symbol| callable_reference_needs_capture(ctx.st, symbol, &name)));
         if !is_data_reference
             || !seen.insert(name.clone())
             || clause_info.explicitly_scoped.contains(&name)
@@ -1694,6 +1862,9 @@ fn validate_data_environment(
             validate_shared_object(ctx, &name, span);
             continue;
         };
+        if symbol.attrs.openmp_threadprivate {
+            continue;
+        }
         let predetermined_shared = symbol.kind == SymbolKind::Parameter
             || symbol
                 .attrs
@@ -1740,6 +1911,16 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
             span,
             format!(
                 "OpenMP PARALLEL capture of '{}' requires a variable or named constant",
+                name
+            ),
+        );
+        return;
+    }
+    if symbol.attrs.openmp_threadprivate {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP THREADPRIVATE variable '{}' may not appear in a SHARED clause",
                 name
             ),
         );
@@ -1905,6 +2086,16 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         ctx.error(
             span,
             format!("OpenMP {} list item '{}' must be a variable", clause, name),
+        );
+        return;
+    }
+    if symbol.attrs.openmp_threadprivate {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP THREADPRIVATE variable '{}' may not appear in a {} clause",
+                name, clause
+            ),
         );
         return;
     }
@@ -2220,20 +2411,35 @@ fn derived_layout_has_polymorphic_allocatable_components(
 }
 
 fn validate_structured_block(ctx: &mut Ctx<'_>, stmts: &[SpannedStmt]) {
-    validate_structured_block_with_cycle_targets(ctx, stmts, &mut Vec::new());
+    let mut internal_labels = HashSet::new();
+    collect_structured_block_labels(stmts, &mut internal_labels);
+    validate_structured_block_with_cycle_targets(ctx, stmts, &mut Vec::new(), &internal_labels);
 }
 
 fn validate_structured_block_with_cycle_targets(
     ctx: &mut Ctx<'_>,
     stmts: &[SpannedStmt],
     cycle_targets: &mut Vec<Option<String>>,
+    internal_labels: &HashSet<u64>,
 ) {
     for stmt in stmts {
         match &stmt.node {
             Stmt::Return { .. } => reject_transfer(ctx, stmt.span, "RETURN"),
-            Stmt::Goto { .. } => reject_transfer(ctx, stmt.span, "GOTO"),
-            Stmt::ComputedGoto { .. } => reject_transfer(ctx, stmt.span, "computed GOTO"),
-            Stmt::ArithmeticIf { .. } => reject_transfer(ctx, stmt.span, "arithmetic IF"),
+            Stmt::Goto { label } if !internal_labels.contains(label) => {
+                reject_external_branch(ctx, stmt.span, "GOTO")
+            }
+            Stmt::ComputedGoto { labels, .. }
+                if labels.iter().any(|label| !internal_labels.contains(label)) =>
+            {
+                reject_external_branch(ctx, stmt.span, "computed GOTO")
+            }
+            Stmt::ArithmeticIf { neg, zero, pos, .. }
+                if [neg, zero, pos]
+                    .into_iter()
+                    .any(|label| !internal_labels.contains(label)) =>
+            {
+                reject_external_branch(ctx, stmt.span, "arithmetic IF")
+            }
             Stmt::Exit { .. } => reject_transfer(ctx, stmt.span, "EXIT"),
             Stmt::Cycle { name } => {
                 let target_is_internal = match name {
@@ -2265,12 +2471,27 @@ fn validate_structured_block_with_cycle_targets(
                 else_body,
                 ..
             } => {
-                validate_structured_block_with_cycle_targets(ctx, then_body, cycle_targets);
+                validate_structured_block_with_cycle_targets(
+                    ctx,
+                    then_body,
+                    cycle_targets,
+                    internal_labels,
+                );
                 for (_, body) in else_ifs {
-                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                    validate_structured_block_with_cycle_targets(
+                        ctx,
+                        body,
+                        cycle_targets,
+                        internal_labels,
+                    );
                 }
                 if let Some(body) = else_body {
-                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                    validate_structured_block_with_cycle_targets(
+                        ctx,
+                        body,
+                        cycle_targets,
+                        internal_labels,
+                    );
                 }
             }
             Stmt::IfStmt { action, .. }
@@ -2281,23 +2502,37 @@ fn validate_structured_block_with_cycle_targets(
                     ctx,
                     std::slice::from_ref(action.as_ref()),
                     cycle_targets,
+                    internal_labels,
                 );
             }
             Stmt::DoLoop { name, body, .. }
             | Stmt::DoWhile { name, body, .. }
             | Stmt::DoConcurrent { name, body, .. } => {
                 cycle_targets.push(name.as_deref().map(str::to_ascii_lowercase));
-                validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                validate_structured_block_with_cycle_targets(
+                    ctx,
+                    body,
+                    cycle_targets,
+                    internal_labels,
+                );
                 cycle_targets.pop();
             }
             Stmt::Block { body, .. }
             | Stmt::Associate { body, .. }
-            | Stmt::ForallConstruct { body, .. } => {
-                validate_structured_block_with_cycle_targets(ctx, body, cycle_targets)
-            }
+            | Stmt::ForallConstruct { body, .. } => validate_structured_block_with_cycle_targets(
+                ctx,
+                body,
+                cycle_targets,
+                internal_labels,
+            ),
             Stmt::SelectCase { cases, .. } => {
                 for case in cases {
-                    validate_structured_block_with_cycle_targets(ctx, &case.body, cycle_targets);
+                    validate_structured_block_with_cycle_targets(
+                        ctx,
+                        &case.body,
+                        cycle_targets,
+                        internal_labels,
+                    );
                 }
             }
             Stmt::SelectType { guards, .. } => {
@@ -2307,7 +2542,12 @@ fn validate_structured_block_with_cycle_targets(
                         | TypeGuard::ClassIs { body, .. }
                         | TypeGuard::ClassDefault { body } => body,
                     };
-                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                    validate_structured_block_with_cycle_targets(
+                        ctx,
+                        body,
+                        cycle_targets,
+                        internal_labels,
+                    );
                 }
             }
             Stmt::SelectRank { guards, .. } => {
@@ -2317,20 +2557,110 @@ fn validate_structured_block_with_cycle_targets(
                         | RankGuard::RankStar { body }
                         | RankGuard::RankDefault { body } => body,
                     };
-                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                    validate_structured_block_with_cycle_targets(
+                        ctx,
+                        body,
+                        cycle_targets,
+                        internal_labels,
+                    );
                 }
             }
             Stmt::WhereConstruct {
                 body, elsewhere, ..
             } => {
-                validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                validate_structured_block_with_cycle_targets(
+                    ctx,
+                    body,
+                    cycle_targets,
+                    internal_labels,
+                );
                 for (_, body) in elsewhere {
-                    validate_structured_block_with_cycle_targets(ctx, body, cycle_targets);
+                    validate_structured_block_with_cycle_targets(
+                        ctx,
+                        body,
+                        cycle_targets,
+                        internal_labels,
+                    );
                 }
             }
             // A nested OpenMP region is a distinct structured block. It is
             // validated independently when normal statement validation
             // reaches it.
+            Stmt::OpenMp(_) => {}
+            _ => {}
+        }
+    }
+}
+
+fn collect_structured_block_labels(stmts: &[SpannedStmt], labels: &mut HashSet<u64>) {
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::Continue { label: Some(label) } => {
+                labels.insert(*label);
+            }
+            Stmt::Labeled { label, stmt } => {
+                labels.insert(*label);
+                collect_structured_block_labels(std::slice::from_ref(stmt.as_ref()), labels);
+            }
+            Stmt::IfConstruct {
+                then_body,
+                else_ifs,
+                else_body,
+                ..
+            } => {
+                collect_structured_block_labels(then_body, labels);
+                for (_, body) in else_ifs {
+                    collect_structured_block_labels(body, labels);
+                }
+                if let Some(body) = else_body {
+                    collect_structured_block_labels(body, labels);
+                }
+            }
+            Stmt::IfStmt { action, .. }
+            | Stmt::WhereStmt { stmt: action, .. }
+            | Stmt::ForallStmt { stmt: action, .. } => {
+                collect_structured_block_labels(std::slice::from_ref(action.as_ref()), labels)
+            }
+            Stmt::DoLoop { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::DoConcurrent { body, .. }
+            | Stmt::Block { body, .. }
+            | Stmt::Associate { body, .. }
+            | Stmt::ForallConstruct { body, .. } => collect_structured_block_labels(body, labels),
+            Stmt::SelectCase { cases, .. } => {
+                for case in cases {
+                    collect_structured_block_labels(&case.body, labels);
+                }
+            }
+            Stmt::SelectType { guards, .. } => {
+                for guard in guards {
+                    let body = match guard {
+                        TypeGuard::TypeIs { body, .. }
+                        | TypeGuard::ClassIs { body, .. }
+                        | TypeGuard::ClassDefault { body } => body,
+                    };
+                    collect_structured_block_labels(body, labels);
+                }
+            }
+            Stmt::SelectRank { guards, .. } => {
+                for guard in guards {
+                    let body = match guard {
+                        RankGuard::Rank { body, .. }
+                        | RankGuard::RankStar { body }
+                        | RankGuard::RankDefault { body } => body,
+                    };
+                    collect_structured_block_labels(body, labels);
+                }
+            }
+            Stmt::WhereConstruct {
+                body, elsewhere, ..
+            } => {
+                collect_structured_block_labels(body, labels);
+                for (_, body) in elsewhere {
+                    collect_structured_block_labels(body, labels);
+                }
+            }
+            // A nested OpenMP construct owns a distinct structured block.
             Stmt::OpenMp(_) => {}
             _ => {}
         }
@@ -2344,6 +2674,13 @@ fn reject_transfer(ctx: &mut Ctx<'_>, span: Span, statement: &str) {
             "{} is not yet supported inside an OpenMP structured block",
             statement
         ),
+    );
+}
+
+fn reject_external_branch(ctx: &mut Ctx<'_>, span: Span, statement: &str) {
+    ctx.error(
+        span,
+        format!("{statement} may not leave an OpenMP structured block"),
     );
 }
 

@@ -23,7 +23,9 @@ use super::pure_elemental::{
     check_pure_stmt_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
     validate_pure_call,
 };
-use crate::ast::decl::{Attribute, Decl, OnlyItem, SpannedDecl, TypeAttr, TypeSpec, UseNature};
+use crate::ast::decl::{
+    ArraySpec, Attribute, Decl, OnlyItem, SpannedDecl, TypeAttr, TypeSpec, UseNature,
+};
 use crate::ast::expr::{AcValue, Argument, Expr, SectionSubscript, SpannedExpr};
 use crate::ast::stmt::*;
 use crate::ast::unit::*;
@@ -155,6 +157,10 @@ pub(super) struct Ctx<'a> {
     /// worksharing constructs bind dynamically, so this tracks only the data
     /// environment that semantic validation can prove from the source tree.
     pub(super) openmp_parallel_depth: usize,
+    /// Nearest enclosing OpenMP regions, used for close-nesting rules such as
+    /// MASTER being directly bound to a PARALLEL region. Ordinary Fortran
+    /// control constructs do not alter this stack.
+    pub(super) openmp_construct_stack: Vec<&'static str>,
     /// Explicitly private data-sharing attributes on each enclosing OpenMP
     /// PARALLEL region. LASTPRIVATE on a bound worksharing loop may not name
     /// an object that is private in that parallel region.
@@ -252,6 +258,7 @@ impl<'a> Ctx<'a> {
             in_bind_c_unit: false,
             openmp_full: false,
             openmp_parallel_depth: 0,
+            openmp_construct_stack: Vec::new(),
             openmp_parallel_private_frames: Vec::new(),
             finalizer_capture_host_scopes: HashSet::new(),
             reported_finalizer_captures: HashSet::new(),
@@ -2376,8 +2383,10 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
         Stmt::Call { callee, args } => {
             validate_const_int_expr_tree(ctx, callee);
             if let Expr::Name { name } = &callee.node {
-                check_intrinsic_call_arity(ctx, stmt.span, name, args.len(), true);
-                check_intrinsic_call_types(ctx, stmt.span, name, args);
+                if intrinsic_call_resolves_to_intrinsic(ctx, name) {
+                    check_intrinsic_call_arity(ctx, stmt.span, name, args.len(), true);
+                    check_intrinsic_call_types(ctx, stmt.span, name, args);
+                }
             }
             let saved = ctx.in_call_arg;
             ctx.in_call_arg = true;
@@ -4920,6 +4929,62 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
         {
             let has_alloc = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
             let has_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
+            let has_threadprivate = attrs
+                .iter()
+                .any(|a| matches!(a, Attribute::OpenMpThreadPrivate));
+            if has_threadprivate {
+                if !matches!(ctx.st.scope(ctx.scope_id).kind, ScopeKind::Module(_)) {
+                    ctx.error(
+                        decl.span,
+                        "OpenMP THREADPRIVATE is currently supported only for module variables",
+                    );
+                }
+                if has_alloc
+                    || has_pointer
+                    || attrs.iter().any(|a| matches!(a, Attribute::Parameter))
+                    || !matches!(
+                        type_spec,
+                        TypeSpec::Integer(_)
+                            | TypeSpec::Real(_)
+                            | TypeSpec::DoublePrecision
+                            | TypeSpec::Complex(_)
+                            | TypeSpec::DoubleComplex
+                            | TypeSpec::Logical(_)
+                    )
+                {
+                    ctx.error(
+                        decl.span,
+                        "OpenMP THREADPRIVATE currently requires a nonallocatable, nonpointer intrinsic numeric or LOGICAL module variable",
+                    );
+                }
+                let attr_shape = attrs.iter().find_map(|attr| match attr {
+                    Attribute::Dimension(specs) => Some(specs),
+                    _ => None,
+                });
+                for entity in entities {
+                    if let Some(specs) = entity.array_spec.as_ref().or(attr_shape) {
+                        for spec in specs {
+                            let ArraySpec::Explicit { lower, upper } = spec else {
+                                ctx.error(
+                                    decl.span,
+                                    "OpenMP THREADPRIVATE arrays currently require constant explicit shape",
+                                );
+                                continue;
+                            };
+                            if lower
+                                .as_ref()
+                                .is_some_and(|expr| validation_const_int_value(ctx, expr).is_none())
+                                || validation_const_int_value(ctx, upper).is_none()
+                            {
+                                ctx.error(
+                                    decl.span,
+                                    "OpenMP THREADPRIVATE arrays currently require constant explicit shape",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             if has_pointer && type_decl_encodes_procedure_interface(attrs, type_spec) {
                 if let TypeSpec::Type(interface_name) = type_spec {
                     let owner_scope = ctx.scope_id;
@@ -6080,14 +6145,18 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                     ctx.openmp_parallel_depth += 1;
                     ctx.openmp_parallel_private_frames.push(frame);
                 }
+                ctx.openmp_construct_stack.push(construct.name());
                 validate_stmts(ctx, body);
+                ctx.openmp_construct_stack.pop();
                 if enters_parallel {
                     ctx.openmp_parallel_private_frames.pop();
                     ctx.openmp_parallel_depth -= 1;
                 }
             }
             if let Some(loop_stmt) = construct.loop_stmt() {
+                ctx.openmp_construct_stack.push(construct.name());
                 validate_stmt(ctx, loop_stmt);
+                ctx.openmp_construct_stack.pop();
             }
         }
 
@@ -11492,6 +11561,23 @@ pub(super) fn resolved_intrinsic_name(ctx: &Ctx<'_>, name: &str) -> Option<Strin
     is_intrinsic_name(&key).then_some(key)
 }
 
+/// A function intrinsic name used as the target of an otherwise undeclared
+/// `CALL` establishes an implicit external subroutine, rather than an
+/// intrinsic reference.  This is how legacy code can call an external such as
+/// NPB's `verify` without an `EXTERNAL` statement.  Intrinsic subroutines and
+/// explicitly declared/imported intrinsic procedures still resolve to their
+/// intrinsic contracts.
+fn intrinsic_call_resolves_to_intrinsic(ctx: &Ctx<'_>, name: &str) -> bool {
+    let Some(key) = resolved_intrinsic_name(ctx, name) else {
+        return false;
+    };
+    intrinsic_is_subroutine(&key)
+        || ctx.lookup_lexical(name).is_some_and(|symbol| {
+            !symbol.attrs.external
+                && (symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc))
+        })
+}
+
 fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &[Argument]) {
     let Some(key) = resolved_intrinsic_name(ctx, name) else {
         return;
@@ -14278,6 +14364,44 @@ end program
             FortranStandard::F2008,
         );
         assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn call_context_treats_undeclared_function_intrinsic_names_as_externals() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: m
+  double precision :: sx, sy, gc(0:9)
+  logical :: verified
+  character :: class
+  call verify(m, sx, sy, gc, verified, class)
+  call abs(m)
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn explicitly_intrinsic_function_still_cannot_be_called_as_subroutine() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  intrinsic :: verify
+  integer :: position
+  call verify('abc', 'a', position)
+end program
+",
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("intrinsic 'verify' is a function") && err.contains("not a CALL")
+            }),
+            "{errs:?}"
+        );
     }
 
     #[test]
