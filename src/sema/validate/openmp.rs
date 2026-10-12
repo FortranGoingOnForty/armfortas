@@ -145,6 +145,14 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             }
             validate_structured_block(ctx, body);
         }
+        OpenMpConstruct::Ordered { body } => {
+            reject_in_pure(ctx, span, "ORDERED");
+            ctx.error(
+                span,
+                "OpenMP ORDERED execution is recognized but not yet implemented",
+            );
+            validate_structured_block(ctx, body);
+        }
         OpenMpConstruct::Barrier => {
             reject_in_pure(ctx, span, "BARRIER");
             if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
@@ -1097,6 +1105,10 @@ fn validate_worksharing_loop(
                 }
             }
             OpenMpClause::Collapse(_) => {}
+            OpenMpClause::Ordered => ctx.error(
+                span,
+                "OpenMP ORDERED clause is recognized but not yet implemented",
+            ),
             OpenMpClause::Reduction { items, .. } if items
                 .iter()
                 .any(|item| associated_loop_keys.contains(&item.base_name().to_ascii_lowercase())) =>
@@ -1653,6 +1665,7 @@ fn clause_name(clause: &OpenMpClause) -> &'static str {
         OpenMpClause::NumThreads(_) => "NUM_THREADS",
         OpenMpClause::Schedule { .. } => "SCHEDULE",
         OpenMpClause::Collapse(_) => "COLLAPSE",
+        OpenMpClause::Ordered => "ORDERED",
         OpenMpClause::Nowait => "NOWAIT",
         OpenMpClause::Reduction { .. } => "REDUCTION",
     }

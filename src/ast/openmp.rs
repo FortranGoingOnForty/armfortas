@@ -32,6 +32,9 @@ pub enum OpenMpConstruct {
     Master {
         body: Vec<SpannedStmt>,
     },
+    Ordered {
+        body: Vec<SpannedStmt>,
+    },
     Barrier,
     AtomicUpdate {
         assignment: Box<SpannedStmt>,
@@ -47,6 +50,7 @@ impl OpenMpConstruct {
             Self::ParallelDo { .. } => "PARALLEL DO",
             Self::Critical { .. } => "CRITICAL",
             Self::Master { .. } => "MASTER",
+            Self::Ordered { .. } => "ORDERED",
             Self::Barrier => "BARRIER",
             Self::AtomicUpdate { .. } => "ATOMIC UPDATE",
         }
@@ -60,6 +64,7 @@ impl OpenMpConstruct {
             | Self::ParallelDo { clauses, .. } => clauses,
             Self::Critical { .. }
             | Self::Master { .. }
+            | Self::Ordered { .. }
             | Self::Barrier
             | Self::AtomicUpdate { .. } => &[],
         }
@@ -67,9 +72,10 @@ impl OpenMpConstruct {
 
     pub fn region_body(&self) -> Option<&[SpannedStmt]> {
         match self {
-            Self::Parallel { body, .. } | Self::Critical { body, .. } | Self::Master { body } => {
-                Some(body)
-            }
+            Self::Parallel { body, .. }
+            | Self::Critical { body, .. }
+            | Self::Master { body }
+            | Self::Ordered { body } => Some(body),
             Self::AtomicUpdate { assignment } => Some(std::slice::from_ref(assignment.as_ref())),
             Self::Do { .. } | Self::Loop { .. } | Self::ParallelDo { .. } | Self::Barrier => None,
         }
@@ -83,6 +89,7 @@ impl OpenMpConstruct {
             Self::Parallel { .. }
             | Self::Critical { .. }
             | Self::Master { .. }
+            | Self::Ordered { .. }
             | Self::Barrier
             | Self::AtomicUpdate { .. } => None,
         }
@@ -109,6 +116,7 @@ pub enum OpenMpClause {
         chunk_size: Option<SpannedExpr>,
     },
     Collapse(SpannedExpr),
+    Ordered,
     Nowait,
     Reduction {
         operator: OpenMpReductionOperator,
@@ -128,6 +136,7 @@ impl OpenMpClause {
             | Self::LastPrivate { .. }
             | Self::Shared(_)
             | Self::Default(_)
+            | Self::Ordered
             | Self::Nowait
             | Self::Reduction { .. } => None,
         }
@@ -147,6 +156,7 @@ impl OpenMpClause {
             | Self::NumThreads(_)
             | Self::Schedule { .. }
             | Self::Collapse(_)
+            | Self::Ordered
             | Self::Nowait => Vec::new(),
         }
     }

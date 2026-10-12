@@ -21,6 +21,7 @@ enum OpenMpHeader {
     ParallelDo(Vec<OpenMpClause>),
     Critical(Option<String>),
     Master,
+    Ordered,
     Barrier,
     AtomicUpdate,
     EndParallel,
@@ -29,6 +30,7 @@ enum OpenMpHeader {
     EndParallelDo { nowait: bool },
     EndCritical(Option<String>),
     EndMaster,
+    EndOrdered,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -169,6 +171,13 @@ impl<'a> Parser<'a> {
                     span_through(directive.span, end_span),
                 ))
             }
+            OpenMpHeader::Ordered => {
+                let (body, end_span) = self.parse_openmp_region_end(OpenMpEnd::Ordered, None)?;
+                Ok(Spanned::new(
+                    Stmt::OpenMp(OpenMpConstruct::Ordered { body }),
+                    span_through(directive.span, end_span),
+                ))
+            }
             OpenMpHeader::Barrier => Ok(Spanned::new(
                 Stmt::OpenMp(OpenMpConstruct::Barrier),
                 directive.span,
@@ -195,7 +204,8 @@ impl<'a> Parser<'a> {
             | OpenMpHeader::EndLoop
             | OpenMpHeader::EndParallelDo { .. }
             | OpenMpHeader::EndCritical(_)
-            | OpenMpHeader::EndMaster => Err(ParseError {
+            | OpenMpHeader::EndMaster
+            | OpenMpHeader::EndOrdered => Err(ParseError {
                 span: directive.span,
                 msg: format!("unexpected OpenMP end directive '!$omp {}'", directive.text),
             }),
@@ -276,6 +286,7 @@ impl<'a> Parser<'a> {
                         true
                     }
                     (OpenMpEnd::Master, OpenMpHeader::EndMaster) => true,
+                    (OpenMpEnd::Ordered, OpenMpHeader::EndOrdered) => true,
                     _ => false,
                 };
                 if matches {
@@ -290,6 +301,7 @@ impl<'a> Parser<'a> {
                         | OpenMpHeader::EndParallelDo { .. }
                         | OpenMpHeader::EndCritical(_)
                         | OpenMpHeader::EndMaster
+                        | OpenMpHeader::EndOrdered
                 ) {
                     return Err(ParseError {
                         span: directive.span,
@@ -311,6 +323,7 @@ enum OpenMpEnd {
     Parallel,
     Critical,
     Master,
+    Ordered,
 }
 
 impl OpenMpEnd {
@@ -319,6 +332,7 @@ impl OpenMpEnd {
             Self::Parallel => "parallel",
             Self::Critical => "critical",
             Self::Master => "master",
+            Self::Ordered => "ordered",
         }
     }
 }
@@ -363,6 +377,10 @@ fn parse_openmp_header(source: &str, span: Span) -> Result<OpenMpHeader, ParseEr
         "master" => {
             cursor.finish()?;
             OpenMpHeader::Master
+        }
+        "ordered" => {
+            cursor.finish()?;
+            OpenMpHeader::Ordered
         }
         "barrier" => {
             cursor.finish()?;
@@ -436,6 +454,10 @@ fn parse_openmp_end_header(cursor: &mut DirectiveCursor<'_>) -> Result<OpenMpHea
         "master" => {
             cursor.finish()?;
             Ok(OpenMpHeader::EndMaster)
+        }
+        "ordered" => {
+            cursor.finish()?;
+            Ok(OpenMpHeader::EndOrdered)
         }
         other => Err(cursor.error(format!("unsupported OpenMP END directive 'end {other}'"))),
     }
@@ -570,6 +592,14 @@ fn parse_clauses(
                 span,
                 "COLLAPSE clause",
             )?),
+            "ordered" => {
+                if cursor.peek_nonblank() == Some(b'(') {
+                    return Err(cursor.error(
+                        "parameterized OpenMP ORDERED clauses are not yet implemented".into(),
+                    ));
+                }
+                OpenMpClause::Ordered
+            }
             "reduction" => {
                 let value = cursor.parenthesized("REDUCTION clause")?;
                 let Some((operator, items)) = split_top_level_once(value, ':') else {
@@ -618,6 +648,7 @@ fn validate_clause_for_construct(
                 | OpenMpClause::LastPrivate { .. }
                 | OpenMpClause::Schedule { .. }
                 | OpenMpClause::Collapse(_)
+                | OpenMpClause::Ordered
                 | OpenMpClause::Reduction { .. }
         ),
         BeginKind::Loop => matches!(
@@ -1110,6 +1141,54 @@ mod tests {
                 ..
             }] if body.len() == 1
         ));
+    }
+
+    #[test]
+    fn parses_ordered_clause_and_region() {
+        let stmt = parse(
+            "!$omp do ordered schedule(static)\n\
+             do i = 1, n\n\
+             !$omp ordered\n\
+             value = i\n\
+             !$omp end ordered\n\
+             end do\n\
+             !$omp end do\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap();
+        let Stmt::OpenMp(OpenMpConstruct::Do { clauses, loop_stmt }) = stmt.node else {
+            panic!("expected worksharing-do construct");
+        };
+        assert!(clauses
+            .iter()
+            .any(|clause| matches!(clause, OpenMpClause::Ordered)));
+        let Stmt::DoLoop { body, .. } = loop_stmt.node else {
+            panic!("expected controlled DO loop");
+        };
+        assert!(matches!(
+            body.as_slice(),
+            [Spanned {
+                node: Stmt::OpenMp(OpenMpConstruct::Ordered { body }),
+                ..
+            }] if body.len() == 1
+        ));
+    }
+
+    #[test]
+    fn rejects_parameterized_ordered_clause() {
+        let error = parse(
+            "!$omp do ordered(2)\n\
+             do i = 1, n\n\
+             end do\n",
+            SourceForm::FreeForm,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .msg
+                .contains("parameterized OpenMP ORDERED clauses are not yet implemented"),
+            "{error}"
+        );
     }
 
     #[test]

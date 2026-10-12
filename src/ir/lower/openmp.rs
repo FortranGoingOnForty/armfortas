@@ -601,6 +601,9 @@ pub(super) fn lower_construct(
             lower_critical_region(b, ctx, name.as_deref(), body)
         }
         OpenMpConstruct::Master { body } => lower_master_region(b, ctx, body),
+        OpenMpConstruct::Ordered { .. } => {
+            unreachable!("semantic validation rejects OpenMP ORDERED until lowering is enabled")
+        }
         OpenMpConstruct::Barrier => {
             b.call(
                 FuncRef::External("afs_omp_barrier".into()),
