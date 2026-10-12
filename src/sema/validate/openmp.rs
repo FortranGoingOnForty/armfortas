@@ -161,7 +161,6 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
                     "the binding OpenMP worksharing loop must specify the ORDERED clause",
                 );
             }
-            ctx.error(span, "OpenMP ORDERED execution lowering is not yet enabled");
             validate_structured_block(ctx, body);
         }
         OpenMpConstruct::Barrier => {
