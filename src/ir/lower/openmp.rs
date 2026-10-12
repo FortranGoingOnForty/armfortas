@@ -551,6 +551,7 @@ pub(super) fn lower_construct(
             lower_parallel_region(b, ctx, clauses, body, ParallelRegionBody::Statements(body));
         }
         OpenMpConstruct::Do { clauses, loop_stmt } => {
+            let captured_originals = ctx.openmp_lastprivate_originals.clone();
             lower_worksharing_loop(
                 b,
                 ctx,
@@ -560,10 +561,11 @@ pub(super) fn lower_construct(
                 false,
                 false,
                 None,
-                None,
+                (!captured_originals.is_empty()).then_some(&captured_originals),
             );
         }
         OpenMpConstruct::Loop { clauses, loop_stmt } => {
+            let captured_originals = ctx.openmp_lastprivate_originals.clone();
             lower_worksharing_loop(
                 b,
                 ctx,
@@ -573,7 +575,7 @@ pub(super) fn lower_construct(
                 false,
                 false,
                 None,
-                None,
+                (!captured_originals.is_empty()).then_some(&captured_originals),
             );
         }
         OpenMpConstruct::ParallelDo { clauses, loop_stmt } => {
@@ -748,8 +750,11 @@ fn lower_parallel_region(
         .flatten()
         .map(|name| name.to_ascii_lowercase())
         .collect();
-    let predetermined_private =
-        crate::sema::validate::openmp::predetermined_private_names(ctx.st, capture_body);
+    let predetermined_private = crate::sema::validate::openmp::predetermined_private_names(
+        ctx.st,
+        capture_body,
+        |clauses| worksharing_collapse_depth(ctx, clauses),
+    );
     let standalone_lastprivate =
         crate::sema::validate::openmp::standalone_worksharing_lastprivate_names(
             capture_body,
@@ -812,12 +817,24 @@ fn lower_parallel_region(
                                 matches!(spec, crate::ast::decl::ArraySpec::AssumedSize { .. })
                             })
                     });
+                let split_lastprivate_original = standalone_lastprivate.contains(&name)
+                    && predetermined_private.contains(&name)
+                    && !private_names.contains(&name)
+                    && !firstprivate_names.contains(&name)
+                    && !lastprivate_names.contains(&name)
+                    && !default_private;
+                // A variable can be a sequential-loop iterator in one part of
+                // the callback and a LOOP-associated iterator in another. Keep
+                // its normal binding task-private, but retain the shared
+                // original separately for the latter construct's copy-out.
                 let kind = if firstprivate_names.contains(&name) {
                     CaptureKind::FirstPrivate
                 } else if private_names.contains(&name) || lastprivate_names.contains(&name) {
                     CaptureKind::Private
                 } else if info.inline_const.is_some() {
                     CaptureKind::InlineConstant
+                } else if split_lastprivate_original {
+                    CaptureKind::Private
                 } else if shared_names.contains(&name) || predetermined_shared {
                     CaptureKind::Shared
                 } else if default_private {
@@ -829,7 +846,7 @@ fn lower_parallel_region(
                 } else {
                     CaptureKind::Shared
                 };
-                let lastprivate = lastprivate_names.contains(&name);
+                let lastprivate = lastprivate_names.contains(&name) || split_lastprivate_original;
                 Capture {
                     name,
                     info,
@@ -975,6 +992,7 @@ fn lower_parallel_region(
                 );
             }
             let cleanup = install_shared_captures(&mut outlined, &mut outlined_ctx, &captures);
+            outlined_ctx.openmp_lastprivate_originals = cleanup.lastprivate_originals.clone();
             let parallel_reductions = match region_body {
                 ParallelRegionBody::Statements(_) => {
                     prepare_reductions(&mut outlined, &mut outlined_ctx, clauses)
