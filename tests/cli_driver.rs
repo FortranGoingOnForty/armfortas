@@ -42514,6 +42514,75 @@ fn explicit_shape_dummy_runtime_bound_materializes_descriptor_extent() {
 }
 
 #[test]
+fn explicit_shape_dummy_runtime_bound_reads_module_variable() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=explicit_shape_dummy_runtime_bound_reads_module_variable count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module shape_state
+  implicit none
+  integer :: width = 3
+end module
+module kernels
+  use shape_state, only: width
+  implicit none
+contains
+  subroutine fill(values)
+    integer, intent(inout) :: values(width,2)
+    if (size(values,1) /= width) error stop 1
+    values(width,2) = 42
+  end subroutine
+  integer function corner(values)
+    integer, intent(in) :: values(width,2)
+    if (size(values,1) /= width) error stop 2
+    corner = values(width,2)
+  end function
+end module
+program p
+  use kernels, only: fill, corner
+  implicit none
+  integer :: values(3,2)
+  values = -1
+  call fill(values)
+  if (values(1,2) /= -1 .or. values(3,2) /= 42) error stop 3
+  if (corner(values) /= 42) error stop 4
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("explicit_shape_module_bound", "bin");
+        let compile = Command::new(compiler("armfortas"))
+            .args([opt, src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("module-bound explicit-shape compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "module-bound explicit-shape dummy should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("module-bound explicit-shape run failed");
+        assert!(
+            run.status.success(),
+            "module-bound explicit-shape dummy should pass at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn explicit_shape_dummy_runtime_lower_bound_preserves_sequence_mapping() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

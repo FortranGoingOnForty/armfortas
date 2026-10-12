@@ -710,6 +710,20 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     &procedure_dummy_closure_params,
                 );
+                // Specification expressions are evaluated on procedure
+                // entry. Install host- and use-associated objects before
+                // lowering runtime character lengths or explicit-shape
+                // dummy bounds that may reference them.
+                install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
+                install_globals_as_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    globals,
+                    &combined_uses,
+                    &decl_spec_import_names,
+                    host_module,
+                    ctx.st,
+                );
 
                 for (pname, _, _, is_value) in &param_info {
                     if *is_value || hidden_len_addrs.contains_key(pname) {
@@ -803,16 +817,6 @@ pub(crate) fn lower_unit(
                 // scoping rules) is short-circuited, and so init_decls has
                 // them available for initialization expressions that
                 // reference host vars.
-                install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
-                install_globals_as_locals(
-                    &mut b,
-                    &mut ctx.locals,
-                    globals,
-                    &combined_uses,
-                    &decl_spec_import_names,
-                    host_module,
-                    ctx.st,
-                );
                 super::alloc::alloc_decls(
                     &mut b,
                     &mut ctx.locals,
@@ -1335,6 +1339,20 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     &procedure_dummy_closure_params,
                 );
+                // Specification expressions are evaluated on procedure
+                // entry. Install host- and use-associated objects before
+                // lowering runtime character lengths or explicit-shape
+                // dummy bounds that may reference them.
+                install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
+                install_globals_as_locals(
+                    &mut b,
+                    &mut ctx.locals,
+                    globals,
+                    &combined_uses,
+                    &decl_spec_import_names,
+                    host_module,
+                    ctx.st,
+                );
 
                 for (pname, _, _, is_value) in &param_info {
                     if *is_value || hidden_len_addrs.contains_key(pname) {
@@ -1671,16 +1689,6 @@ pub(crate) fn lower_unit(
                     decls,
                     &visible_param_consts,
                     st,
-                );
-                install_host_ref_locals(&mut b, &mut ctx.locals, &host_ref_infos);
-                install_globals_as_locals(
-                    &mut b,
-                    &mut ctx.locals,
-                    globals,
-                    &combined_uses,
-                    &decl_spec_import_names,
-                    host_module,
-                    ctx.st,
                 );
                 if hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
                     if let Some(info) = ctx.locals.get(&result_name).cloned() {
