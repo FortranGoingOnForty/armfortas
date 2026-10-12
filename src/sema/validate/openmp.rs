@@ -135,7 +135,10 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
         OpenMpConstruct::Master { body } => {
             reject_in_pure(ctx, span, "MASTER");
             if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
-                if matches!(enclosing, "DO" | "LOOP" | "PARALLEL DO" | "ATOMIC UPDATE") {
+                if matches!(
+                    enclosing,
+                    "DO" | "LOOP" | "PARALLEL DO" | "SECTIONS" | "ATOMIC UPDATE"
+                ) {
                     ctx.error(
                         span,
                         format!(
@@ -156,6 +159,7 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
                         | "CRITICAL"
                         | "MASTER"
                         | "SINGLE"
+                        | "SECTIONS"
                         | "ORDERED"
                         | "ATOMIC UPDATE"
                 ) {
@@ -179,6 +183,48 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
                 }
             }
             validate_structured_block(ctx, body);
+        }
+        OpenMpConstruct::Sections {
+            clauses,
+            body,
+            section_starts,
+        } => {
+            reject_in_pure(ctx, span, "SECTIONS");
+            if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
+                if matches!(
+                    enclosing,
+                    "DO" | "LOOP"
+                        | "PARALLEL DO"
+                        | "CRITICAL"
+                        | "MASTER"
+                        | "SINGLE"
+                        | "SECTIONS"
+                        | "ORDERED"
+                        | "ATOMIC UPDATE"
+                ) {
+                    ctx.error(
+                        span,
+                        format!(
+                            "OpenMP SECTIONS may not be closely nested inside an OpenMP {enclosing} region"
+                        ),
+                    );
+                }
+            }
+            for clause in clauses {
+                if !matches!(clause, OpenMpClause::Nowait) {
+                    ctx.error(
+                        span,
+                        format!(
+                            "OpenMP {} clause on SECTIONS is recognized but not yet implemented",
+                            clause_name(clause)
+                        ),
+                    );
+                }
+            }
+            for (index, start) in section_starts.iter().copied().enumerate() {
+                let end = section_starts.get(index + 1).copied().unwrap_or(body.len());
+                validate_structured_block(ctx, &body[start..end]);
+            }
         }
         OpenMpConstruct::Ordered { body } => {
             reject_in_pure(ctx, span, "ORDERED");
@@ -233,7 +279,12 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
                 if matches!(
                     enclosing,
-                    "DO" | "LOOP" | "PARALLEL DO" | "CRITICAL" | "MASTER" | "ATOMIC UPDATE"
+                    "DO" | "LOOP"
+                        | "PARALLEL DO"
+                        | "CRITICAL"
+                        | "MASTER"
+                        | "SECTIONS"
+                        | "ATOMIC UPDATE"
                 ) {
                     ctx.error(
                         span,
@@ -3358,8 +3409,7 @@ fn validate_structured_block_with_cycle_targets(
             {
                 reject_external_branch(ctx, stmt.span, "arithmetic IF")
             }
-            Stmt::Exit { .. } => reject_transfer(ctx, stmt.span, "EXIT"),
-            Stmt::Cycle { name } => {
+            Stmt::Exit { name } | Stmt::Cycle { name } => {
                 let target_is_internal = match name {
                     Some(name) => cycle_targets.iter().rev().any(|target| {
                         target
@@ -3369,7 +3419,15 @@ fn validate_structured_block_with_cycle_targets(
                     None => !cycle_targets.is_empty(),
                 };
                 if !target_is_internal {
-                    reject_transfer(ctx, stmt.span, "CYCLE");
+                    reject_transfer(
+                        ctx,
+                        stmt.span,
+                        if matches!(&stmt.node, Stmt::Exit { .. }) {
+                            "EXIT"
+                        } else {
+                            "CYCLE"
+                        },
+                    );
                 }
             }
             Stmt::Write { controls, .. } | Stmt::Read { controls, .. } => {

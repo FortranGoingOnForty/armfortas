@@ -612,6 +612,11 @@ pub(super) fn lower_construct(
         }
         OpenMpConstruct::Master { body } => lower_master_region(b, ctx, body),
         OpenMpConstruct::Single { clauses, body } => lower_single_region(b, ctx, clauses, body),
+        OpenMpConstruct::Sections {
+            clauses,
+            body,
+            section_starts,
+        } => lower_sections_region(b, ctx, clauses, body, section_starts),
         OpenMpConstruct::Ordered { body } => lower_ordered_region(b, ctx, body),
         OpenMpConstruct::OrderedDoacross { dependence } => {
             lower_doacross_directive(b, ctx, dependence)
@@ -714,6 +719,62 @@ fn lower_single_region(
     }
 
     b.set_block(done_bb);
+    if !clauses
+        .iter()
+        .any(|clause| matches!(clause, OpenMpClause::Nowait))
+    {
+        b.call(
+            FuncRef::External("afs_omp_barrier".into()),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        );
+    }
+}
+
+fn lower_sections_region(
+    b: &mut FuncBuilder<'_>,
+    ctx: &mut LowerCtx<'_>,
+    clauses: &[OpenMpClause],
+    body: &[SpannedStmt],
+    section_starts: &[usize],
+) {
+    let (thread_num, team_size) = if let Some(team) = ctx.openmp_team {
+        team
+    } else {
+        (
+            b.call(
+                FuncRef::External("afs_omp_get_thread_num".into()),
+                vec![],
+                IrType::Int(IntWidth::I32),
+            ),
+            b.call(
+                FuncRef::External("afs_omp_get_num_threads".into()),
+                vec![],
+                IrType::Int(IntWidth::I32),
+            ),
+        )
+    };
+
+    // A deterministic static owner map needs no shared dispatch cursor: every
+    // section belongs to exactly one implicit task, and repeated or NOWAIT
+    // constructs cannot observe stale mutable generation state.
+    for (index, start) in section_starts.iter().copied().enumerate() {
+        let end = section_starts.get(index + 1).copied().unwrap_or(body.len());
+        let section_index = b.const_i32(index as i32);
+        let owner = b.imod(section_index, team_size);
+        let is_owner = b.icmp(CmpOp::Eq, thread_num, owner);
+        let body_bb = b.create_block(&format!("omp_section_{index}_body"));
+        let next_bb = b.create_block(&format!("omp_section_{index}_done"));
+        b.cond_branch(is_owner, body_bb, vec![], next_bb, vec![]);
+
+        b.set_block(body_bb);
+        super::stmt::lower_stmts(b, ctx, &body[start..end]);
+        if b.func().block(b.current_block()).terminator.is_none() {
+            b.branch(next_bb, vec![]);
+        }
+        b.set_block(next_bb);
+    }
+
     if !clauses
         .iter()
         .any(|clause| matches!(clause, OpenMpClause::Nowait))

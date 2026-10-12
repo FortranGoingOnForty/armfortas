@@ -26,7 +26,7 @@ toward [OpenMP 6.0][omp-60] without silently changing existing behavior.
 | Area | Status | Current boundary |
 |---|---|---|
 | Free- and fixed-form sentinels | Supported | Includes source-form-correct directive continuation and conditional compilation. |
-| Directive syntax model | Partial | `parallel`, `do`, `parallel do`, `loop`, `single`, block and stand-alone doacross `ordered`, `barrier`, `flush`, `master`, `critical`, `atomic read`, `atomic write`, `atomic update`, and the declarative `threadprivate` directive plus their implemented clauses have typed AST forms. |
+| Directive syntax model | Partial | `parallel`, `do`, `parallel do`, `loop`, `single`, `sections`, block and stand-alone doacross `ordered`, `barrier`, `flush`, `master`, `critical`, `atomic read`, `atomic write`, `atomic update`, and the declarative `threadprivate` directive plus their implemented clauses have typed AST forms. |
 | Unsupported syntax handling | Supported | Malformed directives are errors; recognized but unimplemented execution is rejected before IR lowering. |
 | `parallel` | Preview | Owned synchronous fork/join runtime, implicit join, nested serialized regions, `if`, and `num_threads`. |
 | Data sharing | Partial | `shared`, `private`, `firstprivate`, `lastprivate`, bounded `copyin`, `default(shared)`, `default(private)`, and `default(none)` for the scalar and array forms accepted by semantic validation. `copyin` copies the primary thread's supported THREADPRIVATE intrinsic scalar and constant-explicit-shape array values into the other team members before `parallel` or combined `parallel do` execution. Predetermined named constants and assumed-size arrays remain shared under `default(private)`; explicit clauses retain precedence. OpenMP 5.0 `loop` associated iterators are predetermined `lastprivate`, with `private` and `lastprivate` accepted as explicit overrides. Other `lastprivate` support is currently limited to supported intrinsic scalars on worksharing loops. |
@@ -34,7 +34,7 @@ toward [OpenMP 6.0][omp-60] without silently changing existing behavior.
 | Array data | Partial | Numeric, complex, logical, and fixed-length default-kind CHARACTER constant-shape storage plus selected descriptor-backed dummy, allocatable, pointer, section, and shared derived-type views. A nonoptional explicit-shape dummy with runtime bounds may be `private`; its encounter-time shape is snapshotted and each implicit task receives independent storage. `firstprivate` and assumed-shape dummy arrays remain outside that boundary. Unsupported ownership or lifetime cases are diagnosed. |
 | `threadprivate` | Partial | Module INTEGER, REAL, DOUBLE PRECISION, COMPLEX, and LOGICAL scalars and constant-explicit-shape arrays use runtime-owned per-thread storage. Rank-one deferred-shape REAL and DOUBLE PRECISION module pointers without non-NULL initialization are also supported. Worker copies and pointer associations persist across qualifying equal-team top-level parallel regions when dynamic teams are disabled, and the descriptor-backed representation survives separate compilation through `.amod`. `copyin` is supported for the nonpointer intrinsic scalar and constant-explicit-shape forms, including snapshots above the compiler's 64 KiB stack threshold; pointer `copyin` is diagnosed. Allocatable, other pointer, derived, character, and COMMON-block THREADPRIVATE forms remain diagnosed or unsupported. |
 | Worksharing loops | Preview | Canonical `do` and combined `parallel do`, positive/negative strides, static contiguous and chunked schedules, combined dynamic schedules, rectangular and direct-bound nonrectangular `collapse(2)`, implicit barriers, standalone `nowait`, scalar `private` and `lastprivate`, predefined scalar/fixed-rank-one reductions, and one directly nested unconditional block `ordered` region per logical iteration under the default or static schedule. Two-dimensional `ordered(2)` doacross loops support perfect rectangular nests, constant nonzero increments, the default or static schedule, affine predecessor vectors, and both the OpenMP 5.2 `doacross(source/sink:...)` spelling and deprecated `depend(source/sink:...)` synonym. Other parameter depths, doacross with collapse, nonrectangular doacross nests, conditional or multiple block-ordered regions, and ordered SIMD remain diagnosed. OpenMP 5.0 `loop` supports scalar `private`, associated-iterator `lastprivate`, scalar INTEGER `reduction(+:...)`, and rectangular `collapse(1)`/`collapse(2)` when it binds implicitly to an enclosing `parallel` region. Predetermined iterator copy-out follows the sequential termination value; `private(iterator)` suppresses it, and an explicit `lastprivate` list item must be associated with the construct. Other `loop` clauses and reduction forms, explicit `bind`, nonrectangular `loop collapse`, general affine nonrectangular bounds, and nonrectangular `lastprivate` remain diagnosed; standalone dynamic scheduling remains rejected. |
-| Reductions and synchronization | Partial | Scalar objects and constant-explicit-shape rank-one arrays of INTEGER support `+`, `*`, `max`, `min`, `iand`, `ior`, and `ieor`; REAL/DOUBLE PRECISION support `+`, `*`, `max`, and `min`; COMPLEX supports `+` and `*`; and LOGICAL supports `.and.`, `.or.`, `.eqv.`, and `.neqv.` on `parallel`, combined `parallel do`, and standalone worksharing `do`. OpenMP 5.0 `loop` currently supports only scalar INTEGER addition reductions. Whole arrays, constant contiguous unit-stride sections, and constant elements are accepted on the broader constructs. Partial selections reject whole-array and provably out-of-selection references within the region; dynamic element references retain bounds enforcement. Narrow integers combine at their storage width, and REAL(4)/REAL(8) and COMPLEX(4)/COMPLEX(8) combine at their declared precision. Standalone `do reduction` supports result publication at its implicit barrier and barrier-free `nowait` completion. Block `ordered` regions serialize in logical iteration order across repeated worksharing generations. Two-dimensional doacross source events publish completed logical coordinates and sink events wait for every in-domain predecessor; out-of-domain sink vectors are ignored. `single` selects the primary thread as its implementation-defined executor, has the required default exit barrier, and supports `nowait`; `private`, `firstprivate`, `copyprivate`, and `allocate` remain outside the bounded slice. Explicit `barrier` synchronizes the current team, including from an orphaned procedure; the initial one-thread team completes immediately, and prohibited close nesting is diagnosed. Explicit and orphaned `master` regions bind to the current team, execute only on thread zero, and have no implicit barrier; serial calls bind to the initial one-thread team. `atomic read` and `atomic write` support scalar non-CHARACTER intrinsic variables and side-effect-free array elements; `atomic update` supports `x = x + expr` for scalar INTEGER, REAL, DOUBLE PRECISION, and COMPLEX storage. All three use a conservative process-wide lock. Bare `flush`, `flush(list)`, and explicit `flush seq_cst` use a whole-memory sequentially consistent fence; the standard permits the list form to be strengthened this way. Simple blocking locks support `omp_init_lock`, `omp_destroy_lock`, `omp_set_lock`, and `omp_unset_lock` with `integer(omp_lock_kind)` storage and acquire/release synchronization. Atomic capture/compare, weaker memory-order clauses, `omp_test_lock`, hinted initialization, nested locks, wider doacross dimensions/forms, `masked`, the `sections` construct, higher-rank/runtime-shaped reductions, and user-defined reductions remain unimplemented. |
+| Reductions and synchronization | Partial | Scalar objects and constant-explicit-shape rank-one arrays of INTEGER support `+`, `*`, `max`, `min`, `iand`, `ior`, and `ieor`; REAL/DOUBLE PRECISION support `+`, `*`, `max`, and `min`; COMPLEX supports `+` and `*`; and LOGICAL supports `.and.`, `.or.`, `.eqv.`, and `.neqv.` on `parallel`, combined `parallel do`, and standalone worksharing `do`. OpenMP 5.0 `loop` currently supports only scalar INTEGER addition reductions. Whole arrays, constant contiguous unit-stride sections, and constant elements are accepted on the broader constructs. Partial selections reject whole-array and provably out-of-selection references within the region; dynamic element references retain bounds enforcement. Narrow integers combine at their storage width, and REAL(4)/REAL(8) and COMPLEX(4)/COMPLEX(8) combine at their declared precision. Standalone `do reduction` supports result publication at its implicit barrier and barrier-free `nowait` completion. Block `ordered` regions serialize in logical iteration order across repeated worksharing generations. Two-dimensional doacross source events publish completed logical coordinates and sink events wait for every in-domain predecessor; out-of-domain sink vectors are ignored. `single` selects the primary thread as its implementation-defined executor, has the required default exit barrier, and supports `nowait`; `private`, `firstprivate`, `copyprivate`, and `allocate` remain outside the bounded slice. Standalone and orphaned `sections` assign every nonempty structured block to exactly one implicit task with deterministic static ownership, have the required default exit barrier, support `nowait`, and bind serial calls to the initial one-thread team. `private`, `firstprivate`, `lastprivate`, `reduction`, `allocate`, and combined `parallel sections` remain outside this first bounded slice. Explicit `barrier` synchronizes the current team, including from an orphaned procedure; the initial one-thread team completes immediately, and prohibited close nesting is diagnosed. Explicit and orphaned `master` regions bind to the current team, execute only on thread zero, and have no implicit barrier; serial calls bind to the initial one-thread team. `atomic read` and `atomic write` support scalar non-CHARACTER intrinsic variables and side-effect-free array elements; `atomic update` supports `x = x + expr` for scalar INTEGER, REAL, DOUBLE PRECISION, and COMPLEX storage. All three use a conservative process-wide lock. Bare `flush`, `flush(list)`, and explicit `flush seq_cst` use a whole-memory sequentially consistent fence; the standard permits the list form to be strengthened this way. Simple blocking locks support `omp_init_lock`, `omp_destroy_lock`, `omp_set_lock`, and `omp_unset_lock` with `integer(omp_lock_kind)` storage and acquire/release synchronization. Atomic capture/compare, weaker memory-order clauses, `omp_test_lock`, hinted initialization, nested locks, wider doacross dimensions/forms, `masked`, higher-rank/runtime-shaped reductions, and user-defined reductions remain unimplemented. |
 | Runtime library | Partial | Initial `omp_lib` queries, setters, timing routines, simple blocking locks, team execution, barriers, sequentially consistent flush fences, work dispatch, block-ordered and two-dimensional doacross generations, reductions, critical/atomic locks, and module `threadprivate` storage. Implemented no-argument inquiry and timing routines and reference-passed simple lock routines also export their standard symbol spellings for legacy `EXTERNAL` declarations; other argument-bearing routines remain on the typed module lowering path. Unsupported API names are not published as implemented procedures. |
 | Environment variables | Partial | Initial handling for `OMP_NUM_THREADS`, `OMP_DYNAMIC`, `OMP_THREAD_LIMIT`, `OMP_MAX_ACTIVE_LEVELS`, and `OMP_SCHEDULE`. |
 | SIMD semantics | Not implemented | `-fopenmp-simd` does not yet change loop vectorization or accept a SIMD construct as executable support. |
@@ -68,15 +68,16 @@ deterministic. Applicable cases from the [official examples][omp-examples] and
 the [OpenMP Validation and Verification suite][omp-vv] are added incrementally
 rather than treated as an opaque pass/fail corpus.
 
-The pinned official-example corpus uses fourteen unchanged Fortran sources
+The pinned official-example corpus uses fifteen unchanged Fortran sources
 from OpenMP Examples v6.0.1 at revision
 `3e4757ae2b52e51df6cd5d363d6fc1d894509719`. Its manifest covers `parallel`,
 `do`, `schedule(static)`, `nowait`, `private`, `firstprivate`, `lastprivate`,
 `shared`, `default(private)`, `threadprivate`, `copyin`, rectangular and
 direct-bound nonrectangular `collapse(2)`, predefined reductions, runtime
 thread queries, assumed-size sequence forwarding, dynamically bound orphaned
-worksharing, fixed-form shared DO termination labels, and named and unnamed
-critical regions. Every source completes its upstream-requested compile, link,
+worksharing, `sections` with two structured blocks and its implicit barrier,
+fixed-form shared DO termination labels, and named and unnamed critical
+regions. Every source completes its upstream-requested compile, link,
 or run operation at `-O0` and `-O3`; run cases also assert their deterministic
 numeric output. The corpus, license, revision record, and harness live under
 `tests/fixtures/openmp-official/` and `tests/openmp_official_examples.rs`.
@@ -91,8 +92,8 @@ An explicit `barrier` likewise binds dynamically to the current team, so it can
 reside in a procedure whose source is lexically outside a `parallel` region.
 When such a procedure is called serially, the initial one-thread team makes the
 barrier a no-op. A barrier may not be closely nested inside a worksharing
-`do`, `loop`, combined `parallel do`, `critical`, `master`, or `atomic update`
-region.
+`do`, `loop`, combined `parallel do`, `sections`, `critical`, `master`, or
+`atomic update` region.
 
 The pinned OpenMP V&V corpus starts with three unchanged OpenMP 5.0 `loop`
 host cases: `test_loop_private.F90`, `test_loop_reduction_add.F90`, and
@@ -236,11 +237,29 @@ external interface, and verifies a sum of `100.0` from every requested thread
 at `-O0` and `-O3`. The pinned OpenMP V&V revision contains no Fortran source
 using `copyin` or `threadprivate`, so no V&V case is claimed for this slice.
 
+### Bounded `sections`
+
+Standalone and orphaned `sections` constructs support one or more nonempty
+structured blocks separated by `section` directives. An initial `section`
+marker is optional. Each block has a deterministic static owner computed from
+its zero-based index modulo the current team size, so it executes exactly once
+without a shared dispatch cursor or reusable generation state. The construct
+has an implicit exit barrier unless `nowait` is present; serial calls use the
+initial one-thread team.
+
+Focused `-O0` and `-O3` tests exercise seven sections on four threads, repeated
+constructs, `nowait` followed by an explicit barrier, orphaned procedures, and
+serial execution. The unchanged official `fort_loopvar.2.f90` compile example
+covers two sections followed by `single` in one parallel region. The pinned
+OpenMP V&V revision contains no Fortran `sections` source, so no V&V case is
+claimed. Data-environment clauses, `lastprivate`, reductions, allocation
+clauses, and combined `parallel sections` remain diagnosed.
+
 ## Next milestones
 
-1. Add the `sections` worksharing construct with a generation-safe dispatch and
-   implicit-barrier model; keep `lastprivate`, `reduction`, and `nowait`
-   extensions independently testable.
+1. Extend `sections` with bounded `private` and `firstprivate` data environments,
+   then keep `lastprivate`, `reduction`, allocation, and combined
+   `parallel sections` as independently testable slices.
 2. Extend array reductions beyond constant-shape rank one only with a truthful
    descriptor and partial-storage mapping design.
 3. Add guided/runtime scheduling only after each worksharing construct owns an
