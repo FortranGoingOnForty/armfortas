@@ -25399,6 +25399,87 @@ fn fopenmp_shared_module_scalar_runs() {
 }
 
 #[test]
+fn fopenmp_imported_fixed_array_shape_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_imported_fixed_array_shape_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    for opt in ["-O0", "-O3"] {
+        let dir = unique_dir("openmp_imported_fixed_array");
+        let provider = write_program_in(
+            &dir,
+            "fixed_array_m.f90",
+            "module fixed_array_m\n  implicit none\n  double precision :: values(0:3) = -1.d0\nend module fixed_array_m\n",
+        );
+        let consumer = write_program_in(
+            &dir,
+            "fixed_array_main.f90",
+            "program p
+  use omp_lib, only: omp_get_thread_num
+  use fixed_array_m, only: values
+  implicit none
+  integer :: tid
+!$omp parallel default(none) num_threads(4) private(tid) shared(values)
+  tid = omp_get_thread_num()
+  values(tid) = dble(tid + 1)
+!$omp end parallel
+  if (lbound(values, 1) /= 0 .or. ubound(values, 1) /= 3) error stop 1
+  if (any(values /= [1.d0, 2.d0, 3.d0, 4.d0])) error stop 2
+  print *, 'ok'
+end program p
+",
+        );
+        let provider_object = dir.join("fixed_array_m.o");
+        let compile_provider = Command::new(compiler("armfortas"))
+            .args([opt, "-c", "-J"])
+            .arg(&dir)
+            .arg(&provider)
+            .args(["-o"])
+            .arg(&provider_object)
+            .output()
+            .expect("fixed-array provider compile failed to spawn");
+        assert!(
+            compile_provider.status.success(),
+            "fixed-array provider should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile_provider.stderr)
+        );
+
+        let executable = dir.join("fixed_array_main");
+        let runtime_cache = dir.join("runtime-cache");
+        std::fs::create_dir_all(&runtime_cache).expect("cannot create runtime cache");
+        let compile_consumer = Command::new(compiler("armfortas"))
+            .args(["-fopenmp", opt, "-I"])
+            .arg(&dir)
+            .arg(&consumer)
+            .arg(&provider_object)
+            .args(["-o"])
+            .arg(&executable)
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("fixed-array consumer compile failed to spawn");
+        assert!(
+            compile_consumer.status.success(),
+            "imported fixed-array shape should survive .amod at {opt}: {}",
+            String::from_utf8_lossy(&compile_consumer.stderr)
+        );
+        let run = Command::new(&executable)
+            .output()
+            .expect("fixed-array consumer failed to run");
+        assert!(
+            run.status.success(),
+            "imported fixed-array consumer failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
 fn fopenmp_shared_fixed_shape_arrays_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
