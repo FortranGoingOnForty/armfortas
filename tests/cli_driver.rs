@@ -26798,36 +26798,11 @@ fn fopenmp_module_pointer_threadprivate_persists_across_regions() {
             &dir,
             "pointer_threadprivate_m.f90",
             "module pointer_threadprivate_m
-  use omp_lib, only: omp_get_thread_num, omp_get_num_threads
   implicit none
   real(8), pointer :: view(:)
   integer :: saved_id = -1
   integer :: saved_team = -1
 !$omp threadprivate(view, saved_id, saved_team)
-contains
-  subroutine initialize_ids()
-!$omp parallel num_threads(4)
-    saved_id = omp_get_thread_num()
-    saved_team = omp_get_num_threads()
-!$omp end parallel
-  end subroutine initialize_ids
-
-  subroutine fill_views(primary, work, observed)
-    real(8), target, intent(inout) :: primary(3), work(3, 3)
-    integer, intent(out) :: observed(4)
-!$omp parallel default(shared) num_threads(4)
-    if (saved_team /= 4) error stop 1
-    if (saved_id == 0) then
-      view => primary(1:3)
-    else
-      view => work(:, saved_id)
-    end if
-!$omp barrier
-    if (.not. associated(view)) error stop 2
-    view = 10.0d0 + dble(saved_id)
-    observed(saved_id + 1) = int(view(1))
-!$omp end parallel
-  end subroutine fill_views
 end module pointer_threadprivate_m
 ",
         );
@@ -26835,15 +26810,30 @@ end module pointer_threadprivate_m
             &dir,
             "pointer_threadprivate_main.f90",
             "program p
-  use pointer_threadprivate_m, only: initialize_ids, fill_views
+  use omp_lib, only: omp_get_thread_num, omp_get_num_threads
+  use pointer_threadprivate_m, only: view, saved_id, saved_team
   implicit none
-  real(8) :: primary(3), work(3, 3)
+  real(8), target :: primary(3), work(3, 3)
   integer :: observed(4), i
   primary = -1.0d0
   work = -2.0d0
   observed = -99
-  call initialize_ids()
-  call fill_views(primary, work, observed)
+!$omp parallel num_threads(4)
+  saved_id = omp_get_thread_num()
+  saved_team = omp_get_num_threads()
+!$omp end parallel
+!$omp parallel default(shared) num_threads(4)
+  if (saved_team /= 4) error stop 1
+  if (saved_id == 0) then
+    view => primary(1:3)
+  else
+    view => work(:, saved_id)
+  end if
+!$omp barrier
+  if (.not. associated(view)) error stop 2
+  view = 10.0d0 + dble(saved_id)
+  observed(saved_id + 1) = int(view(1))
+!$omp end parallel
   if (any(abs(primary - 10.0d0) > 1.0d-12)) error stop 3
   do i = 1, 3
     if (any(abs(work(:, i) - dble(10 + i)) > 1.0d-12)) error stop 4
