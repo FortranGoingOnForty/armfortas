@@ -3373,6 +3373,19 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                 }
             }
             Decl::AttributeStmt {
+                attr: Attribute::OpenMpThreadPrivate,
+                entities,
+            } => {
+                let entity = entities.first().map(String::as_str).unwrap_or("<missing>");
+                return Err(SemaError {
+                    span: decl.span,
+                    msg: format!(
+                        "OpenMP THREADPRIVATE entity '{}' must be declared in the same module",
+                        entity
+                    ),
+                });
+            }
+            Decl::AttributeStmt {
                 attr: Attribute::External,
                 entities,
             } => {
@@ -4215,6 +4228,7 @@ fn attrs_to_symbol_attrs(attrs: &[Attribute], default_access: Access) -> SymbolA
             Attribute::Asynchronous => sa.asynchronous = true,
             Attribute::Contiguous => sa.contiguous = true,
             Attribute::Volatile => sa.volatile = true,
+            Attribute::OpenMpThreadPrivate => sa.openmp_threadprivate = true,
             Attribute::Target => sa.target = true,
             Attribute::Optional => sa.optional = true,
             Attribute::Save => sa.save = true,

@@ -833,6 +833,7 @@ fn install_external_interface(
             pointer: var.pointer,
             target: var.target,
             volatile: var.volatile,
+            openmp_threadprivate: var.openmp_threadprivate,
             parameter: var.is_parameter,
             external: var.proc_pointer,
             array_spec,

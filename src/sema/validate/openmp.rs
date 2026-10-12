@@ -1080,6 +1080,13 @@ fn validate_reduction_object(
         );
         return;
     }
+    if symbol.attrs.openmp_threadprivate {
+        ctx.error(
+            span,
+            format!("OpenMP THREADPRIVATE variable '{name}' may not appear in a REDUCTION clause"),
+        );
+        return;
+    }
     if symbol.attrs.allocatable || symbol.attrs.pointer {
         ctx.error(
             span,
@@ -1694,6 +1701,9 @@ fn validate_data_environment(
             validate_shared_object(ctx, &name, span);
             continue;
         };
+        if symbol.attrs.openmp_threadprivate {
+            continue;
+        }
         let predetermined_shared = symbol.kind == SymbolKind::Parameter
             || symbol
                 .attrs
@@ -1740,6 +1750,16 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
             span,
             format!(
                 "OpenMP PARALLEL capture of '{}' requires a variable or named constant",
+                name
+            ),
+        );
+        return;
+    }
+    if symbol.attrs.openmp_threadprivate {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP THREADPRIVATE variable '{}' may not appear in a SHARED clause",
                 name
             ),
         );
@@ -1905,6 +1925,16 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         ctx.error(
             span,
             format!("OpenMP {} list item '{}' must be a variable", clause, name),
+        );
+        return;
+    }
+    if symbol.attrs.openmp_threadprivate {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP THREADPRIVATE variable '{}' may not appear in a {} clause",
+                name, clause
+            ),
         );
         return;
     }

@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use super::{ParseError, Parser};
+use crate::ast::decl::{Attribute, Decl, SpannedDecl};
 use crate::ast::expr::Expr;
 use crate::ast::openmp::{
     OpenMpClause, OpenMpConstruct, OpenMpDefault, OpenMpReductionItem, OpenMpReductionOperator,
@@ -35,6 +36,45 @@ enum BeginKind {
 }
 
 impl<'a> Parser<'a> {
+    pub(super) fn parse_openmp_declarative_directive(
+        &mut self,
+    ) -> Result<Option<SpannedDecl>, ParseError> {
+        if self.peek() != &TokenKind::OmpDirective {
+            return Ok(None);
+        }
+        let directive = self.current().clone();
+        let mut cursor = DirectiveCursor::new(&directive.text, directive.span);
+        let first = cursor
+            .identifier("OpenMP directive name")?
+            .to_ascii_lowercase();
+        if first != "threadprivate" {
+            return Ok(None);
+        }
+        let entities = parse_name_list(
+            cursor.parenthesized("THREADPRIVATE list")?,
+            directive.span,
+            "THREADPRIVATE list",
+        )?;
+        cursor.finish()?;
+        let mut seen = HashSet::new();
+        for entity in &entities {
+            if !seen.insert(entity.to_ascii_lowercase()) {
+                return Err(ParseError {
+                    span: directive.span,
+                    msg: format!("duplicate OpenMP THREADPRIVATE list item '{}'", entity),
+                });
+            }
+        }
+        self.advance();
+        Ok(Some(Spanned::new(
+            Decl::AttributeStmt {
+                attr: Attribute::OpenMpThreadPrivate,
+                entities,
+            },
+            directive.span,
+        )))
+    }
+
     pub(super) fn current_openmp_directive_starts_loop(&self) -> bool {
         let directive = self.current();
         directive.kind == TokenKind::OmpDirective
@@ -1097,6 +1137,43 @@ mod tests {
             [OpenMpClause::Collapse(argument)]
                 if matches!(&argument.node, Expr::IntegerLiteral { text, .. } if text == "2")
         ));
+    }
+
+    #[test]
+    fn parses_threadprivate_as_a_module_declaration() {
+        let tokens = tokenize_with_options(
+            "module m\n\
+             implicit none\n\
+             real(8) :: x(4), y(4)\n\
+             !$omp threadprivate(x, y)\n\
+             end module m\n",
+            0,
+            SourceForm::FreeForm,
+            LexerOptions { openmp: true },
+        )
+        .unwrap();
+        let units = Parser::new_for_form(&tokens, SourceForm::FreeForm)
+            .parse_file()
+            .unwrap();
+        let crate::ast::unit::ProgramUnit::Module { decls, .. } = &units[0].node else {
+            panic!("expected module");
+        };
+        let mut threadprivate_names: Vec<_> = decls
+            .iter()
+            .filter_map(|decl| match &decl.node {
+                Decl::TypeDecl {
+                    attrs, entities, ..
+                } if attrs
+                    .iter()
+                    .any(|attr| matches!(attr, Attribute::OpenMpThreadPrivate)) =>
+                {
+                    Some(entities[0].name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        threadprivate_names.sort_unstable();
+        assert_eq!(threadprivate_names, ["x", "y"]);
     }
 
     #[test]

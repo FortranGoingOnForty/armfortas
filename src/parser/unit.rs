@@ -907,6 +907,13 @@ impl<'a> Parser<'a> {
                 break;
             }
 
+            if self.peek() == &TokenKind::OmpDirective {
+                if let Some(decl) = self.parse_openmp_declarative_directive()? {
+                    decls.push(decl);
+                    continue;
+                }
+            }
+
             // Check for derived type definition: type name
             // or type [, attrs] :: name.
             if text == "type" {
@@ -1560,6 +1567,7 @@ fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
                         | Attribute::External
                         | Attribute::Intrinsic
                         | Attribute::Save
+                        | Attribute::OpenMpThreadPrivate
                 ) && (!matches!(attr, Attribute::Save) || !entities.is_empty()) =>
             {
                 (attr.clone(), entities.clone())

@@ -3964,7 +3964,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 15\n", "#!amod 14\n", 1);
+        .replacen("#!amod 16\n", "#!amod 15\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -3991,7 +3991,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 14 (compiler requires 15)")
+        stderr.contains("incompatible .amod version 15 (compiler requires 16)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -25110,6 +25110,146 @@ fn fopenmp_default_private_enforces_data_environment_rules() {
         assert!(
             !result.status.success(),
             "invalid OpenMP DEFAULT(PRIVATE) data environment compiled"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(expected), "unexpected diagnostic: {stderr}");
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
+fn fopenmp_module_threadprivate_storage_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_module_threadprivate_storage_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    for opt in ["-O0", "-O3"] {
+        let dir = unique_dir("openmp_threadprivate");
+        let module_src = write_program_in(
+            &dir,
+            "threadprivate_m.f90",
+            "module threadprivate_m
+  implicit none
+  integer :: scalar = 7
+  integer :: values(2) = [11, 22]
+!$omp threadprivate(scalar, values)
+end module threadprivate_m
+",
+        );
+        let program_src = write_program_in(
+            &dir,
+            "threadprivate_main.f90",
+            "program p
+  use omp_lib, only: omp_get_thread_num
+  use threadprivate_m
+  implicit none
+  integer :: id
+  integer :: observed(4)
+  observed = -1
+  scalar = -1
+  values = [-2, -3]
+!$omp parallel default(shared) private(id) num_threads(4)
+  id = omp_get_thread_num()
+  if (id == 0) then
+    if (scalar /= -1 .or. values(1) /= -2) error stop 1
+  else
+    if (scalar /= 7 .or. values(1) /= 11) error stop 2
+  end if
+  scalar = 100 + id
+  values(1) = 200 + id
+  observed(id + 1) = scalar + values(1)
+!$omp end parallel
+  if (any(observed /= [300, 302, 304, 306])) error stop 3
+  if (scalar /= 100 .or. values(1) /= 200) error stop 4
+  print *, 'ok'
+end program p
+",
+        );
+        let module_object = dir.join("threadprivate_m.o");
+        let compile_module = Command::new(compiler("armfortas"))
+            .args(["-fopenmp", opt, "-c", "-J"])
+            .arg(&dir)
+            .arg(&module_src)
+            .args(["-o"])
+            .arg(&module_object)
+            .output()
+            .expect("THREADPRIVATE module compile failed to spawn");
+        assert!(
+            compile_module.status.success(),
+            "OpenMP THREADPRIVATE module should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile_module.stderr)
+        );
+        let amod = std::fs::read_to_string(dir.join("threadprivate_m.amod"))
+            .expect("THREADPRIVATE module did not publish .amod");
+        assert!(
+            amod.lines().any(|line| line.starts_with("@var scalar ")
+                && line
+                    .split(" @")
+                    .next()
+                    .is_some_and(|decl| decl.split(", ").any(|attr| attr == "threadprivate"))),
+            "THREADPRIVATE attribute was not serialized: {amod}"
+        );
+
+        let executable = dir.join("threadprivate_main");
+        let runtime_cache = dir.join("runtime-cache");
+        std::fs::create_dir_all(&runtime_cache).expect("cannot create runtime cache");
+        let compile_program = Command::new(compiler("armfortas"))
+            .args(["-fopenmp", opt, "-I"])
+            .arg(&dir)
+            .arg(&program_src)
+            .arg(&module_object)
+            .args(["-o"])
+            .arg(&executable)
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("THREADPRIVATE consumer compile failed to spawn");
+        assert!(
+            compile_program.status.success(),
+            "OpenMP THREADPRIVATE consumer should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile_program.stderr)
+        );
+        for _ in 0..3 {
+            let run = Command::new(&executable)
+                .output()
+                .expect("THREADPRIVATE executable failed to run");
+            assert!(
+                run.status.success(),
+                "OpenMP THREADPRIVATE executable failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn fopenmp_threadprivate_rejects_unsupported_entities() {
+    let cases = [
+        (
+            "program p\ninteger :: value\n!$omp threadprivate(value)\nend program p\n",
+            "OpenMP THREADPRIVATE is currently supported only for module variables",
+        ),
+        (
+            "module m\ninteger, allocatable :: values(:)\n!$omp threadprivate(values)\nend module m\n",
+            "OpenMP THREADPRIVATE currently requires a nonallocatable, nonpointer intrinsic numeric or LOGICAL module variable",
+        ),
+        (
+            "module m\ninteger :: value\n!$omp threadprivate(value)\ncontains\nsubroutine s\n!$omp parallel shared(value)\nvalue=1\n!$omp end parallel\nend subroutine s\nend module m\n",
+            "OpenMP THREADPRIVATE variable 'value' may not appear in a SHARED clause",
+        ),
+    ];
+    for (source, expected) in cases {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &["-fopenmp"]);
+        assert!(
+            !result.status.success(),
+            "unsupported OpenMP THREADPRIVATE entity compiled"
         );
         let stderr = String::from_utf8_lossy(&result.stderr);
         assert!(stderr.contains(expected), "unexpected diagnostic: {stderr}");
@@ -46752,7 +46892,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 15\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 16\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))

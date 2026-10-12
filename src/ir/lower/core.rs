@@ -3495,6 +3495,7 @@ pub struct ModuleGlobalInfo {
     pub allocatable: bool,
     pub is_pointer: bool,
     pub volatile: bool,
+    pub openmp_threadprivate: bool,
     pub deferred_char: bool,
     pub derived_type: Option<String>,
     pub(crate) char_kind: CharKind,
@@ -4946,6 +4947,9 @@ pub(super) fn collect_module_globals(
                     || module_scope_id
                         .and_then(|scope_id| st.lookup_in(scope_id, &key))
                         .is_some_and(|symbol| symbol.attrs.volatile);
+                let entity_is_threadprivate = module_scope_id
+                    .and_then(|scope_id| st.lookup_in(scope_id, &key))
+                    .is_some_and(|symbol| symbol.attrs.openmp_threadprivate);
                 let symbol = format!("afs_mod_{}_{}", mod_name.to_lowercase(), key);
                 let init_expr = entity
                     .init
@@ -5023,6 +5027,7 @@ pub(super) fn collect_module_globals(
                             allocatable: true,
                             is_pointer,
                             volatile: entity_is_volatile,
+                            openmp_threadprivate: entity_is_threadprivate,
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: array_char_kind,
@@ -5057,6 +5062,7 @@ pub(super) fn collect_module_globals(
                             allocatable: false,
                             is_pointer,
                             volatile: entity_is_volatile,
+                            openmp_threadprivate: entity_is_threadprivate,
                             deferred_char: true,
                             derived_type: None,
                             char_kind: CharKind::Deferred,
@@ -5106,6 +5112,7 @@ pub(super) fn collect_module_globals(
                             allocatable: true,
                             is_pointer: false,
                             volatile: entity_is_volatile,
+                            openmp_threadprivate: entity_is_threadprivate,
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: global_char_kind.clone(),
@@ -5308,6 +5315,7 @@ pub(super) fn collect_module_globals(
                             allocatable: false,
                             is_pointer,
                             volatile: entity_is_volatile,
+                            openmp_threadprivate: entity_is_threadprivate,
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: global_char_kind.clone(),
@@ -5337,6 +5345,7 @@ pub(super) fn collect_module_globals(
                                 allocatable: false,
                                 is_pointer: true,
                                 volatile: entity_is_volatile,
+                                openmp_threadprivate: entity_is_threadprivate,
                                 deferred_char: false,
                                 derived_type: derived_type_name.clone(),
                                 char_kind: global_char_kind.clone(),
@@ -5378,6 +5387,7 @@ pub(super) fn collect_module_globals(
                                     allocatable: false,
                                     is_pointer: false,
                                     volatile: entity_is_volatile,
+                                    openmp_threadprivate: entity_is_threadprivate,
                                     deferred_char: false,
                                     derived_type: None,
                                     char_kind: CharKind::Fixed(len),
@@ -5445,6 +5455,7 @@ pub(super) fn collect_module_globals(
                                     allocatable: false,
                                     is_pointer,
                                     volatile: entity_is_volatile,
+                                    openmp_threadprivate: entity_is_threadprivate,
                                     deferred_char: false,
                                     derived_type: Some(type_name.clone()),
                                     char_kind: CharKind::None,
@@ -5539,6 +5550,7 @@ pub(super) fn collect_module_globals(
                             allocatable: false,
                             is_pointer,
                             volatile: entity_is_volatile,
+                            openmp_threadprivate: entity_is_threadprivate,
                             deferred_char: false,
                             derived_type: None,
                             char_kind: global_char_kind.clone(),
@@ -8822,7 +8834,32 @@ pub(super) fn install_one_global(
     } else {
         info.ty.clone()
     };
-    let addr = b.global_addr(&info.symbol, addr_ty);
+    let template_addr = b.global_addr(&info.symbol, addr_ty.clone());
+    let addr = if info.openmp_threadprivate {
+        let element_count = info.dims.iter().fold(1_u64, |count, (_, extent)| {
+            count
+                .checked_mul(u64::try_from(*extent).expect("validated THREADPRIVATE extent"))
+                .expect("THREADPRIVATE array element count overflow")
+        });
+        let byte_count = addr_ty
+            .size_bytes(&b.layout)
+            .checked_mul(element_count)
+            .expect("THREADPRIVATE storage size overflow");
+        let byte_count = i64::try_from(byte_count).expect("THREADPRIVATE storage exceeds i64");
+        let alignment = u64::try_from(byte_count)
+            .unwrap_or(1)
+            .clamp(1, 16)
+            .next_power_of_two() as i64;
+        let byte_count_value = b.const_i64(byte_count);
+        let alignment_value = b.const_i64(alignment);
+        b.call(
+            FuncRef::External("afs_omp_threadprivate".into()),
+            vec![template_addr, byte_count_value, alignment_value],
+            IrType::Ptr(Box::new(addr_ty)),
+        )
+    } else {
+        template_addr
+    };
     if info.volatile {
         b.mark_volatile_address(addr);
     }
@@ -9141,6 +9178,42 @@ fn install_resolved_global_import(
         return;
     }
     install_one_global(b, locals, local_key, info, symbol.attrs.array_spec.len());
+}
+
+/// Install a THREADPRIVATE module variable directly in an outlined OpenMP
+/// callback. Unlike an ordinary capture, the callback must resolve the module
+/// template through the runtime on its own host thread; passing the
+/// encountering thread's resolved address through the environment would turn
+/// THREADPRIVATE storage back into shared storage.
+pub(super) fn install_threadprivate_global(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    st: &SymbolTable,
+    proc_scope_id: Option<crate::sema::symtab::ScopeId>,
+    local_key: &str,
+) -> bool {
+    let Some(symbol) = st.lookup_local_then_any(proc_scope_id, local_key) else {
+        return false;
+    };
+    if !symbol.attrs.openmp_threadprivate {
+        return false;
+    }
+    let Some(global_key) = defining_global_key(st, globals, symbol) else {
+        return false;
+    };
+    let info = &globals[&global_key];
+    if !info.openmp_threadprivate {
+        return false;
+    }
+    install_one_global(
+        b,
+        locals,
+        local_key.to_string(),
+        info,
+        symbol.attrs.array_spec.len(),
+    );
+    true
 }
 
 /// Install module globals imported by this function's USE

@@ -15,9 +15,12 @@
 //! joined. `requested_threads <= 0` selects the current nthreads ICV. Version 1
 //! reserves every flag bit; callers must pass zero.
 
+use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock};
 use std::time::Instant;
@@ -304,8 +307,68 @@ struct ThreadState {
     teams: Vec<TeamContext>,
 }
 
+#[derive(Debug)]
+struct ThreadPrivateAllocation {
+    pointer: NonNull<u8>,
+    layout: Layout,
+}
+
+impl Drop for ThreadPrivateAllocation {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.pointer.as_ptr(), self.layout);
+        }
+    }
+}
+
 thread_local! {
     static THREAD_STATE: RefCell<ThreadState> = RefCell::new(ThreadState::default());
+    static THREADPRIVATE_STORAGE: RefCell<HashMap<usize, ThreadPrivateAllocation>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Resolve one module variable's storage for the current host thread.
+///
+/// `template` is both the process-wide identity key and the initial byte
+/// image. The compiler emits one ordinary module global as that stable key;
+/// every source-level access is redirected through this function. Storage is
+/// retained until the host thread exits, which gives the initial thread
+/// persistence across parallel regions while naturally following the
+/// lifetime of worker threads created by the runtime.
+#[no_mangle]
+pub extern "C" fn afs_omp_threadprivate(
+    template: *const u8,
+    byte_count: i64,
+    alignment: i64,
+) -> *mut u8 {
+    if template.is_null() || byte_count <= 0 || alignment <= 0 {
+        return std::ptr::null_mut();
+    }
+    let Ok(byte_count) = usize::try_from(byte_count) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(alignment) = usize::try_from(alignment) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(layout) = Layout::from_size_align(byte_count, alignment) else {
+        return std::ptr::null_mut();
+    };
+    let key = template as usize;
+    THREADPRIVATE_STORAGE.with(|storage| {
+        let mut storage = storage.borrow_mut();
+        if let Some(allocation) = storage.get(&key) {
+            return allocation.pointer.as_ptr();
+        }
+        let pointer = unsafe { alloc(layout) };
+        let Some(pointer) = NonNull::new(pointer) else {
+            return std::ptr::null_mut();
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(template, pointer.as_ptr(), byte_count);
+        }
+        storage.insert(key, ThreadPrivateAllocation { pointer, layout });
+        pointer.as_ptr()
+    })
 }
 
 fn num_processors() -> i32 {
@@ -2118,6 +2181,58 @@ mod tests {
         assert_eq!(afs_omp_get_level(), 0);
         assert!(afs_omp_get_max_threads() >= 1);
         assert!(afs_omp_get_num_procs() >= 1);
+    }
+
+    #[test]
+    fn threadprivate_storage_is_initialized_isolated_and_persistent_per_thread() {
+        #[repr(align(16))]
+        struct AlignedTemplate([u64; 2]);
+        static TEMPLATE: AlignedTemplate = AlignedTemplate([11, 22]);
+
+        let template = TEMPLATE.0.as_ptr().cast::<u8>();
+        let primary = afs_omp_threadprivate(template, 16, 16).cast::<u64>();
+        assert!(!primary.is_null());
+        unsafe {
+            assert_eq!((*primary, *primary.add(1)), (11, 22));
+            *primary = 91;
+        }
+        assert_eq!(
+            afs_omp_threadprivate(template, 16, 16).cast::<u64>(),
+            primary
+        );
+        assert_eq!(unsafe { *primary }, 91);
+
+        let template_address = template as usize;
+        let allocations_ready = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for value in [101_u64, 202_u64] {
+            let allocations_ready = Arc::clone(&allocations_ready);
+            workers.push(std::thread::spawn(move || {
+                let template = template_address as *const u8;
+                let storage = afs_omp_threadprivate(template, 16, 16).cast::<u64>();
+                assert!(!storage.is_null());
+                unsafe {
+                    assert_eq!((*storage, *storage.add(1)), (11, 22));
+                    *storage = value;
+                }
+                let repeated = afs_omp_threadprivate(template, 16, 16).cast::<u64>();
+                assert_eq!(repeated, storage);
+                allocations_ready.wait();
+                (storage as usize, unsafe { *repeated })
+            }));
+        }
+        allocations_ready.wait();
+        let first = workers.remove(0).join().unwrap();
+        let second = workers.remove(0).join().unwrap();
+        assert_ne!(first.0, primary as usize);
+        assert_ne!(second.0, primary as usize);
+        assert_ne!(first.0, second.0);
+        assert_eq!((first.1, second.1), (101, 202));
+        assert_eq!(unsafe { *primary }, 91);
+
+        assert!(afs_omp_threadprivate(std::ptr::null(), 16, 16).is_null());
+        assert!(afs_omp_threadprivate(template, 0, 16).is_null());
+        assert!(afs_omp_threadprivate(template, 16, 3).is_null());
     }
 
     #[test]

@@ -685,6 +685,35 @@ fn lower_parallel_region(
         crate::sema::validate::openmp::predetermined_private_names(ctx.st, capture_body);
     let standalone_lastprivate =
         crate::sema::validate::openmp::standalone_worksharing_lastprivate_names(capture_body);
+    let mut threadprivate_names: Vec<_> =
+        crate::sema::validate::openmp::capture_references(ctx.st, capture_body)
+            .into_iter()
+            .filter_map(|(name, _, role)| {
+                let is_data_reference = role == crate::sema::validate::openmp::ReferenceRole::Value
+                    || (role == crate::sema::validate::openmp::ReferenceRole::Callable
+                        && ctx
+                            .st
+                            .lookup_local_then_any(ctx.proc_scope_id, &name)
+                            .is_some_and(|symbol| {
+                                matches!(
+                                    symbol.kind,
+                                    crate::sema::symtab::SymbolKind::Variable
+                                        | crate::sema::symtab::SymbolKind::Parameter
+                                        | crate::sema::symtab::SymbolKind::ProcedurePointer
+                                )
+                            }));
+                (is_data_reference
+                    && ctx
+                        .st
+                        .lookup_local_then_any(ctx.proc_scope_id, &name)
+                        .is_some_and(|symbol| symbol.attrs.openmp_threadprivate))
+                .then_some(name)
+            })
+            .collect();
+    threadprivate_names.sort_unstable();
+    threadprivate_names.dedup();
+    let threadprivate_name_set: std::collections::HashSet<_> =
+        threadprivate_names.iter().cloned().collect();
     let mut seen_captures = std::collections::HashSet::new();
     let mut captures: Vec<Capture> =
         crate::sema::validate::openmp::capture_references(ctx.st, capture_body)
@@ -703,6 +732,7 @@ fn lower_parallel_region(
                                         | crate::sema::symtab::SymbolKind::ProcedurePointer
                                 )
                             })))
+                    && !threadprivate_name_set.contains(name)
                     && seen_captures.insert(name.clone())
             })
             .map(|(name, _, _)| {
@@ -866,6 +896,19 @@ fn lower_parallel_region(
         {
             let mut outlined = FuncBuilder::new(&mut callback, ctx.layout);
             outlined.set_local_modules(local_modules);
+            for name in &threadprivate_names {
+                assert!(
+                    super::core::install_threadprivate_global(
+                        &mut outlined,
+                        &mut outlined_ctx.locals,
+                        outlined_ctx.globals,
+                        outlined_ctx.st,
+                        outlined_ctx.proc_scope_id,
+                        name,
+                    ),
+                    "validated OpenMP THREADPRIVATE variable '{name}' has no module global"
+                );
+            }
             let cleanup = install_shared_captures(&mut outlined, &mut outlined_ctx, &captures);
             let parallel_reductions = match region_body {
                 ParallelRegionBody::Statements(_) => {

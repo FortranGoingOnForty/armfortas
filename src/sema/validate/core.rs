@@ -23,7 +23,9 @@ use super::pure_elemental::{
     check_pure_stmt_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
     validate_pure_call,
 };
-use crate::ast::decl::{Attribute, Decl, OnlyItem, SpannedDecl, TypeAttr, TypeSpec, UseNature};
+use crate::ast::decl::{
+    ArraySpec, Attribute, Decl, OnlyItem, SpannedDecl, TypeAttr, TypeSpec, UseNature,
+};
 use crate::ast::expr::{AcValue, Argument, Expr, SectionSubscript, SpannedExpr};
 use crate::ast::stmt::*;
 use crate::ast::unit::*;
@@ -4920,6 +4922,62 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
         {
             let has_alloc = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
             let has_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
+            let has_threadprivate = attrs
+                .iter()
+                .any(|a| matches!(a, Attribute::OpenMpThreadPrivate));
+            if has_threadprivate {
+                if !matches!(ctx.st.scope(ctx.scope_id).kind, ScopeKind::Module(_)) {
+                    ctx.error(
+                        decl.span,
+                        "OpenMP THREADPRIVATE is currently supported only for module variables",
+                    );
+                }
+                if has_alloc
+                    || has_pointer
+                    || attrs.iter().any(|a| matches!(a, Attribute::Parameter))
+                    || !matches!(
+                        type_spec,
+                        TypeSpec::Integer(_)
+                            | TypeSpec::Real(_)
+                            | TypeSpec::DoublePrecision
+                            | TypeSpec::Complex(_)
+                            | TypeSpec::DoubleComplex
+                            | TypeSpec::Logical(_)
+                    )
+                {
+                    ctx.error(
+                        decl.span,
+                        "OpenMP THREADPRIVATE currently requires a nonallocatable, nonpointer intrinsic numeric or LOGICAL module variable",
+                    );
+                }
+                let attr_shape = attrs.iter().find_map(|attr| match attr {
+                    Attribute::Dimension(specs) => Some(specs),
+                    _ => None,
+                });
+                for entity in entities {
+                    if let Some(specs) = entity.array_spec.as_ref().or(attr_shape) {
+                        for spec in specs {
+                            let ArraySpec::Explicit { lower, upper } = spec else {
+                                ctx.error(
+                                    decl.span,
+                                    "OpenMP THREADPRIVATE arrays currently require constant explicit shape",
+                                );
+                                continue;
+                            };
+                            if lower
+                                .as_ref()
+                                .is_some_and(|expr| validation_const_int_value(ctx, expr).is_none())
+                                || validation_const_int_value(ctx, upper).is_none()
+                            {
+                                ctx.error(
+                                    decl.span,
+                                    "OpenMP THREADPRIVATE arrays currently require constant explicit shape",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             if has_pointer && type_decl_encodes_procedure_interface(attrs, type_spec) {
                 if let TypeSpec::Type(interface_name) = type_spec {
                     let owner_scope = ctx.scope_id;
