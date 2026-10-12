@@ -48,6 +48,12 @@ enum CaptureKind {
     InlineConstant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorksharingLoopSemantics {
+    Do,
+    Loop,
+}
+
 #[derive(Clone)]
 struct Capture {
     name: String,
@@ -545,10 +551,30 @@ pub(super) fn lower_construct(
             lower_parallel_region(b, ctx, clauses, body, ParallelRegionBody::Statements(body));
         }
         OpenMpConstruct::Do { clauses, loop_stmt } => {
-            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, false, None, None);
+            lower_worksharing_loop(
+                b,
+                ctx,
+                clauses,
+                loop_stmt,
+                WorksharingLoopSemantics::Do,
+                false,
+                false,
+                None,
+                None,
+            );
         }
         OpenMpConstruct::Loop { clauses, loop_stmt } => {
-            lower_worksharing_loop(b, ctx, clauses, loop_stmt, false, false, None, None);
+            lower_worksharing_loop(
+                b,
+                ctx,
+                clauses,
+                loop_stmt,
+                WorksharingLoopSemantics::Loop,
+                false,
+                false,
+                None,
+                None,
+            );
         }
         OpenMpConstruct::ParallelDo { clauses, loop_stmt } => {
             let capture_body = std::slice::from_ref(loop_stmt.as_ref());
@@ -725,7 +751,10 @@ fn lower_parallel_region(
     let predetermined_private =
         crate::sema::validate::openmp::predetermined_private_names(ctx.st, capture_body);
     let standalone_lastprivate =
-        crate::sema::validate::openmp::standalone_worksharing_lastprivate_names(capture_body);
+        crate::sema::validate::openmp::standalone_worksharing_lastprivate_names(
+            capture_body,
+            |clauses| worksharing_collapse_depth(ctx, clauses),
+        );
     let mut threadprivate_names: Vec<_> =
         crate::sema::validate::openmp::capture_references(ctx.st, capture_body)
             .into_iter()
@@ -789,12 +818,13 @@ fn lower_parallel_region(
                     CaptureKind::Private
                 } else if info.inline_const.is_some() {
                     CaptureKind::InlineConstant
-                } else if shared_names.contains(&name)
-                    || standalone_lastprivate.contains(&name)
-                    || predetermined_shared
-                {
+                } else if shared_names.contains(&name) || predetermined_shared {
                     CaptureKind::Shared
-                } else if predetermined_private.contains(&name) || default_private {
+                } else if default_private {
+                    CaptureKind::Private
+                } else if standalone_lastprivate.contains(&name) {
+                    CaptureKind::Shared
+                } else if predetermined_private.contains(&name) {
                     CaptureKind::Private
                 } else {
                     CaptureKind::Shared
@@ -975,6 +1005,7 @@ fn lower_parallel_region(
                         &mut outlined_ctx,
                         clauses,
                         loop_stmt,
+                        WorksharingLoopSemantics::Do,
                         true,
                         true,
                         outlined_worksharing_chunk,
@@ -1602,6 +1633,7 @@ fn prepare_lastprivate_bindings(
     b: &mut FuncBuilder<'_>,
     ctx: &mut LowerCtx<'_>,
     clauses: &[OpenMpClause],
+    implicit_names: &[String],
     captured_originals: Option<&std::collections::HashMap<String, LocalInfo>>,
 ) -> Vec<LastPrivateBinding> {
     let firstprivate_names: std::collections::HashSet<_> = clauses
@@ -1615,60 +1647,63 @@ fn prepare_lastprivate_bindings(
         .collect();
     let mut seen = std::collections::HashSet::new();
     let mut bindings = Vec::new();
-    for clause in clauses {
-        let OpenMpClause::LastPrivate { variables, .. } = clause else {
+    let explicit_names = clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            OpenMpClause::LastPrivate { variables, .. } => Some(variables.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .map(String::as_str);
+    for name in explicit_names.chain(implicit_names.iter().map(String::as_str)) {
+        let key = name.to_ascii_lowercase();
+        if !seen.insert(key.clone()) {
             continue;
-        };
-        for name in variables {
-            let key = name.to_ascii_lowercase();
-            if !seen.insert(key.clone()) {
-                continue;
-            }
-            let current = ctx.locals.get(&key).cloned().unwrap_or_else(|| {
-                panic!("validated OpenMP LASTPRIVATE variable '{key}' has no lowering binding")
-            });
-            if let Some(original) = captured_originals
-                .and_then(|items| items.get(&key))
-                .cloned()
-            {
-                bindings.push(LastPrivateBinding {
-                    name: key,
-                    original,
-                    private: current,
-                    restore: None,
-                });
-                continue;
-            }
-
-            let original = current.clone();
-            let copy_in = firstprivate_names.contains(&key);
-            let private = if fixed_character_scalar_len(&current).is_some() {
-                let source = copy_in.then(|| {
-                    local_char_ptr_and_len(b, &current)
-                        .expect("validated OpenMP FIRSTPRIVATE character should lower")
-                        .0
-                });
-                allocate_fixed_character_private(b, &current, source)
-            } else {
-                let mut private = current.clone();
-                private.addr = b.alloca(private.ty.clone());
-                private.by_ref = false;
-                private.inline_const = None;
-                if copy_in {
-                    let source = scalar_storage_address(b, &current);
-                    let value = b.load_typed(source, current.ty.clone());
-                    b.store(value, private.addr);
-                }
-                private
-            };
-            ctx.locals.insert(key.clone(), private.clone());
+        }
+        let current = ctx.locals.get(&key).cloned().unwrap_or_else(|| {
+            panic!("validated OpenMP LASTPRIVATE variable '{key}' has no lowering binding")
+        });
+        if let Some(original) = captured_originals
+            .and_then(|items| items.get(&key))
+            .cloned()
+        {
             bindings.push(LastPrivateBinding {
                 name: key,
-                original: original.clone(),
-                private,
-                restore: Some(original),
+                original,
+                private: current,
+                restore: None,
             });
+            continue;
         }
+
+        let original = current.clone();
+        let copy_in = firstprivate_names.contains(&key);
+        let private = if fixed_character_scalar_len(&current).is_some() {
+            let source = copy_in.then(|| {
+                local_char_ptr_and_len(b, &current)
+                    .expect("validated OpenMP FIRSTPRIVATE character should lower")
+                    .0
+            });
+            allocate_fixed_character_private(b, &current, source)
+        } else {
+            let mut private = current.clone();
+            private.addr = b.alloca(private.ty.clone());
+            private.by_ref = false;
+            private.inline_const = None;
+            if copy_in {
+                let source = scalar_storage_address(b, &current);
+                let value = b.load_typed(source, current.ty.clone());
+                b.store(value, private.addr);
+            }
+            private
+        };
+        ctx.locals.insert(key.clone(), private.clone());
+        bindings.push(LastPrivateBinding {
+            name: key,
+            original: original.clone(),
+            private,
+            restore: Some(original),
+        });
     }
     bindings
 }
@@ -1701,6 +1736,7 @@ fn lower_worksharing_loop(
     ctx: &mut LowerCtx<'_>,
     clauses: &[OpenMpClause],
     loop_stmt: &SpannedStmt,
+    semantics: WorksharingLoopSemantics,
     suppress_barrier: bool,
     clauses_materialized_by_parallel: bool,
     precomputed_chunk: Option<ValueId>,
@@ -1886,8 +1922,31 @@ fn lower_worksharing_loop(
         }
     });
     let reductions = prepare_reductions(b, ctx, clauses);
-    let mut lastprivate_bindings =
-        prepare_lastprivate_bindings(b, ctx, clauses, captured_lastprivate_originals);
+    let explicitly_private: std::collections::HashSet<_> = clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            OpenMpClause::Private(names) => Some(names.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    let implicit_lastprivate_names = if semantics == WorksharingLoopSemantics::Loop {
+        std::iter::once(var.as_str())
+            .chain(collapsed.as_ref().map(|source| source.inner_var))
+            .filter(|name| !explicitly_private.contains(&name.to_ascii_lowercase()))
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut lastprivate_bindings = prepare_lastprivate_bindings(
+        b,
+        ctx,
+        clauses,
+        &implicit_lastprivate_names,
+        captured_lastprivate_originals,
+    );
 
     let first_addr = b.alloca(i64_ty.clone());
     let last_addr = b.alloca(i64_ty.clone());

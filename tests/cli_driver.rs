@@ -21369,6 +21369,121 @@ end program
 }
 
 #[test]
+fn fopenmp_loop_associated_iterators_are_lastprivate() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_loop_associated_iterators_are_lastprivate count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer, parameter :: depth = 2
+  integer :: i, j
+
+  i = -77
+!$omp parallel num_threads(4)
+!$omp loop
+  do i = 2, 11, 3
+  end do
+!$omp end loop
+!$omp end parallel
+  if (i /= 14) error stop 1
+
+  i = -77
+!$omp parallel num_threads(4)
+!$omp loop lastprivate(i)
+  do i = 10, -2, -3
+  end do
+!$omp end loop
+!$omp end parallel
+  if (i /= -5) error stop 2
+
+  i = -77
+  j = -88
+!$omp parallel num_threads(4)
+!$omp loop collapse(depth)
+  do i = 1, 2
+    do j = 3, 1, -1
+    end do
+  end do
+!$omp end loop
+!$omp end parallel
+  if (i /= 3 .or. j /= 0) error stop 3
+
+  i = -77
+  j = -88
+!$omp parallel num_threads(4)
+!$omp loop collapse(1)
+  do i = 1, 2
+    do j = 1, 3
+    end do
+  end do
+!$omp end loop
+!$omp end parallel
+  if (i /= 3 .or. j /= -88) error stop 4
+
+  i = -77
+!$omp parallel num_threads(4)
+!$omp loop private(i)
+  do i = 1, 9
+  end do
+!$omp end loop
+!$omp end parallel
+  if (i /= -77) error stop 5
+
+  i = -77
+!$omp parallel default(private) num_threads(4)
+!$omp loop
+  do i = 1, 9
+  end do
+!$omp end loop
+!$omp end parallel
+  if (i /= -77) error stop 6
+
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_loop_associated_lastprivate", "bin");
+        let runtime_cache = unique_dir("openmp_loop_associated_lastprivate_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "OpenMP LOOP iterator LASTPRIVATE should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..4 {
+            let run = Command::new(&out).output().expect("failed to run binary");
+            assert!(
+                run.status.success(),
+                "OpenMP LOOP iterator LASTPRIVATE failed at {opt}, iteration {iteration}:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_loop_scalar_integer_add_reduction_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -21384,7 +21499,7 @@ fn fopenmp_loop_scalar_integer_add_reduction_runs() {
   integer :: i
   integer(kind=8) :: total
   total = 7_8
-!$omp parallel default(none) shared(total) num_threads(4)
+!$omp parallel default(none) shared(i,total) num_threads(4)
 !$omp loop reduction(+:total)
   do i = 1, n
     total = total + int(i, kind=8)
@@ -21448,7 +21563,7 @@ fn fopenmp_loop_rectangular_collapse_runs() {
   integer :: chain1(0:5,4), chain2(0:6,5,4)
   chain1 = 0
   chain2 = 0
-!$omp parallel default(none) shared(chain1,chain2) num_threads(4)
+!$omp parallel default(none) shared(i,j,chain1,chain2) num_threads(4)
 !$omp loop collapse(1)
   do i = 1, 4
     do j = 1, 5
@@ -22874,7 +22989,7 @@ fn fopenmp_scalar_lastprivate_runs() {
   if (i /= 3 .or. j /= 0 .or. last_value /= 21) error stop 7
 
   standalone_value = 7
-!$omp parallel default(none) num_threads(4) shared(standalone_value)
+!$omp parallel default(none) num_threads(4) shared(i,standalone_value)
 !$omp do schedule(static,2) firstprivate(standalone_value) &
 !$omp& lastprivate(i,standalone_value)
   do i = 1, 9
@@ -22885,7 +23000,7 @@ fn fopenmp_scalar_lastprivate_runs() {
   if (i /= 10 .or. standalone_value /= 16) error stop 8
 
   clause_only = 77
-!$omp parallel default(none) num_threads(3) shared(clause_only)
+!$omp parallel default(none) num_threads(3) shared(i,clause_only)
 !$omp do firstprivate(clause_only) lastprivate(i,clause_only)
   do i = 1, 4
   end do
@@ -23469,8 +23584,12 @@ fn fopenmp_worksharing_rejects_unsupported_forms() {
             "OpenMP worksharing PRIVATE variable 'values' must currently be a nonallocatable, nonpointer scalar",
         ),
         (
-            "program p\ninteger :: i\n!$omp parallel\n!$omp loop lastprivate(i)\ndo i=1,4\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
-            "OpenMP LASTPRIVATE clause on LOOP is recognized but not yet implemented",
+            "program p\ninteger :: i\n!$omp parallel default(none)\n!$omp loop\ndo i=1,4\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
+            "OpenMP DEFAULT(NONE) variable 'i' must appear in a data-sharing clause",
+        ),
+        (
+            "program p\ninteger :: i,value\n!$omp parallel\n!$omp loop lastprivate(value)\ndo i=1,4\nvalue=i\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
+            "OpenMP LOOP LASTPRIVATE variable 'value' must be an associated iteration variable",
         ),
         (
             "program p\ninteger :: i,total\n!$omp parallel private(total)\n!$omp loop reduction(+:total)\ndo i=1,4\ntotal=total+i\nend do\n!$omp end loop\n!$omp end parallel\nend program\n",
