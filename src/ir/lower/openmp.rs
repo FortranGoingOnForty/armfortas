@@ -47,6 +47,7 @@ enum CaptureKind {
     Shared,
     Private,
     FirstPrivate,
+    CopyIn,
     InlineConstant,
 }
 
@@ -187,7 +188,7 @@ fn capture_base_needs_environment(
 ) -> bool {
     matches!(
         capture.kind,
-        CaptureKind::Shared | CaptureKind::FirstPrivate
+        CaptureKind::Shared | CaptureKind::FirstPrivate | CaptureKind::CopyIn
     ) || (capture.kind == CaptureKind::Private
         && (is_allocatable_entity(&capture.info)
             || is_deferred_character_allocatable_scalar(&capture.info)))
@@ -202,6 +203,13 @@ fn capture_base_needs_environment(
                 .is_some_and(|layout| {
                     derived_layout_needs_component_deallocation(layout, type_layouts)
                 }))
+}
+
+fn capture_snapshots_initial_value(capture: &Capture) -> bool {
+    matches!(
+        capture.kind,
+        CaptureKind::FirstPrivate | CaptureKind::CopyIn
+    )
 }
 
 fn capture_environment_slot_count(
@@ -874,6 +882,7 @@ fn lower_parallel_region(
             OpenMpClause::Shared(_)
             | OpenMpClause::Private(_)
             | OpenMpClause::FirstPrivate(_)
+            | OpenMpClause::CopyIn(_)
             | OpenMpClause::LastPrivate { .. }
             | OpenMpClause::Default(_)
             | OpenMpClause::Schedule { .. }
@@ -902,6 +911,17 @@ fn lower_parallel_region(
         .flatten()
         .map(|name| name.to_ascii_lowercase())
         .collect();
+    let mut copyin_names: Vec<_> = clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            OpenMpClause::CopyIn(names) => Some(names.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    copyin_names.sort_unstable();
+    copyin_names.dedup();
     let shared_names: std::collections::HashSet<_> = clauses
         .iter()
         .filter_map(|clause| match clause {
@@ -955,6 +975,7 @@ fn lower_parallel_region(
                 .then_some(name)
             })
             .collect();
+    threadprivate_names.extend(copyin_names.iter().cloned());
     threadprivate_names.sort_unstable();
     threadprivate_names.dedup();
     let threadprivate_name_set: std::collections::HashSet<_> =
@@ -1080,6 +1101,17 @@ fn lower_parallel_region(
                 lastprivate: false,
             });
         }
+    }
+    for name in &copyin_names {
+        let info = ctx.locals.get(name).cloned().unwrap_or_else(|| {
+            panic!("validated OpenMP COPYIN variable '{name}' has no lowering binding")
+        });
+        captures.push(Capture {
+            name: name.clone(),
+            info,
+            kind: CaptureKind::CopyIn,
+            lastprivate: false,
+        });
     }
     for capture in &mut captures {
         let Some(type_name) = capture.info.derived_type.as_deref() else {
@@ -2642,7 +2674,7 @@ fn materialize_shared_environment(
             // descriptor metadata. Each implicit task allocates independent
             // storage with these encounter-time bounds.
             snapshot_array_descriptor(b, source)
-        } else if capture.kind == CaptureKind::FirstPrivate
+        } else if capture_snapshots_initial_value(capture)
             && is_deferred_character_allocatable_scalar(&capture.info)
         {
             let source = string_descriptor_addr(b, &capture.info);
@@ -2650,16 +2682,15 @@ fn materialize_shared_environment(
                 allocate_deferred_character_private(b, &capture.info, source, true);
             cleanup_string_descriptors.push(cleanup);
             snapshot.addr
-        } else if capture.kind == CaptureKind::FirstPrivate && is_pointer_array(&capture.info) {
+        } else if capture_snapshots_initial_value(capture) && is_pointer_array(&capture.info) {
             // The environment freezes association status before the team is
             // launched. It is a non-owning descriptor snapshot: neither the
             // environment nor an implicit task may free the target.
             let source = array_descriptor_addr(b, &capture.info);
             snapshot_array_descriptor(b, source)
-        } else if capture.kind == CaptureKind::FirstPrivate && is_scalar_pointer(&capture.info) {
+        } else if capture_snapshots_initial_value(capture) && is_scalar_pointer(&capture.info) {
             snapshot_scalar_pointer(b, &capture.info)
-        } else if capture.kind == CaptureKind::FirstPrivate && is_allocatable_entity(&capture.info)
-        {
+        } else if capture_snapshots_initial_value(capture) && is_allocatable_entity(&capture.info) {
             let source = array_descriptor_addr(b, &capture.info);
             // FIRSTPRIVATE values are fixed before any implicit task can
             // run, so the environment owns a stable deep copy until the
@@ -2667,7 +2698,7 @@ fn materialize_shared_environment(
             let (snapshot, cleanup) = allocate_allocatable_private(b, &capture.info, source, true);
             cleanup_descriptors.push(cleanup);
             snapshot.addr
-        } else if capture.kind == CaptureKind::FirstPrivate && is_array(&capture.info) {
+        } else if capture_snapshots_initial_value(capture) && is_array(&capture.info) {
             let descriptor_copy = fixed_array_uses_heap(&capture.info, b.layout);
             let source = if descriptor_copy {
                 if local_uses_array_descriptor(&capture.info) {
@@ -2712,7 +2743,7 @@ fn materialize_shared_environment(
             snapshot_info.inline_const = None;
             derived_snapshots.insert(capture.name.clone(), snapshot_info);
             snapshot
-        } else if capture.kind == CaptureKind::FirstPrivate
+        } else if capture_snapshots_initial_value(capture)
             && fixed_character_scalar_len(&capture.info).is_some()
         {
             let (source, _) = local_char_ptr_and_len(b, &capture.info)
@@ -2725,7 +2756,7 @@ fn materialize_shared_environment(
             ));
             emit_memcpy_bytes(b, snapshot, source, len);
             snapshot
-        } else if capture.kind == CaptureKind::FirstPrivate {
+        } else if capture_snapshots_initial_value(capture) {
             let outside_address = if capture.info.by_ref {
                 b.load(capture.info.addr)
             } else {
@@ -2823,7 +2854,16 @@ fn install_shared_captures(
                 .insert(capture.name.clone(), original);
             slot_index += 1;
         }
-        let mut local = capture.info.clone();
+        let mut local = if capture.kind == CaptureKind::CopyIn {
+            ctx.locals.get(&capture.name).cloned().unwrap_or_else(|| {
+                panic!(
+                    "validated OpenMP COPYIN variable '{}' has no THREADPRIVATE callback binding",
+                    capture.name
+                )
+            })
+        } else {
+            capture.info.clone()
+        };
         match capture.kind {
             CaptureKind::InlineConstant => {
                 // PARAMETER values already lower from `inline_const`; give the
@@ -2944,6 +2984,57 @@ fn install_shared_captures(
                     local = private;
                     cleanup.array_descriptors.extend(cleanup_descriptor);
                 }
+            }
+            CaptureKind::CopyIn => {
+                let index = b.const_i64(slot_index);
+                let slot = b.gep(
+                    environment_slots.expect("missing OpenMP COPYIN environment slot"),
+                    vec![index],
+                    IrType::Int(IntWidth::I64),
+                );
+                let raw_address = b.load_typed(slot, IrType::Int(IntWidth::I64));
+                let descriptor_snapshot =
+                    is_array(&capture.info) && fixed_array_uses_heap(&capture.info, b.layout);
+                let snapshot_type = if descriptor_snapshot {
+                    IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392)
+                } else if is_array(&capture.info) {
+                    fixed_array_storage_type(&capture.info, b.layout)
+                } else {
+                    capture.info.ty.clone()
+                };
+                let snapshot = b.int_to_ptr(raw_address, snapshot_type);
+
+                let thread_num = ctx
+                    .openmp_team
+                    .expect("OpenMP COPYIN lowering requires an outlined team")
+                    .0;
+                let zero = b.const_i32(0);
+                let is_worker = b.icmp(CmpOp::Ne, thread_num, zero);
+                let copy_bb = b.create_block("omp_copyin_worker");
+                let ready_bb = b.create_block("omp_copyin_ready");
+                b.cond_branch(is_worker, copy_bb, vec![], ready_bb, vec![]);
+                b.set_block(copy_bb);
+                if is_array(&capture.info) {
+                    let source = if descriptor_snapshot {
+                        let mut snapshot_info = capture.info.clone();
+                        snapshot_info.addr = snapshot;
+                        snapshot_info.by_ref = false;
+                        snapshot_info.descriptor_arg = true;
+                        array_base_addr(b, &snapshot_info)
+                    } else {
+                        snapshot
+                    };
+                    let destination = array_base_addr(b, &local);
+                    let (_, bytes) = fixed_array_layout(&capture.info, b.layout)
+                        .expect("validated OpenMP COPYIN array lost its constant shape");
+                    emit_memcpy_bytes(b, destination, source, bytes);
+                } else {
+                    let value = b.load_typed(snapshot, capture.info.ty.clone());
+                    b.store(value, local.addr);
+                }
+                b.branch(ready_bb, vec![]);
+                b.set_block(ready_bb);
+                slot_index += 1;
             }
             CaptureKind::Shared | CaptureKind::FirstPrivate => {
                 let index = b.const_i64(slot_index);

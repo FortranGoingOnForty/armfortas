@@ -26783,6 +26783,154 @@ end program p
 }
 
 #[test]
+fn fopenmp_module_threadprivate_copyin_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_module_threadprivate_copyin_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    for opt in ["-O0", "-O3"] {
+        let dir = unique_dir("openmp_threadprivate_copyin");
+        let module_src = write_program_in(
+            &dir,
+            "copyin_m.f90",
+            "module copyin_m
+  implicit none
+  integer :: scalar = 7
+  logical :: flag = .false.
+  complex(8) :: phase = (1.0d0, -1.0d0)
+  real(8) :: values(3) = [11.0d0, 12.0d0, 13.0d0]
+  real(8) :: large(9000)
+!$omp threadprivate(scalar, flag, phase, values, large)
+end module copyin_m
+",
+        );
+        let program_src = write_program_in(
+            &dir,
+            "copyin_main.f90",
+            "program p
+  use omp_lib, only: omp_get_thread_num
+  use copyin_m
+  implicit none
+  integer :: id, i
+  integer :: copied(4), persisted(4), combined(4)
+  copied = -1
+  persisted = -1
+  combined = -1
+!$omp parallel default(shared) private(id) num_threads(4)
+  id = omp_get_thread_num()
+  scalar = 10 + id
+  flag = .false.
+  phase = dble(id)
+  values = [dble(20 + id), dble(30 + id), dble(40 + id)]
+  large(1) = dble(50 + id)
+  large(9000) = dble(60 + id)
+!$omp end parallel
+
+  scalar = 41
+  flag = .true.
+  phase = (3.25d0, -4.5d0)
+  values = [1.0d0, 2.0d0, 3.0d0]
+  large = 5.0d0
+!$omp parallel default(private) private(id) shared(copied) num_threads(4) copyin(scalar, flag, phase, values, large)
+  id = omp_get_thread_num()
+  if (scalar /= 41) error stop 1
+  if (.not. flag) error stop 14
+  if (abs(real(phase, 8) - 3.25d0) > 1.0d-12) error stop 15
+  if (abs(aimag(phase) + 4.5d0) > 1.0d-12) error stop 16
+  if (any(abs(values - [1.0d0, 2.0d0, 3.0d0]) > 1.0d-12)) error stop 2
+  if (abs(large(1) - 5.0d0) > 1.0d-12) error stop 10
+  if (abs(large(9000) - 5.0d0) > 1.0d-12) error stop 11
+  copied(id + 1) = scalar + int(sum(values))
+  scalar = 100 + id
+  flag = mod(id, 2) == 0
+  phase = dble(600 + id)
+  values(1) = dble(200 + id)
+  large(1) = dble(400 + id)
+  large(9000) = dble(500 + id)
+!$omp end parallel
+  if (any(copied /= [47, 47, 47, 47])) error stop 3
+  if (scalar /= 100 .or. abs(values(1) - 200.0d0) > 1.0d-12) error stop 4
+
+!$omp parallel default(shared) private(id) num_threads(4)
+  id = omp_get_thread_num()
+  if (scalar /= 100 + id) error stop 5
+  if (flag .neqv. (mod(id, 2) == 0)) error stop 17
+  if (abs(real(phase, 8) - dble(600 + id)) > 1.0d-12) error stop 18
+  if (abs(aimag(phase)) > 1.0d-12) error stop 19
+  if (abs(values(1) - dble(200 + id)) > 1.0d-12) error stop 6
+  if (any(abs(values(2:3) - [2.0d0, 3.0d0]) > 1.0d-12)) error stop 7
+  if (abs(large(1) - dble(400 + id)) > 1.0d-12) error stop 12
+  if (abs(large(9000) - dble(500 + id)) > 1.0d-12) error stop 13
+  persisted(id + 1) = scalar + int(values(1))
+!$omp end parallel
+  if (any(persisted /= [300, 302, 304, 306])) error stop 8
+
+  scalar = 9
+  values = [1.0d0, 2.0d0, 3.0d0]
+!$omp parallel do default(shared) num_threads(4) copyin(scalar, values)
+  do i = 1, 4
+    combined(i) = scalar + int(sum(values))
+  end do
+!$omp end parallel do
+  if (any(combined /= [15, 15, 15, 15])) error stop 9
+  print *, 'ok'
+end program p
+",
+        );
+        let module_object = dir.join("copyin_m.o");
+        let compile_module = Command::new(compiler("armfortas"))
+            .args(["-fopenmp", opt, "-c", "-J"])
+            .arg(&dir)
+            .arg(&module_src)
+            .args(["-o"])
+            .arg(&module_object)
+            .output()
+            .expect("COPYIN module compile failed to spawn");
+        assert!(
+            compile_module.status.success(),
+            "OpenMP COPYIN module should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile_module.stderr)
+        );
+
+        let executable = dir.join("copyin_main");
+        let runtime_cache = dir.join("runtime-cache");
+        std::fs::create_dir_all(&runtime_cache).expect("cannot create runtime cache");
+        let compile_program = Command::new(compiler("armfortas"))
+            .args(["-fopenmp", opt, "-I"])
+            .arg(&dir)
+            .arg(&program_src)
+            .arg(&module_object)
+            .args(["-o"])
+            .arg(&executable)
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("COPYIN consumer compile failed to spawn");
+        assert!(
+            compile_program.status.success(),
+            "OpenMP COPYIN consumer should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile_program.stderr)
+        );
+        for _ in 0..3 {
+            let run = Command::new(&executable)
+                .output()
+                .expect("COPYIN executable failed to run");
+            assert!(
+                run.status.success(),
+                "OpenMP COPYIN executable failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
 fn fopenmp_module_pointer_threadprivate_persists_across_regions() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -26920,6 +27068,14 @@ fn fopenmp_threadprivate_rejects_unsupported_entities() {
         (
             "module m\ninteger :: value\n!$omp threadprivate(value)\ncontains\nsubroutine s\n!$omp parallel shared(value)\nvalue=1\n!$omp end parallel\nend subroutine s\nend module m\n",
             "OpenMP THREADPRIVATE variable 'value' may not appear in a SHARED clause",
+        ),
+        (
+            "program p\ninteger :: value\n!$omp parallel copyin(value)\nvalue=1\n!$omp end parallel\nend program p\n",
+            "OpenMP COPYIN variable 'value' must be THREADPRIVATE",
+        ),
+        (
+            "module m\nreal, pointer :: values(:)\n!$omp threadprivate(values)\ncontains\nsubroutine s\n!$omp parallel copyin(values)\n!$omp end parallel\nend subroutine s\nend module m\n",
+            "OpenMP COPYIN pointer variable 'values' is recognized but not yet implemented",
         ),
     ];
     for (source, expected) in cases {
