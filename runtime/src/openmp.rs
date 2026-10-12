@@ -2163,6 +2163,57 @@ pub extern "C" fn afs_omp_get_wtick() -> f64 {
     1.0e-9
 }
 
+// No-argument OpenMP inquiry and timing routines have the same ABI in C and
+// in ARMFORTAS's legacy Fortran EXTERNAL convention.  Export their standard
+// spellings as well as the compiler-private `afs_` entry points so unchanged
+// OpenMP sources such as NPB can link against the owned runtime.  Routines
+// with arguments stay on the typed `omp_lib` lowering path until their
+// language-binding ABI is specified separately.
+#[no_mangle]
+pub extern "C" fn omp_get_thread_num() -> i32 {
+    afs_omp_get_thread_num()
+}
+
+#[no_mangle]
+pub extern "C" fn omp_get_num_threads() -> i32 {
+    afs_omp_get_num_threads()
+}
+
+#[no_mangle]
+pub extern "C" fn omp_get_max_threads() -> i32 {
+    afs_omp_get_max_threads()
+}
+
+#[no_mangle]
+pub extern "C" fn omp_get_num_procs() -> i32 {
+    afs_omp_get_num_procs()
+}
+
+#[no_mangle]
+pub extern "C" fn omp_in_parallel() -> i32 {
+    afs_omp_in_parallel()
+}
+
+#[no_mangle]
+pub extern "C" fn omp_get_level() -> i32 {
+    afs_omp_get_level()
+}
+
+#[no_mangle]
+pub extern "C" fn omp_get_active_level() -> i32 {
+    afs_omp_get_active_level()
+}
+
+#[no_mangle]
+pub extern "C" fn omp_get_wtime() -> f64 {
+    afs_omp_get_wtime()
+}
+
+#[no_mangle]
+pub extern "C" fn omp_get_wtick() -> f64 {
+    afs_omp_get_wtick()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2206,6 +2257,20 @@ mod tests {
         assert_eq!(afs_omp_get_level(), 0);
         assert!(afs_omp_get_max_threads() >= 1);
         assert!(afs_omp_get_num_procs() >= 1);
+    }
+
+    #[test]
+    fn standard_no_argument_runtime_aliases_match_owned_entry_points() {
+        reset_thread_state();
+        assert_eq!(omp_get_thread_num(), afs_omp_get_thread_num());
+        assert_eq!(omp_get_num_threads(), afs_omp_get_num_threads());
+        assert_eq!(omp_get_max_threads(), afs_omp_get_max_threads());
+        assert_eq!(omp_get_num_procs(), afs_omp_get_num_procs());
+        assert_eq!(omp_in_parallel(), afs_omp_in_parallel());
+        assert_eq!(omp_get_level(), afs_omp_get_level());
+        assert_eq!(omp_get_active_level(), afs_omp_get_active_level());
+        assert!(omp_get_wtime() >= 0.0);
+        assert!(omp_get_wtick() > 0.0);
     }
 
     #[test]

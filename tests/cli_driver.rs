@@ -22954,6 +22954,54 @@ fn fopenmp_master_requires_close_parallel_nesting() {
 }
 
 #[test]
+fn fopenmp_legacy_external_runtime_queries_link_owned_runtime() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_legacy_external_runtime_queries_link_owned_runtime count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: threads, max_threads\n  double precision :: before, after\n!$ integer :: omp_get_num_threads, omp_get_max_threads\n!$ double precision :: omp_get_wtime\n!$ external :: omp_get_num_threads, omp_get_max_threads, omp_get_wtime\n  threads = 0\n  before = omp_get_wtime()\n!$omp parallel default(shared) num_threads(4)\n!$omp master\n  threads = omp_get_num_threads()\n!$omp end master\n!$omp end parallel\n  max_threads = omp_get_max_threads()\n  after = omp_get_wtime()\n  if (threads /= 4) error stop 1\n  if (max_threads < 1) error stop 2\n  if (after < before) error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_legacy_runtime_queries", "bin");
+        let runtime_cache = unique_dir("openmp_legacy_runtime_queries_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("legacy OpenMP runtime query compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "legacy OpenMP runtime queries should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("legacy OpenMP runtime query binary failed to run");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "legacy OpenMP runtime queries failed at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_atomic_numeric_add_updates_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
