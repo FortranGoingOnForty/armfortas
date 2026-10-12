@@ -21082,7 +21082,7 @@ fn fopenmp_simd_activates_conditional_source_without_defining_openmp() {
 #[test]
 fn fopenmp_models_supported_constructs_in_ast_dump() {
     let src = write_program(
-        "program p\n  implicit none\n  integer :: i, n\n  logical :: any_match, has_error\n  n = 4\n  any_match = .false.\n  has_error = .false.\n!$omp parallel do default(shared) private(i) &\n!$omp& reduction(.or.:any_match,has_error) schedule(dynamic)\n  do i = 1, n\n    any_match = .true.\n  end do\n!$omp end parallel do nowait\nend program\n",
+        "program p\n  implicit none\n  integer :: i, n\n  logical :: any_match, has_error\n  n = 4\n  any_match = .false.\n  has_error = .false.\n!$omp parallel do default(shared) private(i) &\n!$omp& reduction(.or.:any_match,has_error) schedule(dynamic)\n  do i = 1, n\n    any_match = .true.\n  end do\n!$omp end parallel do nowait\n!$omp barrier\nend program\n",
         "f90",
     );
     let out = unique_path("openmp_ast", "ast");
@@ -21102,7 +21102,14 @@ fn fopenmp_models_supported_constructs_in_ast_dump() {
         String::from_utf8_lossy(&result.stderr)
     );
     let ast = std::fs::read_to_string(&out).expect("missing OpenMP AST dump");
-    for expected in ["ParallelDo", "Default(", "Reduction", "Dynamic", "Nowait"] {
+    for expected in [
+        "ParallelDo",
+        "Default(",
+        "Reduction",
+        "Dynamic",
+        "Nowait",
+        "Barrier",
+    ] {
         assert!(ast.contains(expected), "missing {expected} in AST:\n{ast}");
     }
     let _ = std::fs::remove_file(&out);
@@ -23137,7 +23144,48 @@ fn fopenmp_master_region_runs_only_on_primary_thread() {
         return;
     }
     let src = write_program(
-        "program p\n  use omp_lib, only: omp_get_thread_num\n  implicit none\n  integer :: count, primary_thread\n  count = 0\n  primary_thread = -1\n!$omp parallel default(none) num_threads(4) shared(count,primary_thread)\n!$omp master\n  count = count + 1\n  primary_thread = omp_get_thread_num()\n!$omp end master\n!$omp end parallel\n  if (count /= 1) error stop 1\n  if (primary_thread /= 0) error stop 2\n  print *, 'ok'\nend program p\n",
+        "program p
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer :: count, primary_thread
+
+  count = 0
+  primary_thread = -1
+  call orphaned_master(count, primary_thread)
+  if (count /= 1) error stop 1
+  if (primary_thread /= 0) error stop 2
+
+  count = 0
+  primary_thread = -1
+!$omp parallel default(none) num_threads(4) shared(count,primary_thread)
+!$omp master
+  count = count + 1
+  primary_thread = omp_get_thread_num()
+!$omp end master
+!$omp end parallel
+  if (count /= 1) error stop 3
+  if (primary_thread /= 0) error stop 4
+
+  count = 0
+  primary_thread = -1
+!$omp parallel default(none) num_threads(4) shared(count,primary_thread)
+  call orphaned_master(count, primary_thread)
+!$omp end parallel
+  if (count /= 1) error stop 5
+  if (primary_thread /= 0) error stop 6
+  print *, 'ok'
+end program p
+
+subroutine orphaned_master(count, primary_thread)
+  use omp_lib, only: omp_get_thread_num
+  implicit none
+  integer, intent(inout) :: count, primary_thread
+!$omp master
+  count = count + 1
+  primary_thread = omp_get_thread_num()
+!$omp end master
+end subroutine orphaned_master
+",
         "f90",
     );
     for opt in ["-O0", "-O3"] {
@@ -23176,23 +23224,235 @@ fn fopenmp_master_region_runs_only_on_primary_thread() {
 }
 
 #[test]
-fn fopenmp_master_requires_close_parallel_nesting() {
-    for source in [
-        "program p\n!$omp master\ncontinue\n!$omp end master\nend program p\n",
-        "program p\n!$omp parallel\n!$omp critical\n!$omp master\ncontinue\n!$omp end master\n!$omp end critical\n!$omp end parallel\nend program p\n",
+fn fopenmp_io_stars_are_not_data_environment_captures() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_io_stars_are_not_data_environment_captures count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: value
+  value = 7
+!$omp parallel default(none) num_threads(2) shared(value)
+!$omp master
+  if (.false.) read(*,*) value
+  write(*,*) value
+  print *, value
+!$omp end master
+!$omp end parallel
+end program p
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_io_stars", "bin");
+        let runtime_cache = unique_dir("openmp_io_stars_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP I/O-star compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP I/O stars should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("OpenMP I/O-star binary failed to run");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success() && stdout.matches('7').count() == 2,
+            "OpenMP I/O stars failed at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            stdout,
+            String::from_utf8_lossy(&run.stderr),
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_master_rejects_illegal_close_nesting() {
+    for (source, enclosing) in [
+        (
+            "program p\n  integer :: i\n!$omp parallel\n!$omp do\n  do i = 1, 4\n!$omp master\n  continue\n!$omp end master\n  end do\n!$omp end do\n!$omp end parallel\nend program p\n",
+            "DO",
+        ),
+        (
+            "program p\n  integer :: i\n!$omp parallel\n!$omp loop\n  do i = 1, 4\n!$omp master\n  continue\n!$omp end master\n  end do\n!$omp end loop\n!$omp end parallel\nend program p\n",
+            "LOOP",
+        ),
+        (
+            "program p\n  integer :: i\n!$omp parallel do\n  do i = 1, 4\n!$omp master\n  continue\n!$omp end master\n  end do\n!$omp end parallel do\nend program p\n",
+            "PARALLEL DO",
+        ),
     ] {
         let src = write_program(source, "f90");
         let result = diagnostic_output(&src, &["-fopenmp"]);
-        assert!(!result.status.success(), "misnested OpenMP MASTER compiled");
+        assert!(
+            !result.status.success(),
+            "OpenMP MASTER closely nested in {enclosing} compiled"
+        );
         let stderr = String::from_utf8_lossy(&result.stderr);
         assert!(
-            stderr.contains(
-                "OpenMP MASTER must be closely nested inside an OpenMP PARALLEL region"
-            ),
-            "unexpected diagnostic: {stderr}"
+            stderr.contains(&format!(
+                "OpenMP MASTER may not be closely nested inside an OpenMP {enclosing} region"
+            )),
+            "unexpected diagnostic for {enclosing}: {stderr}"
         );
         let _ = std::fs::remove_file(&src);
     }
+}
+
+#[test]
+fn fopenmp_explicit_and_orphaned_barriers_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_explicit_and_orphaned_barriers_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: arrived, failures
+
+  call rendezvous()
+
+  arrived = 0
+  failures = 0
+!$omp parallel default(none) num_threads(4) shared(arrived,failures)
+!$omp atomic update
+  arrived = arrived + 1
+!$omp barrier
+  if (arrived /= 4) then
+!$omp atomic update
+    failures = failures + 1
+  end if
+!$omp end parallel
+  if (arrived /= 4 .or. failures /= 0) error stop 1
+
+  arrived = 0
+  failures = 0
+!$omp parallel default(none) num_threads(4) shared(arrived,failures)
+!$omp atomic update
+  arrived = arrived + 1
+  call rendezvous()
+  if (arrived /= 4) then
+!$omp atomic update
+    failures = failures + 1
+  end if
+!$omp end parallel
+  if (arrived /= 4 .or. failures /= 0) error stop 2
+  print *, 'ok'
+end program p
+
+subroutine rendezvous()
+  implicit none
+!$omp barrier
+end subroutine rendezvous
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_explicit_barrier", "bin");
+        let runtime_cache = unique_dir("openmp_explicit_barrier_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("OpenMP BARRIER compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "OpenMP BARRIER should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for iteration in 0..8 {
+            let run = run_binary_with_timeout(&out, std::time::Duration::from_secs(60))
+                .expect("OpenMP BARRIER binary timed out");
+            assert!(
+                run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+                "OpenMP BARRIER failed at {opt}, iteration {iteration}: status={:?} stdout={} stderr={}",
+                run.status,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr),
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_barrier_rejects_illegal_close_nesting() {
+    for (source, enclosing) in [
+        (
+            "program p\n  integer :: i\n!$omp parallel\n!$omp do\n  do i = 1, 4\n!$omp barrier\n  end do\n!$omp end do\n!$omp end parallel\nend program p\n",
+            "DO",
+        ),
+        (
+            "program p\n  integer :: i\n!$omp parallel\n!$omp loop\n  do i = 1, 4\n!$omp barrier\n  end do\n!$omp end loop\n!$omp end parallel\nend program p\n",
+            "LOOP",
+        ),
+        (
+            "program p\n  integer :: i\n!$omp parallel do\n  do i = 1, 4\n!$omp barrier\n  end do\n!$omp end parallel do\nend program p\n",
+            "PARALLEL DO",
+        ),
+        (
+            "program p\n!$omp critical\n!$omp barrier\n!$omp end critical\nend program p\n",
+            "CRITICAL",
+        ),
+        (
+            "program p\n!$omp parallel\n!$omp master\n!$omp barrier\n!$omp end master\n!$omp end parallel\nend program p\n",
+            "MASTER",
+        ),
+    ] {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &["-fopenmp"]);
+        assert!(
+            !result.status.success(),
+            "OpenMP BARRIER closely nested in {enclosing} compiled"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "OpenMP BARRIER may not be closely nested inside an OpenMP {enclosing} region"
+            )),
+            "unexpected diagnostic for {enclosing}: {stderr}"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+
+    let src = write_program(
+        "pure subroutine p\n!$omp barrier\nend subroutine p\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-fopenmp"]);
+    assert!(!result.status.success(), "OpenMP BARRIER compiled in PURE");
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("OpenMP BARRIER is not allowed in a PURE procedure"));
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
