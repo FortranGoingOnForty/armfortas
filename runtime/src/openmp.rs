@@ -20,7 +20,6 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::ptr::NonNull;
 use std::sync::atomic::{fence, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock};
 use std::time::Instant;
@@ -287,6 +286,7 @@ struct TeamContext {
     ordered_active_generation: Option<u64>,
     doacross: Arc<DoacrossWorkspace>,
     doacross_generation: u64,
+    threadprivate_slot: Option<ThreadPrivateSlot>,
 }
 
 #[derive(Debug, Default)]
@@ -358,34 +358,88 @@ struct ThreadState {
     teams: Vec<TeamContext>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ThreadPrivateSlot {
+    domain: usize,
+    team_size: i32,
+    thread_num: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PersistentThreadPrivateKey {
+    slot: ThreadPrivateSlot,
+    template: usize,
+}
+
 #[derive(Debug)]
 struct ThreadPrivateAllocation {
-    pointer: NonNull<u8>,
+    pointer: usize,
     layout: Layout,
+}
+
+impl ThreadPrivateAllocation {
+    fn new(template: *const u8, byte_count: usize, layout: Layout) -> Option<Self> {
+        let pointer = unsafe { alloc(layout) };
+        if pointer.is_null() {
+            return None;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(template, pointer, byte_count);
+        }
+        Some(Self {
+            pointer: pointer as usize,
+            layout,
+        })
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        self.pointer as *mut u8
+    }
 }
 
 impl Drop for ThreadPrivateAllocation {
     fn drop(&mut self) {
         unsafe {
-            dealloc(self.pointer.as_ptr(), self.layout);
+            dealloc(self.as_ptr(), self.layout);
         }
     }
 }
+
+static NEXT_THREADPRIVATE_DOMAIN: AtomicUsize = AtomicUsize::new(1);
 
 thread_local! {
     static THREAD_STATE: RefCell<ThreadState> = RefCell::new(ThreadState::default());
     static THREADPRIVATE_STORAGE: RefCell<HashMap<usize, ThreadPrivateAllocation>> =
         RefCell::new(HashMap::new());
+    static THREADPRIVATE_DOMAIN: usize = NEXT_THREADPRIVATE_DOMAIN.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Resolve one module variable's storage for the current host thread.
+fn persistent_threadprivate_storage(
+) -> &'static Mutex<HashMap<PersistentThreadPrivateKey, ThreadPrivateAllocation>> {
+    static STORAGE: OnceLock<Mutex<HashMap<PersistentThreadPrivateKey, ThreadPrivateAllocation>>> =
+        OnceLock::new();
+    STORAGE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn current_threadprivate_slot() -> Option<ThreadPrivateSlot> {
+    THREAD_STATE.with(|state| {
+        state
+            .borrow()
+            .teams
+            .last()
+            .and_then(|team| team.threadprivate_slot)
+    })
+}
+
+/// Resolve one module variable's storage for the current OpenMP thread.
 ///
 /// `template` is both the process-wide identity key and the initial byte
 /// image. The compiler emits one ordinary module global as that stable key;
-/// every source-level access is redirected through this function. Storage is
-/// retained until the host thread exits, which gives the initial thread
-/// persistence across parallel regions while naturally following the
-/// lifetime of worker threads created by the runtime.
+/// every source-level access is redirected through this function. Initial
+/// threads and nonpersistent nested workers use host-thread storage. Workers
+/// in qualifying top-level regions use a stable logical slot so matching
+/// thread numbers retain their values even though this runtime currently
+/// creates fresh host threads for each region.
 #[no_mangle]
 pub extern "C" fn afs_omp_threadprivate(
     template: *const u8,
@@ -404,21 +458,37 @@ pub extern "C" fn afs_omp_threadprivate(
     let Ok(layout) = Layout::from_size_align(byte_count, alignment) else {
         return std::ptr::null_mut();
     };
-    let key = template as usize;
-    THREADPRIVATE_STORAGE.with(|storage| {
-        let mut storage = storage.borrow_mut();
+    let template_key = template as usize;
+    if let Some(slot) = current_threadprivate_slot() {
+        let key = PersistentThreadPrivateKey {
+            slot,
+            template: template_key,
+        };
+        let mut storage = persistent_threadprivate_storage()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(allocation) = storage.get(&key) {
-            return allocation.pointer.as_ptr();
+            return allocation.as_ptr();
         }
-        let pointer = unsafe { alloc(layout) };
-        let Some(pointer) = NonNull::new(pointer) else {
+        let Some(allocation) = ThreadPrivateAllocation::new(template, byte_count, layout) else {
             return std::ptr::null_mut();
         };
-        unsafe {
-            std::ptr::copy_nonoverlapping(template, pointer.as_ptr(), byte_count);
+        let pointer = allocation.as_ptr();
+        storage.insert(key, allocation);
+        return pointer;
+    }
+
+    THREADPRIVATE_STORAGE.with(|storage| {
+        let mut storage = storage.borrow_mut();
+        if let Some(allocation) = storage.get(&template_key) {
+            return allocation.as_ptr();
         }
-        storage.insert(key, ThreadPrivateAllocation { pointer, layout });
-        pointer.as_ptr()
+        let Some(allocation) = ThreadPrivateAllocation::new(template, byte_count, layout) else {
+            return std::ptr::null_mut();
+        };
+        let pointer = allocation.as_ptr();
+        storage.insert(template_key, allocation);
+        pointer
     })
 }
 
@@ -533,6 +603,7 @@ fn run_implicit_task(
     dynamic: Arc<Mutex<DynamicWorkspace>>,
     ordered: Arc<OrderedWorkspace>,
     doacross: Arc<DoacrossWorkspace>,
+    threadprivate_slot: Option<ThreadPrivateSlot>,
 ) {
     let _guard = enter_team(
         TeamContext {
@@ -548,6 +619,7 @@ fn run_implicit_task(
             ordered_active_generation: None,
             doacross,
             doacross_generation: 0,
+            threadprivate_slot,
         },
         inherited_requested_threads,
     );
@@ -578,6 +650,10 @@ pub extern "C" fn afs_omp_parallel_region(
     }
 
     let config = runtime_config();
+    let encountering_threadprivate_slot = current_threadprivate_slot();
+    let is_top_level = THREAD_STATE.with(|state| state.borrow().teams.is_empty());
+    let persistent_threadprivate_domain =
+        (is_top_level && !config.dynamic).then(|| THREADPRIVATE_DOMAIN.with(|domain| *domain));
     let inherited_requested_threads = requested_thread_override();
     let fallback_threads = requested_thread_count(config);
     let requested_team_size = determine_team_size(
@@ -609,6 +685,12 @@ pub extern "C" fn afs_omp_parallel_region(
                 let dynamic = Arc::clone(&dynamic);
                 let ordered = Arc::clone(&ordered);
                 let doacross = Arc::clone(&doacross);
+                let threadprivate_slot =
+                    persistent_threadprivate_domain.map(|domain| ThreadPrivateSlot {
+                        domain,
+                        team_size,
+                        thread_num,
+                    });
                 scope.spawn(move || {
                     run_implicit_task(
                         entry,
@@ -622,6 +704,7 @@ pub extern "C" fn afs_omp_parallel_region(
                         dynamic,
                         ordered,
                         doacross,
+                        threadprivate_slot,
                     );
                 });
             }
@@ -637,6 +720,7 @@ pub extern "C" fn afs_omp_parallel_region(
                 Arc::clone(&dynamic),
                 Arc::clone(&ordered),
                 Arc::clone(&doacross),
+                encountering_threadprivate_slot,
             );
         });
     }));
@@ -2853,6 +2937,125 @@ mod tests {
         assert!(afs_omp_threadprivate(std::ptr::null(), 16, 16).is_null());
         assert!(afs_omp_threadprivate(template, 0, 16).is_null());
         assert!(afs_omp_threadprivate(template, 16, 3).is_null());
+    }
+
+    #[repr(align(16))]
+    struct PersistentThreadPrivateTemplate([u64; 2]);
+
+    static PERSISTENT_THREADPRIVATE_TEMPLATE: PersistentThreadPrivateTemplate =
+        PersistentThreadPrivateTemplate([31, 47]);
+
+    struct PersistentThreadPrivateObservations {
+        addresses: [AtomicUsize; 4],
+    }
+
+    unsafe extern "C" fn verify_nested_threadprivate_copy(
+        environment: *mut c_void,
+        thread_num: i32,
+        team_size: i32,
+    ) {
+        assert_eq!((thread_num, team_size), (0, 1));
+        let observations = unsafe { &*(environment as *const PersistentThreadPrivateObservations) };
+        let storage = afs_omp_threadprivate(
+            PERSISTENT_THREADPRIVATE_TEMPLATE.0.as_ptr().cast::<u8>(),
+            16,
+            16,
+        )
+        .cast::<u64>();
+        assert!(!storage.is_null());
+        let value = unsafe { *storage };
+        let outer_thread = usize::try_from(value - 100).unwrap();
+        assert_eq!(
+            storage as usize,
+            observations.addresses[outer_thread].load(Ordering::SeqCst)
+        );
+    }
+
+    unsafe extern "C" fn initialize_persistent_threadprivate_copy(
+        environment: *mut c_void,
+        thread_num: i32,
+        team_size: i32,
+    ) {
+        assert_eq!(team_size, 4);
+        let observations = unsafe { &*(environment as *const PersistentThreadPrivateObservations) };
+        let storage = afs_omp_threadprivate(
+            PERSISTENT_THREADPRIVATE_TEMPLATE.0.as_ptr().cast::<u8>(),
+            16,
+            16,
+        )
+        .cast::<u64>();
+        assert!(!storage.is_null());
+        assert_eq!(unsafe { (*storage, *storage.add(1)) }, (31, 47));
+        observations.addresses[thread_num as usize].store(storage as usize, Ordering::SeqCst);
+        unsafe {
+            *storage = 100 + thread_num as u64;
+        }
+        assert_eq!(
+            afs_omp_parallel_region(Some(verify_nested_threadprivate_copy), environment, 0, 4, 0,),
+            AFS_OMP_SUCCESS
+        );
+    }
+
+    unsafe extern "C" fn verify_persistent_threadprivate_copy(
+        environment: *mut c_void,
+        thread_num: i32,
+        team_size: i32,
+    ) {
+        assert_eq!(team_size, 4);
+        let observations = unsafe { &*(environment as *const PersistentThreadPrivateObservations) };
+        let storage = afs_omp_threadprivate(
+            PERSISTENT_THREADPRIVATE_TEMPLATE.0.as_ptr().cast::<u8>(),
+            16,
+            16,
+        )
+        .cast::<u64>();
+        assert!(!storage.is_null());
+        assert_eq!(
+            storage as usize,
+            observations.addresses[thread_num as usize].load(Ordering::SeqCst)
+        );
+        assert_eq!(unsafe { *storage }, 100 + thread_num as u64);
+    }
+
+    #[test]
+    fn logical_worker_threadprivate_copies_persist_across_parallel_regions() {
+        reset_thread_state();
+        let observations = PersistentThreadPrivateObservations {
+            addresses: std::array::from_fn(|_| AtomicUsize::new(0)),
+        };
+        let environment =
+            &observations as *const PersistentThreadPrivateObservations as *mut c_void;
+
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(initialize_persistent_threadprivate_copy),
+                environment,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_parallel_region(
+                Some(verify_persistent_threadprivate_copy),
+                environment,
+                1,
+                4,
+                0,
+            ),
+            AFS_OMP_SUCCESS
+        );
+
+        let mut addresses: Vec<_> = observations
+            .addresses
+            .iter()
+            .map(|address| address.load(Ordering::SeqCst))
+            .collect();
+        assert!(addresses.iter().all(|address| *address != 0));
+        addresses.sort_unstable();
+        addresses.dedup();
+        assert_eq!(addresses.len(), 4);
     }
 
     #[test]
