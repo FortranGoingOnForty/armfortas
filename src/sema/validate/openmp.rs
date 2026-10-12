@@ -22,7 +22,7 @@ use crate::ast::openmp::{
 };
 use crate::ast::stmt::{IoControl, RankGuard, SpannedStmt, Stmt, TypeGuard};
 use crate::lexer::Span;
-use crate::sema::symtab::{Intent, SymbolKind, SymbolTable, TypeInfo};
+use crate::sema::symtab::{ImplicitType, Intent, SymbolKind, SymbolTable, TypeInfo};
 
 use super::core::{
     collect_default_none_nested_block_references, collect_reference_expr, collect_reference_stmts,
@@ -2675,8 +2675,65 @@ fn validate_data_environment(
     }
 }
 
+fn implicit_type_info(ctx: &Ctx<'_>, name: &str) -> Option<TypeInfo> {
+    let implicit = ctx.st.scope(ctx.scope_id).implicit_rules.type_for(name)?;
+    Some(match implicit {
+        ImplicitType::Integer => TypeInfo::Integer { kind: None },
+        ImplicitType::Real => TypeInfo::Real { kind: None },
+        ImplicitType::DoublePrecision => TypeInfo::DoublePrecision,
+        ImplicitType::Complex => TypeInfo::Complex { kind: None },
+        ImplicitType::Logical => TypeInfo::Logical { kind: None },
+        ImplicitType::Character => TypeInfo::Character {
+            len: Some(1),
+            kind: None,
+        },
+    })
+}
+
+fn supported_shared_scalar_type(type_info: &TypeInfo) -> bool {
+    matches!(
+        type_info,
+        TypeInfo::Integer { .. }
+            | TypeInfo::Real { .. }
+            | TypeInfo::DoublePrecision
+            | TypeInfo::Logical { .. }
+    ) || matches!(
+        type_info,
+        TypeInfo::Complex { kind }
+            if matches!(kind.unwrap_or_else(crate::driver::defaults::default_real_kind), 4 | 8)
+    ) || matches!(
+        type_info,
+        TypeInfo::Character {
+            len: Some(_),
+            kind,
+        } if kind.unwrap_or(1) == 1
+    )
+}
+
+fn supported_private_scalar_type(type_info: &TypeInfo) -> bool {
+    matches!(
+        type_info,
+        TypeInfo::Integer { .. }
+            | TypeInfo::Real { .. }
+            | TypeInfo::DoublePrecision
+            | TypeInfo::Logical { .. }
+    ) || matches!(
+        type_info,
+        TypeInfo::Character {
+            len: Some(_),
+            kind,
+        } if kind.unwrap_or(1) == 1
+    )
+}
+
 fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
     let Some(symbol) = ctx.lookup_lexical(name) else {
+        if implicit_type_info(ctx, name)
+            .as_ref()
+            .is_some_and(supported_shared_scalar_type)
+        {
+            return;
+        }
         ctx.error(
             span,
             format!(
@@ -2686,6 +2743,10 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
         );
         return;
     };
+    let effective_type_info = symbol
+        .type_info
+        .clone()
+        .or_else(|| implicit_type_info(ctx, name));
     if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter) {
         ctx.error(
             span,
@@ -2781,7 +2842,7 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
             return;
         }
         let supported_numeric_or_logical = matches!(
-            symbol.type_info.as_ref(),
+            effective_type_info.as_ref(),
             Some(TypeInfo::Integer { .. })
                 | Some(TypeInfo::Real { .. })
                 | Some(TypeInfo::DoublePrecision)
@@ -2792,7 +2853,7 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
                 if matches!(kind.unwrap_or_else(crate::driver::defaults::default_real_kind), 4 | 8)
         );
         let supported_character = matches!(
-            symbol.type_info.as_ref(),
+            effective_type_info.as_ref(),
             Some(TypeInfo::Character {
                 len: Some(_),
                 kind,
@@ -2811,7 +2872,7 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
         return;
     }
     let supported_numeric_or_logical = matches!(
-        symbol.type_info.as_ref(),
+        effective_type_info.as_ref(),
         Some(TypeInfo::Integer { .. })
             | Some(TypeInfo::Real { .. })
             | Some(TypeInfo::DoublePrecision)
@@ -2822,14 +2883,14 @@ fn validate_shared_object(ctx: &mut Ctx<'_>, name: &str, span: Span) {
             if matches!(kind.unwrap_or_else(crate::driver::defaults::default_real_kind), 4 | 8)
     );
     let supported_character = matches!(
-        symbol.type_info.as_ref(),
+        effective_type_info.as_ref(),
         Some(TypeInfo::Character {
             len: Some(_),
             kind,
         }) if kind.unwrap_or(1) == 1
     ) || (symbol.attrs.allocatable
         && matches!(
-            symbol.type_info.as_ref(),
+            effective_type_info.as_ref(),
             Some(TypeInfo::Character { kind, .. }) if kind.unwrap_or(1) == 1
         ));
     if !supported_numeric_or_logical && !supported_character {
@@ -2907,6 +2968,12 @@ fn is_current_dummy(ctx: &Ctx<'_>, symbol: &crate::sema::symtab::Symbol, name: &
 
 fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &str) {
     let Some(symbol) = ctx.lookup_lexical(name) else {
+        if implicit_type_info(ctx, name)
+            .as_ref()
+            .is_some_and(supported_private_scalar_type)
+        {
+            return;
+        }
         ctx.error(
             span,
             format!(
@@ -2916,6 +2983,10 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         );
         return;
     };
+    let effective_type_info = symbol
+        .type_info
+        .clone()
+        .or_else(|| implicit_type_info(ctx, name));
     if symbol.kind != SymbolKind::Variable {
         ctx.error(
             span,
@@ -2993,14 +3064,14 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
             return;
         }
         let supported_numeric_or_logical = matches!(
-            symbol.type_info.as_ref(),
+            effective_type_info.as_ref(),
             Some(TypeInfo::Integer { .. })
                 | Some(TypeInfo::Real { .. })
                 | Some(TypeInfo::DoublePrecision)
                 | Some(TypeInfo::Logical { .. })
         );
         let supported_character_pointer = matches!(
-            symbol.type_info.as_ref(),
+            effective_type_info.as_ref(),
             Some(TypeInfo::Character {
                 len: Some(_),
                 kind,
@@ -3044,14 +3115,14 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
             return;
         }
         let supported_numeric_or_logical = matches!(
-            symbol.type_info.as_ref(),
+            effective_type_info.as_ref(),
             Some(TypeInfo::Integer { .. })
                 | Some(TypeInfo::Real { .. })
                 | Some(TypeInfo::DoublePrecision)
                 | Some(TypeInfo::Logical { .. })
         );
         let supported_character_allocatable = matches!(
-            symbol.type_info.as_ref(),
+            effective_type_info.as_ref(),
             Some(TypeInfo::Character { len, kind })
                 if kind.unwrap_or(1) == 1 && (scalar || len.is_some())
         );
@@ -3114,7 +3185,7 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
             return;
         }
         let supported_numeric_or_logical = matches!(
-            symbol.type_info.as_ref(),
+            effective_type_info.as_ref(),
             Some(TypeInfo::Integer { .. })
                 | Some(TypeInfo::Real { .. })
                 | Some(TypeInfo::DoublePrecision)
@@ -3125,7 +3196,7 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
                 if matches!(kind.unwrap_or_else(crate::driver::defaults::default_real_kind), 4 | 8)
         );
         let supported_character = matches!(
-            symbol.type_info.as_ref(),
+            effective_type_info.as_ref(),
             Some(TypeInfo::Character {
                 len: Some(_),
                 kind,
@@ -3142,7 +3213,7 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         }
         return;
     }
-    if let Some(TypeInfo::Derived(type_name)) = symbol.type_info.as_ref() {
+    if let Some(TypeInfo::Derived(type_name)) = effective_type_info.as_ref() {
         if clause != "PRIVATE" && clause != "FIRSTPRIVATE" {
             ctx.error(
                 span,
@@ -3199,14 +3270,14 @@ fn validate_private_object(ctx: &mut Ctx<'_>, name: &str, span: Span, clause: &s
         return;
     }
     let supported_numeric_or_logical = matches!(
-        symbol.type_info.as_ref(),
+        effective_type_info.as_ref(),
         Some(TypeInfo::Integer { .. })
             | Some(TypeInfo::Real { .. })
             | Some(TypeInfo::DoublePrecision)
             | Some(TypeInfo::Logical { .. })
     );
     let supported_character = matches!(
-        symbol.type_info.as_ref(),
+        effective_type_info.as_ref(),
         Some(TypeInfo::Character {
             len: Some(_),
             kind,

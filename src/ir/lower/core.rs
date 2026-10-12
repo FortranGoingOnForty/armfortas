@@ -4164,11 +4164,11 @@ pub(super) fn collect_implicit_locals(
         // layer (e.g. module procedures, use-associated symbols whose
         // globals we don't synthesise, interface generics) are
         // skipped so we don't shadow them with a bogus implicit alloca.
-        if ctx
-            .st
-            .lookup_local_then_any(ctx.proc_scope_id, &key)
-            .is_some()
-        {
+        let resolves_in_scope = match ctx.proc_scope_id {
+            Some(scope_id) => ctx.st.lookup_in(scope_id, &key).is_some(),
+            None => ctx.st.find_symbol_any_scope(&key).is_some(),
+        };
+        if resolves_in_scope {
             continue;
         }
 
