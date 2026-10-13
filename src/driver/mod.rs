@@ -44,7 +44,8 @@ impl Drop for RemoveFileOnDrop {
 /// subprocess. Preparing removes any old destination; only a verified,
 /// non-empty regular file survives the guard.
 struct PendingExternalOutput {
-    path: PathBuf,
+    final_path: PathBuf,
+    staging_path: PathBuf,
     committed: bool,
 }
 
@@ -60,25 +61,47 @@ impl PendingExternalOutput {
                 ));
             }
         }
+        let staging_path = sibling_temporary_path(path, tool);
+        match fs::remove_file(&staging_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot remove stale {tool} staging output '{}': {error}",
+                    staging_path.display()
+                ));
+            }
+        }
         Ok(Self {
-            path: path.to_path_buf(),
+            final_path: path.to_path_buf(),
+            staging_path,
             committed: false,
         })
     }
 
+    fn staging_path(&self) -> &Path {
+        &self.staging_path
+    }
+
     fn verify(mut self, tool: &str) -> Result<(), String> {
-        let metadata = fs::symlink_metadata(&self.path).map_err(|error| {
+        let metadata = fs::symlink_metadata(&self.staging_path).map_err(|error| {
             format!(
                 "{tool} reported success but did not produce output '{}': {error}",
-                self.path.display()
+                self.staging_path.display()
             )
         })?;
         if !metadata.file_type().is_file() || metadata.len() == 0 {
             return Err(format!(
                 "{tool} reported success but did not produce a non-empty regular output '{}'",
-                self.path.display()
+                self.staging_path.display()
             ));
         }
+        fs::rename(&self.staging_path, &self.final_path).map_err(|error| {
+            format!(
+                "cannot publish {tool} output '{}' atomically: {error}",
+                self.final_path.display()
+            )
+        })?;
         self.committed = true;
         Ok(())
     }
@@ -87,9 +110,43 @@ impl PendingExternalOutput {
 impl Drop for PendingExternalOutput {
     fn drop(&mut self) {
         if !self.committed {
-            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(&self.staging_path);
         }
     }
+}
+
+fn sibling_temporary_path(path: &Path, purpose: &str) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("output"));
+    let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+    let mut temporary_name = std::ffi::OsString::from(".");
+    temporary_name.push(file_name);
+    temporary_name.push(format!(
+        ".{}.{}.{}.tmp",
+        purpose.replace(|ch: char| !ch.is_ascii_alphanumeric(), "_"),
+        std::process::id(),
+        id
+    ));
+    parent.join(temporary_name)
+}
+
+fn write_primary_output_atomic(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), String> {
+    let temporary = sibling_temporary_path(path, "armfortas");
+    let _cleanup = RemoveFileOnDrop(temporary.clone());
+    fs::write(&temporary, contents).map_err(|error| {
+        format!(
+            "cannot write temporary output '{}': {error}",
+            temporary.display()
+        )
+    })?;
+    fs::rename(&temporary, path).map_err(|error| {
+        format!(
+            "cannot publish output '{}' atomically: {error}",
+            path.display()
+        )
+    })
 }
 
 /// Optimization level requested at the CLI.
@@ -2204,8 +2261,7 @@ fn compile_with_bundled_runtime_inner(
             if out.as_os_str() == "-" {
                 write_stdout_bytes(&preprocessed_bytes)?;
             } else {
-                fs::write(&out, &preprocessed_bytes)
-                    .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+                write_primary_output_atomic(&out, &preprocessed_bytes)?;
             }
             if opts.verbose {
                 eprintln!(" preprocess-only: wrote {}", out.display());
@@ -2253,7 +2309,7 @@ fn compile_with_bundled_runtime_inner(
         for t in &tokens {
             buf.push_str(&format!("{:?}\n", t));
         }
-        fs::write(&out, &buf).map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+        write_primary_output_atomic(&out, &buf)?;
         return Ok(());
     }
 
@@ -2284,7 +2340,7 @@ fn compile_with_bundled_runtime_inner(
         for u in &units {
             buf.push_str(&format!("{:#?}\n", u));
         }
-        fs::write(&out, &buf).map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+        write_primary_output_atomic(&out, &buf)?;
         return Ok(());
     }
 
@@ -2438,8 +2494,7 @@ fn compile_with_bundled_runtime_inner(
     if opts.emit_ir {
         let ir_text = ir_printer::print_module(&ir_module);
         let out = opts.output_path();
-        fs::write(&out, &ir_text)
-            .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+        write_primary_output_atomic(&out, &ir_text)?;
         return Ok(());
     }
 
@@ -2465,8 +2520,7 @@ fn compile_with_bundled_runtime_inner(
     };
     if opts.emit_asm {
         let out = opts.output_path();
-        fs::write(&out, &asm_text)
-            .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+        write_primary_output_atomic(&out, &asm_text)?;
         write_module_artifacts(opts, &module_artifacts)?;
         write_dependency_file(opts, &out, included_files)?;
         if opts.verbose {
@@ -2565,15 +2619,14 @@ fn compile_with_bundled_runtime_inner(
                     .map_err(|e| format!("afs-as: {}: {}", asm_path.display(), e))?;
                 let bytes = afs_as::elf::write_elf(&obj)
                     .map_err(|e| format!("afs-as: elf writer: {}", e))?;
-                fs::write(&obj_path, bytes)
-                    .map_err(|e| format!("cannot write '{}': {}", obj_path.display(), e))?;
+                write_primary_output_atomic(&obj_path, bytes)?;
                 phase.end(&mut phases);
             }
             Some(assembler) => {
                 let pending_output = PendingExternalOutput::prepare(&obj_path, "assembler")?;
                 let as_result = Command::new(assembler)
                     .args(["--64", "-o"])
-                    .arg(&obj_path)
+                    .arg(pending_output.staging_path())
                     .arg(&asm_path)
                     .output()
                     .map_err(|e| format!("cannot run assembler: {}", e))?;
@@ -2624,14 +2677,17 @@ fn compile_with_bundled_runtime_inner(
         host.arch != opts.target.arch || host.object_format() != crate::target::ObjectFormat::MachO;
     let assembler = env_override("AFS_AS_PATH");
     let assemble_result = if cross && assembler.is_none() {
-        afs_as::assemble::assemble_file(&asm_path, &obj_path).map_err(|e| format!("afs-as: {}", e))
+        let pending_output = PendingExternalOutput::prepare(&obj_path, "assembler")?;
+        afs_as::assemble::assemble_file(&asm_path, pending_output.staging_path())
+            .map_err(|e| format!("afs-as: {}", e))?;
+        pending_output.verify("assembler")
     } else {
         let assembler = assembler.unwrap_or_else(|| "as".into());
         let pending_output = PendingExternalOutput::prepare(&obj_path, "assembler")?;
         let result = Command::new(assembler)
             .arg(&asm_path)
             .arg("-o")
-            .arg(&obj_path)
+            .arg(pending_output.staging_path())
             .output()
             .map_err(|e| format!("cannot run assembler: {}", e))?;
         if result.status.success() {
@@ -3099,12 +3155,13 @@ fn link_inputs_elf_with_bundled_runtime(
         lib_paths.extend(dirs.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
     }
     let operands = resolve_link_operands(inputs, opts)?;
+    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
     let args = elf_crt::elf_link_args(
         &opts.target,
         &crt,
         &operands,
         runtime.path(),
-        output,
+        pending_output.staging_path(),
         pie,
         &lib_paths,
     )?;
@@ -3116,7 +3173,6 @@ fn link_inputs_elf_with_bundled_runtime(
     if opts.verbose {
         print_verbose_command_line(&linker, &args);
     }
-    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
     let result = Command::new(&linker)
         .args(&args)
         .output()
@@ -3156,7 +3212,11 @@ fn link_inputs(
     }
     let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
 
-    let mut args: Vec<String> = vec!["-o".into(), output.to_string_lossy().into_owned()];
+    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
+    let mut args: Vec<String> = vec![
+        "-o".into(),
+        pending_output.staging_path().to_string_lossy().into_owned(),
+    ];
     for dir in &opts.library_search_paths {
         args.push(format!("-L{}", dir.display()));
     }
@@ -3180,13 +3240,13 @@ fn link_inputs(
         // executables. The shared runtime is a separate image and unaffected.
         args.push("-dead_strip".into());
     }
+    push_staged_macho_output_identity(&mut args, output, opts);
     push_macho_tail_link_flags(&mut args, opts);
 
     if opts.verbose {
         print_verbose_command_line("ld", &args);
     }
 
-    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
     let ld_result = Command::new("ld")
         .args(&args)
         .output()
@@ -3221,7 +3281,11 @@ fn link_inputs_with_afs_ld(
     } else {
         args.extend(["-e".into(), "_main".into()]);
     }
-    args.extend(["-o".into(), output.to_string_lossy().into_owned()]);
+    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
+    args.extend([
+        "-o".into(),
+        pending_output.staging_path().to_string_lossy().into_owned(),
+    ]);
     args.extend(["-syslibroot".into(), sysroot]);
     for dir in &opts.library_search_paths {
         args.push("-L".into());
@@ -3239,13 +3303,13 @@ fn link_inputs_with_afs_ld(
     push_macho_runtime_link_input(&mut args, &runtime);
     args.push(libsystem_tbd);
     push_macho_runtime_rpath(&mut args, &runtime);
+    push_staged_macho_output_identity(&mut args, output, opts);
     push_afs_ld_tail_link_flags(&mut args, opts);
 
     if opts.verbose {
         print_verbose_command_line(linker, &args);
     }
 
-    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
     let link_result = Command::new(linker)
         .args(&args)
         .output()
@@ -3260,6 +3324,23 @@ fn link_inputs_with_afs_ld(
             String::from_utf8_lossy(&link_result.stderr)
         ))
     }
+}
+
+/// Linking through a sibling staging path must not leak that private name into
+/// a dylib's public LC_ID_DYLIB. Apple ld normally derives the omitted install
+/// name from the final `-o` spelling, so make that implicit contract explicit
+/// whenever staging changes the path passed to the linker.
+fn push_staged_macho_output_identity(args: &mut Vec<String>, output: &Path, opts: &Options) {
+    if !opts.shared
+        || opts
+            .extra_link_args
+            .iter()
+            .any(|argument| argument == "-install_name")
+    {
+        return;
+    }
+    args.push("-install_name".into());
+    args.push(output.to_string_lossy().into_owned());
 }
 
 /// Append Mach-O flags that do not participate in the ordered user operand
@@ -3857,6 +3938,27 @@ mod tests {
     }
 
     #[test]
+    fn staged_macho_dylib_identity_uses_the_final_output_path() {
+        let output = Path::new("build/libanswer.dylib");
+        let shared = Options {
+            shared: true,
+            ..Options::default()
+        };
+        let mut default_args = Vec::new();
+        push_staged_macho_output_identity(&mut default_args, output, &shared);
+        assert_eq!(default_args, ["-install_name", "build/libanswer.dylib"]);
+
+        let explicit = Options {
+            shared: true,
+            extra_link_args: vec!["-install_name".into(), "@rpath/libanswer.dylib".into()],
+            ..Options::default()
+        };
+        let mut explicit_args = Vec::new();
+        push_staged_macho_output_identity(&mut explicit_args, output, &explicit);
+        assert!(explicit_args.is_empty());
+    }
+
+    #[test]
     fn conventional_dynamic_runtime_uses_searchable_link_arguments() {
         let runtime =
             MachoRuntime::Dynamic(PathBuf::from("/opt/armfortas/lib/libarmfortas_rt.dylib"));
@@ -3900,7 +4002,7 @@ mod tests {
             PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
         assert!(!output.exists(), "prepare retained a stale output");
 
-        fs::write(&output, b"").expect("cannot write empty output");
+        fs::write(pending.staging_path(), b"").expect("cannot write empty output");
         let error = pending
             .verify("test tool")
             .expect_err("empty output must not commit");
@@ -3912,13 +4014,19 @@ mod tests {
 
         let pending =
             PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
-        fs::write(&output, b"partial").expect("cannot write partial output");
+        let staging = pending.staging_path().to_path_buf();
+        fs::write(&staging, b"partial").expect("cannot write partial output");
         drop(pending);
         assert!(!output.exists(), "drop retained a partial output");
+        assert!(!staging.exists(), "drop retained a staging output");
 
         let pending =
             PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
-        fs::write(&output, b"complete").expect("cannot write complete output");
+        fs::write(pending.staging_path(), b"complete").expect("cannot write complete output");
+        assert!(
+            !output.exists(),
+            "staging published output before verification"
+        );
         pending
             .verify("test tool")
             .expect("non-empty regular output must commit");
