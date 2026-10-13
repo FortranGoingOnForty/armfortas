@@ -337,6 +337,57 @@ fn terminal_output_collision_key(output: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
+fn paths_refer_to_same_file(left: &Path, right: &Path, cwd: &Path) -> bool {
+    if terminal_output_collision_key(left, cwd) == terminal_output_collision_key(right, cwd) {
+        return true;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) {
+            return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
+
+    false
+}
+
+fn validate_output_against_inputs<'a>(
+    output: &Path,
+    inputs: impl IntoIterator<Item = &'a PathBuf>,
+) -> Result<(), String> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot determine current directory: {error}"))?;
+    for input in inputs {
+        if paths_refer_to_same_file(output, input, &cwd) {
+            return Err(format!(
+                "output '{}' conflicts with compiler input '{}'; refusing to overwrite an input file",
+                output.display(),
+                input.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_primary_output_destination(
+    opts: &Options,
+    output: &Path,
+    included_files: &[PathBuf],
+) -> Result<(), String> {
+    let preprocesses_to_stdout = opts.preprocess_only
+        && opts
+            .output
+            .as_ref()
+            .is_none_or(|path| path.as_os_str() == "-");
+    if preprocesses_to_stdout {
+        return Ok(());
+    }
+    validate_output_against_inputs(output, all_input_paths(opts).iter().chain(included_files))
+}
+
 fn validate_unique_terminal_outputs(
     inputs: &[PathBuf],
     outputs: &[Option<PathBuf>],
@@ -573,7 +624,7 @@ impl Options {
         } else if self.emit_tokens {
             PathBuf::from(format!("{}.tokens", stem))
         } else {
-            PathBuf::from(stem)
+            PathBuf::from("a.out")
         }
     }
 
@@ -1914,11 +1965,10 @@ fn discard_failed_output(
     // deletion.
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot determine current directory: {error}"))?;
-    let output_key = terminal_output_collision_key(output, &cwd);
     if all_input_paths(opts)
         .iter()
         .chain(included_files)
-        .any(|input| terminal_output_collision_key(input, &cwd) == output_key)
+        .any(|input| paths_refer_to_same_file(output, input, &cwd))
     {
         return Ok(());
     }
@@ -1973,6 +2023,7 @@ fn compile_with_bundled_runtime_inner(
     bundled_runtime: Option<&'static [u8]>,
     dependency_output: Option<&mut Vec<PathBuf>>,
 ) -> Result<(), String> {
+    validate_primary_output_destination(opts, &opts.output_path(), &[])?;
     if TerminalMode::from_options(opts).is_none() {
         validate_dependency_file_destination(opts, &opts.output_path(), &[])?;
     }
@@ -2110,6 +2161,7 @@ fn compile_with_bundled_runtime_inner(
         dependencies.clone_from(&pp_result.included_files);
     }
     let included_files = &pp_result.included_files;
+    validate_primary_output_destination(opts, &opts.output_path(), included_files)?;
     if conformance_warnings_are_errors {
         let depfile_cleanup = prepare_dependency_file(opts, &opts.output_path(), included_files);
         let failure = raw_source_failure(opts, included_files);
@@ -2809,8 +2861,7 @@ fn validate_dependency_file_destination(
     };
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot determine current directory: {error}"))?;
-    let depfile_key = terminal_output_collision_key(&depfile, &cwd);
-    if depfile_key == terminal_output_collision_key(output, &cwd) {
+    if paths_refer_to_same_file(&depfile, output, &cwd) {
         return Err(format!(
             "dependency file '{}' conflicts with output '{}'",
             depfile.display(),
@@ -2818,7 +2869,7 @@ fn validate_dependency_file_destination(
         ));
     }
     for input in all_input_paths(opts).iter().chain(included_files) {
-        if depfile_key == terminal_output_collision_key(input, &cwd) {
+        if paths_refer_to_same_file(&depfile, input, &cwd) {
             return Err(format!(
                 "dependency file '{}' conflicts with compiler input '{}'",
                 depfile.display(),
@@ -3086,6 +3137,8 @@ fn link_inputs(
     opts: &Options,
     bundled_runtime: Option<&'static [u8]>,
 ) -> Result<(), String> {
+    let compiler_inputs = all_input_paths(opts);
+    validate_output_against_inputs(output, compiler_inputs.iter().chain(inputs))?;
     if opts.target.object_format() == crate::target::ObjectFormat::Elf {
         return link_inputs_elf_with_bundled_runtime(inputs, output, opts, bundled_runtime);
     }
@@ -3407,6 +3460,7 @@ fn compile_multi_with_bundled_runtime(
         .and_then(|output| dependency_file_path(opts, output))
         .is_some();
     if let Some(output) = link_output.as_deref() {
+        validate_output_against_inputs(output, all_inputs.iter())?;
         reject_unsupported_elf_link_mode(opts, output)?;
         validate_dependency_file_destination(opts, output, &[])?;
     }
@@ -3428,6 +3482,9 @@ fn compile_multi_with_bundled_runtime(
     });
     if let Some(outputs) = terminal_outputs.as_deref() {
         validate_unique_terminal_outputs(&source_inputs, outputs)?;
+        for output in outputs.iter().flatten() {
+            validate_output_against_inputs(output, all_inputs.iter())?;
+        }
     }
 
     // A terminal multi-input job owns one default output per source. Remove
@@ -3561,6 +3618,7 @@ fn compile_multi_with_bundled_runtime(
 
     // Link all object files.
     let output = link_output.expect("link output for multi-file link");
+    validate_output_against_inputs(&output, all_inputs.iter().chain(included_files.iter()))?;
     prepare_dependency_file(opts, &output, &included_files)?;
     link_multi(&link_list, &output, opts, bundled_runtime)?;
 

@@ -17470,6 +17470,138 @@ fn dash_o_equals_form_sets_output_path() {
 }
 
 #[test]
+fn single_source_default_link_uses_a_out_without_replacing_extensionless_source() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=single_source_default_link_uses_a_out_without_replacing_extensionless_source count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("default_a_out");
+    let source_text = "program p\n  print *, 17\nend program p\n";
+    let source = write_program_in(&dir, "prog", source_text);
+
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .arg("prog")
+        .output()
+        .expect("default-output compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "default-output compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source).expect("extensionless source disappeared"),
+        source_text,
+        "default linking replaced the extensionless source"
+    );
+    let executable = dir.join("a.out");
+    assert!(executable.exists(), "default link did not publish a.out");
+    let run = Command::new(&executable)
+        .output()
+        .expect("default a.out failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("17"),
+        "default a.out produced the wrong result: {:?}",
+        run
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn explicit_primary_output_aliases_are_rejected_without_touching_source() {
+    let dir = unique_dir("primary_output_alias");
+    let source_text = "program p\n  print *, 23\nend program p\n";
+    let source = write_program_in(&dir, "source.f90", source_text);
+
+    for mode in ["-E", "--emit-tokens", "--emit-ast", "--emit-ir", "-S", "-c"] {
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([mode, "source.f90", "-o", "source.f90"])
+            .output()
+            .expect("aliased-output compile failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{mode} unexpectedly accepted an input/output alias"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("output 'source.f90' conflicts with compiler input 'source.f90'")
+                && stderr.contains("refusing to overwrite an input file"),
+            "{mode} emitted the wrong alias diagnostic: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&source).expect("source disappeared"),
+            source_text,
+            "{mode} modified the source before rejecting the alias"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn primary_output_hardlink_alias_is_rejected_by_file_identity() {
+    let dir = unique_dir("primary_output_hardlink");
+    let source_text = "program p\nend program p\n";
+    let source = write_program_in(&dir, "source.f90", source_text);
+    let alias = dir.join("output.s");
+    std::fs::hard_link(&source, &alias).expect("cannot create hardlink alias");
+
+    let result = Command::new(compiler("armfortas"))
+        .arg("-S")
+        .arg(&source)
+        .arg("-o")
+        .arg(&alias)
+        .output()
+        .expect("hardlink-alias compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "hardlink alias unexpectedly compiled"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("refusing to overwrite an input file"),
+        "missing hardlink alias diagnostic: {stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), source_text);
+    assert_eq!(std::fs::read_to_string(&alias).unwrap(), source_text);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn preprocess_output_cannot_alias_an_included_file() {
+    let dir = unique_dir("include_output_alias");
+    write_program_in(&dir, "main.F90", "#include \"payload.inc\"\n");
+    let include_text = "integer, parameter :: answer = 42\n";
+    let include = write_program_in(&dir, "payload.inc", include_text);
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-E", "main.F90", "-o", "payload.inc"])
+        .output()
+        .expect("include-alias preprocess failed to spawn");
+    assert!(
+        !result.status.success(),
+        "preprocessing unexpectedly overwrote an included input"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("output 'payload.inc' conflicts with compiler input")
+            && stderr.contains("payload.inc"),
+        "missing included-input alias diagnostic: {stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(include).unwrap(), include_text);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn duplicate_o_is_rejected() {
     let src = write_program("program p\n  print *, 1\nend program\n", "f90");
     let out_a = unique_path("dup_a", "bin");
