@@ -17543,6 +17543,67 @@ fn explicit_primary_output_aliases_are_rejected_without_touching_source() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn linked_output_cannot_alias_source_input() {
+    let dir = unique_dir("linked_output_source_alias");
+    let source_text = "program p\n  print *, 29\nend program p\n";
+    let source = write_program_in(&dir, "source.f90", source_text);
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["source.f90", "-o", "source.f90"])
+        .env("AFS_LD_PATH", "/usr/bin/false")
+        .output()
+        .expect("aliased linked-output compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "linking unexpectedly accepted a source/output alias"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("output 'source.f90' conflicts with compiler input 'source.f90'")
+            && stderr.contains("refusing to overwrite an input file"),
+        "linked output emitted the wrong alias diagnostic: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source).expect("source disappeared"),
+        source_text,
+        "linking modified the source before rejecting the alias"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn linked_output_cannot_alias_link_input() {
+    let dir = unique_dir("linked_output_link_input_alias");
+    let object = write_program_in(&dir, "input.o", "object sentinel\n");
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["input.o", "-o", "input.o"])
+        .env("AFS_LD_PATH", "/usr/bin/false")
+        .output()
+        .expect("aliased link-only command failed to spawn");
+    assert!(
+        !result.status.success(),
+        "linking unexpectedly accepted a link-input/output alias"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("output 'input.o' conflicts with compiler input 'input.o'")
+            && stderr.contains("refusing to overwrite an input file"),
+        "link-only output emitted the wrong alias diagnostic: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&object).expect("link input disappeared"),
+        "object sentinel\n",
+        "linking modified its input before rejecting the alias"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[cfg(unix)]
 #[test]
 fn primary_output_hardlink_alias_is_rejected_by_file_identity() {
