@@ -45,6 +45,7 @@ impl Drop for RemoveFileOnDrop {
 /// non-empty regular file survives the guard.
 struct PendingExternalOutput {
     final_path: PathBuf,
+    staging_dir: PathBuf,
     staging_path: PathBuf,
     committed: bool,
 }
@@ -61,19 +62,10 @@ impl PendingExternalOutput {
                 ));
             }
         }
-        let staging_path = sibling_temporary_path(path, tool);
-        match fs::remove_file(&staging_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "cannot remove stale {tool} staging output '{}': {error}",
-                    staging_path.display()
-                ));
-            }
-        }
+        let (staging_dir, staging_path) = external_staging_path(path, tool)?;
         Ok(Self {
             final_path: path.to_path_buf(),
+            staging_dir,
             staging_path,
             committed: false,
         })
@@ -102,6 +94,7 @@ impl PendingExternalOutput {
                 self.final_path.display()
             )
         })?;
+        let _ = fs::remove_dir(&self.staging_dir);
         self.committed = true;
         Ok(())
     }
@@ -111,8 +104,38 @@ impl Drop for PendingExternalOutput {
     fn drop(&mut self) {
         if !self.committed {
             let _ = fs::remove_file(&self.staging_path);
+            let _ = fs::remove_dir(&self.staging_dir);
         }
     }
+}
+
+fn external_staging_path(path: &Path, tool: &str) -> Result<(PathBuf, PathBuf), String> {
+    let file_name = path.file_name().ok_or_else(|| {
+        format!(
+            "cannot create {tool} staging output for '{}': output has no file name",
+            path.display()
+        )
+    })?;
+    for _ in 0..32 {
+        let staging_dir = sibling_temporary_path(path, tool);
+        match fs::create_dir(&staging_dir) {
+            Ok(()) => {
+                let staging_path = staging_dir.join(file_name);
+                return Ok((staging_dir, staging_path));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot create {tool} staging directory '{}': {error}",
+                    staging_dir.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "cannot create a unique {tool} staging directory beside '{}'",
+        path.display()
+    ))
 }
 
 fn sibling_temporary_path(path: &Path, purpose: &str) -> PathBuf {
@@ -4001,6 +4024,12 @@ mod tests {
         let pending =
             PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
         assert!(!output.exists(), "prepare retained a stale output");
+        assert_eq!(
+            pending.staging_path().file_name(),
+            output.file_name(),
+            "external staging must preserve the final basename"
+        );
+        let empty_staging_dir = pending.staging_dir.clone();
 
         fs::write(pending.staging_path(), b"").expect("cannot write empty output");
         let error = pending
@@ -4011,17 +4040,24 @@ mod tests {
             "unexpected empty-output diagnostic: {error}"
         );
         assert!(!output.exists(), "verify retained an empty output");
+        assert!(
+            !empty_staging_dir.exists(),
+            "verify retained an empty staging directory"
+        );
 
         let pending =
             PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
         let staging = pending.staging_path().to_path_buf();
+        let staging_dir = pending.staging_dir.clone();
         fs::write(&staging, b"partial").expect("cannot write partial output");
         drop(pending);
         assert!(!output.exists(), "drop retained a partial output");
         assert!(!staging.exists(), "drop retained a staging output");
+        assert!(!staging_dir.exists(), "drop retained a staging directory");
 
         let pending =
             PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
+        let staging_dir = pending.staging_dir.clone();
         fs::write(pending.staging_path(), b"complete").expect("cannot write complete output");
         assert!(
             !output.exists(),
@@ -4034,6 +4070,7 @@ mod tests {
             fs::read(&output).expect("cannot read committed output"),
             b"complete"
         );
+        assert!(!staging_dir.exists(), "commit retained a staging directory");
         let _ = fs::remove_file(output);
     }
 
