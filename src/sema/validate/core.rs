@@ -10442,40 +10442,6 @@ fn validate_derived_type(
             );
         }
 
-        if let Some(pass_name) = tbp.pass_name.as_deref() {
-            let target = tbp.binding.as_deref().unwrap_or(&tbp.name);
-            let interface = tbp.interface.as_deref();
-            let procedure_scope = ctx.st.all_scopes().iter().find(|scope| {
-                let name_matches = match &scope.kind {
-                    ScopeKind::Function(scope_name) | ScopeKind::Subroutine(scope_name) => {
-                        scope_name.eq_ignore_ascii_case(target)
-                            || interface.is_some_and(|name| scope_name.eq_ignore_ascii_case(name))
-                    }
-                    _ => false,
-                };
-                name_matches
-                    && (scope.parent == Some(ctx.scope_id)
-                        || scope.parent.is_some_and(|parent| {
-                            ctx.st.scope(parent).parent == Some(ctx.scope_id)
-                                && matches!(ctx.st.scope(parent).kind, ScopeKind::Interface)
-                        }))
-            });
-            if !procedure_scope.is_some_and(|scope| {
-                scope
-                    .arg_order
-                    .iter()
-                    .any(|dummy| dummy.eq_ignore_ascii_case(pass_name))
-            }) {
-                ctx.error(
-                    span,
-                    format!(
-                        "PASS dummy '{}' is not a dummy argument of type-bound procedure '{}'",
-                        pass_name, tbp.name
-                    ),
-                );
-            }
-        }
-
         // Deferred procedures must declare an explicit interface.
         if is_deferred && tbp.interface.is_none() {
             ctx.error(
@@ -10485,6 +10451,151 @@ fn validate_derived_type(
                     tbp.name
                 ),
             );
+        }
+
+        if !tbp.is_generic && !has_nopass {
+            let target = tbp.binding.as_deref().unwrap_or(&tbp.name);
+            let interface = tbp.interface.as_deref();
+            let procedure_scope_id = ctx.st.all_scopes().iter().find_map(|scope| {
+                let name_matches = match &scope.kind {
+                    ScopeKind::Function(scope_name) | ScopeKind::Subroutine(scope_name) => {
+                        scope_name.eq_ignore_ascii_case(target)
+                            || interface.is_some_and(|name| scope_name.eq_ignore_ascii_case(name))
+                    }
+                    _ => false,
+                };
+                (name_matches
+                    && (scope.parent == Some(ctx.scope_id)
+                        || scope.parent.is_some_and(|parent| {
+                            ctx.st.scope(parent).parent == Some(ctx.scope_id)
+                                && matches!(ctx.st.scope(parent).kind, ScopeKind::Interface)
+                        })))
+                .then_some(scope.id)
+            });
+
+            if let Some(procedure_scope_id) = procedure_scope_id {
+                let procedure_scope = ctx.st.scope(procedure_scope_id);
+                let pass_name = if let Some(pass_name) = tbp.pass_name.as_deref() {
+                    procedure_scope
+                        .arg_order
+                        .iter()
+                        .find(|dummy| dummy.eq_ignore_ascii_case(pass_name))
+                        .cloned()
+                } else {
+                    procedure_scope.arg_order.first().cloned()
+                };
+
+                let Some(pass_name) = pass_name else {
+                    if let Some(pass_name) = tbp.pass_name.as_deref() {
+                        ctx.error(
+                            span,
+                            format!(
+                                "PASS dummy '{}' is not a dummy argument of type-bound procedure '{}'",
+                                pass_name, tbp.name
+                            ),
+                        );
+                    } else {
+                        ctx.error(
+                            span,
+                            format!(
+                                "type-bound procedure '{}' has no first dummy argument for its passed object",
+                                tbp.name
+                            ),
+                        );
+                    }
+                    continue;
+                };
+                let Some(dummy) = procedure_scope
+                    .symbols
+                    .get(&pass_name.to_ascii_lowercase())
+                    .cloned()
+                else {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' is not a data object",
+                            pass_name, tbp.name
+                        ),
+                    );
+                    continue;
+                };
+
+                if dummy.kind != SymbolKind::Variable {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' must be a data object",
+                            pass_name, tbp.name
+                        ),
+                    );
+                }
+                if !dummy.attrs.array_spec.is_empty() {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' must be scalar",
+                            pass_name, tbp.name
+                        ),
+                    );
+                }
+                if dummy.attrs.pointer {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' may not have the POINTER attribute",
+                            pass_name, tbp.name
+                        ),
+                    );
+                }
+                if dummy.attrs.allocatable {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' may not have the ALLOCATABLE attribute",
+                            pass_name, tbp.name
+                        ),
+                    );
+                }
+                if dummy.attrs.value {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' may not have the VALUE attribute",
+                            pass_name, tbp.name
+                        ),
+                    );
+                }
+                let has_required_type = matches!(
+                    dummy.type_info.as_ref(),
+                    Some(TypeInfo::Class(dummy_type))
+                        if generic_same_derived_type(
+                            ctx,
+                            procedure_scope_id,
+                            dummy_type,
+                            ctx.scope_id,
+                            name,
+                        )
+                );
+                if !has_required_type {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' must be declared CLASS({})",
+                            pass_name, tbp.name, name
+                        ),
+                    );
+                }
+            } else if let Some(pass_name) = tbp.pass_name.as_deref() {
+                // Preserve the declaration-local diagnostic even when the
+                // binding target could not be resolved to a procedure scope.
+                ctx.error(
+                    span,
+                    format!(
+                        "PASS dummy '{}' is not a dummy argument of type-bound procedure '{}'",
+                        pass_name, tbp.name
+                    ),
+                );
+            }
         }
     }
 }
@@ -19235,6 +19346,107 @@ end module
         assert!(
             errs.iter()
                 .any(|error| error.contains("PASS dummy 'missing'")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn passed_object_dummy_characteristics_are_validated() {
+        let cases = [
+            (
+                "declared type",
+                "integer, intent(inout) :: self",
+                "must be declared CLASS(thing)",
+            ),
+            (
+                "declared derived-type identity",
+                "class(other), intent(inout) :: self",
+                "must be declared CLASS(thing)",
+            ),
+            (
+                "polymorphism",
+                "type(thing), intent(inout) :: self",
+                "must be declared CLASS(thing)",
+            ),
+            (
+                "rank",
+                "class(thing), intent(inout) :: self(:)",
+                "must be scalar",
+            ),
+            (
+                "pointer",
+                "class(thing), pointer, intent(inout) :: self",
+                "may not have the POINTER attribute",
+            ),
+            (
+                "allocatable",
+                "class(thing), allocatable, intent(inout) :: self",
+                "may not have the ALLOCATABLE attribute",
+            ),
+            (
+                "value",
+                "class(thing), value :: self",
+                "may not have the VALUE attribute",
+            ),
+        ];
+
+        for (case, declaration, expected) in cases {
+            let source = format!(
+                "module m\n  implicit none\n  type :: other\n  end type\n  type :: thing\n  contains\n    procedure :: method\n  end type\ncontains\n  subroutine method(self)\n    {declaration}\n  end subroutine\nend module\n"
+            );
+            let errs = errors_from(&source);
+            assert!(
+                errs.iter().any(|error| error.contains(expected)),
+                "{case}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_pass_requires_a_first_dummy_argument() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+  type :: thing
+  contains
+    procedure :: method
+  end type
+contains
+  subroutine method()
+  end subroutine
+end module
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|error| error.contains("has no first dummy argument")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn optional_named_nonfirst_passed_object_is_valid() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+  type :: thing
+  contains
+    procedure, pass(self) :: method
+  end type
+contains
+  subroutine method(value, self)
+    integer, intent(in) :: value
+    class(thing), optional, intent(inout) :: self
+  end subroutine
+end module
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|error| error.contains("passed-object") || error.contains("PASS dummy")),
             "{errs:?}"
         );
     }

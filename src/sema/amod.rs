@@ -20,7 +20,9 @@ use crate::driver::defaults::DefaultKinds;
 use crate::ir::inst::Module as IrModule;
 use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
-use crate::sema::type_layout::{concretize_intrinsic_type_info, TypeLayout, TypeLayoutRegistry};
+use crate::sema::type_layout::{
+    concretize_intrinsic_type_info, BoundProc, TypeLayout, TypeLayoutRegistry,
+};
 
 const AMOD_VERSION: u32 = 17;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
@@ -2256,7 +2258,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     }
 
     if version >= 17 {
-        validate_bound_proc_metadata(&types, &procedures, path)?;
+        validate_bound_proc_metadata(&types, &procedures, &module_name, path)?;
     }
 
     Ok(ModuleInterface {
@@ -2281,11 +2283,149 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
 fn validate_bound_proc_metadata(
     types: &[AmodType],
     procedures: &[AmodProc],
+    module_name: &str,
     path: &Path,
 ) -> Result<(), String> {
+    fn same_optional_name(left: Option<&str>, right: Option<&str>) -> bool {
+        match (left, right) {
+            (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn same_binding(left: &BoundProc, right: &BoundProc) -> bool {
+        left.method_name.eq_ignore_ascii_case(&right.method_name)
+            && left.target_name.eq_ignore_ascii_case(&right.target_name)
+            && left.abi_name.eq_ignore_ascii_case(&right.abi_name)
+            && left.nopass == right.nopass
+            && same_optional_name(left.pass_name.as_deref(), right.pass_name.as_deref())
+            && left.pass_index == right.pass_index
+    }
+
+    fn type_ref_parts(name: &str) -> (Option<&str>, &str) {
+        name.rsplit_once("::")
+            .map_or((None, name), |(owner, local)| (Some(owner), local))
+    }
+
+    fn type_ref_matches_layout(name: &str, layout: &TypeLayout) -> bool {
+        let (owner, local) = type_ref_parts(name);
+        local.eq_ignore_ascii_case(&layout.name)
+            && owner.is_none_or(|owner| {
+                layout
+                    .owner_module
+                    .as_deref()
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(owner))
+            })
+    }
+
+    fn find_type_for_ref<'a>(
+        types: &'a [AmodType],
+        name: &str,
+        fallback_owner: Option<&str>,
+    ) -> Option<&'a AmodType> {
+        let (owner, local) = type_ref_parts(name);
+        let expected_owner = owner.or(fallback_owner);
+        types.iter().find(|candidate| {
+            candidate.layout.name.eq_ignore_ascii_case(local)
+                && expected_owner.is_none_or(|expected| {
+                    candidate
+                        .layout
+                        .owner_module
+                        .as_deref()
+                        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+                })
+        })
+    }
+
+    fn binding_defining_type<'a>(
+        types: &'a [AmodType],
+        carrying_type: &'a AmodType,
+        binding: &BoundProc,
+    ) -> (&'a AmodType, bool) {
+        let mut defining_type = carrying_type;
+        let mut inherited = false;
+        let mut seen = HashSet::new();
+        loop {
+            let key = format!(
+                "{}::{}",
+                defining_type.layout.owner_module.as_deref().unwrap_or(""),
+                defining_type.layout.name
+            )
+            .to_ascii_lowercase();
+            if !seen.insert(key) {
+                break;
+            }
+            let Some(parent_name) = defining_type.layout.parent.as_deref() else {
+                break;
+            };
+            let Some(parent_type) = find_type_for_ref(
+                types,
+                parent_name,
+                defining_type.layout.owner_module.as_deref(),
+            ) else {
+                break;
+            };
+            if !parent_type
+                .layout
+                .bound_procs
+                .iter()
+                .any(|parent_binding| same_binding(parent_binding, binding))
+            {
+                break;
+            }
+            defining_type = parent_type;
+            inherited = true;
+        }
+        (defining_type, inherited)
+    }
+
+    fn target_matches_procedure(
+        binding: &BoundProc,
+        defining_type: &TypeLayout,
+        procedure: &AmodProc,
+    ) -> bool {
+        if binding.target_name.eq_ignore_ascii_case(&procedure.name) {
+            return true;
+        }
+        let Some(owner) = defining_type.owner_module.as_deref() else {
+            return false;
+        };
+        let prefix = format!("afs_modproc_{}_", owner.to_ascii_lowercase());
+        binding
+            .target_name
+            .get(..prefix.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
+            && binding.target_name[prefix.len()..].eq_ignore_ascii_case(&procedure.name)
+    }
+
     for amod_type in types {
+        if amod_type
+            .layout
+            .owner_module
+            .as_deref()
+            .is_some_and(|owner| !owner.eq_ignore_ascii_case(module_name))
+        {
+            // Imported ancestor layouts are redundant closure records. Their
+            // locally declared bindings were validated in the owning module.
+            continue;
+        }
         for binding in &amod_type.layout.bound_procs {
             if binding.nopass {
+                continue;
+            }
+            let (defining_type, inherited) = binding_defining_type(types, amod_type, binding);
+            if inherited
+                && !same_optional_name(
+                    defining_type.layout.owner_module.as_deref(),
+                    amod_type.layout.owner_module.as_deref(),
+                )
+            {
+                // This binding was inherited from a type owned by another
+                // module. Its procedure contract was validated when that
+                // provider published its own artifact. Do not correlate it
+                // with this module's procedure table: a local procedure may
+                // legitimately have the same source or ABI name.
                 continue;
             }
             let pass_name = binding.pass_name.as_deref().ok_or_else(|| {
@@ -2302,19 +2442,22 @@ fn validate_bound_proc_metadata(
                     binding.method_name
                 )
             })?;
-            let procedure = procedures.iter().find(|procedure| {
-                procedure.name.eq_ignore_ascii_case(&binding.abi_name)
-                    || procedure.name.eq_ignore_ascii_case(&binding.target_name)
-                    || binding
-                        .target_name
-                        .rsplit_once('_')
-                        .is_some_and(|(_, suffix)| procedure.name.eq_ignore_ascii_case(suffix))
-            });
+            let procedure = procedures
+                .iter()
+                .find(|procedure| {
+                    target_matches_procedure(binding, &defining_type.layout, procedure)
+                })
+                .or_else(|| {
+                    procedures
+                        .iter()
+                        .find(|procedure| procedure.name.eq_ignore_ascii_case(&binding.abi_name))
+                });
             let Some(procedure) = procedure else {
-                // Inherited bindings can name a procedure owned by an
-                // ancestor module.  Its interface is validated in that
-                // provider's own artifact; retain the redundant metadata here.
-                continue;
+                return Err(format!(
+                    "{}: corrupt .amod file (missing procedure metadata for binding '{}'); rebuild the provider module",
+                    path.display(),
+                    binding.method_name
+                ));
             };
             let visible_args: Vec<_> = procedure.args.iter().filter(|arg| !arg.hidden).collect();
             let Some(argument) = visible_args.get(pass_index) else {
@@ -2330,6 +2473,47 @@ fn validate_bound_proc_metadata(
                     "{}: corrupt .amod file (passed-object name/index disagree for binding '{}'); rebuild the provider module",
                     path.display(),
                     binding.method_name
+                ));
+            }
+            if argument.rank != 0 {
+                return Err(format!(
+                    "{}: corrupt .amod file (passed-object dummy for binding '{}' is not scalar); rebuild the provider module",
+                    path.display(),
+                    binding.method_name
+                ));
+            }
+            if argument.pointer {
+                return Err(format!(
+                    "{}: corrupt .amod file (passed-object dummy for binding '{}' has the POINTER attribute); rebuild the provider module",
+                    path.display(),
+                    binding.method_name
+                ));
+            }
+            if argument.allocatable {
+                return Err(format!(
+                    "{}: corrupt .amod file (passed-object dummy for binding '{}' has the ALLOCATABLE attribute); rebuild the provider module",
+                    path.display(),
+                    binding.method_name
+                ));
+            }
+            if argument.value {
+                return Err(format!(
+                    "{}: corrupt .amod file (passed-object dummy for binding '{}' has the VALUE attribute); rebuild the provider module",
+                    path.display(),
+                    binding.method_name
+                ));
+            }
+            let has_required_type = matches!(
+                argument.type_info.as_ref(),
+                Some(TypeInfo::Class(dummy_type))
+                    if type_ref_matches_layout(dummy_type, &defining_type.layout)
+            );
+            if !has_required_type {
+                return Err(format!(
+                    "{}: corrupt .amod file (passed-object dummy for binding '{}' is not CLASS({})); rebuild the provider module",
+                    path.display(),
+                    binding.method_name,
+                    defining_type.layout.name
                 ));
             }
         }
@@ -4333,6 +4517,83 @@ mod tests {
         let error = read_amod_content(&missing, Path::new("pass_schema.amod"))
             .expect_err("binding without a PASS form was accepted");
         assert!(error.contains("must encode exactly one"), "{error}");
+    }
+
+    #[test]
+    fn current_schema_validates_passed_object_characteristics() {
+        let source = format!(
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine apply\n  @arg self : class(item_t), intent(inout)\n@end subroutine\n\n@type item_t, public\n  @layout size=4 align=4\n  @field value : integer(4) @offset 0 @size 4 @access public @owner pass_schema\n  @binds run => apply @pass-name self @pass-index 0 @abi apply\n  @owner pass_schema\n  @tag 1\n@end type\n"
+        );
+        let malformed = [
+            ("class(item_t)", "integer(4)"),
+            ("class(item_t)", "class(other_t)"),
+            (
+                "class(item_t), intent(inout)",
+                "class(item_t), intent(inout), rank=1, array_spec=\"(:)\"",
+            ),
+            (
+                "class(item_t), intent(inout)",
+                "class(item_t), intent(inout), pointer",
+            ),
+            (
+                "class(item_t), intent(inout)",
+                "class(item_t), intent(inout), allocatable",
+            ),
+            (
+                "class(item_t), intent(inout)",
+                "class(item_t), intent(inout), value",
+            ),
+        ];
+        for (from, to) in malformed {
+            let text = add_integrity_headers(source.replacen(from, to, 1));
+            let error = read_amod_content(&text, Path::new("pass_schema.amod"))
+                .expect_err("malformed passed-object characteristics were accepted");
+            assert!(
+                error.contains("passed-object dummy")
+                    && error.contains("corrupt .amod file")
+                    && error.contains("rebuild the provider module"),
+                "{error}"
+            );
+        }
+
+        let optional = add_integrity_headers(source.replacen(
+            "class(item_t), intent(inout)",
+            "class(item_t), intent(inout), optional",
+            1,
+        ));
+        read_amod_content(&optional, Path::new("pass_schema.amod"))
+            .expect("OPTIONAL passed-object dummy is valid");
+    }
+
+    #[test]
+    fn current_schema_validates_passed_object_against_defining_type() {
+        let source = format!(
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine base_touch\n  @arg self : class(base_t), intent(inout)\n@end subroutine\n\n@subroutine child_touch\n  @arg self : class(override_t), intent(inout)\n@end subroutine\n\n@type inherited_t, public\n  @layout size=0 align=1\n  @extends pass_schema::base_t\n  @binds touch => base_touch @pass-name self @pass-index 0 @abi base_touch\n  @owner pass_schema\n  @tag 2\n@end type\n\n@type override_t, public\n  @layout size=0 align=1\n  @extends pass_schema::base_t\n  @binds touch => child_touch @pass-name self @pass-index 0 @abi child_touch\n  @owner pass_schema\n  @tag 3\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => base_touch @pass-name self @pass-index 0 @abi base_touch\n  @owner pass_schema\n  @tag 1\n@end type\n"
+        );
+        let text = add_integrity_headers(source);
+        read_amod_content(&text, Path::new("pass_schema.amod"))
+            .expect("inherited and overridden bindings have truthful defining types");
+    }
+
+    #[test]
+    fn current_schema_requires_local_binding_procedure_metadata() {
+        let source = format!(
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@type item_t, public\n  @layout size=0 align=1\n  @binds run => apply @pass-name self @pass-index 0 @abi apply\n  @owner pass_schema\n  @tag 1\n@end type\n"
+        );
+        let text = add_integrity_headers(source);
+        let error = read_amod_content(&text, Path::new("pass_schema.amod"))
+            .expect_err("local binding without procedure metadata was accepted");
+        assert!(error.contains("missing procedure metadata"), "{error}");
+    }
+
+    #[test]
+    fn current_schema_allows_external_inherited_binding_metadata() {
+        let source = format!(
+            "#!amod {AMOD_VERSION}\n# module: child_schema\n# default-access: public\n\n@subroutine touch\n  @arg value : integer(4), intent(inout)\n@end subroutine\n\n@type child_t, public\n  @layout size=0 align=1\n  @extends ancestor_schema::base_t\n  @binds touch => afs_modproc_ancestor_schema_touch @pass-name self @pass-index 0 @abi touch\n  @owner child_schema\n  @tag 2\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => afs_modproc_ancestor_schema_touch @pass-name self @pass-index 0 @abi touch\n  @owner ancestor_schema\n  @tag 1\n@end type\n"
+        );
+        let text = add_integrity_headers(source);
+        read_amod_content(&text, Path::new("child_schema.amod"))
+            .expect("external inherited binding may rely on its provider artifact");
     }
 
     #[test]

@@ -378,6 +378,105 @@ fn named_pass_position_round_trips_across_amod() {
 }
 
 #[test]
+fn inherited_passed_object_type_round_trips_across_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=inherited_passed_object_type_round_trips_across_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let root = unique_dir();
+    for level in ["-O0", "-O3"] {
+        let dir = root.join(level.trim_start_matches('-'));
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider = dir.join("inherited_pass_provider.f90");
+        let consumer = dir.join("inherited_pass_consumer.f90");
+        let provider_object = dir.join("provider.o");
+        let consumer_object = dir.join("consumer.o");
+        let binary = dir.join("probe");
+        std::fs::write(
+            &provider,
+            "module inherited_pass_provider\n  implicit none\n  type :: base_t\n    integer :: value = 0\n  contains\n    procedure :: touch => base_touch\n  end type\n  type, extends(base_t) :: inherited_t\n  end type\n  type, extends(base_t) :: override_t\n  contains\n    procedure :: touch => child_touch\n  end type\ncontains\n  subroutine base_touch(self)\n    class(base_t), intent(inout) :: self\n    self%value = self%value + 1\n  end subroutine\n  subroutine child_touch(self)\n    class(override_t), intent(inout) :: self\n    self%value = self%value + 10\n  end subroutine\nend module\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &consumer,
+            "program p\n  use inherited_pass_provider, only : inherited_t, override_t\n  implicit none\n  type(inherited_t) :: inherited\n  type(override_t) :: overridden\n  call inherited%touch()\n  call overridden%touch()\n  if (inherited%value /= 1) error stop 81\n  if (overridden%value /= 10) error stop 82\n  print *, 'inherited-pass-ok'\nend program\n",
+        )
+        .unwrap();
+        compile_file_flags(&compiler, &provider, &provider_object, None, &[level]);
+        compile_file_flags(&compiler, &consumer, &consumer_object, Some(&dir), &[level]);
+        link_files(&[&provider_object, &consumer_object], &binary);
+        let output = run_binary(&binary);
+        assert!(output.contains("inherited-pass-ok"), "{level}: {output}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn external_inherited_pass_ignores_overlapping_module_name_collision_across_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=external_inherited_pass_ignores_overlapping_module_name_collision_across_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let root = unique_dir();
+    for level in ["-O0", "-O3"] {
+        let dir = root.join(level.trim_start_matches('-'));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = dir.join("external_parent.f90");
+        let child = dir.join("external_child.f90");
+        let consumer = dir.join("external_consumer.f90");
+        let parent_object = dir.join("parent.o");
+        let child_object = dir.join("child.o");
+        let consumer_object = dir.join("consumer.o");
+        let binary = dir.join("probe");
+        std::fs::write(
+            &parent,
+            "module a_b\n  implicit none\n  private\n  public :: base_t\n  type :: base_t\n    integer :: value = 0\n  contains\n    procedure :: touch\n  end type\ncontains\n  subroutine touch(self)\n    class(base_t), intent(inout) :: self\n    self%value = self%value + 1\n  end subroutine\nend module\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            "module a\n  use a_b, only : base_t\n  implicit none\n  type, extends(base_t) :: child_t\n  end type\ncontains\n  subroutine b_TOUCH(value) bind(c, name='local_collision')\n    integer, intent(inout) :: value\n    value = -1\n  end subroutine\nend module\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &consumer,
+            "program p\n  use a, only : child_t\n  implicit none\n  type(child_t) :: value\n  call value%touch()\n  if (value%value /= 1) error stop 91\n  print *, 'external-inherited-pass-ok'\nend program\n",
+        )
+        .unwrap();
+
+        compile_file_flags(&compiler, &parent, &parent_object, None, &[level]);
+        compile_file_flags(&compiler, &child, &child_object, Some(&dir), &[level]);
+        let child_amod = std::fs::read_to_string(dir.join("a.amod"))
+            .expect("child module did not publish its interface");
+        assert!(
+            child_amod.lines().any(|line| {
+                line.contains("@binds touch => afs_modproc_a_b_touch")
+                    && line.contains("@pass-name self @pass-index 0")
+            }),
+            "{level}: inherited PASS metadata was rewritten:\n{child_amod}"
+        );
+        compile_file_flags(&compiler, &consumer, &consumer_object, Some(&dir), &[level]);
+        link_files(&[&parent_object, &child_object, &consumer_object], &binary);
+        let output = run_binary(&binary);
+        assert!(
+            output.contains("external-inherited-pass-ok"),
+            "{level}: {output}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn protected_origin_round_trips_across_amod() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

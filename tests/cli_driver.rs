@@ -68440,6 +68440,43 @@ fn named_nonfirst_pass_dummy_controls_type_bound_call_slot() {
 }
 
 #[test]
+fn invalid_passed_object_type_is_a_hard_error() {
+    let src = write_program(
+        "module invalid_pass_m\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  contains\n    procedure, pass(self) :: mutate\n  end type\ncontains\n  subroutine mutate(delta, self)\n    integer, intent(in) :: delta\n    integer, intent(inout) :: self\n    self = delta\n  end subroutine\nend module\n",
+        "f90",
+    );
+    for level in ["-O0", "-O3"] {
+        let obj = unique_path(
+            &format!("invalid_pass_type_{}", level.trim_start_matches('-')),
+            "o",
+        );
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                level,
+                "-c",
+                src.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("invalid PASS compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        assert!(
+            !compile.status.success()
+                && stderr.contains("passed-object dummy 'self'")
+                && stderr.contains("must be declared CLASS(box_t)"),
+            "{level}: status={:?} stdout={} stderr={stderr}",
+            compile.status,
+            String::from_utf8_lossy(&compile.stdout)
+        );
+        assert!(!obj.exists(), "{level}: invalid source produced an object");
+        let _ = std::fs::remove_file(obj);
+    }
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
 fn type_bound_defined_operator_accepts_character_result_left_operand() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

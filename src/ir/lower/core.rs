@@ -22345,25 +22345,14 @@ pub(super) fn emit_resolved_bound_proc_call(
     }
     for (i, slot) in arg_slots.iter().enumerate() {
         if Some(i) == pass_index {
-            let wants_bind_c_char = callee_bind_c_char_args
-                .as_ref()
-                .map(|mask| mask.get(i).copied().unwrap_or(false))
-                .unwrap_or(false);
-            let mask_wants_descriptor = callee_descriptor_args
-                .as_ref()
-                .map(|mask| mask.get(i).copied().unwrap_or(false))
-                .unwrap_or(false);
-            let pass_dummy_is_class = callee_class_args
-                .as_ref()
-                .map(|mask| mask.get(i).copied().unwrap_or(false))
-                .unwrap_or(false);
-            let wants_descriptor =
-                (mask_wants_descriptor || pass_dummy_is_class) && !wants_bind_c_char;
-            call_args.push(if wants_descriptor {
-                pass_desc_addr.unwrap_or(obj_addr)
-            } else {
-                obj_addr
-            });
+            // F2018 C760 requires the passed-object dummy of an extensible
+            // type to be polymorphic. A type with a type-bound procedure is
+            // extensible, and sema plus current-schema `.amod` validation
+            // enforce CLASS(owner). Treat that binding contract as
+            // authoritative: an inherited private target may have no local
+            // procedure record, while an unrelated local procedure can share
+            // a suffix of its mangled name and advertise a raw scalar ABI.
+            call_args.push(pass_desc_addr.unwrap_or(obj_addr));
             arg_presence.push(b.const_bool(true));
             continue;
         }

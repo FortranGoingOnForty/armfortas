@@ -2844,7 +2844,13 @@ fn register_local_type_layouts(
                 final_proc.rank = final_procedure_rank(st, scope_id, source_name).unwrap_or(0);
                 final_proc.elemental = final_procedure_is_elemental(st, scope_id, source_name);
             }
-            resolve_bound_proc_pass_metadata(st, scope_id, host_module, &mut layout);
+            resolve_bound_proc_pass_metadata(
+                st,
+                scope_id,
+                host_module,
+                parent.as_ref(),
+                &mut layout,
+            );
             // Don't overwrite a layout that has bound_procs or final_procs with one that doesn't.
             // This handles the case where a subroutine redefines a type without CONTAINS.
             let dominated = layouts
@@ -2867,6 +2873,7 @@ fn resolve_bound_proc_pass_metadata(
     st: &SymbolTable,
     owner_scope: ScopeId,
     host_module: Option<&str>,
+    parent_layout: Option<&crate::sema::type_layout::TypeLayout>,
     layout: &mut crate::sema::type_layout::TypeLayout,
 ) {
     let module_prefix = host_module.map(|module| format!("afs_modproc_{}_", module.to_lowercase()));
@@ -2874,6 +2881,24 @@ fn resolve_bound_proc_pass_metadata(
         if binding.nopass {
             binding.pass_name = None;
             binding.pass_index = None;
+            continue;
+        }
+
+        let inherited_unchanged = parent_layout.is_some_and(|parent| {
+            parent.bound_procs.iter().any(|parent_binding| {
+                parent_binding.method_name == binding.method_name
+                    && parent_binding.target_name == binding.target_name
+                    && parent_binding.abi_name == binding.abi_name
+                    && parent_binding.nopass == binding.nopass
+                    && parent_binding.pass_name == binding.pass_name
+                    && parent_binding.pass_index == binding.pass_index
+            })
+        });
+        if inherited_unchanged {
+            // Parent layouts have already resolved or imported truthful PASS
+            // metadata. Preserve an unchanged inherited binding verbatim;
+            // mangled module prefixes are not an ownership boundary because
+            // module names can overlap (for example `a` and `a_b`).
             continue;
         }
 
