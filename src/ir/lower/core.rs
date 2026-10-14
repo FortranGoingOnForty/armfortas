@@ -4911,7 +4911,7 @@ pub(super) fn collect_module_globals(
                 if let Some(value) = sym.const_value {
                     param_consts
                         .entry(name.clone())
-                        .or_insert(ConstScalar::Int(value as i128));
+                        .or_insert(ConstScalar::Int(value));
                 }
             }
         }
@@ -4948,7 +4948,7 @@ pub(super) fn collect_module_globals(
                     if let Some(value) = sym.const_value {
                         param_consts
                             .entry(assoc.local_name)
-                            .or_insert(ConstScalar::Int(value as i128));
+                            .or_insert(ConstScalar::Int(value));
                     }
                 }
             }
@@ -9046,7 +9046,7 @@ fn install_parameter_inline_const(
             by_ref: false,
             char_kind: CharKind::None,
             derived_type: None,
-            inline_const: Some(ConstScalar::Int(value as i128)),
+            inline_const: Some(ConstScalar::Int(value)),
             is_pointer: false,
             runtime_dim_upper: vec![],
             is_class: false,
@@ -9532,7 +9532,7 @@ pub(super) fn eval_const_scalar_with_any_scope(
             let key = name.to_ascii_lowercase();
             param_consts.get(&key).copied().or_else(|| {
                 st.lookup_local_then_any(current_proc_scope(), &key)
-                    .and_then(|sym| sym.const_value.map(|v| ConstScalar::Int(v as i128)))
+                    .and_then(|sym| sym.const_value.map(ConstScalar::Int))
             })
         }
         Expr::ParenExpr { inner } => eval_const_scalar_with_any_scope(inner, param_consts, st),
@@ -10101,7 +10101,7 @@ fn integer_kind_storage_bytes(
             .or_else(|| {
                 st.find_symbol_any_scope(&key)
                     .and_then(|sym| sym.const_value)
-                    .and_then(|value| integer_kind_value_storage_bytes(value as i128))
+                    .and_then(integer_kind_value_storage_bytes)
             }),
     }
 }
@@ -10409,7 +10409,7 @@ pub(super) fn eval_const_scalar_with_decl_scope(
             let key = name.to_ascii_lowercase();
             param_consts.get(&key).copied().or_else(|| {
                 st.lookup_local_then_any(current_proc_scope(), &key)
-                    .and_then(|sym| sym.const_value.map(|v| ConstScalar::Int(v as i128)))
+                    .and_then(|sym| sym.const_value.map(ConstScalar::Int))
             })
         }
         Expr::ParenExpr { inner } => {
@@ -10679,7 +10679,7 @@ pub(super) fn eval_const_int_in_scope_or_any_scope(
 pub(super) fn symbol_table_parameter_const(st: &SymbolTable, name: &str) -> Option<ConstScalar> {
     st.find_symbol_any_scope(name).and_then(|sym| {
         if sym.attrs.parameter {
-            sym.const_value.map(|value| ConstScalar::Int(value as i128))
+            sym.const_value.map(ConstScalar::Int)
         } else {
             None
         }

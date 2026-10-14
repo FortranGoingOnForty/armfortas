@@ -782,7 +782,6 @@ fn character_literal_kind(ctx: &Ctx<'_>, kind: &str) -> Option<i128> {
     kind.parse::<i128>().ok().or_else(|| {
         ctx.lookup_lexical(kind)
             .and_then(|symbol| symbol.const_value)
-            .map(i128::from)
     })
 }
 
@@ -826,7 +825,7 @@ fn eval_const_int_expr_checked(
             let Some(kind) = const_int_kind_of_symbol(sym) else {
                 return Ok(None);
             };
-            let Some(value) = sym.const_value.map(i128::from) else {
+            let Some(value) = sym.const_value else {
                 return Ok(None);
             };
             checked_int_value(value, kind, expr.span).map(Some)

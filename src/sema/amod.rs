@@ -919,7 +919,6 @@ fn emit_parameter(
         .map(|value| hex_encode_bytes(&crate::source_bytes::from_source_view(value)));
     let const_int = sym
         .const_value
-        .map(i128::from)
         .or_else(|| global_info.and_then(|info| info.const_value));
     let const_real = global_info.and_then(|info| info.const_real_value);
     if let Some(rv) = const_real {
@@ -3725,7 +3724,7 @@ fn parse_type_info_for_version(
         let value = encoded
             .strip_prefix(prefix)
             .and_then(|rest| rest.strip_suffix(')'))
-            .ok_or_else(&corrupt)?;
+            .ok_or_else(corrupt)?;
         if value.is_empty() || value.bytes().any(|byte| !byte.is_ascii_digit()) {
             return Err(corrupt());
         }
@@ -3758,7 +3757,7 @@ fn parse_type_info_for_version(
         .strip_prefix("character(len=")
         .and_then(|rest| rest.strip_suffix(')'))
     {
-        let (len, kind) = inner.split_once(",kind=").ok_or_else(&corrupt)?;
+        let (len, kind) = inner.split_once(",kind=").ok_or_else(corrupt)?;
         let len = if len == ":" {
             None
         } else {
