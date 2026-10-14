@@ -17552,7 +17552,7 @@ fn linked_output_cannot_alias_source_input() {
     let result = Command::new(compiler("armfortas"))
         .current_dir(&dir)
         .args(["source.f90", "-o", "source.f90"])
-        .env("AFS_LD_PATH", "/usr/bin/false")
+        .env("AFS_LD_PATH", "false")
         .output()
         .expect("aliased linked-output compile failed to spawn");
     assert!(
@@ -17582,7 +17582,7 @@ fn linked_output_cannot_alias_link_input() {
     let result = Command::new(compiler("armfortas"))
         .current_dir(&dir)
         .args(["input.o", "-o", "input.o"])
-        .env("AFS_LD_PATH", "/usr/bin/false")
+        .env("AFS_LD_PATH", "false")
         .output()
         .expect("aliased link-only command failed to spawn");
     assert!(
@@ -18274,7 +18274,7 @@ fn failed_assembler_or_module_publication_preserves_compilation_outputs() {
         .arg("-o")
         .arg(&object)
         .env_remove("AFS_AS")
-        .env("AFS_AS_PATH", "/usr/bin/false")
+        .env("AFS_AS_PATH", "false")
         .output()
         .expect("failing assembler compile failed to spawn");
     assert!(
