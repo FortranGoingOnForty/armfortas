@@ -18114,6 +18114,240 @@ fn multi_input_terminal_mode_failure_removes_only_the_failed_stale_output() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn failed_assembler_or_module_publication_preserves_compilation_outputs() {
+    let dir = unique_dir("assembler_publish_guard");
+    let module_dir = dir.join("modules");
+    fs::create_dir(&module_dir).expect("cannot create module output directory");
+    let source = write_program_in(
+        &dir,
+        "guarded_publish.f90",
+        "module guarded_publish\n  implicit none\n  integer :: value = 7\ncontains\n  integer function get_value()\n    get_value = value\n  end function get_value\nend module guarded_publish\n",
+    );
+    let object = dir.join("guarded_publish.o");
+    let compile = Command::new(compiler("armfortas"))
+        .arg("-c")
+        .arg("-J")
+        .arg(&module_dir)
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .env_remove("AFS_AS")
+        .env_remove("AFS_AS_PATH")
+        .output()
+        .expect("initial module compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "initial module compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let amod = module_dir.join("guarded_publish.amod");
+    let conventional_mod = module_dir.join("guarded_publish.mod");
+    let published_object = fs::read(&object).expect("missing initial object");
+    let published_amod = fs::read(&amod).expect("missing initial .amod");
+    let published_mod = fs::read(&conventional_mod).expect("missing initial .mod");
+
+    for reserved_depfile in [
+        amod.clone(),
+        conventional_mod.clone(),
+        module_dir.join("guarded_publish.smod"),
+    ] {
+        let aliased = Command::new(compiler("armfortas"))
+            .args(["-c", "-MD", "-MF"])
+            .arg(&reserved_depfile)
+            .arg("-J")
+            .arg(&module_dir)
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .env_remove("AFS_AS")
+            .env_remove("AFS_AS_PATH")
+            .output()
+            .expect("reserved depfile rejection failed to spawn");
+        assert!(
+            !aliased.status.success(),
+            "reserved depfile destination '{}' was accepted",
+            reserved_depfile.display()
+        );
+        let stderr = String::from_utf8_lossy(&aliased.stderr);
+        assert!(
+            stderr.contains("conflicts with module interface")
+                || stderr.contains("reserved module-interface extension"),
+            "missing reserved depfile diagnostic for '{}': {}",
+            reserved_depfile.display(),
+            stderr
+        );
+    }
+    assert_eq!(
+        fs::read(&object).expect("depfile alias rejection removed the object"),
+        published_object,
+        "depfile alias rejection replaced the object"
+    );
+    assert_eq!(
+        fs::read(&amod).expect("depfile alias rejection removed the .amod"),
+        published_amod,
+        "depfile alias rejection replaced the .amod"
+    );
+    assert_eq!(
+        fs::read(&conventional_mod).expect("depfile alias rejection removed the .mod"),
+        published_mod,
+        "depfile alias rejection replaced the .mod"
+    );
+    assert!(
+        !module_dir.join("guarded_publish.smod").exists(),
+        "reserved .smod depfile was published"
+    );
+
+    for reserved_output in [
+        amod.clone(),
+        conventional_mod.clone(),
+        module_dir.join("guarded_publish.smod"),
+    ] {
+        let aliased = Command::new(compiler("armfortas"))
+            .arg("-c")
+            .arg("-J")
+            .arg(&module_dir)
+            .arg(&source)
+            .arg("-o")
+            .arg(&reserved_output)
+            .env_remove("AFS_AS")
+            .env_remove("AFS_AS_PATH")
+            .output()
+            .expect("reserved primary-output rejection failed to spawn");
+        assert!(
+            !aliased.status.success(),
+            "reserved primary destination '{}' was accepted",
+            reserved_output.display()
+        );
+        let stderr = String::from_utf8_lossy(&aliased.stderr);
+        assert!(
+            stderr.contains("conflicts with module interface")
+                || stderr.contains("reserved module-interface extension"),
+            "missing reserved output diagnostic for '{}': {}",
+            reserved_output.display(),
+            stderr
+        );
+    }
+
+    let identity_alias = module_dir.join("interface-identity-alias.o");
+    fs::hard_link(&amod, &identity_alias).expect("cannot hard-link interface identity alias");
+    let identity_collision = Command::new(compiler("armfortas"))
+        .arg("-c")
+        .arg("-J")
+        .arg(&module_dir)
+        .arg(&source)
+        .arg("-o")
+        .arg(&identity_alias)
+        .env_remove("AFS_AS")
+        .env_remove("AFS_AS_PATH")
+        .output()
+        .expect("module-interface identity collision failed to spawn");
+    assert!(
+        !identity_collision.status.success(),
+        "hard-link alias of the module interface was accepted as the primary output"
+    );
+    assert!(
+        String::from_utf8_lossy(&identity_collision.stderr)
+            .contains("conflicts with module interface"),
+        "missing module-interface identity diagnostic: {}",
+        String::from_utf8_lossy(&identity_collision.stderr)
+    );
+    assert_eq!(
+        fs::read(&amod).expect("identity collision removed the .amod"),
+        published_amod,
+        "identity collision replaced the .amod"
+    );
+    fs::remove_file(identity_alias).expect("cannot remove interface identity alias");
+
+    fs::write(
+        &source,
+        "module guarded_publish\n  implicit none\n  real :: value = 9.5\ncontains\n  real function get_value()\n    get_value = value\n  end function get_value\nend module guarded_publish\n",
+    )
+    .expect("cannot replace module source");
+    let failed = Command::new(compiler("armfortas"))
+        .arg("-c")
+        .arg("-J")
+        .arg(&module_dir)
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .env_remove("AFS_AS")
+        .env("AFS_AS_PATH", "/usr/bin/false")
+        .output()
+        .expect("failing assembler compile failed to spawn");
+    assert!(
+        !failed.status.success(),
+        "the forced assembler failure unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("assembler failed"),
+        "unexpected forced-assembler diagnostic: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&object).expect("assembler failure removed the published object"),
+        published_object,
+        "assembler failure replaced the published object"
+    );
+    assert_eq!(
+        fs::read(&amod).expect("assembler failure removed the published .amod"),
+        published_amod,
+        "assembler failure replaced the published .amod"
+    );
+    assert_eq!(
+        fs::read(&conventional_mod).expect("assembler failure removed the published .mod"),
+        published_mod.clone(),
+        "assembler failure replaced the published .mod"
+    );
+
+    fs::write(
+        &source,
+        "module guarded_publish\n  implicit none\n  real :: value = 9.5\ncontains\n  real function get_value()\n    get_value = value\n  end function get_value\nend module guarded_publish\nmodule blocked_publish\n  implicit none\n  integer :: other = 11\nend module blocked_publish\n",
+    )
+    .expect("cannot add blocked module source");
+    fs::create_dir(module_dir.join("blocked_publish.amod"))
+        .expect("cannot create module-interface destination blocker");
+    let module_failure = Command::new(compiler("armfortas"))
+        .arg("-c")
+        .arg("-J")
+        .arg(&module_dir)
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .env_remove("AFS_AS")
+        .env_remove("AFS_AS_PATH")
+        .output()
+        .expect("module-publication failure compile failed to spawn");
+    assert!(
+        !module_failure.status.success(),
+        "the forced module-publication failure unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&module_failure.stderr);
+    assert!(
+        stderr.contains("module interface") && stderr.contains("destination is a directory"),
+        "unexpected module-publication diagnostic: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&object).expect("module failure removed the published object"),
+        published_object,
+        "module failure replaced the published object"
+    );
+    assert_eq!(
+        fs::read(&amod).expect("module failure removed the published .amod"),
+        published_amod,
+        "module failure replaced the published .amod"
+    );
+    assert_eq!(
+        fs::read(&conventional_mod).expect("module failure removed the published .mod"),
+        published_mod,
+        "module failure replaced the published .mod"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn compile_only_explicit_object_path_keeps_module_in_current_dir() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
@@ -18470,6 +18704,7 @@ fn elf_link_preserves_object_and_dash_l_operand_order() {
 
     let stale_wrong = dir.join("stale-wrong-order");
     std::fs::copy(&correct, &stale_wrong).expect("failed to seed stale executable");
+    let stale_wrong_bytes = std::fs::read(&stale_wrong).expect("failed to read stale executable");
     let stale_wrong_link = Command::new(compiler("armfortas"))
         .env("AFS_LD", "0")
         .args([
@@ -18487,9 +18722,10 @@ fn elf_link_preserves_object_and_dash_l_operand_order() {
         !stale_wrong_link.status.success(),
         "a stale output must not turn an order-sensitive link failure into success"
     );
-    assert!(
-        !stale_wrong.exists(),
-        "a failed order-sensitive link must not preserve a stale executable"
+    assert_eq!(
+        std::fs::read(&stale_wrong).expect("failed link removed the published executable"),
+        stale_wrong_bytes,
+        "a failed order-sensitive link replaced the published executable"
     );
 
     // The sources are deliberately supplied consumer-last even though the

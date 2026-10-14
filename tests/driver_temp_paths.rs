@@ -158,10 +158,18 @@ fn zero_exit_external_tools_cannot_publish_missing_or_stale_outputs() {
                     && stderr.contains("did not produce"),
                 "zero-exit {phase} {state} diagnostic did not identify the missing output:\n{stderr}"
             );
-            assert!(
-                !output.exists(),
-                "zero-exit {phase} left a {state} destination looking current"
-            );
+            if stale {
+                assert_eq!(
+                    std::fs::read(&output).expect("stale destination disappeared"),
+                    b"stale artifact",
+                    "zero-exit {phase} replaced the last published destination"
+                );
+            } else {
+                assert!(
+                    !output.exists(),
+                    "zero-exit {phase} published a fresh destination"
+                );
+            }
         }
     }
 
@@ -236,9 +244,10 @@ fn failing_external_tools_cannot_publish_partial_outputs() {
             "failing {phase} diagnostic did not identify the phase:\n{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert!(
-            !output.exists(),
-            "failing {phase} left a partial destination looking current"
+        assert_eq!(
+            std::fs::read(&output).expect("failing tool removed the published destination"),
+            b"stale artifact",
+            "failing {phase} replaced the published destination with partial output"
         );
     }
 
@@ -425,9 +434,11 @@ fn successful_external_tool_diagnostics_reach_compiler_stderr_in_phase_order() {
         "failing assembler diagnostics were lost or duplicated:\n{}",
         String::from_utf8_lossy(&failed_assemble.stderr)
     );
-    assert!(
-        !failed_object.exists(),
-        "failing diagnostic assembler retained a stale output"
+    assert_eq!(
+        std::fs::read(&failed_object)
+            .expect("failing diagnostic assembler removed the published object"),
+        b"stale failed object",
+        "failing diagnostic assembler replaced the published object"
     );
 
     for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
