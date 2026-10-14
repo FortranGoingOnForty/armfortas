@@ -2722,11 +2722,27 @@ fn parse_proc(
             source_nature,
         })
     });
-    let result_rank = attr_chunks
+    let result_rank_values: Vec<_> = attr_chunks
         .iter()
-        .find_map(|attr| attr.strip_prefix("result_rank="))
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or(0);
+        .filter_map(|attr| attr.strip_prefix("result_rank="))
+        .collect();
+    let result_rank = match result_rank_values.as_slice() {
+        [] => 0,
+        [value] => value.parse::<u8>().map_err(|_| {
+            format!(
+                "{}: corrupt .amod file (invalid function result rank '{}'); rebuild the provider module",
+                path.display(),
+                value
+            )
+        })?,
+        _ if version >= 17 => {
+            return Err(format!(
+                "{}: corrupt .amod file (duplicate function result rank); rebuild the provider module",
+                path.display()
+            ));
+        }
+        _ => 0,
+    };
     // Sprint35-SMP Phase 2: optional `result_name=NAME` when the
     // source used a `result(NAME)` clause that differs from the
     // function name. Otherwise the result variable shares the name.
@@ -2853,11 +2869,27 @@ fn parse_arg(line: &str, version: u32, path: &Path) -> Result<AmodArg, String> {
     let assumed_rank = has_attr("assumed-rank");
     // Sprint35-SMP Phase 1: parse `rank=N` if present. Emitted only when
     // the dummy is array-shaped; absence means rank 0 (scalar).
-    let rank = attr_chunks
+    let rank_values: Vec<_> = attr_chunks
         .iter()
-        .find_map(|attr| attr.strip_prefix("rank="))
-        .and_then(|s| s.trim().parse::<u8>().ok())
-        .unwrap_or(0);
+        .filter_map(|attr| attr.strip_prefix("rank="))
+        .collect();
+    let rank = match rank_values.as_slice() {
+        [] => 0,
+        [value] => value.trim().parse::<u8>().map_err(|_| {
+            format!(
+                "{}: corrupt .amod file (invalid procedure dummy rank '{}'); rebuild the provider module",
+                path.display(),
+                value
+            )
+        })?,
+        _ if version >= 17 => {
+            return Err(format!(
+                "{}: corrupt .amod file (duplicate procedure dummy rank); rebuild the provider module",
+                path.display()
+            ));
+        }
+        _ => 0,
+    };
     let procedure_iface = attr_chunks.iter().find_map(|attr| {
         let inner = attr.strip_prefix("procedure(")?;
         inner.strip_suffix(')').map(|s| s.trim().to_string())
@@ -2880,11 +2912,33 @@ fn parse_arg(line: &str, version: u32, path: &Path) -> Result<AmodArg, String> {
             source_nature,
         })
     });
-    let array_spec = attr_chunks
+    let encoded_array_specs: Vec<_> = attr_chunks
         .iter()
-        .find_map(|attr| attr.strip_prefix("array_spec="))
-        .map(|spec| spec.trim_matches('"'))
-        .and_then(parse_dummy_array_spec);
+        .filter_map(|attr| attr.strip_prefix("array_spec="))
+        .collect();
+    let array_spec = match encoded_array_specs.as_slice() {
+        [] => None,
+        [spec] => {
+            let spec = spec.strip_prefix('"').and_then(|s| s.strip_suffix('"'));
+            match spec.and_then(parse_dummy_array_spec) {
+                Some(parsed) => Some(parsed),
+                None if version >= 17 => {
+                    return Err(format!(
+                        "{}: corrupt .amod file (invalid procedure dummy array specification); rebuild the provider module",
+                        path.display()
+                    ));
+                }
+                None => None,
+            }
+        }
+        _ if version >= 17 => {
+            return Err(format!(
+                "{}: corrupt .amod file (duplicate procedure dummy array specification); rebuild the provider module",
+                path.display()
+            ));
+        }
+        _ => None,
+    };
 
     Ok(AmodArg {
         name,
@@ -2964,33 +3018,106 @@ fn parse_type(
     let mut type_tag = 0u64;
     let mut is_abstract = false;
     let mut saw_end = false;
+    let mut saw_layout = false;
+    let mut saw_tag = false;
 
     for line in lines.by_ref() {
         let trimmed = line.trim();
-        if trimmed.starts_with("@end type") {
+        if trimmed == "@end type" {
             saw_end = true;
             break;
         }
 
         if let Some(rest) = trimmed.strip_prefix("@layout ") {
+            if version >= 17 && saw_layout {
+                return Err(format!(
+                    "{}: corrupt .amod file (duplicate @layout for type '{}'); rebuild the provider module",
+                    path.display(),
+                    name
+                ));
+            }
+            saw_layout = true;
+            let mut parsed_size = None;
+            let mut parsed_align = None;
+            let mut saw_size = false;
+            let mut saw_align = false;
             for part in rest.split_whitespace() {
                 if let Some(v) = part.strip_prefix("size=") {
-                    size = v.parse().unwrap_or(0);
+                    if version >= 17 && saw_size {
+                        return Err(format!(
+                            "{}: corrupt .amod file (duplicate @layout size for type '{}'); rebuild the provider module",
+                            path.display(),
+                            name
+                        ));
+                    }
+                    saw_size = true;
+                    parsed_size = v.parse::<usize>().ok();
                 } else if let Some(v) = part.strip_prefix("align=") {
-                    align = v.parse().unwrap_or(1);
+                    if version >= 17 && saw_align {
+                        return Err(format!(
+                            "{}: corrupt .amod file (duplicate @layout alignment for type '{}'); rebuild the provider module",
+                            path.display(),
+                            name
+                        ));
+                    }
+                    saw_align = true;
+                    parsed_align = v.parse::<usize>().ok();
+                } else if version >= 17 {
+                    return Err(format!(
+                        "{}: corrupt .amod file (unknown @layout metadata '{}' for type '{}'); rebuild the provider module",
+                        path.display(),
+                        part,
+                        name
+                    ));
                 }
+            }
+            if version >= 17 && (parsed_size.is_none() || parsed_align.is_none()) {
+                return Err(format!(
+                    "{}: corrupt .amod file (malformed @layout for type '{}'); rebuild the provider module",
+                    path.display(),
+                    name
+                ));
+            }
+            size = parsed_size.unwrap_or(0);
+            align = parsed_align.unwrap_or(1);
+            if version >= 17 && (align == 0 || !align.is_power_of_two()) {
+                return Err(format!(
+                    "{}: corrupt .amod file (invalid @layout alignment '{}' for type '{}'); rebuild the provider module",
+                    path.display(),
+                    align,
+                    name
+                ));
             }
         } else if let Some(rest) = trimmed.strip_prefix("@extends ") {
             parent = Some(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("@field ") {
             // @field name : type @offset N @size M [@allocatable] [@pointer] [@target]
             if let Some((name_type, offset_part)) = rest.split_once(" @offset ") {
-                let (fname, ftype_str) = name_type
-                    .split_once(" : ")
-                    .unwrap_or((name_type, "unknown"));
+                let (fname, ftype_str) = match name_type.split_once(" : ") {
+                    Some((fname, ftype))
+                        if !fname.trim().is_empty() && !ftype.trim().is_empty() =>
+                    {
+                        (fname, ftype)
+                    }
+                    _ if version >= 17 => {
+                        return Err(format!(
+                            "{}: corrupt .amod file (malformed @field record in type '{}'); rebuild the provider module",
+                            path.display(),
+                            name
+                        ));
+                    }
+                    _ => (name_type, "unknown"),
+                };
                 // Split off the size and any trailing attribute flags.
                 let (offset_str, after_offset) = match offset_part.find(" @size ") {
                     Some(idx) => (&offset_part[..idx], &offset_part[idx + 7..]),
+                    None if version >= 17 => {
+                        return Err(format!(
+                            "{}: corrupt .amod file (missing @field size for '{}'); rebuild the provider module",
+                            path.display(),
+                            fname.trim()
+                        ));
+                    }
                     None => (offset_part, "0"),
                 };
                 let mut size_str = after_offset;
@@ -3004,15 +3131,33 @@ fn parse_type(
                     } else {
                         (dims_part, "")
                     };
-                    for dim in dims_str
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|dim| !dim.is_empty())
-                    {
-                        if let Some((lower_str, upper_str)) = dim.split_once(':') {
-                            let lower = lower_str.trim().parse().unwrap_or(1);
-                            let upper = upper_str.trim().parse().unwrap_or(lower - 1);
-                            dims.push((lower, (upper - lower + 1).max(0)));
+                    if version >= 17 && dims_str.trim().is_empty() {
+                        return Err(format!(
+                            "{}: corrupt .amod file (empty @field dimensions for '{}'); rebuild the provider module",
+                            path.display(),
+                            fname.trim()
+                        ));
+                    }
+                    for dim in dims_str.split(',').map(str::trim) {
+                        let parsed = dim.split_once(':').and_then(|(lower_str, upper_str)| {
+                            if upper_str.contains(':') {
+                                return None;
+                            }
+                            let lower = lower_str.trim().parse::<i64>().ok()?;
+                            let upper = upper_str.trim().parse::<i64>().ok()?;
+                            let extent = upper.checked_sub(lower)?.checked_add(1)?.max(0);
+                            Some((lower, extent))
+                        });
+                        match parsed {
+                            Some(dim) => dims.push(dim),
+                            None if version >= 17 => {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (malformed @field dimensions for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    fname.trim()
+                                ));
+                            }
+                            None => {}
                         }
                     }
                     flag_tail = tail;
@@ -3030,17 +3175,32 @@ fn parse_type(
                 let mut default_init = None;
                 let mut access = None;
                 let mut field_owner_module = None;
+                let mut flag_names = HashSet::new();
                 let tokens: Vec<&str> = flag_tail.split_whitespace().collect();
                 let mut token_index = 0;
                 while token_index < tokens.len() {
                     match tokens[token_index] {
-                        "@allocatable" => allocatable = true,
-                        "@pointer" => pointer = true,
-                        "@deferred_char" => deferred_char = true,
-                        "@procptr" => procedure_pointer = true,
-                        "@nopass" => procedure_pointer_nopass = true,
-                        "@target" => target = true,
-                        "@declared_array" => declared_array = true,
+                        flag @ ("@allocatable" | "@pointer" | "@deferred_char" | "@procptr"
+                        | "@nopass" | "@target" | "@declared_array") => {
+                            if version >= 17 && !flag_names.insert(flag) {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (duplicate @field metadata '{}' for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    flag,
+                                    fname.trim()
+                                ));
+                            }
+                            match flag {
+                                "@allocatable" => allocatable = true,
+                                "@pointer" => pointer = true,
+                                "@deferred_char" => deferred_char = true,
+                                "@procptr" => procedure_pointer = true,
+                                "@nopass" => procedure_pointer_nopass = true,
+                                "@target" => target = true,
+                                "@declared_array" => declared_array = true,
+                                _ => unreachable!(),
+                            }
+                        }
                         "@access" => {
                             if access.is_some() {
                                 return Err(format!(
@@ -3098,12 +3258,35 @@ fn parse_type(
                             token_index += 2;
                             continue;
                         }
-                        _ => {
-                            if let Some(init) = parse_field_default_init_token(tokens[token_index])
-                            {
-                                default_init = Some(init);
+                        token if token.starts_with("@init=") => {
+                            if version >= 17 && default_init.is_some() {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (duplicate @field initializer for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    fname.trim()
+                                ));
+                            }
+                            match parse_field_default_init_token(token) {
+                                Some(init) => default_init = Some(init),
+                                None if version >= 17 => {
+                                    return Err(format!(
+                                        "{}: corrupt .amod file (invalid @field initializer for '{}'); rebuild the provider module",
+                                        path.display(),
+                                        fname.trim()
+                                    ));
+                                }
+                                None => {}
                             }
                         }
+                        token if version >= 17 => {
+                            return Err(format!(
+                                "{}: corrupt .amod file (unknown @field metadata '{}' for '{}'); rebuild the provider module",
+                                path.display(),
+                                token,
+                                fname.trim()
+                            ));
+                        }
+                        _ => {}
                     }
                     token_index += 1;
                 }
@@ -3132,12 +3315,26 @@ fn parse_type(
                     path,
                     "derived-type field",
                 )?;
+                let offset = offset_str.trim().parse::<usize>().map_err(|_| {
+                    format!(
+                        "{}: corrupt .amod file (invalid @field offset for '{}'); rebuild the provider module",
+                        path.display(),
+                        fname.trim()
+                    )
+                })?;
+                let field_size = size_str.trim().parse::<usize>().map_err(|_| {
+                    format!(
+                        "{}: corrupt .amod file (invalid @field size for '{}'); rebuild the provider module",
+                        path.display(),
+                        fname.trim()
+                    )
+                })?;
                 fields.push(FieldLayout {
                     name: fname.trim().to_string(),
                     access,
                     owner_module: field_owner_module,
-                    offset: offset_str.trim().parse().unwrap_or(0),
-                    size: size_str.trim().parse().unwrap_or(0),
+                    offset,
+                    size: field_size,
                     dims,
                     declared_array,
                     type_info: ftype.unwrap_or(TypeInfo::Integer { kind: None }),
@@ -3149,6 +3346,12 @@ fn parse_type(
                     procedure_pointer_nopass,
                     default_init,
                 });
+            } else if version >= 17 {
+                return Err(format!(
+                    "{}: corrupt .amod file (malformed @field record in type '{}'); rebuild the provider module",
+                    path.display(),
+                    name
+                ));
             }
         } else if let Some(rest) = trimmed.strip_prefix("@binds ") {
             if version >= 17 {
@@ -3316,9 +3519,29 @@ fn parse_type(
         } else if let Some(rest) = trimmed.strip_prefix("@owner ") {
             owner_module = Some(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("@tag ") {
-            type_tag = rest.trim().parse().unwrap_or(0);
+            if version >= 17 && saw_tag {
+                return Err(format!(
+                    "{}: corrupt .amod file (duplicate @tag for type '{}'); rebuild the provider module",
+                    path.display(),
+                    name
+                ));
+            }
+            type_tag = rest.trim().parse().map_err(|_| {
+                format!(
+                    "{}: corrupt .amod file (invalid @tag for type '{}'); rebuild the provider module",
+                    path.display(),
+                    name
+                )
+            })?;
+            saw_tag = true;
         } else if trimmed == "@abstract" {
             is_abstract = true;
+        } else if version >= 17 {
+            return Err(format!(
+                "{}: corrupt .amod file (unknown derived-type directive '{}'); rebuild the provider module",
+                path.display(),
+                trimmed
+            ));
         }
     }
 
@@ -3336,6 +3559,39 @@ fn parse_type(
             path.display(),
             name
         ));
+    }
+    if version >= 17 && !saw_layout {
+        return Err(format!(
+            "{}: corrupt .amod file (missing @layout for type '{}'); rebuild the provider module",
+            path.display(),
+            name
+        ));
+    }
+    if version >= 17 && !saw_tag {
+        return Err(format!(
+            "{}: corrupt .amod file (missing @tag for type '{}'); rebuild the provider module",
+            path.display(),
+            name
+        ));
+    }
+    if version >= 17 {
+        for field in &fields {
+            let field_end = field.offset.checked_add(field.size).ok_or_else(|| {
+                format!(
+                    "{}: corrupt .amod file (@field '{}' layout overflows); rebuild the provider module",
+                    path.display(),
+                    field.name
+                )
+            })?;
+            if field_end > size {
+                return Err(format!(
+                    "{}: corrupt .amod file (@field '{}' exceeds type '{}' layout); rebuild the provider module",
+                    path.display(),
+                    field.name,
+                    name
+                ));
+            }
+        }
     }
     Ok(TypeLayout {
         name,
@@ -4008,6 +4264,55 @@ mod tests {
             assert!(
                 error.contains("invalid variable type"),
                 "{encoded}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_schema_rejects_malformed_abi_layout_metadata() {
+        let valid_type = "@type item_t, public\n  @layout size=8 align=4\n  @field value : integer(4) @offset 4 @size 4 @dims 1:1 @access public @owner schema_test\n  @owner schema_test\n  @tag 1\n@end type\n";
+        let malformed = [
+            valid_type.replace("size=8", "size=oops"),
+            valid_type.replace("align=4", "align=0"),
+            valid_type.replace("@offset 4", "@offset oops"),
+            valid_type.replace("@size 4", "@size oops"),
+            valid_type.replace("@dims 1:1", "@dims 1:oops"),
+            valid_type.replace("@access public", "@unknown"),
+            valid_type.replace("@access public", "@init=int:oops @access public"),
+            valid_type.replace("@tag 1", "@tag oops"),
+            valid_type.replace("@offset 4", "@offset 8"),
+        ];
+        for body in malformed {
+            let text = add_integrity_headers(format!(
+                "#!amod {AMOD_VERSION}\n# module: schema_test\n# default-access: public\n\n{body}"
+            ));
+            let error = read_amod_content(&text, Path::new("schema_test.amod"))
+                .expect_err("malformed current-version ABI layout metadata was accepted");
+            assert!(
+                error.contains("corrupt .amod file")
+                    && error.contains("rebuild the provider module"),
+                "{body:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_schema_rejects_malformed_procedure_shape_metadata() {
+        let bodies = [
+            "@function make -> integer(4), result_rank=oops\n@end function\n",
+            "@subroutine take\n  @arg value : integer(4), rank=oops\n@end subroutine\n",
+            "@subroutine take\n  @arg value : integer(4), rank=1, array_spec=\"broken\"\n@end subroutine\n",
+        ];
+        for body in bodies {
+            let text = add_integrity_headers(format!(
+                "#!amod {AMOD_VERSION}\n# module: schema_test\n# default-access: public\n\n{body}"
+            ));
+            let error = read_amod_content(&text, Path::new("schema_test.amod"))
+                .expect_err("malformed current-version procedure shape metadata was accepted");
+            assert!(
+                error.contains("corrupt .amod file")
+                    && error.contains("rebuild the provider module"),
+                "{body:?}: {error}"
             );
         }
     }
