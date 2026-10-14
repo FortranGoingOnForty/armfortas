@@ -14817,7 +14817,7 @@ fn automatic_component_array_bound_size_lowers_without_raw_symbol() {
         return;
     }
     let src = write_program(
-        "module m\n  implicit none\n  type :: state_set_t\n    integer(8) :: bits(4) = 0_8\n  contains\n    procedure :: f\n  end type\ncontains\n  subroutine f(state_set)\n    type(state_set_t), intent(inout) :: state_set\n    integer(8) :: original_bits(size(state_set%bits))\n    original_bits = state_set%bits\n    print *, size(original_bits)\n  end subroutine\nend module\n",
+        "module m\n  implicit none\n  type :: state_set_t\n    integer(8) :: bits(4) = 0_8\n  contains\n    procedure :: f\n  end type\ncontains\n  subroutine f(state_set)\n    class(state_set_t), intent(inout) :: state_set\n    integer(8) :: original_bits(size(state_set%bits))\n    original_bits = state_set%bits\n    print *, size(original_bits)\n  end subroutine\nend module\n",
         "f90",
     );
     let out = unique_path("auto_component_bound_size", "o");
