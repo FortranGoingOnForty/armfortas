@@ -172,6 +172,58 @@ fn output_contains_expected(output: &str, expected: &str) -> bool {
 // ---- Tests ----
 
 #[test]
+fn integer16_parameters_round_trip_across_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=integer16_parameters_round_trip_across_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let root = unique_dir();
+    for level in ["-O0", "-O3"] {
+        let dir = root.join(level.trim_start_matches('-'));
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider = dir.join("wide_params.f90");
+        let consumer = dir.join("wide_consumer.f90");
+        let provider_object = dir.join("wide_params.o");
+        let consumer_object = dir.join("wide_consumer.o");
+        let binary = dir.join("wide_probe");
+
+        std::fs::write(
+            &provider,
+            "module wide_params\n  implicit none\n  integer(16), parameter :: beyond_i64 = 9223372036854775808_16\n  integer(16), parameter :: power_100 = 2_16**100\nend module\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &consumer,
+            "program p\n  use wide_params, only : beyond_i64, power_100\n  implicit none\n  if (beyond_i64 /= 9223372036854775808_16) error stop 81\n  if (power_100 /= 1267650600228229401496703205376_16) error stop 82\n  print *, beyond_i64\nend program\n",
+        )
+        .unwrap();
+
+        compile_file_flags(&compiler, &provider, &provider_object, None, &[level]);
+        compile_file_flags(&compiler, &consumer, &consumer_object, Some(&dir), &[level]);
+        link_files(&[&provider_object, &consumer_object], &binary);
+        let output = run_binary(&binary);
+        assert!(output.contains("9223372036854775808"), "{level}: {output}");
+
+        let amod = std::fs::read_to_string(dir.join("wide_params.amod")).unwrap();
+        assert!(
+            amod.contains("@param beyond_i64 : integer(16) = 9223372036854775808"),
+            "{level}: {amod}"
+        );
+        assert!(
+            amod.contains("@param power_100 : integer(16) = 1267650600228229401496703205376"),
+            "{level}: {amod}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn volatile_module_variable_survives_amod_round_trip() {
     let compiler = find_compiler();
     let dir = unique_dir();

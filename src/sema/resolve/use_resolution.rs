@@ -921,7 +921,7 @@ fn install_external_interface(
                 defined_at: dummy_span,
                 scope: scope_id,
                 arg_names: vec![],
-                const_value: Some((i + 1) as i64),
+                const_value: Some((i + 1) as i128),
                 const_char_value: None,
             });
         }

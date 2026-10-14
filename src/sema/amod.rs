@@ -1708,7 +1708,7 @@ pub struct AmodVar {
     pub deferred_char: bool,
     pub rank: usize,
     pub dims: Vec<(i64, i64)>,
-    pub const_value: Option<i64>,
+    pub const_value: Option<i128>,
     pub const_real_value: Option<f64>,
     pub const_char_value: Option<String>,
     /// Access level. F2008 §11.2.3 requires private parent symbols to
@@ -2137,9 +2137,13 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             // `@use_rename <local> = <original> from <module>`
             renames.push(parse_use_binding(rest, "@use_rename", path)?);
         } else if trimmed.starts_with("@var ") {
-            variables.push(parse_var(trimmed, false));
+            variables.push(parse_var(trimmed, false, path)?);
         } else if trimmed.starts_with("@param ") {
-            variables.push(parse_var(&trimmed.replacen("@param", "@var", 1), true));
+            variables.push(parse_var(
+                &trimmed.replacen("@param", "@var", 1),
+                true,
+                path,
+            )?);
         } else if trimmed.starts_with("@function ") || trimmed.starts_with("@subroutine ") {
             let proc = parse_proc(trimmed, &mut lines);
             procedures.push(proc);
@@ -2237,7 +2241,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     })
 }
 
-fn parse_var(line: &str, is_param: bool) -> AmodVar {
+fn parse_var(line: &str, is_param: bool, path: &Path) -> Result<AmodVar, String> {
     // @var name : type[, attrs...] [@ir symbol] [@charhex hex] [@deferred_char] [@dims ...]
     let rest = line.strip_prefix("@var ").unwrap_or(line);
     let (name_type, meta_part) = if let Some(idx) = rest.find(" @") {
@@ -2246,9 +2250,12 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         (rest, None)
     };
 
-    let (name, type_and_attrs) = name_type
-        .split_once(" : ")
-        .unwrap_or((name_type, "unknown"));
+    let (name, type_and_attrs) = name_type.split_once(" : ").ok_or_else(|| {
+        format!(
+            "{}: corrupt .amod file (malformed variable record); rebuild the provider module",
+            path.display()
+        )
+    })?;
     let name = name.trim().to_string();
 
     // Split type from attrs on comma.
@@ -2258,16 +2265,13 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         (type_and_attrs, "")
     };
 
-    let mut const_value = None;
-    let mut const_real_value = None;
+    let mut encoded_value = None;
     let mut const_char_value = None;
     // For @param with `= value`, strip the value suffix from the
     // type string before parsing the type.
     let clean_type_str = if is_param {
         if let Some(eq_idx) = type_str.rfind(" = ") {
-            let val_str = type_str[eq_idx + 3..].trim();
-            const_value = val_str.parse::<i64>().ok();
-            const_real_value = val_str.parse::<f64>().ok();
+            encoded_value = Some(type_str[eq_idx + 3..].trim());
             &type_str[..eq_idx]
         } else {
             type_str
@@ -2277,6 +2281,39 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     };
 
     let type_info = parse_type_info(clean_type_str.trim());
+    let mut const_value = None;
+    let mut const_real_value = None;
+    if let Some(value) = encoded_value {
+        match type_info.as_ref() {
+            Some(TypeInfo::Integer { .. })
+            | Some(TypeInfo::Logical { .. })
+            | Some(TypeInfo::Enumeration(_)) => {
+                const_value = Some(value.parse::<i128>().map_err(|_| {
+                    format!(
+                        "{}: corrupt .amod file (invalid integer parameter value for '{}'); rebuild the provider module",
+                        path.display(),
+                        name
+                    )
+                })?);
+            }
+            Some(TypeInfo::Real { .. }) | Some(TypeInfo::DoublePrecision) => {
+                const_real_value = Some(value.parse::<f64>().map_err(|_| {
+                    format!(
+                        "{}: corrupt .amod file (invalid real parameter value for '{}'); rebuild the provider module",
+                        path.display(),
+                        name
+                    )
+                })?);
+            }
+            _ => {
+                return Err(format!(
+                    "{}: corrupt .amod file (unexpected parameter value for '{}'); rebuild the provider module",
+                    path.display(),
+                    name
+                ));
+            }
+        }
+    }
     let attrs: HashSet<_> = attr_str
         .split(", ")
         .filter(|attr| !attr.is_empty())
@@ -2323,9 +2360,19 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
                     // A parse failure means a corrupt or version-mismatched
                     // .amod; defaulting to 0 would silently demote an array to
                     // a scalar and miscompile every use (audit T3).
-                    rank = value.parse().unwrap_or_else(|_| {
-                        panic!(".amod: malformed @rank value {value:?} — corrupt or version-mismatched module interface")
-                    });
+                    rank = value.parse().map_err(|_| {
+                        format!(
+                            "{}: corrupt .amod file (malformed @rank value for '{}'); rebuild the provider module",
+                            path.display(),
+                            name
+                        )
+                    })?;
+                } else {
+                    return Err(format!(
+                        "{}: corrupt .amod file (missing @rank value for '{}'); rebuild the provider module",
+                        path.display(),
+                        name
+                    ));
                 }
                 i += 2;
             } else if parts[i] == "@dims" {
@@ -2336,12 +2383,22 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
                 while i < parts.len() && parts[i].contains(':') && !parts[i].starts_with('@') {
                     let pair = parts[i];
                     if let Some((lo_s, ext_s)) = pair.split_once(':') {
-                        let bound = |s: &str, what: &str| -> i64 {
-                            s.parse::<i64>().unwrap_or_else(|_| {
-                                panic!(".amod: malformed @dims {what} {s:?} — corrupt or version-mismatched module interface")
+                        let bound = |s: &str, what: &str| -> Result<i64, String> {
+                            s.parse::<i64>().map_err(|_| {
+                                format!(
+                                    "{}: corrupt .amod file (malformed @dims {what} for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    name
+                                )
                             })
                         };
-                        dims.push((bound(lo_s, "lower bound"), bound(ext_s, "extent")));
+                        dims.push((bound(lo_s, "lower bound")?, bound(ext_s, "extent")?));
+                    } else {
+                        return Err(format!(
+                            "{}: corrupt .amod file (malformed @dims entry for '{}'); rebuild the provider module",
+                            path.display(),
+                            name
+                        ));
                     }
                     i += 1;
                 }
@@ -2351,7 +2408,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         }
     }
 
-    AmodVar {
+    Ok(AmodVar {
         name,
         type_info,
         is_parameter: is_param,
@@ -2370,7 +2427,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         const_real_value,
         const_char_value,
         access,
-    }
+    })
 }
 
 /// Split a comma-separated attribute list while honoring paren depth and
@@ -3224,7 +3281,7 @@ pub fn extract_module_globals(
                         Some(TypeInfo::Logical { kind }) => Some(kind.unwrap_or(4)),
                         _ => None,
                     },
-                    const_value: var.const_value.map(i128::from),
+                    const_value: var.const_value,
                     const_real_value: var.const_real_value,
                     external: true,
                     private: var.access == Access::Private,
@@ -3380,15 +3437,47 @@ mod tests {
     // Audit T3: a corrupt @rank/@dims in a .amod (the writer only ever emits
     // integers) must fail loudly, not silently demote the array's shape.
     #[test]
-    #[should_panic(expected = "malformed @rank")]
     fn parse_var_rejects_corrupt_rank() {
-        parse_var("@var a : integer @rank notanumber", false);
+        let error = parse_var(
+            "@var a : integer @rank notanumber",
+            false,
+            Path::new("test.amod"),
+        )
+        .unwrap_err();
+        assert!(error.contains("malformed @rank"), "{error}");
     }
 
     #[test]
-    #[should_panic(expected = "malformed @dims")]
     fn parse_var_rejects_corrupt_dims() {
-        parse_var("@var a : integer @dims 1:oops", false);
+        let error = parse_var(
+            "@var a : integer @dims 1:oops",
+            false,
+            Path::new("test.amod"),
+        )
+        .unwrap_err();
+        assert!(error.contains("malformed @dims"), "{error}");
+    }
+
+    #[test]
+    fn parse_var_preserves_full_width_integer_parameter() {
+        let var = parse_var(
+            "@var big : integer(16) = 170141183460469231731687303715884105727",
+            true,
+            Path::new("test.amod"),
+        )
+        .unwrap();
+        assert_eq!(var.const_value, Some(i128::MAX));
+    }
+
+    #[test]
+    fn parse_var_rejects_invalid_integer_parameter() {
+        let error = parse_var(
+            "@var big : integer(16) = 170141183460469231731687303715884105728",
+            true,
+            Path::new("test.amod"),
+        )
+        .unwrap_err();
+        assert!(error.contains("invalid integer parameter value"), "{error}");
     }
 
     #[test]
@@ -3429,7 +3518,12 @@ mod tests {
 
     #[test]
     fn character_kind_survives_all_type_record_parsers() {
-        let var = parse_var("@var text : character(len=8,kind=4)", false);
+        let var = parse_var(
+            "@var text : character(len=8,kind=4)",
+            false,
+            Path::new("test.amod"),
+        )
+        .unwrap();
         assert_eq!(
             var.type_info,
             Some(TypeInfo::Character {

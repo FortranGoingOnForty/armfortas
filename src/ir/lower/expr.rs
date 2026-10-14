@@ -780,13 +780,14 @@ pub(crate) fn lower_expr_full(
                     if let Some(cv) = sym.const_value {
                         if let Some(type_info) = sym.type_info.as_ref() {
                             let target = type_info_to_ir_type(type_info);
-                            let clamped =
-                                clamp_const_to_type(ConstScalar::Int(cv as i128), &target);
+                            let clamped = clamp_const_to_type(ConstScalar::Int(cv), &target);
                             materialize_const_scalar(b, clamped, &target)
                         } else if i32::try_from(cv).is_ok() {
                             b.const_i32(cv as i32)
-                        } else {
+                        } else if let Ok(cv) = i64::try_from(cv) {
                             b.const_i64(cv)
+                        } else {
+                            b.const_i128(cv)
                         }
                     } else {
                         b.const_i32(0)

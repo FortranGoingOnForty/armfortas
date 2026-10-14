@@ -2383,7 +2383,11 @@ pub struct Symbol {
     /// Ordered dummy argument names (for functions/subroutines).
     pub arg_names: Vec<String>,
     /// Compile-time constant value (for PARAMETERs like c_int=4).
-    pub const_value: Option<i64>,
+    /// Exact value of an integer named constant.  Keep the full language
+    /// width here: INTEGER(16) parameters cross this semantic boundary and
+    /// must not be narrowed merely because most kind/shape consumers use
+    /// machine-sized values.
+    pub const_value: Option<i128>,
     /// Compile-time character value for character PARAMETERs.
     pub const_char_value: Option<String>,
 }

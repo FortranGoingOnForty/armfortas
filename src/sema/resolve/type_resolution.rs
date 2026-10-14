@@ -169,7 +169,8 @@ fn extract_char_len_in_scope(
 ) -> Option<i64> {
     match sel {
         Some(cs) => match &cs.len {
-            Some(decl::LenSpec::Expr(expr)) => eval_const_int_expr_in_scope(expr, st, scope_id),
+            Some(decl::LenSpec::Expr(expr)) => eval_const_int_expr_in_scope(expr, st, scope_id)
+                .and_then(|value| i64::try_from(value).ok()),
             Some(decl::LenSpec::Star) => None,  // assumed length
             Some(decl::LenSpec::Colon) => None, // deferred length
             None => Some(1),
@@ -287,7 +288,9 @@ pub(super) fn entity_char_len_to_info(
         return;
     };
     *len = match entity_len {
-        decl::LenSpec::Expr(e) => eval_const_int_expr(e, st),
+        decl::LenSpec::Expr(e) => {
+            eval_const_int_expr(e, st).and_then(|value| i64::try_from(value).ok())
+        }
         decl::LenSpec::Star | decl::LenSpec::Colon => None,
     };
 }
