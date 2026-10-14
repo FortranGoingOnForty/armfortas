@@ -5872,6 +5872,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             // F2023 10.2.2.2 bounds remapping from an array constructor
             // (`q([2, 3]) => t`) lowers via remap_bounds_args.
             validate_pointer_assignment(ctx, target, value, stmt.span);
+            reject_nondefinable_target(ctx, target, true, "pointer assignment");
             reject_pure_nonlocal_definition(ctx, target, stmt.span, "pointer assignment");
         }
 
@@ -5901,6 +5902,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             validate_distinct_allocation_objects(ctx, items, "ALLOCATE");
             for item in items {
                 validate_allocatable_item(ctx, item, "allocate");
+                reject_nondefinable_target(ctx, item, true, "ALLOCATE");
                 reject_pure_nonlocal_definition(ctx, item, item.span, "ALLOCATE");
                 if !has_source && !has_mold && allocate_item_needs_explicit_shape(ctx, item) {
                     ctx.error(item.span, "array ALLOCATE requires bounds or SOURCE=/MOLD=");
@@ -5922,15 +5924,26 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             validate_distinct_allocation_objects(ctx, items, "DEALLOCATE");
             for item in items {
                 validate_allocatable_item(ctx, item, "deallocate");
+                reject_nondefinable_target(ctx, item, true, "DEALLOCATE");
                 reject_pure_nonlocal_definition(ctx, item, item.span, "DEALLOCATE");
             }
         }
 
         // ---- I/O in pure ----
-        Stmt::Write { controls, .. } | Stmt::Read { controls, .. }
+        Stmt::Write { controls, .. }
             if ctx.in_pure && !uses_internal_character_file(ctx, controls) =>
         {
             ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
+        }
+        Stmt::Read {
+            controls, items, ..
+        } => {
+            if ctx.in_pure && !uses_internal_character_file(ctx, controls) {
+                ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
+            }
+            for item in items {
+                reject_nondefinable_target(ctx, item, false, "READ input item");
+            }
         }
         Stmt::Print { .. }
         | Stmt::Open { .. }
@@ -6271,6 +6284,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         // Nullify: items must be pointers.
         Stmt::Nullify { items } => {
             for item in items {
+                reject_nondefinable_target(ctx, item, true, "NULLIFY");
                 if expr_selects_component(item) {
                     if let Some(leaf) = leaf_field_layout(ctx, item) {
                         if !leaf.field.pointer {
@@ -8606,9 +8620,9 @@ fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedE
         if ctx.is_associate_name(&name) {
             return;
         }
-        let (is_intent_in, is_parameter, is_pointer) =
+        let (is_intent_in, is_parameter, is_pointer, is_protected_use) =
             if let Some(attrs) = ctx.block_binding_attrs(&name) {
-                (attrs.intent_in, attrs.parameter, attrs.pointer)
+                (attrs.intent_in, attrs.parameter, attrs.pointer, false)
             } else {
                 ctx.lookup(&name)
                     .map(|sym| {
@@ -8616,9 +8630,13 @@ fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedE
                             matches!(sym.attrs.intent, Some(Intent::In)),
                             sym.attrs.parameter,
                             sym.attrs.pointer,
+                            sym.attrs.protected
+                                && ctx
+                                    .st
+                                    .name_is_use_associated_in(ctx.lexical_scope_id(), &name),
                         )
                     })
-                    .unwrap_or((false, false, false))
+                    .unwrap_or((false, false, false, false))
             };
         let writes_through_pointer_target = is_pointer && !matches!(target.node, Expr::Name { .. });
         if is_intent_in && !writes_through_pointer_target {
@@ -8630,6 +8648,34 @@ fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedE
         if is_parameter {
             ctx.error(span, format!("cannot assign to named constant '{}'", name));
         }
+        let path_has_pointer = match &target.node {
+            Expr::ComponentAccess { .. } => leaf_field_layout(ctx, target)
+                .is_some_and(|leaf| leaf.field.pointer || leaf.ancestor_is_pointer),
+            _ => false,
+        };
+        if is_protected_use && !(is_pointer || path_has_pointer) {
+            ctx.error(
+                span,
+                format!("cannot define PROTECTED use-associated entity '{}'", name),
+            );
+        }
+    }
+}
+
+fn reject_nondefinable_target(
+    ctx: &mut Ctx<'_>,
+    target: &SpannedExpr,
+    defines_association: bool,
+    role: &str,
+) {
+    if matches!(
+        actual_is_definable(ctx, target, defines_association),
+        Some(false)
+    ) {
+        ctx.error(
+            target.span,
+            format!("{role} target must be a definable variable"),
+        );
     }
 }
 
@@ -9719,10 +9765,15 @@ fn named_actual_is_definable(
     if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter) {
         return Some(false);
     }
+    let defines_pointer_target = !defines_association && (path_has_pointer || symbol.attrs.pointer);
+    let protected_use = symbol.attrs.protected
+        && ctx
+            .st
+            .name_is_use_associated_in(ctx.lexical_scope_id(), name);
     Some(
         !symbol.attrs.parameter
-            && (!matches!(symbol.attrs.intent, Some(Intent::In))
-                || (!defines_association && (path_has_pointer || symbol.attrs.pointer))),
+            && (!matches!(symbol.attrs.intent, Some(Intent::In)) || defines_pointer_target)
+            && (!protected_use || defines_pointer_target),
     )
 }
 
@@ -19170,6 +19221,133 @@ end module
         assert!(
             errs.iter()
                 .any(|error| error.contains("PASS dummy 'missing'")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn protected_entity_is_definable_only_in_its_module_hierarchy() {
+        let errs = errors_from(
+            "\
+module protected_m
+  implicit none
+  integer, protected :: guarded = 1
+contains
+  subroutine owner_update()
+    guarded = 2
+  end subroutine
+end module
+program p
+  use protected_m, only : local_guard => guarded
+  implicit none
+  local_guard = 3
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|error| error.contains("PROTECTED use-associated entity"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn protected_pointer_target_definition_does_not_change_association() {
+        let errs = errors_from(
+            "\
+module protected_pointer_m
+  implicit none
+  integer, pointer, protected :: view
+end module
+program p
+  use protected_pointer_m
+  implicit none
+  integer, target :: storage
+  view = 1
+  view => storage
+  nullify(view)
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|error| {
+                    error.contains("pointer assignment target must be a definable variable")
+                        || error.contains("NULLIFY target must be a definable variable")
+                })
+                .count(),
+            2,
+            "{errs:?}"
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|error| error.contains("cannot define PROTECTED") && error.contains("view")),
+            "ordinary assignment through the protected pointer target was rejected: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn protected_use_association_rejects_other_definition_contexts() {
+        let errs = errors_from(
+            "\
+module protected_defs_m
+  implicit none
+  integer, protected :: scalar = 1
+  integer, allocatable, protected :: values(:)
+end module
+program p
+  use protected_defs_m
+  implicit none
+  call overwrite(scalar)
+  read (*, *) scalar
+  allocate(values(1))
+  deallocate(values)
+contains
+  subroutine overwrite(value)
+    integer, intent(out) :: value
+    value = 4
+  end subroutine
+end program
+",
+        );
+        for expected in [
+            "actual argument for INTENT(OUT/INOUT)",
+            "READ input item target must be a definable variable",
+            "ALLOCATE target must be a definable variable",
+            "DEALLOCATE target must be a definable variable",
+        ] {
+            assert!(
+                errs.iter().any(|error| error.contains(expected)),
+                "missing {expected:?}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_origin_survives_transitive_use_association() {
+        let errs = errors_from(
+            "\
+module origin_m
+  implicit none
+  integer, protected :: guarded = 1
+end module
+module reexport_m
+  use origin_m
+  implicit none
+end module
+program p
+  use reexport_m
+  implicit none
+  guarded = 2
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|error| error.contains("PROTECTED use-associated entity 'guarded'")),
             "{errs:?}"
         );
     }

@@ -4377,6 +4377,7 @@ fn attrs_to_symbol_attrs(attrs: &[Attribute], default_access: Access) -> SymbolA
             Attribute::Asynchronous => sa.asynchronous = true,
             Attribute::Contiguous => sa.contiguous = true,
             Attribute::Volatile => sa.volatile = true,
+            Attribute::Protected => sa.protected = true,
             Attribute::OpenMpThreadPrivate => sa.openmp_threadprivate = true,
             Attribute::Target => sa.target = true,
             Attribute::Optional => sa.optional = true,
