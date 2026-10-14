@@ -316,6 +316,10 @@ pub struct TypeBoundProc {
     pub binding: Option<String>,   // procedure :: name => binding
     pub bindings: Vec<String>,     // generic :: name => specific_a, specific_b
     pub attrs: Vec<String>,        // pass, nopass, deferred, etc.
+    /// Explicit passed-object dummy from PASS(name).  `None` means the
+    /// default first dummy for a passed binding (or no passed object when the
+    /// NOPASS attribute is present).
+    pub pass_name: Option<String>,
     pub is_generic: bool,
 }
 

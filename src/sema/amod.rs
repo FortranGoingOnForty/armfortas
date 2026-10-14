@@ -2991,6 +2991,8 @@ fn parse_type(
                 target_name: target,
                 abi_name: parsed_abi_name,
                 nopass,
+                pass_name: None,
+                pass_index: (!nopass).then_some(0),
             });
         } else if let Some(rest) = trimmed.strip_prefix("@final ") {
             let mut parts = rest.split_whitespace();

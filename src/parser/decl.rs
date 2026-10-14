@@ -1279,35 +1279,21 @@ impl<'a> Parser<'a> {
             None
         };
         let mut proc_attrs = Vec::new();
+        let mut pass_name = None;
         while self.eat(&TokenKind::Comma) {
             let text = self.peek_text().to_lowercase();
             match text.as_str() {
                 "pass" => {
                     proc_attrs.push(self.advance().clone().text);
-                    // Optional argument: pass(arg). Consume balanced parens
-                    // — we don't track which arg the pass is on; F2018 says
-                    // it defaults to the first dummy if not specified.
-                    if self.peek() == &TokenKind::LParen {
-                        let mut depth = 0;
-                        loop {
-                            match self.peek() {
-                                TokenKind::LParen => {
-                                    self.advance();
-                                    depth += 1;
-                                }
-                                TokenKind::RParen => {
-                                    self.advance();
-                                    depth -= 1;
-                                    if depth == 0 {
-                                        break;
-                                    }
-                                }
-                                TokenKind::Eof => break,
-                                _ => {
-                                    self.advance();
-                                }
-                            }
+                    if self.eat(&TokenKind::LParen) {
+                        if self.peek() != &TokenKind::Identifier {
+                            return Err(self.error(format!(
+                                "expected passed-object dummy name, got {}",
+                                self.peek()
+                            )));
                         }
+                        pass_name = Some(self.advance().clone().text);
+                        self.expect(&TokenKind::RParen)?;
                     }
                 }
                 "nopass" | "deferred" | "non_overridable" | "public" | "private" => {
@@ -1332,6 +1318,7 @@ impl<'a> Parser<'a> {
                 binding,
                 bindings,
                 attrs: proc_attrs.clone(),
+                pass_name: pass_name.clone(),
                 is_generic: false,
             });
             if !self.eat(&TokenKind::Comma) {
@@ -1382,6 +1369,7 @@ impl<'a> Parser<'a> {
             binding,
             bindings,
             attrs: proc_attrs,
+            pass_name: None,
             is_generic: true,
         })
     }

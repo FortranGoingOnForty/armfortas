@@ -68164,6 +68164,46 @@ fn user_op_dispatch_rank_filters_scalar_actual_to_scalar_specific() {
 }
 
 #[test]
+fn named_nonfirst_pass_dummy_controls_type_bound_call_slot() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=named_nonfirst_pass_dummy_controls_type_bound_call_slot count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module named_pass_m\n  implicit none\n  type :: box_t\n    integer :: tag = 0\n  contains\n    procedure, pass(self) :: encode\n  end type\ncontains\n  integer function encode(other, self, scale)\n    class(box_t), intent(in) :: other\n    class(box_t), intent(in) :: self\n    integer, intent(in), optional :: scale\n    integer :: factor\n    factor = 10\n    if (present(scale)) factor = scale\n    encode = factor * self%tag + other%tag\n  end function\nend module\nprogram p\n  use named_pass_m\n  implicit none\n  type(box_t) :: box, other\n  box%tag = 1\n  other%tag = 2\n  if (box%encode(other) /= 12) error stop 1\n  if (box%encode(other=other, scale=100) /= 102) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    for level in ["-O0", "-O3"] {
+        let out = unique_path(
+            &format!("named_nonfirst_pass_{}", level.trim_start_matches('-')),
+            "bin",
+        );
+        let compile = Command::new(compiler("armfortas"))
+            .args([level, src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("named PASS compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{level} named PASS compile failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("named PASS run failed");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{level} named PASS: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_file(out);
+    }
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
 fn type_bound_defined_operator_accepts_character_result_left_operand() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -6594,7 +6594,7 @@ fn component_call_result_metadata(
         else {
             continue;
         };
-        let passed_object = (!binding.nopass).then_some(base.as_ref());
+        let passed_object = binding.pass_index.map(|index| (index, base.as_ref()));
         if !call_candidate_matches(ctx, scope, symbol, args, passed_object) {
             continue;
         }
@@ -7494,26 +7494,32 @@ fn call_candidate_matches(
     scope: &Scope,
     symbol: &Symbol,
     args: &[Argument],
-    passed_object: Option<&SpannedExpr>,
+    passed_object: Option<(usize, &SpannedExpr)>,
 ) -> bool {
-    let mut actuals: Vec<(Option<&str>, Option<&SpannedExpr>)> = Vec::with_capacity(args.len() + 1);
-    if let Some(object) = passed_object {
-        actuals.push((None, Some(object)));
+    let mut actuals: Vec<(Option<usize>, Option<&str>, Option<&SpannedExpr>)> =
+        Vec::with_capacity(args.len() + 1);
+    if let Some((index, object)) = passed_object {
+        actuals.push((Some(index), None, Some(object)));
     }
     actuals.extend(args.iter().map(|arg| {
         let expr = match &arg.value {
             SectionSubscript::Element(expr) => Some(expr),
             SectionSubscript::Range { .. } => None,
         };
-        (arg.keyword.as_deref(), expr)
+        (None, arg.keyword.as_deref(), expr)
     }));
 
     let mut matched = vec![false; scope.arg_order.len()];
     let mut position = 0;
     let mut seen_keyword = false;
     let mut elemental_rank = None;
-    for (keyword, actual) in actuals {
-        let dummy_index = if let Some(keyword) = keyword {
+    for (forced_index, keyword, actual) in actuals {
+        let dummy_index = if let Some(index) = forced_index {
+            if index >= scope.arg_order.len() {
+                return false;
+            }
+            index
+        } else if let Some(keyword) = keyword {
             seen_keyword = true;
             let Some(index) = scope
                 .arg_order
@@ -7611,7 +7617,7 @@ fn candidate_result_metadata(
     scope: &Scope,
     symbol: &Symbol,
     args: &[Argument],
-    passed_object: Option<&SpannedExpr>,
+    passed_object: Option<(usize, &SpannedExpr)>,
 ) -> Option<(TypeInfo, usize)> {
     let result_symbol = result_symbol_in_procedure_scope(scope);
     let type_info = symbol
@@ -7625,7 +7631,7 @@ fn candidate_result_metadata(
     let rank = if symbol.attrs.elemental && declared_rank == 0 {
         max_elemental_actual_rank(ctx, args)
             .into_iter()
-            .chain(passed_object.and_then(|object| validation_expr_rank(ctx, object)))
+            .chain(passed_object.and_then(|(_, object)| validation_expr_rank(ctx, object)))
             .max()
             .unwrap_or(0)
     } else {
@@ -10369,6 +10375,40 @@ fn validate_derived_type(
                     tbp.name
                 ),
             );
+        }
+
+        if let Some(pass_name) = tbp.pass_name.as_deref() {
+            let target = tbp.binding.as_deref().unwrap_or(&tbp.name);
+            let interface = tbp.interface.as_deref();
+            let procedure_scope = ctx.st.all_scopes().iter().find(|scope| {
+                let name_matches = match &scope.kind {
+                    ScopeKind::Function(scope_name) | ScopeKind::Subroutine(scope_name) => {
+                        scope_name.eq_ignore_ascii_case(target)
+                            || interface.is_some_and(|name| scope_name.eq_ignore_ascii_case(name))
+                    }
+                    _ => false,
+                };
+                name_matches
+                    && (scope.parent == Some(ctx.scope_id)
+                        || scope.parent.is_some_and(|parent| {
+                            ctx.st.scope(parent).parent == Some(ctx.scope_id)
+                                && matches!(ctx.st.scope(parent).kind, ScopeKind::Interface)
+                        }))
+            });
+            if !procedure_scope.is_some_and(|scope| {
+                scope
+                    .arg_order
+                    .iter()
+                    .any(|dummy| dummy.eq_ignore_ascii_case(pass_name))
+            }) {
+                ctx.error(
+                    span,
+                    format!(
+                        "PASS dummy '{}' is not a dummy argument of type-bound procedure '{}'",
+                        pass_name, tbp.name
+                    ),
+                );
+            }
         }
 
         // Deferred procedures must declare an explicit interface.
@@ -19107,6 +19147,31 @@ end module
 ",
         );
         assert!(errs.iter().any(|e| e.contains("both PASS and NOPASS")));
+    }
+
+    #[test]
+    fn named_pass_dummy_must_exist_in_bound_procedure() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+  type :: thing
+  contains
+    procedure, pass(missing) :: method
+  end type
+contains
+  subroutine method(value, self)
+    integer, intent(in) :: value
+    class(thing), intent(inout) :: self
+  end subroutine
+end module
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|error| error.contains("PASS dummy 'missing'")),
+            "{errs:?}"
+        );
     }
 
     // ---- Standard conformance (--std=) ----

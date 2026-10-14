@@ -85,6 +85,12 @@ pub struct BoundProc {
     pub target_name: String,
     pub abi_name: String,
     pub nopass: bool,
+    /// Source dummy selected by PASS(name), or the resolved first dummy for
+    /// default PASS once procedure metadata is available.
+    pub pass_name: Option<String>,
+    /// Zero-based source-formal slot occupied by the passed object.  `None`
+    /// is the NOPASS state.
+    pub pass_index: Option<usize>,
 }
 
 /// Complete layout of a derived type.
@@ -1732,6 +1738,8 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
             target_name,
             abi_name,
             nopass,
+            pass_name: tbp.pass_name.clone(),
+            pass_index: (!nopass).then_some(0),
         };
         upsert_bound_proc(&mut bound_procs, proc);
         if let Some(override_proc) = bound_procs
@@ -1752,6 +1760,8 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
                 {
                     inherited_alias.target_name = override_proc.target_name.clone();
                     inherited_alias.nopass = override_proc.nopass;
+                    inherited_alias.pass_name = override_proc.pass_name.clone();
+                    inherited_alias.pass_index = override_proc.pass_index;
                 }
             }
         }
@@ -1771,6 +1781,8 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
                     target_name: lowered_bound_proc_target(host_module, specific),
                     abi_name: specific.to_lowercase(),
                     nopass: false,
+                    pass_name: None,
+                    pass_index: Some(0),
                 });
             upsert_bound_proc(
                 &mut bound_procs,
@@ -1779,6 +1791,8 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
                     target_name: alias.target_name,
                     abi_name: alias.abi_name,
                     nopass: alias.nopass,
+                    pass_name: alias.pass_name,
+                    pass_index: alias.pass_index,
                 },
             );
         }

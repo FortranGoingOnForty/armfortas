@@ -2844,6 +2844,7 @@ fn register_local_type_layouts(
                 final_proc.rank = final_procedure_rank(st, scope_id, source_name).unwrap_or(0);
                 final_proc.elemental = final_procedure_is_elemental(st, scope_id, source_name);
             }
+            resolve_bound_proc_pass_metadata(st, scope_id, host_module, &mut layout);
             // Don't overwrite a layout that has bound_procs or final_procs with one that doesn't.
             // This handles the case where a subroutine redefines a type without CONTAINS.
             let dominated = layouts
@@ -2858,6 +2859,59 @@ fn register_local_type_layouts(
             if !dominated {
                 layouts.insert(layout);
             }
+        }
+    }
+}
+
+fn resolve_bound_proc_pass_metadata(
+    st: &SymbolTable,
+    owner_scope: ScopeId,
+    host_module: Option<&str>,
+    layout: &mut crate::sema::type_layout::TypeLayout,
+) {
+    let module_prefix = host_module.map(|module| format!("afs_modproc_{}_", module.to_lowercase()));
+    for binding in &mut layout.bound_procs {
+        if binding.nopass {
+            binding.pass_name = None;
+            binding.pass_index = None;
+            continue;
+        }
+
+        let target_source_name = module_prefix
+            .as_deref()
+            .and_then(|prefix| binding.target_name.strip_prefix(prefix))
+            .unwrap_or(&binding.target_name);
+        let procedure_scope = st.all_scopes().iter().find(|scope| {
+            let name_matches = match &scope.kind {
+                ScopeKind::Function(name) | ScopeKind::Subroutine(name) => {
+                    name.eq_ignore_ascii_case(target_source_name)
+                        || name.eq_ignore_ascii_case(&binding.abi_name)
+                }
+                _ => false,
+            };
+            name_matches
+                && (scope.parent == Some(owner_scope)
+                    || scope.parent.is_some_and(|parent| {
+                        st.scope(parent).parent == Some(owner_scope)
+                            && matches!(st.scope(parent).kind, ScopeKind::Interface)
+                    }))
+        });
+        let Some(procedure_scope) = procedure_scope else {
+            continue;
+        };
+        let pass_index = binding
+            .pass_name
+            .as_ref()
+            .and_then(|name| {
+                procedure_scope
+                    .arg_order
+                    .iter()
+                    .position(|dummy| dummy.eq_ignore_ascii_case(name))
+            })
+            .unwrap_or(0);
+        if let Some(name) = procedure_scope.arg_order.get(pass_index) {
+            binding.pass_name = Some(name.clone());
+            binding.pass_index = Some(pass_index);
         }
     }
 }
