@@ -10,7 +10,10 @@ use crate::ast::unit::*;
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
 use crate::ir::types::*;
-use crate::sema::symtab::SymbolTable;
+use crate::sema::symtab::{
+    is_reserved_module_procedure_link_name, module_procedure_link_name_prefix,
+    split_module_procedure_link_name, SymbolTable,
+};
 use crate::sema::validate::FortranStandard;
 
 use crate::ast::decl::ArraySpec;
@@ -228,9 +231,8 @@ pub(super) fn bound_proc_target_is_local_to_owner(
     let Some(owner) = layout.owner_module.as_ref() else {
         return false;
     };
-    target
-        .to_lowercase()
-        .starts_with(&format!("afs_modproc_{}_", owner.to_lowercase()))
+    split_module_procedure_link_name(target)
+        .is_some_and(|(target_owner, _)| target_owner.eq_ignore_ascii_case(owner))
 }
 
 /// Resolve the linker symbol a bound-procedure slot points at, or `None`
@@ -246,11 +248,7 @@ fn bound_proc_slot_target_symbol(
     internal_funcs: &HashMap<String, u32>,
     available_targets: &HashSet<String>,
 ) -> Option<String> {
-    if layout.owner_module.is_none()
-        && bp
-            .target_name
-            .to_ascii_lowercase()
-            .starts_with("afs_modproc_")
+    if layout.owner_module.is_none() && split_module_procedure_link_name(&bp.target_name).is_some()
     {
         return Some(bp.target_name.clone());
     }
@@ -491,10 +489,11 @@ fn derived_memory_helper_available_from_current_func(
     let Some(owner) = layout.owner_module.as_ref() else {
         return true;
     };
+    let procedure_prefix = module_procedure_link_name_prefix(owner).to_ascii_lowercase();
     let owner = sanitize_internal_host_symbol(owner);
     let func = b.func().name.to_lowercase();
-    func.starts_with(&format!("afs_modproc_{}_", owner))
-        || func.contains(&format!("_afs_modproc_{}_", owner))
+    func.starts_with(&procedure_prefix)
+        || func.contains(&format!("_{procedure_prefix}"))
         || func.starts_with(&format!("afs_derived_{}_", owner))
 }
 
@@ -20704,7 +20703,7 @@ pub(super) fn resolve_subroutine_call_name(
 ) -> (String, String) {
     // Prefer the reverse map from the caller's link name, but fall back to the
     // scope actually being lowered. An internal subprogram's link name (e.g.
-    // `afs_internal_afs_modproc_m_c_make_file_0`) has no matching scope name, so
+    // `afs_internal_afs_modproc$v2$m$m$p$c_make_file_0`) has no matching scope name, so
     // callee_scope_id_for_lookup returns None; without the fallback, resolution
     // drops to find_linkable_symbol_any_scope, which picks the first same-named
     // callable in source order regardless of what the caller actually imported.
@@ -20827,7 +20826,7 @@ pub(super) fn sanitize_internal_host_symbol(host_link_name: &str) -> String {
     host_link_name
         .chars()
         .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
+            if ch.is_ascii_alphanumeric() || ch == '$' {
                 ch.to_ascii_lowercase()
             } else {
                 '_'
@@ -21207,6 +21206,11 @@ pub(super) fn abi_key_for_link_name(st: &SymbolTable, link_name: &str) -> Option
     use crate::sema::symtab::SymbolKind;
 
     let link_lower = link_name.to_lowercase();
+    let encoded_procedure = split_module_procedure_link_name(link_name)
+        .map(|(_, procedure)| procedure.to_ascii_lowercase());
+    if encoded_procedure.is_none() && is_reserved_module_procedure_link_name(link_name) {
+        return None;
+    }
     let mut suffix_match: Option<(usize, String)> = None;
     for scope in st.all_scopes() {
         match &scope.kind {
@@ -21217,7 +21221,7 @@ pub(super) fn abi_key_for_link_name(st: &SymbolTable, link_name: &str) -> Option
                     return Some(key);
                 }
                 let suffix = format!("_{}", key);
-                if link_lower.ends_with(&suffix) {
+                if encoded_procedure.is_none() && link_lower.ends_with(&suffix) {
                     let len = key.len();
                     if suffix_match
                         .as_ref()
@@ -21255,7 +21259,7 @@ pub(super) fn abi_key_for_link_name(st: &SymbolTable, link_name: &str) -> Option
                     | SymbolKind::ProcedurePointer
             ) {
                 let suffix = format!("_{}", sym.name.to_lowercase());
-                if link_lower.ends_with(&suffix) {
+                if encoded_procedure.is_none() && link_lower.ends_with(&suffix) {
                     let key = sym.name.to_lowercase();
                     let len = key.len();
                     if suffix_match
@@ -21269,7 +21273,7 @@ pub(super) fn abi_key_for_link_name(st: &SymbolTable, link_name: &str) -> Option
             }
         }
     }
-    suffix_match.map(|(_, key)| key)
+    encoded_procedure.or_else(|| suffix_match.map(|(_, key)| key))
 }
 
 pub(super) fn find_linkable_symbol_any_scope<'a>(
@@ -21568,16 +21572,9 @@ pub(super) fn procedure_abi_lookup_keys(st: &SymbolTable, keys: &[&str]) -> Vec<
 }
 
 fn module_procedure_link_name_candidates(link_name: &str) -> Vec<String> {
-    let Some(stripped) = link_name.strip_prefix("afs_modproc_") else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut cursor = stripped;
-    while let Some(idx) = cursor.find('_') {
-        cursor = &cursor[idx + 1..];
-        out.push(cursor.to_string());
-    }
-    out
+    split_module_procedure_link_name(link_name)
+        .map(|(_, procedure)| vec![procedure.to_string()])
+        .unwrap_or_default()
 }
 
 pub(super) fn procedure_abi_lookup_keys_for_call_target(
@@ -61934,7 +61931,7 @@ pub(super) fn apply_field_default_init_runtime(
         }
         crate::sema::type_layout::FieldDefaultInit::ProcedurePointer(target_symbol) => {
             // Take the function's link-time address (the layout
-            // builder pre-mangles to `afs_modproc_<mod>_<proc>` for
+            // builder encodes with the module-procedure symbol codec for
             // module procedures) and store it in the procedure-pointer
             // record. Default component initializers cannot capture a
             // dynamic host frame, so the closure payload is null.
@@ -62884,33 +62881,14 @@ pub(super) fn expr_is_character_expr(
                         resolve_component_base_for_method(b, locals, tbp_base, st, tl)?;
                     let layout = tl.get(&base_type)?;
                     let bp = layout.bound_proc(tbp_component)?;
-                    // The TBP `target_name` carries the mangled IR symbol
-                    // (e.g. `afs_modproc_mod_proc`); the symbol table is
-                    // keyed by the source-level procedure name. Strip the
-                    // mangling prefix and the leading module segment so
-                    // the lookup hits the function symbol with its
-                    // type_info populated.
+                    // The TBP target carries the module procedure's encoded
+                    // linker identity while the symbol table is keyed by the
+                    // source-level procedure name.
                     let raw_target = bp.target_name.as_str();
-                    let stripped = raw_target
-                        .strip_prefix("afs_modproc_")
-                        .map(|s| {
-                            // Format: afs_modproc_<module>_<proc>. Module
-                            // name itself can contain underscores, so
-                            // try progressively shorter prefixes until
-                            // the symtab finds a match.
-                            let mut candidates: Vec<String> = Vec::new();
-                            candidates.push(s.to_string());
-                            let mut cursor = s;
-                            while let Some(idx) = cursor.find('_') {
-                                cursor = &cursor[idx + 1..];
-                                candidates.push(cursor.to_string());
-                            }
-                            candidates
-                        })
-                        .unwrap_or_else(|| vec![raw_target.to_string()]);
-                    let target = stripped
-                        .iter()
-                        .find_map(|cand| st.find_symbol_any_scope(cand))?;
+                    let source_target = split_module_procedure_link_name(raw_target)
+                        .map(|(_, procedure)| procedure)
+                        .unwrap_or(raw_target);
+                    let target = st.find_symbol_any_scope(source_target)?;
                     Some(matches!(
                         target.type_info,
                         Some(crate::sema::symtab::TypeInfo::Character { .. })
@@ -68101,6 +68079,30 @@ mod tests {
     }
 
     #[test]
+    fn malformed_reserved_module_procedure_name_never_uses_suffix_fallback() {
+        let tokens = Lexer::tokenize(
+            "module m\ncontains\n  subroutine proc()\n  end subroutine\nend module\n",
+            0,
+        )
+        .unwrap();
+        let mut parser = Parser::new(&tokens);
+        let units = parser.parse_file().unwrap();
+        let resolved =
+            resolve::resolve_file(&units, &[], crate::target::TargetLayout::LP64).unwrap();
+
+        assert_eq!(
+            abi_key_for_link_name(&resolved.st, "legacy_decoy_proc"),
+            Some("proc".to_string()),
+            "test precondition: non-reserved legacy names retain suffix lookup"
+        );
+        assert_eq!(
+            abi_key_for_link_name(&resolved.st, "afs_modproc$v2$m$$p$decoy_proc"),
+            None,
+            "malformed names in the reserved v2 namespace must fail closed"
+        );
+    }
+
+    #[test]
     fn transitive_use_chain_keeps_only_defining_global_entries() {
         const DEPTH: usize = 24;
         let mut source = String::new();
@@ -68223,13 +68225,16 @@ mod tests {
         collect_optional_params(&units[0].node, &mut optional);
         collect_descriptor_params(&units[0].node, &mut descriptor);
         collect_char_len_star_params(&units[0].node, &mut char_len);
-        let root_key = "afs_modproc_root_compute";
+        let root_key = "afs_modproc$v2$m$root$p$compute";
 
         assert_eq!(optional.get(root_key), Some(&vec![false, false, true]));
         assert_eq!(descriptor.get(root_key), Some(&vec![true, false, false]));
         assert_eq!(char_len.get(root_key), Some(&vec![false, true, false]));
-        assert_eq!(optional.get("afs_modproc_root_no_args"), Some(&Vec::new()));
-        let child_key = "afs_modproc_child_helper";
+        assert_eq!(
+            optional.get("afs_modproc$v2$m$root$p$no_args"),
+            Some(&Vec::new())
+        );
+        let child_key = "afs_modproc$v2$m$child$p$helper";
         assert_eq!(optional.get(child_key), Some(&vec![false, false, true]));
         assert_eq!(descriptor.get(child_key), Some(&vec![true, false, false]));
         assert_eq!(char_len.get(child_key), Some(&vec![false, true, false]));
@@ -69869,7 +69874,7 @@ end module
 ",
         );
         let test_ir = ir
-            .split("  func @afs_modproc_helpers_test")
+            .split("  func @afs_modproc$v2$m$helpers$p$test")
             .nth(1)
             .expect("expected test procedure");
         assert_eq!(
@@ -70734,11 +70739,11 @@ end program
             .unwrap_or(program_tail.len());
         let program_ir = &program_tail[..program_end];
         let borrowed_start = program_ir
-            .find("call @afs_modproc_result_temp_m_make_borrowed")
+            .find("call @afs_modproc$v2$m$result_temp_m$p$make_borrowed")
             .expect("missing pointer-result call");
         let borrowed_tail = &program_ir[borrowed_start..];
         let next_owned = borrowed_tail
-            .find("call @afs_modproc_result_temp_m_make_direct")
+            .find("call @afs_modproc$v2$m$result_temp_m$p$make_direct")
             .expect("missing owned call after pointer-result call");
 
         assert_eq!(
@@ -70785,7 +70790,7 @@ end module
 ",
         );
         let consume_start = ir
-            .find("func @afs_modproc_character_result_ownership_m_consume")
+            .find("func @afs_modproc$v2$m$character_result_ownership_m$p$consume")
             .expect("missing character result caller IR");
         let consume_tail = &ir[consume_start..];
         let consume_end = consume_tail
@@ -70841,10 +70846,10 @@ end program
             .unwrap_or(program_tail.len());
         let program_ir = &program_tail[..program_end];
         let owned_start = program_ir
-            .find("call @afs_modproc_generic_result_temp_m_make_owned")
+            .find("call @afs_modproc$v2$m$generic_result_temp_m$p$make_owned")
             .expect("missing allocatable-result generic specific call");
         let borrowed_start = program_ir
-            .find("call @afs_modproc_generic_result_temp_m_make_borrowed")
+            .find("call @afs_modproc$v2$m$generic_result_temp_m$p$make_borrowed")
             .expect("missing pointer-result generic specific call");
 
         assert!(
@@ -70865,7 +70870,7 @@ end program
         let (module, ir) = lower_and_verify(include_str!(
             "../../../test_programs/generic_private_rename_derived_result.f90"
         ));
-        let callee_name = "afs_modproc_generic_private_rename_string_mod_lower_string";
+        let callee_name = "afs_modproc$v2$m$generic_private_rename_string_mod$p$lower_string";
         let (callee_index, callee) = module
             .functions
             .iter()
@@ -71035,10 +71040,10 @@ end program
             .unwrap_or(program_tail.len());
         let program_ir = &program_tail[..program_end];
         let owned_start = program_ir
-            .find("call @afs_modproc_owned_bound_result_m_make_bound")
+            .find("call @afs_modproc$v2$m$owned_bound_result_m$p$make_bound")
             .expect("missing owned module binding call");
         let borrowed_start = program_ir
-            .find("call @afs_modproc_borrowed_bound_result_m_make_bound")
+            .find("call @afs_modproc$v2$m$borrowed_bound_result_m$p$make_bound")
             .expect("missing borrowed module binding call");
 
         assert!(
@@ -71079,7 +71084,7 @@ end module
 ",
         );
         let choose_start = ir
-            .find("func @afs_modproc_conditional_character_result_m_choose")
+            .find("func @afs_modproc$v2$m$conditional_character_result_m$p$choose")
             .expect("missing conditional-result caller IR");
         let choose_tail = &ir[choose_start..];
         let choose_end = choose_tail.find("\n  func @").unwrap_or(choose_tail.len());
@@ -71087,13 +71092,13 @@ end module
 
         assert_eq!(
             choose_ir
-                .matches("call @afs_modproc_conditional_character_result_m_make_owned")
+                .matches("call @afs_modproc$v2$m$conditional_character_result_m$p$make_owned")
                 .count(),
             1
         );
         assert_eq!(
             choose_ir
-                .matches("call @afs_modproc_conditional_character_result_m_make_borrowed")
+                .matches("call @afs_modproc$v2$m$conditional_character_result_m$p$make_borrowed")
                 .count(),
             1
         );
@@ -71142,7 +71147,7 @@ end module
 ",
         );
         let run_start = ir
-            .find("func @afs_modproc_procedure_pointer_character_result_m_run")
+            .find("func @afs_modproc$v2$m$procedure_pointer_character_result_m$p$run")
             .expect("missing plain procedure-pointer result caller IR");
         let run_tail = &ir[run_start..];
         let run_end = run_tail.find("\n  func @").unwrap_or(run_tail.len());
@@ -71208,7 +71213,7 @@ end module
 ",
         );
         let run_start = ir
-            .find("func @afs_modproc_procedure_pointer_component_result_m_run")
+            .find("func @afs_modproc$v2$m$procedure_pointer_component_result_m$p$run")
             .expect("missing procedure-pointer-component result caller IR");
         let run_tail = &ir[run_start..];
         let run_end = run_tail.find("\n  func @").unwrap_or(run_tail.len());
@@ -71310,7 +71315,7 @@ end program
 
         assert_eq!(
             program_ir
-                .matches("call @afs_modproc_character_actual_m_make_text")
+                .matches("call @afs_modproc$v2$m$character_actual_m$p$make_text")
                 .count(),
             6,
             "each source actual must evaluate its function exactly once:\n{}",
@@ -71375,7 +71380,7 @@ end program
 
         assert_eq!(
             program_ir
-                .matches("call @afs_modproc_bind_c_character_actual_m_make_owned")
+                .matches("call @afs_modproc$v2$m$bind_c_character_actual_m$p$make_owned")
                 .count(),
             3,
             "each owned BIND(C) actual must evaluate exactly once:\n{}",
@@ -71383,7 +71388,7 @@ end program
         );
         assert_eq!(
             program_ir
-                .matches("call @afs_modproc_bind_c_character_actual_m_make_borrowed")
+                .matches("call @afs_modproc$v2$m$bind_c_character_actual_m$p$make_borrowed")
                 .count(),
             1,
             "the borrowed BIND(C) actual must evaluate exactly once:\n{}",
@@ -71396,7 +71401,7 @@ end program
             program_ir
         );
         let borrowed_start = program_ir
-            .find("call @afs_modproc_bind_c_character_actual_m_make_borrowed")
+            .find("call @afs_modproc$v2$m$bind_c_character_actual_m$p$make_borrowed")
             .expect("missing borrowed BIND(C) character-result call");
         assert!(
             !program_ir[borrowed_start..].contains("rt_call @__afs_deallocate"),
@@ -71459,7 +71464,7 @@ end module
 ",
         );
         let run_start = ir
-            .find("func @afs_modproc_bind_c_procptr_component_m_run")
+            .find("func @afs_modproc$v2$m$bind_c_procptr_component_m$p$run")
             .expect("missing BIND(C) procedure-pointer-component caller IR");
         let run_tail = &ir[run_start..];
         let run_end = run_tail.find("\n  func @").unwrap_or(run_tail.len());
@@ -71467,7 +71472,7 @@ end module
 
         assert_eq!(
             run_ir
-                .matches("call @afs_modproc_bind_c_procptr_component_m_make_owned")
+                .matches("call @afs_modproc$v2$m$bind_c_procptr_component_m$p$make_owned")
                 .count(),
             4,
             "each owned BIND(C) component actual must evaluate once:\n{}",
@@ -71475,7 +71480,7 @@ end module
         );
         assert_eq!(
             run_ir
-                .matches("call @afs_modproc_bind_c_procptr_component_m_make_borrowed")
+                .matches("call @afs_modproc$v2$m$bind_c_procptr_component_m$p$make_borrowed")
                 .count(),
             2,
             "each borrowed BIND(C) component actual must evaluate once:\n{}",
@@ -71593,7 +71598,7 @@ end module
 ",
         );
         let run_start = ir
-            .find("func @afs_modproc_conditional_character_actual_m_run")
+            .find("func @afs_modproc$v2$m$conditional_character_actual_m$p$run")
             .expect("missing conditional-actual caller IR");
         let run_tail = &ir[run_start..];
         let run_end = run_tail.find("\n  func @").unwrap_or(run_tail.len());
@@ -71601,7 +71606,7 @@ end module
 
         assert_eq!(
             run_ir
-                .matches("call @afs_modproc_conditional_character_actual_m_make_left")
+                .matches("call @afs_modproc$v2$m$conditional_character_actual_m$p$make_left")
                 .count(),
             3,
             "each left arm must be emitted once per conditional actual:\n{}",
@@ -71609,7 +71614,7 @@ end module
         );
         assert_eq!(
             run_ir
-                .matches("call @afs_modproc_conditional_character_actual_m_make_right")
+                .matches("call @afs_modproc$v2$m$conditional_character_actual_m$p$make_right")
                 .count(),
             2,
             "each right arm must be emitted once per conditional actual:\n{}",
@@ -71651,7 +71656,7 @@ end module
 ",
         );
         let consume_start = ir
-            .find("func @afs_modproc_character_intrinsic_result_m_consume")
+            .find("func @afs_modproc$v2$m$character_intrinsic_result_m$p$consume")
             .expect("missing intrinsic consumer IR");
         let consume_tail = &ir[consume_start..];
         let consume_end = consume_tail
@@ -71661,7 +71666,7 @@ end module
 
         assert_eq!(
             consume_ir
-                .matches("call @afs_modproc_character_intrinsic_result_m_make_text")
+                .matches("call @afs_modproc$v2$m$character_intrinsic_result_m$p$make_text")
                 .count(),
             9,
             "each scalar intrinsic argument must be evaluated once:\n{}",
@@ -71706,7 +71711,7 @@ end module
 ",
         );
         let consume_start = ir
-            .find("func @afs_modproc_character_intrinsic_keyword_m_consume")
+            .find("func @afs_modproc$v2$m$character_intrinsic_keyword_m$p$consume")
             .expect("missing keyword intrinsic consumer IR");
         let consume_tail = &ir[consume_start..];
         let consume_end = consume_tail
@@ -71716,7 +71721,7 @@ end module
 
         assert_eq!(
             consume_ir
-                .matches("call @afs_modproc_character_intrinsic_keyword_m_make_text")
+                .matches("call @afs_modproc$v2$m$character_intrinsic_keyword_m$p$make_text")
                 .count(),
             1,
             "keyword actuals must be associated and evaluated exactly once:\n{consume_ir}"
@@ -71770,7 +71775,7 @@ end module
 ",
         );
         let consume_start = ir
-            .find("func @afs_modproc_character_transfer_result_m_consume")
+            .find("func @afs_modproc$v2$m$character_transfer_result_m$p$consume")
             .expect("missing TRANSFER consumer IR");
         let consume_tail = &ir[consume_start..];
         let consume_end = consume_tail
@@ -71780,7 +71785,7 @@ end module
 
         assert_eq!(
             consume_ir
-                .matches("call @afs_modproc_character_transfer_result_m_make_owned")
+                .matches("call @afs_modproc$v2$m$character_transfer_result_m$p$make_owned")
                 .count(),
             1,
             "the owned TRANSFER source must be evaluated once:\n{}",
@@ -71788,7 +71793,7 @@ end module
         );
         assert_eq!(
             consume_ir
-                .matches("call @afs_modproc_character_transfer_result_m_make_borrowed")
+                .matches("call @afs_modproc$v2$m$character_transfer_result_m$p$make_borrowed")
                 .count(),
             1,
             "the borrowed TRANSFER source must be evaluated once:\n{}",
@@ -71821,7 +71826,7 @@ end module
 ",
         );
         let consume_start = ir
-            .find("func @afs_modproc_character_array_constructor_result_m_consume")
+            .find("func @afs_modproc$v2$m$character_array_constructor_result_m$p$consume")
             .expect("missing character array-constructor consumer IR");
         let consume_tail = &ir[consume_start..];
         let consume_end = consume_tail
@@ -71831,7 +71836,7 @@ end module
 
         assert_eq!(
             consume_ir
-                .matches("call @afs_modproc_character_array_constructor_result_m_make_text")
+                .matches("call @afs_modproc$v2$m$character_array_constructor_result_m$p$make_text")
                 .count(),
             1,
             "the character array-constructor element must be evaluated once:\n{}",
@@ -71865,7 +71870,7 @@ end module
 ",
         );
         let consume_start = ir
-            .find("func @afs_modproc_character_eoshift_boundary_m_consume")
+            .find("func @afs_modproc$v2$m$character_eoshift_boundary_m$p$consume")
             .expect("missing EOSHIFT consumer IR");
         let consume_tail = &ir[consume_start..];
         let consume_end = consume_tail
@@ -71875,7 +71880,7 @@ end module
 
         assert_eq!(
             consume_ir
-                .matches("call @afs_modproc_character_eoshift_boundary_m_make_text")
+                .matches("call @afs_modproc$v2$m$character_eoshift_boundary_m$p$make_text")
                 .count(),
             1,
             "the EOSHIFT boundary must be evaluated once:\n{}",
@@ -71932,7 +71937,7 @@ end module
 ",
         );
         let consume_start = ir
-            .find("func @afs_modproc_class_star_character_actual_m_consume")
+            .find("func @afs_modproc$v2$m$class_star_character_actual_m$p$consume")
             .expect("missing CLASS(*) character-actual consumer IR");
         let consume_tail = &ir[consume_start..];
         let consume_end = consume_tail
@@ -71942,7 +71947,7 @@ end module
 
         assert_eq!(
             consume_ir
-                .matches("call @afs_modproc_class_star_character_actual_m_make_text")
+                .matches("call @afs_modproc$v2$m$class_star_character_actual_m$p$make_text")
                 .count(),
             4,
             "each CLASS(*) character actual must be evaluated once:\n{}",
@@ -71992,11 +71997,11 @@ end module
         for (procedure, marker) in [
             (
                 "assign_local",
-                "func @afs_modproc_class_star_character_assignment_m_assign_local",
+                "func @afs_modproc$v2$m$class_star_character_assignment_m$p$assign_local",
             ),
             (
                 "assign_component",
-                "func @afs_modproc_class_star_character_assignment_m_assign_component",
+                "func @afs_modproc$v2$m$class_star_character_assignment_m$p$assign_component",
             ),
             ("assign_host", "func @afs_internal_"),
         ] {
@@ -72009,7 +72014,7 @@ end module
 
             assert_eq!(
                 procedure_ir
-                    .matches("call @afs_modproc_class_star_character_assignment_m_make_text")
+                    .matches("call @afs_modproc$v2$m$class_star_character_assignment_m$p$make_text")
                     .count(),
                 1,
                 "the {procedure} source must be evaluated once:\n{procedure_ir}"
@@ -72073,7 +72078,7 @@ end module
 ",
         );
         let consume_start = ir
-            .find("func @afs_modproc_dynamic_character_result_m_consume")
+            .find("func @afs_modproc$v2$m$dynamic_character_result_m$p$consume")
             .expect("missing dynamic character-result caller IR");
         let consume_tail = &ir[consume_start..];
         let consume_end = consume_tail
@@ -72121,7 +72126,7 @@ end module
 ",
         );
         let consume_start = ir
-            .find("func @afs_modproc_operator_character_result_m_consume")
+            .find("func @afs_modproc$v2$m$operator_character_result_m$p$consume")
             .expect("missing defined-operator caller IR");
         let consume_tail = &ir[consume_start..];
         let consume_end = consume_tail
@@ -72130,7 +72135,7 @@ end module
         let consume_ir = &consume_tail[..consume_end];
 
         assert!(
-            consume_ir.contains("call @afs_modproc_operator_character_result_m_join_tokens"),
+            consume_ir.contains("call @afs_modproc$v2$m$operator_character_result_m$p$join_tokens"),
             "expected resolved defined-operator call:\n{}",
             consume_ir
         );
@@ -72173,7 +72178,7 @@ end module
 ",
         );
         let consume_start = ir
-            .find("func @afs_modproc_operator_character_operand_m_consume")
+            .find("func @afs_modproc$v2$m$operator_character_operand_m$p$consume")
             .expect("missing defined-operator operand caller IR");
         let consume_tail = &ir[consume_start..];
         let consume_end = consume_tail
@@ -72183,7 +72188,7 @@ end module
 
         assert_eq!(
             consume_ir
-                .matches("call @afs_modproc_operator_character_operand_m_make_owned")
+                .matches("call @afs_modproc$v2$m$operator_character_operand_m$p$make_owned")
                 .count(),
             1,
             "the allocatable operand must be evaluated once:\n{}",
@@ -72191,7 +72196,7 @@ end module
         );
         assert_eq!(
             consume_ir
-                .matches("call @afs_modproc_operator_character_operand_m_make_borrowed")
+                .matches("call @afs_modproc$v2$m$operator_character_operand_m$p$make_borrowed")
                 .count(),
             1,
             "the pointer operand must be evaluated once:\n{}",
@@ -72231,7 +72236,7 @@ end module
 ",
         );
         let consume_start = ir
-            .find("func @afs_modproc_operator_character_materialized_operand_m_consume")
+            .find("func @afs_modproc$v2$m$operator_character_materialized_operand_m$p$consume")
             .expect("missing materialized defined-operator caller IR");
         let consume_tail = &ir[consume_start..];
         let consume_end = consume_tail
@@ -72241,7 +72246,9 @@ end module
 
         assert_eq!(
             consume_ir
-                .matches("call @afs_modproc_operator_character_materialized_operand_m_make_owned",)
+                .matches(
+                    "call @afs_modproc$v2$m$operator_character_materialized_operand_m$p$make_owned",
+                )
                 .count(),
             1,
             "the materialized operand must be evaluated once:\n{}",
@@ -72280,7 +72287,7 @@ end module
 ",
         );
         let choose_start = ir
-            .find("func @afs_modproc_select_character_temp_m_choose")
+            .find("func @afs_modproc$v2$m$select_character_temp_m$p$choose")
             .expect("missing character selector caller IR");
         let choose_tail = &ir[choose_start..];
         let choose_end = choose_tail.find("\n  func @").unwrap_or(choose_tail.len());
@@ -72288,7 +72295,7 @@ end module
 
         assert_eq!(
             choose_ir
-                .matches("call @afs_modproc_select_character_temp_m_make_selector")
+                .matches("call @afs_modproc$v2$m$select_character_temp_m$p$make_selector")
                 .count(),
             1,
             "the selector must be evaluated once:\n{}",
@@ -72355,7 +72362,7 @@ end module
 ",
         );
         let consume_start = ir
-            .find("func @afs_modproc_io_character_temp_m_consume")
+            .find("func @afs_modproc$v2$m$io_character_temp_m$p$consume")
             .expect("missing I/O temporary caller IR");
         let consume_tail = &ir[consume_start..];
         let consume_end = consume_tail
@@ -72365,7 +72372,7 @@ end module
 
         assert_eq!(
             consume_ir
-                .matches("call @afs_modproc_io_character_temp_m_make_")
+                .matches("call @afs_modproc$v2$m$io_character_temp_m$p$make_")
                 .count(),
             14,
             "each I/O control and item expression must be evaluated once:\n{}",
@@ -72401,7 +72408,7 @@ end module
 ",
         );
         let consume_start = ir
-            .find("func @afs_modproc_substring_character_temp_m_consume")
+            .find("func @afs_modproc$v2$m$substring_character_temp_m$p$consume")
             .expect("missing substring temporary caller IR");
         let consume_tail = &ir[consume_start..];
         let consume_end = consume_tail
@@ -72411,7 +72418,7 @@ end module
 
         assert_eq!(
             consume_ir
-                .matches("call @afs_modproc_substring_character_temp_m_make_text")
+                .matches("call @afs_modproc$v2$m$substring_character_temp_m$p$make_text")
                 .count(),
             4,
             "each substring source must be evaluated once:\n{}",
@@ -72479,7 +72486,7 @@ end program
         let program_ir = &program_tail[..program_end];
 
         assert!(
-            program_ir.contains("call @afs_modproc_child_owner_m_child_value"),
+            program_ir.contains("call @afs_modproc$v2$m$child_owner_m$p$child_value"),
             "the inherited binding must dispatch to its concrete target:\n{}",
             program_ir
         );

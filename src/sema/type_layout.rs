@@ -5,7 +5,7 @@
 //! alignments come from `TargetLayout`, identical across the LP64
 //! targets we support).
 
-use super::symtab::{Access, ScopeId, TypeInfo};
+use super::symtab::{module_procedure_link_name, Access, ScopeId, TypeInfo};
 use crate::driver::defaults::DefaultKinds;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -1727,17 +1727,11 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
     }
 
     fn lowered_bound_proc_target(host_module: Option<&str>, target: &str) -> String {
-        // Body emission via `module_procedure_symbol_name` lowercases
-        // only the module name and preserves the procedure's source
-        // case (see `module_procedure_case_and_bind_label_survive_amod_
-        // import`). The TBP target stored in the type layout drives
-        // the call-site `bl <target>` and must match exactly. Without
-        // matching, `procedure :: pid => process_get_ID` defines
-        // `_afs_modproc_<mod>_process_get_ID` while every TBP dispatch
-        // looked up `_afs_modproc_<mod>_process_get_id` — caught at
-        // stdlib `example_process_5` link.
+        // The TBP target and procedure body must share the exact canonical
+        // module-procedure identity. Both source components are folded to
+        // lowercase because Fortran identifiers are case-insensitive.
         if let Some(module_name) = host_module {
-            format!("afs_modproc_{}_{}", module_name.to_lowercase(), target)
+            module_procedure_link_name(module_name, target)
         } else {
             target.to_string()
         }
@@ -1844,11 +1838,7 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
         .iter()
         .map(|name| {
             let name = if let Some(module_name) = host_module {
-                format!(
-                    "afs_modproc_{}_{}",
-                    module_name.to_lowercase(),
-                    name.to_lowercase()
-                )
+                module_procedure_link_name(module_name, &name.to_lowercase())
             } else {
                 name.clone()
             };

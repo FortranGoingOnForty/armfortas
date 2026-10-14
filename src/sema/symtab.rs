@@ -153,12 +153,43 @@ impl ScopeIndex {
     }
 }
 
+const MODULE_PROCEDURE_LINK_NAMESPACE: &str = "afs_modproc$v2$";
+const MODULE_PROCEDURE_LINK_PREFIX: &str = "afs_modproc$v2$m$";
+const MODULE_PROCEDURE_LINK_SEPARATOR: &str = "$p$";
+
+pub(crate) fn is_reserved_module_procedure_link_name(link_name: &str) -> bool {
+    link_name
+        .get(..MODULE_PROCEDURE_LINK_NAMESPACE.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(MODULE_PROCEDURE_LINK_NAMESPACE))
+}
+
+fn is_canonical_fortran_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+pub(crate) fn module_procedure_link_name_prefix(module_name: &str) -> String {
+    let module_name = module_name.to_ascii_lowercase();
+    format!("{MODULE_PROCEDURE_LINK_PREFIX}{module_name}{MODULE_PROCEDURE_LINK_SEPARATOR}")
+}
+
 pub(crate) fn module_procedure_link_name(module_name: &str, procedure_name: &str) -> String {
     format!(
-        "afs_modproc_{}_{}",
-        module_name.to_ascii_lowercase(),
-        procedure_name
+        "{}{}",
+        module_procedure_link_name_prefix(module_name),
+        procedure_name.to_ascii_lowercase()
     )
+}
+
+pub(crate) fn split_module_procedure_link_name(link_name: &str) -> Option<(&str, &str)> {
+    let encoded = link_name.strip_prefix(MODULE_PROCEDURE_LINK_PREFIX)?;
+    let (module_name, procedure_name) = encoded.split_once(MODULE_PROCEDURE_LINK_SEPARATOR)?;
+    (is_canonical_fortran_identifier(module_name)
+        && is_canonical_fortran_identifier(procedure_name))
+    .then_some((module_name, procedure_name))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2598,7 +2629,7 @@ pub struct SymbolAttrs {
     /// submodule — the body of a separate module procedure declared
     /// in the parent module's interface block. Codegen links these
     /// under the parent module's name, not the submodule's, so call
-    /// sites match `_afs_modproc_<parent>_<proc>`.
+    /// sites match the parent module's encoded procedure identity.
     pub is_separate_module_procedure: bool,
     /// Procedure interface body declared with the MODULE prefix in an
     /// ancestor module. Only these interfaces may be implemented by a
@@ -3662,7 +3693,9 @@ mod tests {
             &[procedure_scope]
         );
         assert_eq!(
-            st.procedure_scopes_for_link_name("AFS_MODPROC_MIXED_MODULE_DO_WORK"),
+            st.procedure_scopes_for_link_name(
+                &module_procedure_link_name("MIXED_MODULE", "DO_WORK").to_ascii_uppercase()
+            ),
             &[procedure_scope]
         );
 
@@ -3684,17 +3717,82 @@ mod tests {
         st.pop_scope();
 
         assert_eq!(
-            st.procedure_scopes_for_link_name("afs_modproc_implementation_step"),
+            st.procedure_scopes_for_link_name(&module_procedure_link_name(
+                "implementation",
+                "step"
+            )),
             &[separate_scope]
         );
         st.set_submodule_ancestor(submodule_scope, "ancestor");
         assert!(st
-            .procedure_scopes_for_link_name("afs_modproc_implementation_step")
+            .procedure_scopes_for_link_name(&module_procedure_link_name("implementation", "step"))
             .is_empty());
         assert_eq!(
-            st.procedure_scopes_for_link_name("AFS_MODPROC_ANCESTOR_STEP"),
+            st.procedure_scopes_for_link_name(
+                &module_procedure_link_name("ancestor", "step").to_ascii_uppercase()
+            ),
             &[separate_scope]
         );
+    }
+
+    #[test]
+    fn module_procedure_link_names_are_injective_and_round_trip() {
+        let left = module_procedure_link_name("a_b", "c");
+        let right = module_procedure_link_name("a", "b_c");
+
+        assert_eq!(left, "afs_modproc$v2$m$a_b$p$c");
+        assert_eq!(right, "afs_modproc$v2$m$a$p$b_c");
+        assert_ne!(left, right);
+        assert_eq!(split_module_procedure_link_name(&left), Some(("a_b", "c")));
+        assert_eq!(split_module_procedure_link_name(&right), Some(("a", "b_c")));
+        assert_eq!(
+            split_module_procedure_link_name(&module_procedure_link_name(
+                "Mixed_Module",
+                "Source_Case"
+            )),
+            Some(("mixed_module", "source_case"))
+        );
+        assert_eq!(split_module_procedure_link_name("afs_modproc_a_b_c"), None);
+        assert_eq!(
+            module_procedure_link_name("Mixed_Module", "Source_Case"),
+            module_procedure_link_name("mixed_module", "source_case")
+        );
+        assert_eq!(
+            split_module_procedure_link_name("afs_modproc$v2$m$a_b$p$c$tail"),
+            None
+        );
+        assert_eq!(
+            split_module_procedure_link_name("afs_modproc$v2$m$m2_name$p$p3_name"),
+            Some(("m2_name", "p3_name"))
+        );
+        assert_eq!(
+            split_module_procedure_link_name("afs_modproc$v2$m$_m2$p$_p3"),
+            Some(("_m2", "_p3"))
+        );
+        for malformed in [
+            "afs_modproc$v2$",
+            "afs_modproc$v2$m$",
+            "afs_modproc$v2$m$$p$proc",
+            "afs_modproc$v2$m$module$p$",
+            "afs_modproc$v2$m$module$p$proc$p$tail",
+            "afs_modproc$v2$m$Module$p$proc",
+            "afs_modproc$v2$m$module$p$Proc",
+            "afs_modproc$v2$m$module-name$p$proc",
+            "afs_modproc$v2$m$module$p$9proc",
+        ] {
+            assert!(
+                is_reserved_module_procedure_link_name(malformed),
+                "reserved namespace was not recognized: {malformed}"
+            );
+            assert_eq!(
+                split_module_procedure_link_name(malformed),
+                None,
+                "malformed identity decoded: {malformed}"
+            );
+        }
+        assert!(is_reserved_module_procedure_link_name(
+            "AFS_MODPROC$V2$M$module$P$proc"
+        ));
     }
 
     // ---- Default access ----

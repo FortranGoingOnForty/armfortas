@@ -1977,7 +1977,7 @@ pub(crate) fn lower_unit(
             //
             // Caveat: only separate-module-procedure bodies (those with
             // a `module` prefix or matching a parent interface) link as
-            // `afs_modproc_<parent>_<name>`; plain contained helpers
+            // the parent module's encoded procedure identity; plain contained helpers
             // (`pure function anycolor(...)` declared only inside the
             // submodule) live in the submodule's own scope, and the call
             // site resolves them through the `Submodule(name)` scope —
