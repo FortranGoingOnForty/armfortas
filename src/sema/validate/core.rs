@@ -10456,22 +10456,31 @@ fn validate_derived_type(
         if !tbp.is_generic && !has_nopass {
             let target = tbp.binding.as_deref().unwrap_or(&tbp.name);
             let interface = tbp.interface.as_deref();
-            let procedure_scope_id = ctx.st.all_scopes().iter().find_map(|scope| {
-                let name_matches = match &scope.kind {
-                    ScopeKind::Function(scope_name) | ScopeKind::Subroutine(scope_name) => {
-                        scope_name.eq_ignore_ascii_case(target)
-                            || interface.is_some_and(|name| scope_name.eq_ignore_ascii_case(name))
-                    }
-                    _ => false,
-                };
-                (name_matches
-                    && (scope.parent == Some(ctx.scope_id)
-                        || scope.parent.is_some_and(|parent| {
-                            ctx.st.scope(parent).parent == Some(ctx.scope_id)
-                                && matches!(ctx.st.scope(parent).kind, ScopeKind::Interface)
-                        })))
-                .then_some(scope.id)
-            });
+            let find_procedure_scope = |name: &str| {
+                ctx.st.all_scopes().iter().find_map(|scope| {
+                    let name_matches = matches!(
+                        &scope.kind,
+                        ScopeKind::Function(scope_name) | ScopeKind::Subroutine(scope_name)
+                            if scope_name.eq_ignore_ascii_case(name)
+                    );
+                    (name_matches
+                        && (scope.parent == Some(ctx.scope_id)
+                            || scope.parent.is_some_and(|parent| {
+                                ctx.st.scope(parent).parent == Some(ctx.scope_id)
+                                    && matches!(ctx.st.scope(parent).kind, ScopeKind::Interface)
+                            })))
+                    .then_some(scope.id)
+                })
+            };
+            // A deferred binding names its contract explicitly. Resolve only
+            // that interface: an override later in the module can legitimately
+            // share the binding name while taking CLASS(derived), not
+            // CLASS(base).
+            let procedure_scope_id = if let Some(interface) = interface {
+                find_procedure_scope(interface)
+            } else {
+                find_procedure_scope(target)
+            };
 
             if let Some(procedure_scope_id) = procedure_scope_id {
                 let procedure_scope = ctx.st.scope(procedure_scope_id);
@@ -19449,6 +19458,36 @@ end module
                 .any(|error| error.contains("passed-object") || error.contains("PASS dummy")),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn deferred_binding_uses_its_named_interface_over_same_named_override() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+  type, abstract :: base_t
+  contains
+    procedure(base_get), deferred :: get
+  end type
+  abstract interface
+    subroutine base_get(self)
+      import base_t
+      class(base_t), intent(inout) :: self
+    end subroutine
+  end interface
+  type, extends(base_t) :: child_t
+  contains
+    procedure :: get
+  end type
+contains
+  subroutine get(self)
+    class(child_t), intent(inout) :: self
+  end subroutine
+end module
+",
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
     #[test]
