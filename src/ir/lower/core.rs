@@ -9030,7 +9030,9 @@ fn install_parameter_inline_const(
         .unwrap_or(IrType::Int(IntWidth::I32));
     let addr = b.alloca(ty.clone());
     let logical_kind = symbol.type_info.as_ref().and_then(|ty| match ty {
-        crate::sema::symtab::TypeInfo::Logical { kind } => Some(kind.unwrap_or(4)),
+        crate::sema::symtab::TypeInfo::Logical { kind } => {
+            Some(kind.unwrap_or_else(crate::driver::defaults::default_int_kind))
+        }
         _ => None,
     });
     locals.insert(
@@ -30133,7 +30135,12 @@ pub(super) fn type_spec_logical_kind(
     st: Option<&SymbolTable>,
 ) -> Option<u8> {
     if let TypeSpec::Logical(sel) = ts {
-        Some(extract_kind_with_context(sel, 4, param_consts, st))
+        Some(extract_kind_with_context(
+            sel,
+            crate::driver::defaults::default_int_kind(),
+            param_consts,
+            st,
+        ))
     } else {
         None
     }
@@ -30193,7 +30200,12 @@ pub(super) fn lower_type_spec_with_param_consts(
             // Without this, `logical(int8) :: a(N) = .true.` allocated
             // 4 N bytes on the stack while the .data path used N bytes,
             // and `all(a)` walked the descriptor at the wrong stride.
-            match extract_kind_with_context(sel, 4, param_consts, st) {
+            match extract_kind_with_context(
+                sel,
+                crate::driver::defaults::default_int_kind(),
+                param_consts,
+                st,
+            ) {
                 1 => IrType::Int(IntWidth::I8),
                 2 => IrType::Int(IntWidth::I16),
                 8 => IrType::Int(IntWidth::I64),
@@ -41120,11 +41132,21 @@ fn parse_intrinsic_class_star_guard(
         return Some(IntrinsicClassStarGuard::Real(kind));
     }
     if let Some(selector) = intrinsic_guard_selector(&compact, "complex") {
-        let kind = intrinsic_guard_kind_value(selector, 4, true, st);
+        let kind = intrinsic_guard_kind_value(
+            selector,
+            crate::driver::defaults::default_real_kind(),
+            true,
+            st,
+        );
         return Some(IntrinsicClassStarGuard::Complex(kind));
     }
     if let Some(selector) = intrinsic_guard_selector(&compact, "logical") {
-        let kind = intrinsic_guard_kind_value(selector, 4, true, st);
+        let kind = intrinsic_guard_kind_value(
+            selector,
+            crate::driver::defaults::default_int_kind(),
+            true,
+            st,
+        );
         return Some(IntrinsicClassStarGuard::Logical(kind));
     }
     if let Some(selector) = intrinsic_guard_selector(&compact, "character") {
@@ -41150,11 +41172,11 @@ pub(super) fn intrinsic_class_star_type_tag_for_type_info(
         TypeInfo::DoublePrecision => Some(class_star_intrinsic_tag(CLASS_STAR_TAG_REAL_BASE, 8)),
         TypeInfo::Complex { kind } => Some(class_star_intrinsic_tag(
             CLASS_STAR_TAG_COMPLEX_BASE,
-            kind.unwrap_or(4),
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
         )),
         TypeInfo::Logical { kind } => Some(class_star_intrinsic_tag(
             CLASS_STAR_TAG_LOGICAL_BASE,
-            kind.unwrap_or(4),
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
         )),
         TypeInfo::Character { kind, .. } => Some(class_star_intrinsic_tag(
             CLASS_STAR_TAG_CHARACTER_BASE,
@@ -45725,9 +45747,13 @@ pub(super) fn lower_transfer_array_expr_descriptor(
     // descriptor-shape handling we don't emit here.
     let mold_ti = operator_expr_type_info(mold_expr, Some(locals), st, type_layouts)?;
     let mold_kind = match &mold_ti {
-        TypeInfo::Integer { kind } => kind.unwrap_or(4),
-        TypeInfo::Real { kind } => kind.unwrap_or(4),
-        TypeInfo::Logical { kind } => kind.unwrap_or(4),
+        TypeInfo::Integer { kind } => {
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind)
+        }
+        TypeInfo::Real { kind } => kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
+        TypeInfo::Logical { kind } => {
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind)
+        }
         _ => return None,
     } as i64;
     if mold_kind <= 0 {
@@ -45795,9 +45821,15 @@ pub(super) fn lower_transfer_array_expr_descriptor(
                 operator_expr_type_info(e, Some(locals), st, type_layouts)
             })?;
             let src_elem_bytes: i64 = match elem_ti {
-                TypeInfo::Integer { kind } => kind.unwrap_or(4) as i64,
-                TypeInfo::Real { kind } => kind.unwrap_or(4) as i64,
-                TypeInfo::Logical { kind } => kind.unwrap_or(4) as i64,
+                TypeInfo::Integer { kind } => {
+                    kind.unwrap_or_else(crate::driver::defaults::default_int_kind) as i64
+                }
+                TypeInfo::Real { kind } => {
+                    kind.unwrap_or_else(crate::driver::defaults::default_real_kind) as i64
+                }
+                TypeInfo::Logical { kind } => {
+                    kind.unwrap_or_else(crate::driver::defaults::default_int_kind) as i64
+                }
                 _ => return None,
             };
             let total_const = n_elems * src_elem_bytes;
@@ -48583,7 +48615,7 @@ pub(super) fn try_lower_complex_part_assignment(
         return false;
     };
 
-    let kind_bytes = kind.unwrap_or(4) as i64;
+    let kind_bytes = kind.unwrap_or_else(crate::driver::defaults::default_real_kind) as i64;
     let lane_ty = if kind_bytes == 8 {
         IrType::Float(FloatWidth::F64)
     } else {
@@ -61009,8 +61041,13 @@ pub(super) fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType
             return IrType::Int(IntWidth::I64);
         }
     }
-    if let TypeInfo::Complex { kind } = ti {
-        let fw = if kind.unwrap_or(4) == 8 {
+    if let TypeInfo::Complex { .. } = ti {
+        let kind = crate::sema::type_layout::concrete_intrinsic_kind(
+            ti,
+            crate::driver::defaults::current(),
+        )
+        .expect("COMPLEX has an intrinsic kind");
+        let fw = if kind == 8 {
             FloatWidth::F64
         } else {
             FloatWidth::F32
@@ -67280,9 +67317,15 @@ pub(super) fn try_lower_transfer_into_array(
     let mold_ti =
         operator_expr_type_info(mold_expr, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts));
     let scalar_size: i64 = match mold_ti {
-        Some(crate::sema::symtab::TypeInfo::Integer { kind }) => kind.unwrap_or(4) as i64,
-        Some(crate::sema::symtab::TypeInfo::Real { kind }) => kind.unwrap_or(4) as i64,
-        Some(crate::sema::symtab::TypeInfo::Logical { kind }) => kind.unwrap_or(4) as i64,
+        Some(crate::sema::symtab::TypeInfo::Integer { kind }) => {
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind) as i64
+        }
+        Some(crate::sema::symtab::TypeInfo::Real { kind }) => {
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind) as i64
+        }
+        Some(crate::sema::symtab::TypeInfo::Logical { kind }) => {
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind) as i64
+        }
         Some(crate::sema::symtab::TypeInfo::Character { len: Some(len), .. }) => len,
         Some(crate::sema::symtab::TypeInfo::Character { .. }) => {
             let Some(len) =
@@ -67383,9 +67426,15 @@ pub(super) fn try_lower_transfer_into_array(
                 operator_expr_type_info(expr, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
             });
             let src_elem_size: i64 = match elem_ti {
-                Some(crate::sema::symtab::TypeInfo::Integer { kind }) => kind.unwrap_or(4) as i64,
-                Some(crate::sema::symtab::TypeInfo::Real { kind }) => kind.unwrap_or(4) as i64,
-                Some(crate::sema::symtab::TypeInfo::Logical { kind }) => kind.unwrap_or(4) as i64,
+                Some(crate::sema::symtab::TypeInfo::Integer { kind }) => {
+                    kind.unwrap_or_else(crate::driver::defaults::default_int_kind) as i64
+                }
+                Some(crate::sema::symtab::TypeInfo::Real { kind }) => {
+                    kind.unwrap_or_else(crate::driver::defaults::default_real_kind) as i64
+                }
+                Some(crate::sema::symtab::TypeInfo::Logical { kind }) => {
+                    kind.unwrap_or_else(crate::driver::defaults::default_int_kind) as i64
+                }
                 _ => return false,
             };
             let total_bytes = n_elems * src_elem_size;
@@ -67758,9 +67807,15 @@ pub(super) fn lower_transfer_intrinsic(
     // Scalar mold: bit-cast SOURCE into one mold-sized value.
     let mold_ti = operator_expr_type_info(mold_expr, Some(locals), st, type_layouts)?;
     let mold_ty = match &mold_ti {
-        crate::sema::symtab::TypeInfo::Integer { kind } => IrType::int_from_kind(kind.unwrap_or(4)),
-        crate::sema::symtab::TypeInfo::Real { kind } => IrType::float_from_kind(kind.unwrap_or(4)),
-        crate::sema::symtab::TypeInfo::Logical { kind } => IrType::int_from_kind(kind.unwrap_or(4)),
+        crate::sema::symtab::TypeInfo::Integer { kind } => {
+            IrType::int_from_kind(kind.unwrap_or_else(crate::driver::defaults::default_int_kind))
+        }
+        crate::sema::symtab::TypeInfo::Real { kind } => {
+            IrType::float_from_kind(kind.unwrap_or_else(crate::driver::defaults::default_real_kind))
+        }
+        crate::sema::symtab::TypeInfo::Logical { kind } => {
+            IrType::int_from_kind(kind.unwrap_or_else(crate::driver::defaults::default_int_kind))
+        }
         _ => return None,
     };
 

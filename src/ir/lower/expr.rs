@@ -3905,7 +3905,8 @@ pub(crate) fn lower_expr_full(
             if lc_component == "re" || lc_component == "im" {
                 let base_ti = operator_expr_type_info(base, Some(locals), st, type_layouts);
                 if let Some(crate::sema::symtab::TypeInfo::Complex { kind }) = base_ti {
-                    let kind_bytes = kind.unwrap_or(4) as i64;
+                    let kind_bytes =
+                        kind.unwrap_or_else(crate::driver::defaults::default_real_kind) as i64;
                     let elem_ty = if kind_bytes == 8 {
                         IrType::Float(FloatWidth::F64)
                     } else {

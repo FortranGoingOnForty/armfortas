@@ -46304,7 +46304,7 @@ fn fdefault_integer_8_changes_default_kind() {
         return;
     }
     let src = write_program(
-        "program p\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  interface assignment(=)\n    procedure :: assign_integer\n  end interface\n  integer :: x\n  type(box_t) :: box\n  x = 5\n  box = x\n  if (box%value /= 5) error stop 1\n  print *, kind(x)\ncontains\n  subroutine assign_integer(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    integer, intent(in) :: rhs\n    lhs%value = rhs\n  end subroutine\nend program\n",
+        "program p\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  type :: state_t\n    logical :: enabled = .false.\n    integer :: guard = 0\n  end type\n  interface assignment(=)\n    procedure :: assign_integer\n  end interface\n  integer :: x\n  logical :: flag\n  type(box_t) :: box\n  type(state_t) :: state\n  x = 5\n  flag = .true.\n  box = x\n  state%enabled = flag\n  state%guard = 37\n  if (box%value /= 5) error stop 1\n  if (kind(flag) /= 8 .or. .not. state%enabled) error stop 2\n  if (state%guard /= 37) error stop 3\n  print *, kind(x)\ncontains\n  subroutine assign_integer(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    integer, intent(in) :: rhs\n    lhs%value = rhs\n  end subroutine\nend program\n",
         "f90",
     );
     let out = unique_path("defint", "bin");

@@ -3280,7 +3280,9 @@ pub fn extract_module_globals(
                         _ => crate::ir::lower::CharKind::None,
                     },
                     logical_kind: match var.type_info.as_ref() {
-                        Some(TypeInfo::Logical { kind }) => Some(kind.unwrap_or(4)),
+                        Some(TypeInfo::Logical { kind }) => {
+                            Some(kind.unwrap_or_else(crate::driver::defaults::default_int_kind))
+                        }
                         _ => None,
                     },
                     const_value: var.const_value,
@@ -3392,6 +3394,12 @@ pub fn extract_descriptor_params(iface: &ModuleInterface) -> HashMap<String, Vec
 
 fn type_info_to_ir_type(info: Option<&TypeInfo>) -> crate::ir::types::IrType {
     use crate::ir::types::{FloatWidth, IntWidth, IrType};
+    let concrete_kind = info.and_then(|type_info| {
+        crate::sema::type_layout::concrete_intrinsic_kind(
+            type_info,
+            crate::driver::defaults::current(),
+        )
+    });
     match info {
         Some(TypeInfo::Derived(name)) => {
             let lower = name.to_lowercase();
@@ -3401,32 +3409,34 @@ fn type_info_to_ir_type(info: Option<&TypeInfo>) -> crate::ir::types::IrType {
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
             }
         }
-        Some(TypeInfo::Integer { kind }) => IrType::Int(match kind {
+        Some(TypeInfo::Integer { .. }) => IrType::Int(match concrete_kind {
             Some(1) => IntWidth::I8,
             Some(2) => IntWidth::I16,
             Some(8) => IntWidth::I64,
             Some(16) => IntWidth::I128,
             _ => IntWidth::I32,
         }),
-        Some(TypeInfo::Real { kind }) => IrType::Float(match kind {
+        Some(TypeInfo::Real { .. }) => IrType::Float(match concrete_kind {
             Some(8) => FloatWidth::F64,
             _ => FloatWidth::F32,
         }),
         Some(TypeInfo::DoublePrecision) => IrType::Float(FloatWidth::F64),
-        Some(TypeInfo::Complex { kind }) => {
-            let fw = match kind {
+        Some(TypeInfo::Complex { .. }) => {
+            let fw = match concrete_kind {
                 Some(8) => FloatWidth::F64,
                 _ => FloatWidth::F32,
             };
             IrType::Array(Box::new(IrType::Float(fw)), 2)
         }
-        Some(TypeInfo::Logical { kind }) => match kind.unwrap_or(4) {
-            1 => IrType::Int(IntWidth::I8),
-            2 => IrType::Int(IntWidth::I16),
-            8 => IrType::Int(IntWidth::I64),
-            16 => IrType::Int(IntWidth::I128),
-            _ => IrType::Bool,
-        },
+        Some(TypeInfo::Logical { .. }) => {
+            match concrete_kind.expect("LOGICAL has an intrinsic kind") {
+                1 => IrType::Int(IntWidth::I8),
+                2 => IrType::Int(IntWidth::I16),
+                8 => IrType::Int(IntWidth::I64),
+                16 => IrType::Int(IntWidth::I128),
+                _ => IrType::Bool,
+            }
+        }
         Some(TypeInfo::Character { .. }) => IrType::Int(IntWidth::I8),
         _ => IrType::Int(IntWidth::I32),
     }

@@ -6,6 +6,7 @@
 //! targets we support).
 
 use super::symtab::{Access, ScopeId, TypeInfo};
+use crate::driver::defaults::DefaultKinds;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
@@ -15,6 +16,50 @@ const TYPE_TAG_VALUE_MASK: u64 = i64::MAX as u64;
 /// fixed closure payload for contained-procedure host references.
 pub const PROC_PTR_CLOSURE_SLOTS: usize = 8;
 pub const PROC_PTR_COMPONENT_SIZE: usize = 8 * (1 + PROC_PTR_CLOSURE_SLOTS);
+
+/// Resolve an intrinsic type's ABI kind in the provider's default-kind
+/// context.  INTEGER/LOGICAL share the integer default, REAL/COMPLEX share
+/// the real default, and default CHARACTER is kind 1.
+pub fn concrete_intrinsic_kind(ti: &TypeInfo, defaults: DefaultKinds) -> Option<u8> {
+    match ti {
+        TypeInfo::Integer { kind } | TypeInfo::Logical { kind } => {
+            Some(kind.unwrap_or(defaults.integer))
+        }
+        TypeInfo::Real { kind } | TypeInfo::Complex { kind } => Some(kind.unwrap_or(defaults.real)),
+        TypeInfo::DoublePrecision => Some(8),
+        TypeInfo::Character { kind, .. } => Some(kind.unwrap_or(1)),
+        TypeInfo::Enumeration(_)
+        | TypeInfo::Derived(_)
+        | TypeInfo::Class(_)
+        | TypeInfo::ClassStar
+        | TypeInfo::TypeStar => None,
+    }
+}
+
+/// Materialize omitted intrinsic kind selectors before a type crosses an ABI
+/// boundary.  Non-intrinsic variants are returned unchanged.
+pub fn concretize_intrinsic_type_info(ti: &TypeInfo, defaults: DefaultKinds) -> TypeInfo {
+    match ti {
+        TypeInfo::Integer { .. } => TypeInfo::Integer {
+            kind: concrete_intrinsic_kind(ti, defaults),
+        },
+        TypeInfo::Real { .. } => TypeInfo::Real {
+            kind: concrete_intrinsic_kind(ti, defaults),
+        },
+        TypeInfo::DoublePrecision => TypeInfo::DoublePrecision,
+        TypeInfo::Complex { .. } => TypeInfo::Complex {
+            kind: concrete_intrinsic_kind(ti, defaults),
+        },
+        TypeInfo::Logical { .. } => TypeInfo::Logical {
+            kind: concrete_intrinsic_kind(ti, defaults),
+        },
+        TypeInfo::Character { len, .. } => TypeInfo::Character {
+            len: *len,
+            kind: concrete_intrinsic_kind(ti, defaults),
+        },
+        _ => ti.clone(),
+    }
+}
 
 /// Sprint 07: borrow when the input is already canonical lowercase,
 /// allocate only when at least one ASCII uppercase byte needs folding.
@@ -754,31 +799,28 @@ impl TypeLayoutRegistry {
 /// variants (e.g. `type_info_to_ir_type`) use this directly instead of
 /// threading a layout they cannot consume.
 pub fn size_of_scalar_kind(ti: &TypeInfo) -> Option<(usize, usize)> {
+    let defaults = crate::driver::defaults::current();
     match ti {
         // Enumeration values are default-integer ordinals.
         TypeInfo::Enumeration(_) => Some((4, 4)),
-        TypeInfo::Integer { kind } => {
+        TypeInfo::Integer { .. } => {
             // No explicit kind selector → honour the driver's
             // -fdefault-integer-8 (sprint 32 #504).  Standard
             // processor default is 4.
-            let k = kind
-                .map(|k| k as usize)
-                .unwrap_or_else(|| crate::driver::defaults::default_int_kind() as usize);
+            let k = concrete_intrinsic_kind(ti, defaults).unwrap() as usize;
             Some((k, k))
         }
-        TypeInfo::Real { kind } => {
-            let k = kind
-                .map(|k| k as usize)
-                .unwrap_or_else(|| crate::driver::defaults::default_real_kind() as usize);
+        TypeInfo::Real { .. } => {
+            let k = concrete_intrinsic_kind(ti, defaults).unwrap() as usize;
             Some((k, k))
         }
         TypeInfo::DoublePrecision => Some((8, 8)),
-        TypeInfo::Complex { kind } => {
-            let k = kind.unwrap_or(4) as usize;
+        TypeInfo::Complex { .. } => {
+            let k = concrete_intrinsic_kind(ti, defaults).unwrap() as usize;
             Some((k * 2, k)) // complex(4) = 8 bytes, aligned to 4
         }
-        TypeInfo::Logical { kind } => {
-            let k = kind.unwrap_or(4) as usize;
+        TypeInfo::Logical { .. } => {
+            let k = concrete_intrinsic_kind(ti, defaults).unwrap() as usize;
             Some((k, k))
         }
         TypeInfo::Character { len, kind: _ } => {
@@ -1837,6 +1879,64 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_defaults_concretize_each_intrinsic_family() {
+        let cases = [
+            (DefaultKinds::new(4, 4), 4, 4, 4, 4),
+            (DefaultKinds::new(8, 4), 8, 4, 4, 8),
+            (DefaultKinds::new(4, 8), 4, 8, 8, 4),
+            (DefaultKinds::new(8, 8), 8, 8, 8, 8),
+        ];
+        for (defaults, integer, real, complex, logical) in cases {
+            assert_eq!(
+                concrete_intrinsic_kind(&TypeInfo::Integer { kind: None }, defaults),
+                Some(integer)
+            );
+            assert_eq!(
+                concrete_intrinsic_kind(&TypeInfo::Real { kind: None }, defaults),
+                Some(real)
+            );
+            assert_eq!(
+                concrete_intrinsic_kind(&TypeInfo::Complex { kind: None }, defaults),
+                Some(complex)
+            );
+            assert_eq!(
+                concrete_intrinsic_kind(&TypeInfo::Logical { kind: None }, defaults),
+                Some(logical)
+            );
+            assert_eq!(
+                concrete_intrinsic_kind(
+                    &TypeInfo::Character {
+                        len: None,
+                        kind: None,
+                    },
+                    defaults,
+                ),
+                Some(1)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_intrinsic_kinds_ignore_provider_defaults() {
+        let defaults = DefaultKinds::new(8, 8);
+        for type_info in [
+            TypeInfo::Integer { kind: Some(2) },
+            TypeInfo::Real { kind: Some(4) },
+            TypeInfo::Complex { kind: Some(4) },
+            TypeInfo::Logical { kind: Some(1) },
+            TypeInfo::Character {
+                len: Some(3),
+                kind: Some(1),
+            },
+        ] {
+            assert_eq!(
+                concretize_intrinsic_type_info(&type_info, defaults),
+                type_info
+            );
+        }
+    }
 
     #[test]
     fn size_of_basic_types() {
