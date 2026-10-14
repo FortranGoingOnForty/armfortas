@@ -4,6 +4,7 @@
 //! with `-c`, links the .o files with the runtime, runs the binary,
 //! and checks the output.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -221,6 +222,217 @@ fn integer16_parameters_round_trip_across_amod() {
     }
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn default_kind_interfaces_are_concrete_across_split_builds() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=default_kind_interfaces_are_concrete_across_split_builds count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    const PROVIDER: &str = "module default_kind_provider\n  implicit none\n  type :: payload_t\n    integer :: i\n    real :: r\n    complex :: z\n    logical :: l\n  end type\n  integer :: global_i = 17\n  real :: global_r = 3.25\n  complex :: global_z = (1.5, -2.5)\n  logical :: global_l = .true.\n  integer, parameter :: param_i = 23\n  real, parameter :: param_r = 6.5\ncontains\n  integer function echo_i(value) result(answer)\n    integer, intent(in) :: value\n    answer = value\n  end function\n  real function echo_r(value) result(answer)\n    real, intent(in) :: value\n    answer = value\n  end function\n  complex function echo_z(value) result(answer)\n    complex, intent(in) :: value\n    answer = value\n  end function\n  logical function echo_l(value) result(answer)\n    logical, intent(in) :: value\n    answer = value\n  end function\nend module\n";
+
+    let compiler = find_compiler();
+    let root = unique_dir();
+    let rows = [
+        ("d8_o0_to_d4_o3", true, "-O0", false, "-O3", 8u8),
+        ("d8_o3_to_d4_o0", true, "-O3", false, "-O0", 8u8),
+        ("d4_o0_to_d8_o3", false, "-O0", true, "-O3", 4u8),
+        ("d4_o3_to_d8_o0", false, "-O3", true, "-O0", 4u8),
+    ];
+    let mut profile_artifacts: HashMap<u8, String> = HashMap::new();
+
+    for (label, provider_d8, provider_opt, consumer_d8, consumer_opt, expected_kind) in rows {
+        let dir = root.join(label);
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider = dir.join("default_kind_provider.f90");
+        let consumer = dir.join("default_kind_consumer.f90");
+        let provider_object = dir.join("provider.o");
+        let consumer_object = dir.join("consumer.o");
+        let binary = dir.join("probe");
+        std::fs::write(&provider, PROVIDER).unwrap();
+
+        let suffix = expected_kind;
+        std::fs::write(
+            &consumer,
+            format!(
+                "program p\n  use default_kind_provider\n  implicit none\n  type(payload_t) :: value\n  if (kind(global_i) /= {suffix}) error stop 1\n  if (kind(global_r) /= {suffix}) error stop 2\n  if (kind(global_z) /= {suffix}) error stop 3\n  if (kind(global_l) /= {suffix}) error stop 4\n  if (kind(param_i) /= {suffix} .or. param_i /= 23_{suffix}) error stop 5\n  if (kind(param_r) /= {suffix} .or. param_r /= 6.5_{suffix}) error stop 6\n  if (global_i /= 17_{suffix} .or. global_r /= 3.25_{suffix}) error stop 7\n  if (global_z /= cmplx(1.5_{suffix}, -2.5_{suffix}, kind={suffix})) error stop 8\n  if (.not. global_l) error stop 9\n  if (echo_i(31_{suffix}) /= 31_{suffix}) error stop 10\n  if (echo_r(7.25_{suffix}) /= 7.25_{suffix}) error stop 11\n  if (echo_z(cmplx(2.0_{suffix}, -4.0_{suffix}, kind={suffix})) /= cmplx(2.0_{suffix}, -4.0_{suffix}, kind={suffix})) error stop 12\n  if (.not. echo_l(.true._{suffix})) error stop 13\n  value%i = 41_{suffix}\n  value%r = 9.5_{suffix}\n  value%z = cmplx(3.0_{suffix}, -6.0_{suffix}, kind={suffix})\n  value%l = .true._{suffix}\n  if (kind(value%i) /= {suffix} .or. kind(value%r) /= {suffix}) error stop 14\n  if (kind(value%z) /= {suffix} .or. kind(value%l) /= {suffix}) error stop 15\n  if (value%i /= 41_{suffix} .or. value%r /= 9.5_{suffix}) error stop 16\n  if (value%z /= cmplx(3.0_{suffix}, -6.0_{suffix}, kind={suffix})) error stop 17\n  if (.not. value%l) error stop 18\n  print *, 'default-kind-ok', {suffix}\nend program\n"
+            ),
+        )
+        .unwrap();
+
+        let mut provider_flags = vec![provider_opt];
+        if provider_d8 {
+            provider_flags.extend(["-fdefault-integer-8", "-fdefault-real-8"]);
+        }
+        let mut consumer_flags = vec![consumer_opt];
+        if consumer_d8 {
+            consumer_flags.extend(["-fdefault-integer-8", "-fdefault-real-8"]);
+        }
+        compile_file_flags(
+            &compiler,
+            &provider,
+            &provider_object,
+            None,
+            &provider_flags,
+        );
+        compile_file_flags(
+            &compiler,
+            &consumer,
+            &consumer_object,
+            Some(&dir),
+            &consumer_flags,
+        );
+        link_files(&[&provider_object, &consumer_object], &binary);
+        let output = run_binary(&binary);
+        assert!(output.contains("default-kind-ok"), "{label}: {output}");
+
+        let amod = std::fs::read_to_string(dir.join("default_kind_provider.amod")).unwrap();
+        for record in [
+            format!("@var global_i : integer({suffix})"),
+            format!("@var global_r : real({suffix})"),
+            format!("@var global_z : complex({suffix})"),
+            format!("@var global_l : logical({suffix})"),
+            format!("@param param_i : integer({suffix})"),
+            format!("@param param_r : real({suffix})"),
+            format!("@function echo_i -> integer({suffix})"),
+            format!("@function echo_r -> real({suffix})"),
+            format!("@function echo_z -> complex({suffix})"),
+            format!("@function echo_l -> logical({suffix})"),
+            format!("@field i : integer({suffix})"),
+            format!("@field r : real({suffix})"),
+            format!("@field z : complex({suffix})"),
+            format!("@field l : logical({suffix})"),
+        ] {
+            assert!(
+                amod.contains(&record),
+                "{label}: missing {record:?}\n{amod}"
+            );
+        }
+        let body = amod
+            .split_once("\n\n")
+            .expect(".amod header terminator")
+            .1
+            .to_string();
+        if let Some(previous) = profile_artifacts.insert(expected_kind, body.clone()) {
+            assert_eq!(
+                body, previous,
+                "{label}: provider artifact changed with -O level"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn named_pass_position_round_trips_across_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=named_pass_position_round_trips_across_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let root = unique_dir();
+    for level in ["-O0", "-O3"] {
+        let dir = root.join(level.trim_start_matches('-'));
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider = dir.join("named_pass_provider.f90");
+        let consumer = dir.join("named_pass_consumer.f90");
+        let provider_object = dir.join("provider.o");
+        let consumer_object = dir.join("consumer.o");
+        let binary = dir.join("probe");
+        std::fs::write(
+            &provider,
+            "module named_pass_provider\n  implicit none\n  type :: counter_t\n    integer :: value = 0\n  contains\n    procedure, pass(self) :: add => counter_add\n  end type\ncontains\n  subroutine counter_add(delta, self, scale)\n    integer, intent(in) :: delta\n    class(counter_t), intent(inout) :: self\n    integer, intent(in), optional :: scale\n    if (present(scale)) then\n      self%value = self%value + delta * scale\n    else\n      self%value = self%value + delta\n    end if\n  end subroutine\nend module\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &consumer,
+            "program p\n  use named_pass_provider\n  implicit none\n  type(counter_t) :: counter\n  call counter%add(3)\n  call counter%add(scale=4, delta=2)\n  if (counter%value /= 11) error stop 71\n  print *, 'named-pass-ok', counter%value\nend program\n",
+        )
+        .unwrap();
+        compile_file_flags(&compiler, &provider, &provider_object, None, &[level]);
+        compile_file_flags(&compiler, &consumer, &consumer_object, Some(&dir), &[level]);
+        link_files(&[&provider_object, &consumer_object], &binary);
+        let output = run_binary(&binary);
+        assert!(output.contains("named-pass-ok"), "{level}: {output}");
+        let amod = std::fs::read_to_string(dir.join("named_pass_provider.amod")).unwrap();
+        assert!(
+            amod.lines().any(|line| {
+                line.contains("@binds add")
+                    && line.contains("@pass-name self")
+                    && line.contains("@pass-index 1")
+            }),
+            "{level}: {amod}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn protected_origin_round_trips_across_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=protected_origin_round_trips_across_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let provider = dir.join("protected_provider.f90");
+    let consumer = dir.join("protected_consumer.f90");
+    let provider_object = dir.join("provider.o");
+    let consumer_object = dir.join("consumer.o");
+    std::fs::write(
+        &provider,
+        "module protected_provider\n  implicit none\n  integer, protected :: guarded = 1\ncontains\n  subroutine owner_update(value)\n    integer, intent(in) :: value\n    guarded = value\n  end subroutine\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &consumer,
+        "program p\n  use protected_provider, only : local_guard => guarded\n  implicit none\n  local_guard = 2\nend program\n",
+    )
+    .unwrap();
+    compile_file(&compiler, &provider, &provider_object, None);
+    let amod = std::fs::read_to_string(dir.join("protected_provider.amod")).unwrap();
+    assert!(
+        amod.lines().any(|line| {
+            line.starts_with("@var guarded : integer(4)") && line.contains("protected")
+        }),
+        "{amod}"
+    );
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            consumer.to_str().unwrap(),
+            "-o",
+            consumer_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("consumer compiler launch failed");
+    assert!(
+        !result.status.success(),
+        "protected consumer unexpectedly compiled"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("cannot define PROTECTED use-associated entity 'local_guard'"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1091,7 +1303,7 @@ end program consumer
             .find(|line| line.starts_with("@param copied :"))
             .expect("victim_m.amod omitted copied");
         assert!(
-            copied.contains("character(len=1)"),
+            copied.contains("character(len=1,kind=1)"),
             "{order} serialized a non-lexical character length:\n{copied}"
         );
 
@@ -2649,7 +2861,7 @@ end program p
         .expect("missing provider module artifact");
     assert!(
         amod.contains(
-            "@function array_factory -> integer, result_rank=2, result_name=values, result_array_bounds=\"(2; n)\""
+            "@function array_factory -> integer(4), result_rank=2, result_name=values, result_array_bounds=\"(2; n)\""
         ),
         "abstract interface array-result metadata missing from .amod:\n{}",
         amod
@@ -2739,7 +2951,7 @@ end program
     compile_file(&compiler, &parent_f90, &parent_o, None);
     let amod = std::fs::read_to_string(dir.join("alloc_parent.amod")).unwrap();
     assert!(
-        amod.contains("@function make_square -> real, result_allocatable, result_rank=2"),
+        amod.contains("@function make_square -> real(4), result_allocatable, result_rank=2"),
         "allocatable module-function result ABI missing from parent .amod:\n{}",
         amod
     );

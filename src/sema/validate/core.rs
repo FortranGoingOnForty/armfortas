@@ -8668,6 +8668,21 @@ fn reject_nondefinable_target(
     defines_association: bool,
     role: &str,
 ) {
+    let Some(base_name) = extract_base_name(target) else {
+        return;
+    };
+    if ctx.is_associate_name(&base_name) || ctx.block_binding_attrs(&base_name).is_some() {
+        return;
+    }
+    let is_protected_use = ctx.lookup_lexical(&base_name).is_some_and(|symbol| {
+        symbol.attrs.protected
+            && ctx
+                .st
+                .name_is_use_associated_in(ctx.lexical_scope_id(), &base_name)
+    });
+    if !is_protected_use {
+        return;
+    }
     if matches!(
         actual_is_definable(ctx, target, defines_association),
         Some(false)

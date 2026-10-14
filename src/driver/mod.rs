@@ -2812,7 +2812,7 @@ fn write_module_artifacts(
                     context.ir_module,
                     &descriptor_params,
                     &char_len_star_params,
-                );
+                )?;
                 let amod_path = output_dir.join(format!("{}.amod", mod_key));
                 write_module_file_atomic(&amod_path, &amod_text)?;
                 // `.amod` remains the ARMFORTAS module ABI file. A
@@ -2863,7 +2863,7 @@ fn write_module_artifacts(
                 context.ir_module,
                 &descriptor_params,
                 &char_len_star_params,
-            );
+            )?;
             let interface_fingerprint = crate::sema::amod::artifact_fingerprint(&interface_text);
             let interface_path = output_dir.join(&interface_name);
             write_module_file_atomic(&interface_path, &interface_text)?;

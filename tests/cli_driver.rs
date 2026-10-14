@@ -3964,7 +3964,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 16\n", "#!amod 15\n", 1);
+        .replacen("#!amod 17\n", "#!amod 16\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -3991,7 +3991,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 15 (compiler requires 16)")
+        stderr.contains("incompatible .amod version 16 (compiler requires 17)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -4941,7 +4941,7 @@ fn imported_character_star_parameter_array_preserves_shape_and_length() {
     let amod = std::fs::read_to_string(dir.join("provider.amod"))
         .expect("provider .amod should be emitted");
     assert!(
-        amod.contains("@param table : character(len=4)")
+        amod.contains("@param table : character(len=4,kind=1)")
             && amod.contains("@rank 2")
             && amod.contains("@dims 1:2 1:3"),
         "provider .amod should preserve table length and shape: {}",
@@ -11454,7 +11454,7 @@ end program p
     let amod = fs::read_to_string(dir.join("callback_impl.amod"))
         .expect("callback implementation did not publish its .amod");
     assert!(
-        amod.contains("@param kp : integer = 8") && amod.contains("@arg x : real(8)"),
+        amod.contains("@param kp : integer(4) = 8") && amod.contains("@arg x : real(8)"),
         "literal KIND inquiries did not preserve the named kind suffix:\n{amod}"
     );
     let run = Command::new(&executable)
@@ -31193,8 +31193,8 @@ fn imported_named_char_component_lengths_round_trip_through_amod_and_run() {
     let amod = dir.join("m.amod");
     let amod_text = std::fs::read_to_string(&amod).expect("missing m.amod");
     assert!(
-        amod_text.contains("@field assignments : character(len=16)")
-            && amod_text.contains("@field heredoc_delimiter : character(len=16)"),
+        amod_text.contains("@field assignments : character(len=16,kind=1)")
+            && amod_text.contains("@field heredoc_delimiter : character(len=16,kind=1)"),
         "fixed imported character component lengths should survive into .amod: {}",
         amod_text
     );
@@ -48995,7 +48995,7 @@ fn imported_char_parameter_component_default_round_trips_through_amod() {
     let constants_amod =
         std::fs::read_to_string(dir.join("path_constants.amod")).expect("read path_constants.amod");
     assert!(
-        constants_amod.contains("@param dot : character(len=1) @ir")
+        constants_amod.contains("@param dot : character(len=1,kind=1) @ir")
             && constants_amod.contains("@charhex 2e"),
         "character parameter value should be exported through .amod:\n{}",
         constants_amod
@@ -49003,7 +49003,7 @@ fn imported_char_parameter_component_default_round_trips_through_amod() {
     let type_amod =
         std::fs::read_to_string(dir.join("path_state.amod")).expect("read path_state.amod");
     assert!(
-        type_amod.contains("@field sep : character(len=1)")
+        type_amod.contains("@field sep : character(len=1,kind=1)")
             && type_amod.contains("@init=charhex:2e"),
         "imported character parameter default should fold into type layout:\n{}",
         type_amod
@@ -49082,17 +49082,17 @@ fn char_parameter_substrings_keep_fixed_len_through_amod_import() {
 
     let amod = std::fs::read_to_string(dir.join("ascii_like.amod")).expect("read ascii_like.amod");
     assert!(
-        amod.contains("@param uppercase : character(len=3)"),
+        amod.contains("@param uppercase : character(len=3,kind=1)"),
         "uppercase parameter length should be fixed in .amod:\n{}",
         amod
     );
     assert!(
-        amod.contains("@param lowercase : character(len=3)"),
+        amod.contains("@param lowercase : character(len=3,kind=1)"),
         "lowercase parameter length should be fixed in .amod:\n{}",
         amod
     );
     assert!(
-        amod.contains("@param octal_digits : character(len=8)"),
+        amod.contains("@param octal_digits : character(len=8,kind=1)"),
         "octal_digits parameter length should be fixed in .amod:\n{}",
         amod
     );
@@ -49543,7 +49543,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 16\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 17\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))
@@ -67977,7 +67977,7 @@ fn amod_result_bounds_follow_selected_result_deterministically() {
     let dir = unique_dir("amod_result_bounds_determinism");
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("test_programs/defined_unary_array_result_assignment.f90");
-    let expected_record = "@function flip_matrix -> real, result_rank=2, result_name=out, result_array_bounds=\"(size(a, 2); size(a, 1))\"";
+    let expected_record = "@function flip_matrix -> real(4), result_rank=2, result_name=out, result_array_bounds=\"(size(a, 2); size(a, 1))\"";
     let mut first_amod = None;
 
     for iteration in 0..16 {
@@ -68522,9 +68522,9 @@ fn storage_size_parameter_values_round_trip_through_amod() {
     let amod = std::fs::read_to_string(dir.join("storage_size_provider.amod"))
         .expect("missing storage_size_provider.amod");
     assert!(
-        amod.contains("@param int_bits : integer = 32")
-            && amod.contains("@param logical_bits : integer = 32")
-            && amod.contains("@param real_bits : integer = 64"),
+        amod.contains("@param int_bits : integer(4) = 32")
+            && amod.contains("@param logical_bits : integer(4) = 32")
+            && amod.contains("@param real_bits : integer(4) = 64"),
         "storage_size parameter values must be concrete across translation units: {amod}"
     );
 
