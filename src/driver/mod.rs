@@ -42,6 +42,43 @@ impl Drop for RemoveFileOnDrop {
     }
 }
 
+/// A uniquely created temporary directory owned by this driver invocation.
+/// The create-only loop prevents us from claiming or deleting a stale path.
+struct RemoveDirOnDrop(PathBuf);
+
+impl RemoveDirOnDrop {
+    fn create(prefix: &str) -> Result<Self, String> {
+        for _ in 0..32 {
+            let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("{prefix}_{}_{}", std::process::id(), id));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "cannot create temporary directory '{}': {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "cannot create a unique {prefix} temporary directory under '{}'",
+            std::env::temp_dir().display()
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Transaction guard for an object or executable written directly by a
 /// subprocess. The old destination remains published until a verified,
 /// non-empty regular replacement is ready.
@@ -3886,9 +3923,7 @@ fn compile_multi_with_bundled_runtime(
     let tmp_dir = if terminal_mode.is_some() {
         None
     } else {
-        let dir = std::env::temp_dir().join(format!("afs_multi_{}", std::process::id()));
-        fs::create_dir_all(&dir).map_err(|e| format!("cannot create temp dir: {}", e))?;
-        Some(dir)
+        Some(RemoveDirOnDrop::create("afs_multi")?)
     };
 
     // Compilation may run in dependency order, but linker operands must remain
@@ -3903,7 +3938,7 @@ fn compile_multi_with_bundled_runtime(
             Some(outputs) => outputs[idx].clone(),
             None => {
                 let tmp_dir = tmp_dir.as_ref().expect("temp dir for multi-file link");
-                Some(tmp_dir.join(format!("source_{}.o", idx)))
+                Some(tmp_dir.path().join(format!("source_{}.o", idx)))
             }
         };
 
@@ -3921,7 +3956,7 @@ fn compile_multi_with_bundled_runtime(
         sub_opts.module_search_paths = {
             let mut paths = opts.module_search_paths.clone();
             if let Some(tmp_dir) = tmp_dir.as_ref() {
-                paths.push(tmp_dir.clone()); // find .amod from earlier compilations
+                paths.push(tmp_dir.path().to_path_buf()); // find .amod from earlier compilations
             }
             paths
         };
@@ -3987,11 +4022,6 @@ fn compile_multi_with_bundled_runtime(
         &source_inputs,
         &included_files,
     )?;
-
-    // Cleanup.
-    if let Some(tmp_dir) = tmp_dir {
-        let _ = fs::remove_dir_all(&tmp_dir);
-    }
 
     Ok(())
 }
