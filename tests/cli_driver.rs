@@ -45885,6 +45885,47 @@ fn garbage_text_is_rejected_as_parse_error() {
 }
 
 #[test]
+fn invalid_call_designators_fail_without_publishing_output() {
+    for (name, statement) in [
+        ("binary", "call 1 + 2"),
+        ("parenthesized", "call (sub)"),
+        ("call_result", "call sub() + 1"),
+    ] {
+        let source = write_program(&format!("program p\n  {statement}\nend program p\n"), "f90");
+        let output = unique_path(&format!("invalid_call_{name}"), "o");
+        let result = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                source.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("invalid CALL compile failed to start");
+        assert!(
+            !result.status.success(),
+            "invalid CALL unexpectedly compiled: {statement}"
+        );
+        assert_eq!(
+            result.status.code(),
+            Some(1),
+            "invalid CALL must be a compile-time parse error: {statement}"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("CALL requires a procedure designator"),
+            "missing invalid CALL diagnostic for {statement}: {stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "invalid CALL published an object: {statement}"
+        );
+        let _ = std::fs::remove_file(source);
+    }
+}
+
+#[test]
 fn utf8_lexer_error_reports_character_and_caret() {
     let src = write_program("program p\n  café = 1\nend program\n", "f90");
     let out = unique_path("utf8", "bin");

@@ -5845,6 +5845,9 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
     });
 
     match &stmt.node {
+        Stmt::Call { callee, .. } if !callee.node.is_procedure_designator_shape() => {
+            ctx.error(callee.span, "CALL requires a procedure designator");
+        }
         // ---- Assignment ----
         Stmt::Assignment { target, value } => {
             validate_assignment_target(ctx, target, stmt.span);
@@ -12571,6 +12574,40 @@ end program local_types
             "{errors:?}"
         );
         assert_eq!(errors.len(), 3, "{errors:?}");
+    }
+
+    #[test]
+    fn semantic_validation_rejects_an_invalid_call_ast_shape() {
+        use crate::ast::Spanned;
+        use crate::lexer::Position;
+
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 2 },
+        };
+        let stmt = Spanned::new(
+            Stmt::Call {
+                callee: Spanned::new(
+                    Expr::IntegerLiteral {
+                        text: "1".into(),
+                        kind: None,
+                    },
+                    span,
+                ),
+                args: Vec::new(),
+            },
+            span,
+        );
+        let st = SymbolTable::new();
+        let mut ctx = Ctx::new(&st, None, false, false);
+
+        validate_stmt(&mut ctx, &stmt);
+
+        assert!(ctx
+            .diags
+            .iter()
+            .any(|diag| diag.msg == "CALL requires a procedure designator"));
     }
 
     #[test]

@@ -917,28 +917,23 @@ impl<'a> Parser<'a> {
         let span = span_from_to(start, self.prev_span());
         // The expression parser handles the (args) part as FunctionCall.
         // Extract the args from the FunctionCall if present.
-        if let Expr::FunctionCall {
+        let (callee, args) = if let Expr::FunctionCall {
             callee: inner,
             args,
         } = callee.node
         {
-            Ok(Spanned::new(
-                Stmt::Call {
-                    callee: *inner,
-                    args,
-                },
-                span,
-            ))
+            (*inner, args)
         } else {
             // Call with no arguments: call sub
-            Ok(Spanned::new(
-                Stmt::Call {
-                    callee,
-                    args: Vec::new(),
-                },
-                span,
-            ))
+            (callee, Vec::new())
+        };
+        if !callee.node.is_procedure_designator_shape() {
+            return Err(ParseError {
+                span: callee.span,
+                msg: "CALL requires a procedure designator".into(),
+            });
         }
+        Ok(Spanned::new(Stmt::Call { callee, args }, span))
     }
 
     fn parse_print(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
@@ -2554,6 +2549,39 @@ mod tests {
     fn call_stmt() {
         let s = parse_one("call sub(a, b)\n");
         assert!(matches!(s.node, Stmt::Call { .. }));
+    }
+
+    #[test]
+    fn call_accepts_name_and_component_procedure_designators() {
+        for source in [
+            "call sub\n",
+            "call sub(a, b)\n",
+            "call object%method()\n",
+            "call objects(i)%method(a)\n",
+        ] {
+            assert!(
+                matches!(parse_one(source).node, Stmt::Call { .. }),
+                "valid CALL was rejected: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_rejects_non_procedure_designator_expressions() {
+        for source in [
+            "call 1 + 2\n",
+            "call (sub)\n",
+            "call sub() + 1\n",
+            "call (object)%method()\n",
+        ] {
+            let error = parse_error(source);
+            assert!(
+                error
+                    .to_string()
+                    .contains("CALL requires a procedure designator"),
+                "unexpected diagnostic for {source}: {error}"
+            );
+        }
     }
 
     #[test]

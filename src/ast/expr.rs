@@ -194,6 +194,33 @@ pub enum Expr {
     },
 }
 
+impl Expr {
+    /// Whether this expression has the syntactic shape of a Fortran
+    /// procedure-designator after a CALL argument list has been detached.
+    ///
+    /// A component base may contain call-form nodes because the parser cannot
+    /// yet distinguish an array element such as `objects(i)` from a function
+    /// reference.  Semantic resolution owns that ambiguity.  Arbitrary
+    /// expressions, including parenthesized expressions, are never valid
+    /// procedure designators.
+    pub(crate) fn is_procedure_designator_shape(&self) -> bool {
+        match self {
+            Expr::Name { .. } => true,
+            Expr::ComponentAccess { base, .. } => base.node.is_data_ref_shape(),
+            _ => false,
+        }
+    }
+
+    fn is_data_ref_shape(&self) -> bool {
+        match self {
+            Expr::Name { .. } => true,
+            Expr::ComponentAccess { base, .. } => base.node.is_data_ref_shape(),
+            Expr::FunctionCall { callee, .. } => callee.node.is_data_ref_shape(),
+            _ => false,
+        }
+    }
+}
+
 /// An expression with source location.
 pub type SpannedExpr = super::Spanned<Expr>;
 
