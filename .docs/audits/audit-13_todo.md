@@ -61,18 +61,18 @@ Status: `[x]`
 
 ## Tranche 4: Central OpenMP nesting model
 
-Status: `[ ]`
+Status: `[x]`
 
-- `[ ]` A13-06: reject `BARRIER` closely nested in `SINGLE` and `ORDERED`.
-- `[ ]` A13-07: reject named, case-variant, unnamed, and non-closely nested
+- `[x]` A13-06: reject `BARRIER` closely nested in `SINGLE` and `ORDERED`.
+- `[x]` A13-07: reject named, case-variant, unnamed, and non-closely nested
   same-name `CRITICAL` regions.
-- `[ ]` A13-14: reject worksharing `DO`/`LOOP` within `SINGLE` and other
+- `[x]` A13-14: reject worksharing `DO`/`LOOP` within `SINGLE` and other
   prohibited worksharing nests.
-- `[ ]` Replace independent string deny-lists with structured region frames
+- `[x]` Replace independent string deny-lists with structured region frames
   and a shared OpenMP nesting-relation model.
-- `[ ]` Low L06: align `_OPENMP`/`openmp_version` claims with the documented
+- `[x]` Low L06: align `_OPENMP`/`openmp_version` claims with the documented
   supported subset, or explicitly define and test the preview policy.
-- `[ ]` Add compile-fail tests so prohibited forms never need runtime timeout
+- `[x]` Add compile-fail tests so prohibited forms never need runtime timeout
   tests in the ordinary suite.
 
 ## Tranche 5: OpenMP initial team and collapsed-loop scaling
