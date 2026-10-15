@@ -24,7 +24,7 @@ use crate::sema::type_layout::{
     concretize_intrinsic_type_info, BoundProc, TypeLayout, TypeLayoutRegistry,
 };
 
-const AMOD_VERSION: u32 = 18;
+const AMOD_VERSION: u32 = 19;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
 const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
 const AMOD_FINAL_ELEMENTAL_VERSION: u32 = 12;
@@ -857,6 +857,12 @@ fn emit_variable(
     }
     if sym.attrs.target {
         attrs.push("target");
+    }
+    if sym.attrs.asynchronous {
+        attrs.push("asynchronous");
+    }
+    if sym.attrs.contiguous {
+        attrs.push("contiguous");
     }
     if sym.attrs.volatile {
         attrs.push("volatile");
@@ -1735,6 +1741,8 @@ pub struct AmodVar {
     pub pointer: bool,
     pub proc_pointer: bool,
     pub target: bool,
+    pub asynchronous: bool,
+    pub contiguous: bool,
     pub volatile: bool,
     pub protected: bool,
     pub openmp_threadprivate: bool,
@@ -2647,20 +2655,19 @@ fn parse_var(line: &str, is_param: bool, version: u32, path: &Path) -> Result<Am
     }
     let mut attrs = HashSet::new();
     for attr in attr_str.split(", ").filter(|attr| !attr.is_empty()) {
-        if version >= 17
-            && !matches!(
-                attr,
-                "allocatable"
-                    | "save"
-                    | "pointer"
-                    | "procptr"
-                    | "target"
-                    | "volatile"
-                    | "protected"
-                    | "threadprivate"
-                    | "private"
-            )
-        {
+        let known_attribute = matches!(
+            attr,
+            "allocatable"
+                | "save"
+                | "pointer"
+                | "procptr"
+                | "target"
+                | "volatile"
+                | "protected"
+                | "threadprivate"
+                | "private"
+        ) || (version >= 19 && matches!(attr, "asynchronous" | "contiguous"));
+        if version >= 17 && !known_attribute {
             return Err(format!(
                 "{}: corrupt .amod file (unknown variable attribute '{}' for '{}'); rebuild the provider module",
                 path.display(),
@@ -2683,6 +2690,8 @@ fn parse_var(line: &str, is_param: bool, version: u32, path: &Path) -> Result<Am
     let pointer = attrs.contains("pointer");
     let proc_pointer = attrs.contains("procptr");
     let target = attrs.contains("target");
+    let asynchronous = attrs.contains("asynchronous");
+    let contiguous = attrs.contains("contiguous");
     let volatile = attrs.contains("volatile");
     let protected = attrs.contains("protected");
     let openmp_threadprivate = attrs.contains("threadprivate");
@@ -2801,6 +2810,8 @@ fn parse_var(line: &str, is_param: bool, version: u32, path: &Path) -> Result<Am
         pointer,
         proc_pointer,
         target,
+        asynchronous,
+        contiguous,
         volatile,
         protected,
         openmp_threadprivate,
@@ -4342,6 +4353,28 @@ mod tests {
     }
 
     #[test]
+    fn module_variable_memory_attributes_require_current_schema() {
+        let var = parse_var(
+            "@var values : integer(4), target, asynchronous, contiguous",
+            false,
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap();
+        assert!(var.asynchronous);
+        assert!(var.contiguous);
+
+        let error = parse_var(
+            "@var values : integer(4), asynchronous",
+            false,
+            AMOD_VERSION - 1,
+            Path::new("stale.amod"),
+        )
+        .expect_err("older schema accepted a new variable attribute");
+        assert!(error.contains("unknown variable attribute"), "{error}");
+    }
+
+    #[test]
     fn parse_var_preserves_full_width_integer_parameter() {
         let var = parse_var(
             "@var big : integer(16) = 170141183460469231731687303715884105727",
@@ -4755,7 +4788,7 @@ mod tests {
 
     #[test]
     fn current_default_access_header_is_required_and_preserved() {
-        let private = r#"#!amod 18
+        let private = r#"#!amod 19
 # module: private_facade
 # default-access: private
 
@@ -4773,7 +4806,7 @@ mod tests {
             ]
         );
 
-        let missing = r#"#!amod 18
+        let missing = r#"#!amod 19
 # module: missing_default_access
 
 @uses provider
@@ -4798,7 +4831,7 @@ mod tests {
 
     #[test]
     fn dotted_relational_operator_interface_loads_with_canonical_name() {
-        let text = r#"#!amod 18
+        let text = r#"#!amod 19
 # module: operators
 # default-access: public
 
@@ -5255,7 +5288,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 18
+            r#"#!amod 19
 # module: cache_test
 # default-access: public
 # source: cache_test.f90
@@ -5288,7 +5321,7 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 18
+            r#"#!amod 19
 # module: cached_parent
 # default-access: public
 # source: cached_parent.f90
@@ -5302,7 +5335,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 18
+            r#"#!amod 19
 # module: supplied_parent
 # default-access: private
 # ancestor-module: supplied_root
@@ -5336,7 +5369,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 18
+            r#"#!amod 19
 # module: child
 # default-access: public
 # ancestor-module: root
@@ -5422,7 +5455,7 @@ mod tests {
             std::process::id()
         ));
         let text = add_integrity_headers(
-            r#"#!amod 17
+            r#"#!amod 18
 # module: stale_test
 # source: stale_test.f90
 
@@ -5436,7 +5469,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 17 (compiler requires 18)")
+            err.contains("incompatible .amod version 18 (compiler requires 19)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );
