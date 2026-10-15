@@ -1,5 +1,5 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_modproc_defined_unary_array_result_assignment_m_flip_matrix
+! IR_CHECK: call @afs_modproc$v2$m$defined_unary_array_result_assignment_m$p$flip_matrix
 ! IR_CHECK: call @afs_copy_array_result_to_fixed
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj

@@ -1,5 +1,5 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_modproc_check_like_check_logical
+! IR_CHECK: call @afs_modproc$v2$m$check_like$p$check_logical
 ! REPRO_CHECK: run
 module stats_like
   implicit none

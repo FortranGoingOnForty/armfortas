@@ -1,5 +1,5 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_modproc_special_like_l_gamma_iint32
+! IR_CHECK: call @afs_modproc$v2$m$special_like$p$l_gamma_iint32
 ! IR_NOT: call @lgamma
 ! REPRO_CHECK: run
 module special_like

@@ -1,6 +1,6 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_modproc_fixture_testdrive_check_logical(
-! IR_NOT: call @afs_modproc_fixture_error_check(
+! IR_CHECK: call @afs_modproc$v2$m$fixture_testdrive$p$check_logical(
+! IR_NOT: call @afs_modproc$v2$m$fixture_error$p$check(
 ! REPRO_CHECK: run
 module fixture_error
   implicit none

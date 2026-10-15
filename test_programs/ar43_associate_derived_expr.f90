@@ -3,8 +3,8 @@
 ! control leaves the construct.
 !
 ! CHECK: 6 8 396
-! IR_CHECK: call @afs_modproc_ar43_associate_derived_expr_m_finish_token
-! IR_CHECK: call @afs_modproc_ar43_associate_derived_expr_m_finish_tokens
+! IR_CHECK: call @afs_modproc$v2$m$ar43_associate_derived_expr_m$p$finish_token
+! IR_CHECK: call @afs_modproc$v2$m$ar43_associate_derived_expr_m$p$finish_tokens
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj
 ! REPRO_CHECK: run

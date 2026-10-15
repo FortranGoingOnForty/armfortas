@@ -24,7 +24,7 @@ use crate::sema::type_layout::{
     concretize_intrinsic_type_info, BoundProc, TypeLayout, TypeLayoutRegistry,
 };
 
-const AMOD_VERSION: u32 = 17;
+const AMOD_VERSION: u32 = 18;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
 const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
 const AMOD_FINAL_ELEMENTAL_VERSION: u32 = 12;
@@ -805,9 +805,9 @@ fn serialized_type_access(scope: &Scope, layout: &TypeLayout) -> Access {
 }
 
 fn bound_proc_target_export_key(module_key: &str, target_name: &str) -> String {
-    let prefix = format!("afs_modproc_{}_", module_key.to_lowercase());
-    target_name
-        .strip_prefix(&prefix)
+    split_module_procedure_link_name(target_name)
+        .filter(|(owner, _)| owner.eq_ignore_ascii_case(module_key))
+        .map(|(_, procedure)| procedure)
         .unwrap_or(target_name)
         .to_lowercase()
 }
@@ -2230,13 +2230,24 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
         // Skip unrecognized directives (forward compatibility).
     }
 
-    let final_proc_prefix = format!("afs_modproc_{}_", module_name.to_lowercase());
+    validate_serialized_module_procedure_targets(&types, path)?;
+
     for amod_type in &mut types {
         let layout = &mut amod_type.layout;
         for final_proc in &mut layout.final_procs {
-            let source_name = final_proc
-                .name
-                .strip_prefix(&final_proc_prefix)
+            let source_name = split_module_procedure_link_name(&final_proc.name)
+                .filter(|(owner, _)| owner.eq_ignore_ascii_case(&module_name))
+                .map(|(_, procedure)| procedure)
+                .or_else(|| {
+                    (version < 18).then(|| {
+                        let legacy_prefix =
+                            format!("afs_modproc_{}_", module_name.to_ascii_lowercase());
+                        final_proc
+                            .name
+                            .strip_prefix(&legacy_prefix)
+                            .unwrap_or(&final_proc.name)
+                    })
+                })
                 .unwrap_or(&final_proc.name);
             let procedure = procedures
                 .iter()
@@ -2278,6 +2289,42 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
         enum_types,
         checksum,
     })
+}
+
+fn validate_serialized_module_procedure_targets(
+    types: &[AmodType],
+    path: &Path,
+) -> Result<(), String> {
+    fn validate(path: &Path, record: &str, target: &str) -> Result<(), String> {
+        if is_reserved_module_procedure_link_name(target)
+            && split_module_procedure_link_name(target).is_none()
+        {
+            return Err(format!(
+                "{}: corrupt .amod file (malformed encoded module-procedure target '{}' in {}); rebuild the provider module",
+                path.display(),
+                target,
+                record
+            ));
+        }
+        Ok(())
+    }
+
+    for amod_type in types {
+        for binding in &amod_type.layout.bound_procs {
+            validate(path, "@binds", &binding.target_name)?;
+        }
+        for final_proc in &amod_type.layout.final_procs {
+            validate(path, "@final", &final_proc.name)?;
+        }
+        for field in &amod_type.layout.fields {
+            if let Some(crate::sema::type_layout::FieldDefaultInit::ProcedurePointer(target)) =
+                &field.default_init
+            {
+                validate(path, "@init=procptr", target)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_bound_proc_metadata(
@@ -2388,15 +2435,14 @@ fn validate_bound_proc_metadata(
         if binding.target_name.eq_ignore_ascii_case(&procedure.name) {
             return true;
         }
-        let Some(owner) = defining_type.owner_module.as_deref() else {
-            return false;
-        };
-        let prefix = format!("afs_modproc_{}_", owner.to_ascii_lowercase());
-        binding
-            .target_name
-            .get(..prefix.len())
-            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
-            && binding.target_name[prefix.len()..].eq_ignore_ascii_case(&procedure.name)
+        defining_type.owner_module.as_deref().is_some_and(|owner| {
+            split_module_procedure_link_name(&binding.target_name).is_some_and(
+                |(target_owner, target_procedure)| {
+                    target_owner.eq_ignore_ascii_case(owner)
+                        && target_procedure.eq_ignore_ascii_case(&procedure.name)
+                },
+            )
+        })
     }
 
     for amod_type in types {
@@ -4131,17 +4177,17 @@ fn procedure_abi_owner<'a>(iface: &'a ModuleInterface, proc: &AmodProc) -> &'a s
 }
 
 fn procedure_abi_link_name(iface: &ModuleInterface, proc: &AmodProc) -> String {
-    if proc.external && !proc.is_separate_module_interface && !proc.is_separate_module_procedure {
-        return proc
-            .binding_label
-            .clone()
-            .unwrap_or_else(|| proc.name.to_ascii_lowercase());
+    if let Some(binding_label) = proc
+        .binding_label
+        .as_ref()
+        .filter(|label| !label.is_empty())
+    {
+        return binding_label.clone();
     }
-    format!(
-        "afs_modproc_{}_{}",
-        procedure_abi_owner(iface, proc).to_lowercase(),
-        proc.name.to_lowercase()
-    )
+    if proc.external && !proc.is_separate_module_interface && !proc.is_separate_module_procedure {
+        return proc.name.to_ascii_lowercase();
+    }
+    module_procedure_link_name(procedure_abi_owner(iface, proc), &proc.name.to_lowercase())
 }
 
 /// Extract optional-parameter masks from a loaded ModuleInterface.
@@ -4589,11 +4635,28 @@ mod tests {
     #[test]
     fn current_schema_allows_external_inherited_binding_metadata() {
         let source = format!(
-            "#!amod {AMOD_VERSION}\n# module: child_schema\n# default-access: public\n\n@subroutine touch\n  @arg value : integer(4), intent(inout)\n@end subroutine\n\n@type child_t, public\n  @layout size=0 align=1\n  @extends ancestor_schema::base_t\n  @binds touch => afs_modproc_ancestor_schema_touch @pass-name self @pass-index 0 @abi touch\n  @owner child_schema\n  @tag 2\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => afs_modproc_ancestor_schema_touch @pass-name self @pass-index 0 @abi touch\n  @owner ancestor_schema\n  @tag 1\n@end type\n"
+            "#!amod {AMOD_VERSION}\n# module: child_schema\n# default-access: public\n\n@subroutine touch\n  @arg value : integer(4), intent(inout)\n@end subroutine\n\n@type child_t, public\n  @layout size=0 align=1\n  @extends ancestor_schema::base_t\n  @binds touch => afs_modproc$v2$m$ancestor_schema$p$touch @pass-name self @pass-index 0 @abi touch\n  @owner child_schema\n  @tag 2\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => afs_modproc$v2$m$ancestor_schema$p$touch @pass-name self @pass-index 0 @abi touch\n  @owner ancestor_schema\n  @tag 1\n@end type\n"
         );
         let text = add_integrity_headers(source);
         read_amod_content(&text, Path::new("child_schema.amod"))
             .expect("external inherited binding may rely on its provider artifact");
+    }
+
+    #[test]
+    fn current_schema_rejects_malformed_reserved_module_procedure_targets() {
+        let source = format!(
+            "#!amod {AMOD_VERSION}\n# module: malformed_target\n# default-access: public\n\n@type item_t, public\n  @layout size=0 align=1\n  @binds run => afs_modproc$v2$m$$p$decoy_proc @nopass @abi run\n  @owner malformed_target\n  @tag 1\n@end type\n"
+        );
+        let text = add_integrity_headers(source);
+        let error = read_amod_content(&text, Path::new("malformed_target.amod"))
+            .expect_err("malformed reserved module-procedure target was accepted");
+
+        assert!(
+            error.contains("malformed encoded module-procedure target")
+                && error.contains("@binds")
+                && error.contains("rebuild the provider module"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -4692,7 +4755,7 @@ mod tests {
 
     #[test]
     fn current_default_access_header_is_required_and_preserved() {
-        let private = r#"#!amod 17
+        let private = r#"#!amod 18
 # module: private_facade
 # default-access: private
 
@@ -4710,7 +4773,7 @@ mod tests {
             ]
         );
 
-        let missing = r#"#!amod 17
+        let missing = r#"#!amod 18
 # module: missing_default_access
 
 @uses provider
@@ -4735,7 +4798,7 @@ mod tests {
 
     #[test]
     fn dotted_relational_operator_interface_loads_with_canonical_name() {
-        let text = r#"#!amod 17
+        let text = r#"#!amod 18
 # module: operators
 # default-access: public
 
@@ -5192,7 +5255,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 17
+            r#"#!amod 18
 # module: cache_test
 # default-access: public
 # source: cache_test.f90
@@ -5225,7 +5288,7 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 17
+            r#"#!amod 18
 # module: cached_parent
 # default-access: public
 # source: cached_parent.f90
@@ -5239,7 +5302,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 17
+            r#"#!amod 18
 # module: supplied_parent
 # default-access: private
 # ancestor-module: supplied_root
@@ -5273,7 +5336,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 17
+            r#"#!amod 18
 # module: child
 # default-access: public
 # ancestor-module: root
@@ -5299,7 +5362,7 @@ mod tests {
             .to_string(),
         );
         let iface = read_amod_content(&text, Path::new("child.amod")).unwrap();
-        let root_key = "afs_modproc_root_compute";
+        let root_key = "afs_modproc$v2$m$root$p$compute";
 
         assert_eq!(
             extract_optional_params(&iface).get(root_key),
@@ -5314,7 +5377,7 @@ mod tests {
             Some(&vec![false, true, false])
         );
         assert_eq!(
-            extract_optional_params(&iface).get("afs_modproc_root_required"),
+            extract_optional_params(&iface).get("afs_modproc$v2$m$root$p$required"),
             Some(&vec![false])
         );
     }
@@ -5359,7 +5422,7 @@ mod tests {
             std::process::id()
         ));
         let text = add_integrity_headers(
-            r#"#!amod 16
+            r#"#!amod 17
 # module: stale_test
 # source: stale_test.f90
 
@@ -5373,7 +5436,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 16 (compiler requires 17)")
+            err.contains("incompatible .amod version 17 (compiler requires 18)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

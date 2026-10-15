@@ -445,7 +445,7 @@ fn external_inherited_pass_ignores_overlapping_module_name_collision_across_amod
         .unwrap();
         std::fs::write(
             &child,
-            "module a\n  use a_b, only : base_t\n  implicit none\n  type, extends(base_t) :: child_t\n  end type\ncontains\n  subroutine b_TOUCH(value) bind(c, name='local_collision')\n    integer, intent(inout) :: value\n    value = -1\n  end subroutine\nend module\n",
+            "module a\n  use a_b, only : base_t\n  implicit none\n  type, extends(base_t) :: child_t\n  end type\ncontains\n  subroutine b_TOUCH(value)\n    integer, intent(inout) :: value\n    value = -1\n  end subroutine\nend module\n",
         )
         .unwrap();
         std::fs::write(
@@ -460,7 +460,7 @@ fn external_inherited_pass_ignores_overlapping_module_name_collision_across_amod
             .expect("child module did not publish its interface");
         assert!(
             child_amod.lines().any(|line| {
-                line.contains("@binds touch => afs_modproc_a_b_touch")
+                line.contains("@binds touch => afs_modproc$v2$m$a_b$p$touch")
                     && line.contains("@pass-name self @pass-index 0")
             }),
             "{level}: inherited PASS metadata was rewritten:\n{child_amod}"
@@ -472,6 +472,91 @@ fn external_inherited_pass_ignores_overlapping_module_name_collision_across_amod
             output.contains("external-inherited-pass-ok"),
             "{level}: {output}"
         );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn overlapping_module_and_procedure_names_keep_distinct_archive_symbols() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=overlapping_module_and_procedure_names_keep_distinct_archive_symbols count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let runtime = find_runtime();
+    let root = unique_dir();
+    for level in ["-O0", "-O3"] {
+        let dir = root.join(level.trim_start_matches('-'));
+        std::fs::create_dir_all(&dir).unwrap();
+        let left_source = dir.join("a_b.f90");
+        let right_source = dir.join("a.f90");
+        let consumer_source = dir.join("consumer.f90");
+        let left_object = dir.join("a_b.o");
+        let right_object = dir.join("a.o");
+        let consumer_object = dir.join("consumer.o");
+        std::fs::write(
+            &left_source,
+            "module a_b\n  implicit none\ncontains\n  integer function c()\n    c = 11\n  end function\nend module\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &right_source,
+            "module a\n  implicit none\ncontains\n  integer function b_c()\n    b_c = 22\n  end function\nend module\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &consumer_source,
+            "program p\n  use a_b, only : left => c\n  use a, only : right => b_c\n  implicit none\n  integer :: x, y\n  x = left()\n  y = right()\n  if (x /= 11 .or. y /= 22) error stop 1\n  print *, 'module-procedure-identity-ok'\nend program\n",
+        )
+        .unwrap();
+
+        compile_file_flags(&compiler, &left_source, &left_object, None, &[level]);
+        compile_file_flags(&compiler, &right_source, &right_object, None, &[level]);
+        compile_file_flags(
+            &compiler,
+            &consumer_source,
+            &consumer_object,
+            Some(&dir),
+            &[level],
+        );
+
+        for (archive_name, members) in [
+            ("left-first.a", [&left_object, &right_object]),
+            ("right-first.a", [&right_object, &left_object]),
+        ] {
+            let archive = dir.join(archive_name);
+            let archive_result = Command::new("ar")
+                .args(["rcs", archive.to_str().unwrap()])
+                .args(members.iter().map(|path| path.to_str().unwrap()))
+                .output()
+                .expect("archive tool failed to spawn");
+            assert!(
+                archive_result.status.success(),
+                "{level}: archive creation failed: {}",
+                String::from_utf8_lossy(&archive_result.stderr)
+            );
+            let binary = dir.join(format!("{archive_name}.bin"));
+            let link_result = Command::new(&compiler)
+                .args([consumer_object.as_os_str(), archive.as_os_str()])
+                .arg(&runtime)
+                .args(["-o", binary.to_str().unwrap()])
+                .output()
+                .expect("archive link failed to spawn");
+            assert!(
+                link_result.status.success(),
+                "{level} {archive_name}: link failed: {}",
+                String::from_utf8_lossy(&link_result.stderr)
+            );
+            let output = run_binary(&binary);
+            assert!(
+                output.contains("module-procedure-identity-ok"),
+                "{level} {archive_name}: {output}"
+            );
+        }
     }
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1956,7 +2041,10 @@ end program
     let call_offsets: Vec<_> = call_markers
         .iter()
         .map(|(name, owned)| {
-            let marker = format!("call @afs_modproc_imported_character_results_m_{}", name);
+            let marker = format!(
+                "call @afs_modproc$v2$m$imported_character_results_m$p${}",
+                name
+            );
             (
                 program_ir
                     .find(&marker)
@@ -3478,7 +3566,7 @@ fn local_child_vtable_keeps_imported_tbp_target_over_same_abi_interface_name() {
     assert!(
         !undef.iter().any(|sym| {
             sym.trim_start_matches('_')
-                == "afs_modproc_rk_b_step_func"
+                == "afs_modproc$v2$m$rk_b$p$step_func"
         }),
         "local child vtable should keep rk_a's imported target, not rk_b's interface placeholder: {:?}",
         undef
@@ -3682,7 +3770,7 @@ fn cross_tu_class_base_source_and_mold_report_unavailable_finalizer_context() {
     );
     let ir = std::fs::read_to_string(&mod_ir).expect("cannot read module IR");
     let function_start = ir
-        .find("func @afs_modproc_dynamic_base_copy_m_clone_bounded_mold")
+        .find("func @afs_modproc$v2$m$dynamic_base_copy_m$p$clone_bounded_mold")
         .expect("missing clone_bounded_mold IR");
     let function_tail = &ir[function_start..];
     let function_end = function_tail

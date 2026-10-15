@@ -1,5 +1,5 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_modproc_proc_dummy_iface_scope_m_new_string(
+! IR_CHECK: call @afs_modproc$v2$m$proc_dummy_iface_scope_m$p$new_string(
 ! IR_CHECK: call %
 ! REPRO_CHECK: run
 module proc_dummy_iface_scope_m

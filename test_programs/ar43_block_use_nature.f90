@@ -3,9 +3,9 @@
 ! while NON_INTRINSIC and ordinary USE must still select the authored module.
 !
 ! CHECK: 1 4 4 F T
-! IR_CHECK: func @afs_modproc_iso_c_binding_c_associated(
+! IR_CHECK: func @afs_modproc$v2$m$iso_c_binding$p$c_associated(
 ! IR_CHECK: func @__prog_ar43_block_use_nature(
-! IR_CHECK: call @afs_modproc_iso_c_binding_c_associated(
+! IR_CHECK: call @afs_modproc$v2$m$iso_c_binding$p$c_associated(
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj
 ! REPRO_CHECK: run

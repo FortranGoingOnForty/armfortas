@@ -1,5 +1,5 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_modproc_defined_operator_char_chain_m_join_op_char_char
+! IR_CHECK: call @afs_modproc$v2$m$defined_operator_char_chain_m$p$join_op_char_char
 ! REPRO_CHECK: run
 module defined_operator_char_chain_m
   implicit none

@@ -3964,7 +3964,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 17\n", "#!amod 16\n", 1);
+        .replacen("#!amod 18\n", "#!amod 17\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -3991,7 +3991,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 16 (compiler requires 17)")
+        stderr.contains("incompatible .amod version 17 (compiler requires 18)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -10938,15 +10938,15 @@ fn module_procedure_case_and_bind_label_survive_amod_import() {
     assert!(
         undefined
             .iter()
-            .any(|sym| sym.trim_start_matches('_') == "afs_modproc_m_WEXITSTATUS"),
-        "mixed-case module procedures should retain case across .amod import: {:?}",
+            .any(|sym| sym.trim_start_matches('_') == "afs_modproc$v2$m$m$p$wexitstatus"),
+        "mixed-case module procedures should use canonical Fortran identity across .amod import: {:?}",
         undefined
     );
     assert!(
         !undefined
             .iter()
-            .any(|sym| sym.trim_start_matches('_') == "afs_modproc_m_wexitstatus"),
-        "imported mixed-case module procedures should not be downcased: {:?}",
+            .any(|sym| sym.trim_start_matches('_') == "afs_modproc$v2$m$m$p$WEXITSTATUS"),
+        "compiler-owned module procedure symbols should not retain source-case variants: {:?}",
         undefined
     );
     assert!(
@@ -34430,7 +34430,7 @@ fn imported_type_finalizer_round_trips_through_amod_and_runs() {
     let amod = dir.join("m.amod");
     let amod_text = std::fs::read_to_string(&amod).expect("missing m.amod");
     assert!(
-        amod_text.contains("@final afs_modproc_m_destroy_box rank=0 elemental=false"),
+        amod_text.contains("@final afs_modproc$v2$m$m$p$destroy_box rank=0 elemental=false"),
         "module finalizer should round-trip with ABI-qualified characteristics: {}",
         amod_text
     );
@@ -36584,7 +36584,7 @@ fn procedure_pointer_component_default_init_resolves_renamed_target() {
     // Without the parser/sema/lower pipeline the lay-out building
     // pass installs `FieldDefaultInit::ProcedurePointer` for and
     // `sema::resolve` rewrites bare names to
-    // `afs_modproc_<origin_module>_<proc>` mangle the link target,
+    // the canonical origin-module/procedure identity for the link target,
     // every default-constructed instance left the field at zero and
     // every dispatch through the pointer crashed on a null callsite.
     let src = write_program(
@@ -40380,20 +40380,9 @@ fn type_bound_procedure_target_with_uppercase_name_links_correctly() {
         );
         return;
     }
-    // Fortran is case-insensitive but Mach-O is not. Module-procedure
-    // body emission via `module_procedure_symbol_name` lowercases only
-    // the module name and preserves the procedure's source case (see
-    // `module_procedure_case_and_bind_label_survive_amod_import`),
-    // producing `_afs_modproc_<mod>_<Source_Case_Name>`. Type-bound
-    // procedures dispatch through `bound_proc.target_name`, which
-    // used to be assembled by `lowered_bound_proc_target` with
-    // `target.to_lowercase()` — so a TBP whose target was declared
-    // mixed-case (`procedure :: pid => process_get_ID`) emitted the
-    // body as `_afs_modproc_<mod>_process_get_ID` while every dispatch
-    // site asked the linker for `_afs_modproc_<mod>_process_get_id`.
-    // Surfaced in stdlib `example_process_5` against
-    // `_afs_modproc_stdlib_system_process_get_id`. Now the TBP target
-    // preserves source case to match the body emission.
+    // Fortran is case-insensitive but object symbols are not. Definitions,
+    // direct calls, and TBP targets must all use the same canonical lowercase
+    // identity even when the source declaration uses mixed case.
     let src = write_program(
         "module mp\n  implicit none\n  type :: my_type\n    integer :: x = 42\n  contains\n    procedure :: get_x => my_get_X\n  end type my_type\ncontains\n  function my_get_X(self) result(v)\n    class(my_type), intent(in) :: self\n    integer :: v\n    v = self%x\n  end function\nend module\n\nprogram t\n  use mp\n  type(my_type) :: o\n  if (o%get_x() /= 42) error stop 1\n  print *, 'ok'\nend program\n",
         "f90",
@@ -44435,7 +44424,7 @@ fn same_name_contained_function_return_type_is_caller_relative() {
     let ir_text = fs::read_to_string(&ir).expect("cannot read same-name contained return IR");
     let second_helper_calls: Vec<_> = ir_text
         .lines()
-        .filter(|line| line.contains("call @afs_internal_afs_modproc_m_second"))
+        .filter(|line| line.contains("call @afs_internal_afs_modproc$v2$m$m$p$second"))
         .collect();
     assert!(
         second_helper_calls
@@ -47555,7 +47544,8 @@ fn procedure_pointer_calls_and_assignment_run_indirectly() {
             asm
         );
         assert!(
-            asm.contains("twice(%rip)") && asm.contains("bump(%rip)"),
+            asm.contains("afs_modproc$v2$m$m$p$twice(%rip)")
+                && asm.contains("afs_modproc$v2$m$m$p$bump(%rip)"),
             "procedure-pointer assignment should materialize callee addresses: {}",
             asm
         );
@@ -47571,7 +47561,8 @@ fn procedure_pointer_calls_and_assignment_run_indirectly() {
             asm
         );
         assert!(
-            asm.contains("_twice@PAGE") && asm.contains("_bump@PAGE"),
+            asm.contains("_afs_modproc$v2$m$m$p$twice@PAGE")
+                && asm.contains("_afs_modproc$v2$m$m$p$bump@PAGE"),
             "procedure-pointer assignment should materialize callee addresses: {}",
             asm
         );
@@ -47757,7 +47748,7 @@ fn c_funloc_bind_c_handler_uses_binding_label_symbol() {
             asm
         );
         assert!(
-            !asm.contains("afs_modproc_m_sig_handler(%rip)"),
+            !asm.contains("afs_modproc$v2$m$m$p$sig_handler(%rip)"),
             "c_funloc should not reference the non-bind(C) module procedure symbol: {}",
             asm
         );
@@ -47768,7 +47759,7 @@ fn c_funloc_bind_c_handler_uses_binding_label_symbol() {
             asm
         );
         assert!(
-            !asm.contains("_afs_modproc_m_sig_handler@PAGE"),
+            !asm.contains("_afs_modproc$v2$m$m$p$sig_handler@PAGE"),
             "c_funloc should not reference the non-bind(C) module procedure symbol: {}",
             asm
         );
@@ -49779,7 +49770,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 17\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 18\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))
@@ -51521,7 +51512,7 @@ fn use_renamed_procedure_call_uses_remote_symbol() {
     assert!(
         undefined
             .iter()
-            .any(|sym| sym.trim_start_matches('_') == "afs_modproc_m_set_shell_variable"),
+            .any(|sym| sym.trim_start_matches('_') == "afs_modproc$v2$m$m$p$set_shell_variable"),
         "USE rename should call the imported procedure symbol: {:?}",
         undefined
     );
@@ -61269,7 +61260,7 @@ fn smp_body_with_internal_procedure_links_under_parent_module() {
     }
     // F2018 §11.2.3: a separate-module-procedure body declared in the
     // parent module's interface block links under the parent module's
-    // name (`_afs_modproc_<parent>_<proc>`), not the submodule's. When
+    // encoded identity using the parent module, not the submodule. When
     // the body itself contains an internal procedure, the contained
     // procedure's `_afs_internal_<host>_<idx>` symbol must derive its
     // host link name from the SMP body's parent-prefixed link name —
@@ -69429,9 +69420,9 @@ fn nested_call_chain_with_array_section_args_keeps_frame_bounded() {
     );
     let asm_text = std::fs::read_to_string(&asm).expect("read asm");
     let outer_fn_marker = if cfg!(target_arch = "x86_64") {
-        "afs_modproc_wmin_water_simple:"
+        "afs_modproc$v2$m$wmin$p$water_simple:"
     } else {
-        "_afs_modproc_wmin_water_simple:"
+        "_afs_modproc$v2$m$wmin$p$water_simple:"
     };
     let outer_start = asm_text
         .find(outer_fn_marker)
@@ -69463,7 +69454,7 @@ fn nested_call_chain_with_array_section_args_keeps_frame_bounded() {
         let probes_to_next_label = asm_text[outer_start..]
             .lines()
             .take_while(|line| {
-                !line.trim_start().starts_with("_afs_modproc_") || line.contains("water_simple:")
+                !line.trim_start().starts_with("_afs_modproc$v2$") || line.contains("water_simple:")
             })
             .filter(|line| line.contains("movz x16, #16384"))
             .count();
@@ -69550,9 +69541,9 @@ fn nested_derived_allocatable_assignment_uses_owned_helpers() {
         "expected module-owned derived copy helper symbols in asm"
     );
     let add_defaults_marker = if cfg!(target_arch = "x86_64") {
-        "afs_modproc_helper_collection_m_add_defaults:"
+        "afs_modproc$v2$m$helper_collection_m$p$add_defaults:"
     } else {
-        "_afs_modproc_helper_collection_m_add_defaults:"
+        "_afs_modproc$v2$m$helper_collection_m$p$add_defaults:"
     };
     let start = asm_text
         .find(add_defaults_marker)
@@ -71962,14 +71953,14 @@ fn same_name_imported_generic_preserves_private_c_ptr_specifics() {
         "_get_ptr"
     };
     let pick_ptr_symbol = if cfg!(target_arch = "x86_64") {
-        "afs_modproc_generic_cptr_provider_pick_ptr"
+        "afs_modproc$v2$m$generic_cptr_provider$p$pick_ptr"
     } else {
-        "_afs_modproc_generic_cptr_provider_pick_ptr"
+        "_afs_modproc$v2$m$generic_cptr_provider$p$pick_ptr"
     };
     let wrong_pick_call = if cfg!(target_arch = "x86_64") {
-        "call afs_modproc_generic_cptr_provider_pick\n"
+        "call afs_modproc$v2$m$generic_cptr_provider$p$pick\n"
     } else {
-        "bl _afs_modproc_generic_cptr_provider_pick\n"
+        "bl _afs_modproc$v2$m$generic_cptr_provider$p$pick\n"
     };
     assert!(
         asm_text.contains(get_ptr_symbol)
@@ -72220,7 +72211,7 @@ fn abstract_type_bound_operator_dispatch_avoids_direct_interface_call() {
     assert!(
         !undefined
             .iter()
-            .any(|sym| sym == "_afs_modproc_m_is_equal" || sym == "_is_equal"),
+            .any(|sym| sym == "_afs_modproc$v2$m$m$p$is_equal" || sym == "_is_equal"),
         "abstract operator interface lowered as direct call: {:?}",
         undefined
     );
@@ -72685,7 +72676,7 @@ fn module_subroutine_shadows_split_intrinsic_subroutine() {
     );
     let ir_text = fs::read_to_string(&ir).expect("cannot read emitted IR");
     assert!(
-        ir_text.contains("call @afs_modproc_m_split"),
+        ir_text.contains("call @afs_modproc$v2$m$m$p$split"),
         "CALL split did not resolve to the module subroutine:\n{}",
         ir_text
     );
@@ -74365,7 +74356,7 @@ fn generic_subroutine_matches_use_renamed_class_actual() {
     );
     let ir_text = fs::read_to_string(&ir).expect("cannot read emitted IR");
     assert!(
-        ir_text.contains("call @afs_modproc_parser_m_json_load_file"),
+        ir_text.contains("call @afs_modproc$v2$m$parser_m$p$json_load_file"),
         "json_load did not resolve to the filename specific:\n{}",
         ir_text
     );
@@ -74901,7 +74892,7 @@ fn use_only_generic_collects_all_bare_reexport_specifics() {
     );
     let ir_text = fs::read_to_string(&ir).expect("cannot read emitted IR");
     assert!(
-        ir_text.contains("call @afs_modproc_table_api_get_child_array"),
+        ir_text.contains("call @afs_modproc$v2$m$table_api$p$get_child_array"),
         "get_value did not resolve to the table child-array specific:\n{}",
         ir_text
     );
@@ -74933,7 +74924,7 @@ fn imported_generic_function_shadows_intrinsic_type_probe() {
     );
     let ir_text = fs::read_to_string(&ir).expect("cannot read emitted IR");
     assert!(
-        ir_text.contains("call @afs_modproc_special_like_l_gamma_iint32"),
+        ir_text.contains("call @afs_modproc$v2$m$special_like$p$l_gamma_iint32"),
         "shadowing generic did not resolve to module specific:\n{}",
         ir_text
     );
@@ -75818,7 +75809,7 @@ end program p
         String::from_utf8_lossy(&emit_ir.stderr)
     );
     let ir_text = fs::read_to_string(&ir).expect("cannot read rank-one column RHS IR");
-    let marker = "func @afs_modproc_outprod_fusion_m_outer_product";
+    let marker = "func @afs_modproc$v2$m$outprod_fusion_m$p$outer_product";
     let function_ir = ir_text
         .split_once(marker)
         .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))
@@ -75920,7 +75911,7 @@ end program p
         String::from_utf8_lossy(&emit_ir.stderr)
     );
     let ir_text = fs::read_to_string(&ir).expect("cannot read inline descriptor bounds IR");
-    let marker = "func @afs_modproc_descriptor_inline_m_probe";
+    let marker = "func @afs_modproc$v2$m$descriptor_inline_m$p$probe";
     let function_ir = ir_text
         .split_once(marker)
         .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))
@@ -76132,7 +76123,7 @@ end program p
     );
     let ir_text = fs::read_to_string(&ir).expect("cannot read descriptor dot-loop IR");
     let function_ir = |name: &str| {
-        let marker = format!("func @afs_modproc_descriptor_dot_loop_m_{}", name);
+        let marker = format!("func @afs_modproc$v2$m$descriptor_dot_loop_m$p${}", name);
         ir_text
             .split_once(&marker)
             .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))
@@ -76299,7 +76290,10 @@ end program p
     );
     let ir_text = fs::read_to_string(&ir).expect("cannot read squared-column-distance IR");
     let function_ir = |name: &str| {
-        let marker = format!("func @afs_modproc_squared_column_distance_m_{}", name);
+        let marker = format!(
+            "func @afs_modproc$v2$m$squared_column_distance_m$p${}",
+            name
+        );
         ir_text
             .split_once(&marker)
             .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))
@@ -76497,7 +76491,7 @@ end program
     );
     let ir_text = fs::read_to_string(&ir).expect("cannot read sum-squares DIM IR");
     let function_ir = |name: &str| {
-        let marker = format!("func @afs_modproc_sum_squares_dim_m_{}", name);
+        let marker = format!("func @afs_modproc$v2$m$sum_squares_dim_m$p${}", name);
         ir_text
             .split_once(&marker)
             .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))
@@ -76651,7 +76645,7 @@ end program
     );
     let ir_text = fs::read_to_string(&ir).expect("cannot read multi-array reduction IR");
     let function_ir = |name: &str| {
-        let marker = format!("func @afs_modproc_multi_array_reduction_m_{}", name);
+        let marker = format!("func @afs_modproc$v2$m$multi_array_reduction_m$p${}", name);
         ir_text
             .split_once(&marker)
             .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))

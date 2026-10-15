@@ -1,6 +1,6 @@
 ! CHECK: ok
 ! IR_CHECK: call @afs_concat(
-! IR_CHECK: call @afs_modproc_parenthesized_concat_char_actual_m_check_pair(
+! IR_CHECK: call @afs_modproc$v2$m$parenthesized_concat_char_actual_m$p$check_pair(
 ! REPRO_CHECK: run
 module parenthesized_concat_char_actual_m
   implicit none

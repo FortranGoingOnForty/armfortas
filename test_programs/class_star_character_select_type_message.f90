@@ -1,6 +1,6 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_modproc_class_star_message_m_appendr
-! IR_CHECK: call @afs_modproc_class_star_message_m_append
+! IR_CHECK: call @afs_modproc$v2$m$class_star_message_m$p$appendr
+! IR_CHECK: call @afs_modproc$v2$m$class_star_message_m$p$append
 ! REPRO_CHECK: run
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit
 ! PHASE_TRIANGULATE: ir|asm|obj|repro

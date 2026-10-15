@@ -1,5 +1,5 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_modproc_parser_like_parse_simple_cmd
+! IR_CHECK: call @afs_modproc$v2$m$parser_like$p$parse_simple_cmd
 ! IR_NOT: call @memcpy(
 ! REPRO_CHECK: run
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit

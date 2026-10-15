@@ -2876,7 +2876,6 @@ fn resolve_bound_proc_pass_metadata(
     parent_layout: Option<&crate::sema::type_layout::TypeLayout>,
     layout: &mut crate::sema::type_layout::TypeLayout,
 ) {
-    let module_prefix = host_module.map(|module| format!("afs_modproc_{}_", module.to_lowercase()));
     for binding in &mut layout.bound_procs {
         if binding.nopass {
             binding.pass_name = None;
@@ -2902,9 +2901,11 @@ fn resolve_bound_proc_pass_metadata(
             continue;
         }
 
-        let target_source_name = module_prefix
-            .as_deref()
-            .and_then(|prefix| binding.target_name.strip_prefix(prefix))
+        let target_source_name = split_module_procedure_link_name(&binding.target_name)
+            .filter(|(owner, _)| {
+                host_module.is_some_and(|module| owner.eq_ignore_ascii_case(module))
+            })
+            .map(|(_, procedure)| procedure)
             .unwrap_or(&binding.target_name);
         let procedure_scope = st.all_scopes().iter().find(|scope| {
             let name_matches = match &scope.kind {
@@ -2979,9 +2980,9 @@ fn final_procedure_is_elemental(st: &SymbolTable, owner_scope: ScopeId, name: &s
 /// This pass walks every layout the file just registered, looks each
 /// proc-pointer target up in its owning type's host-module scope
 /// (chasing USE chains), and rewrites the stored string to the
-/// `afs_modproc_<origin_mod>_<proc>` mangle the runtime initializer
-/// emits via `global_addr`.  Without it the linker reports an
-/// undefined `_afs_modproc_<host_mod>_<alias>` reference at example
+/// canonical module-procedure identity that the runtime initializer
+/// emits via `global_addr`. Without it the linker reports an undefined
+/// reference using the host module and local alias at example
 /// link.
 fn resolve_proc_pointer_default_targets(
     st: &SymbolTable,
@@ -3012,7 +3013,7 @@ fn resolve_proc_pointer_default_targets(
 
 /// Walk the symbol table from `from_scope` to find the link-time
 /// symbol that the source name refers to.  Module procedures get the
-/// `afs_modproc_<origin_mod>_<proc>` mangle keyed on the procedure's
+/// canonical module-procedure identity keyed on the procedure's
 /// declaring module; bare external/intrinsic references fall through
 /// unmodified.  USE associations are followed transitively so renames
 /// like `default_hasher => fnv_1_hasher` resolve to the underlying
@@ -3057,6 +3058,9 @@ fn mangle_link_symbol_for(
     name_in_scope: &str,
 ) -> String {
     use crate::sema::symtab::{ScopeKind, SymbolKind};
+    if let Some(binding_label) = sym.attrs.binding_label.as_deref() {
+        return binding_label.to_string();
+    }
     if sym.kind == SymbolKind::IntrinsicProc || sym.attrs.intrinsic {
         return crate::sema::specific_intrinsic::specific_intrinsic_wrapper_symbol(name_in_scope)
             .unwrap_or(name_in_scope)
@@ -3064,11 +3068,9 @@ fn mangle_link_symbol_for(
     }
     match sym.kind {
         SymbolKind::Function | SymbolKind::Subroutine => match &scope.kind {
-            ScopeKind::Module(module_name) | ScopeKind::Submodule(module_name) => format!(
-                "afs_modproc_{}_{}",
-                module_name.to_lowercase(),
-                name_in_scope
-            ),
+            ScopeKind::Module(module_name) | ScopeKind::Submodule(module_name) => {
+                module_procedure_link_name(module_name, name_in_scope)
+            }
             _ => name_in_scope.to_string(),
         },
         _ => name_in_scope.to_string(),

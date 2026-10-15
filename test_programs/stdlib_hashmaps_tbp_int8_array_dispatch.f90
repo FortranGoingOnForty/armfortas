@@ -1,5 +1,5 @@
 ! CHECK: ok
-! IR_CHECK: afs_modproc_m_int8_map_entry
+! IR_CHECK: afs_modproc$v2$m$m$p$int8_map_entry
 ! REPRO_CHECK: run
 module m
   use iso_fortran_env, only: int8, int32, int64

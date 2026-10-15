@@ -1,5 +1,5 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_modproc_mvbits_component_class_i64_m_clear_range
+! IR_CHECK: call @afs_modproc$v2$m$mvbits_component_class_i64_m$p$clear_range
 ! REPRO_CHECK: run
 module mvbits_component_class_i64_m
   use iso_fortran_env, only: int32, int64
