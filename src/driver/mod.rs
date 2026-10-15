@@ -3998,16 +3998,26 @@ fn find_runtime_lib(bundled_runtime: Option<&'static [u8]>) -> Result<RuntimeArc
     // 1. $AFS_RUNTIME_PATH — the explicit override.  Accepts either
     //    a directory containing libarmfortas_rt.a or the archive
     //    path directly.
-    if let Ok(env_path) = std::env::var("AFS_RUNTIME_PATH") {
-        let p = PathBuf::from(&env_path);
+    if let Some(env_path) = std::env::var_os("AFS_RUNTIME_PATH") {
+        let p = PathBuf::from(env_path);
+        if p.as_os_str().is_empty() {
+            return Err(
+                "AFS_RUNTIME_PATH is set but empty; set it to libarmfortas_rt.a or its containing directory"
+                    .into(),
+            );
+        }
         if p.is_dir() {
             let candidate = p.join("libarmfortas_rt.a");
-            if candidate.exists() {
+            if candidate.is_file() {
                 return Ok(RuntimeArchive::external(candidate));
             }
-        } else if p.exists() {
+        } else if p.is_file() {
             return Ok(RuntimeArchive::external(p));
         }
+        return Err(format!(
+            "AFS_RUNTIME_PATH '{}' does not provide libarmfortas_rt.a for a static link; set it to the archive or its containing directory",
+            p.display()
+        ));
     }
 
     // 2. A source workspace that owns the compiler executable. Development
@@ -4099,8 +4109,14 @@ fn find_runtime_dylib() -> Result<PathBuf, String> {
         ));
     }
 
-    if let Some(path) = env_override("AFS_RUNTIME_PATH") {
-        let requested = PathBuf::from(&path);
+    if let Some(path) = std::env::var_os("AFS_RUNTIME_PATH") {
+        let requested = PathBuf::from(path);
+        if requested.as_os_str().is_empty() {
+            return Err(
+                "AFS_RUNTIME_PATH is set but empty; set it to libarmfortas_rt.dylib or its containing directory"
+                    .into(),
+            );
+        }
         let dylib = if requested.is_dir() {
             requested.join("libarmfortas_rt.dylib")
         } else {

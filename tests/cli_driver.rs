@@ -47260,6 +47260,51 @@ fn afs_runtime_path_env_overrides_runtime_discovery() {
 }
 
 #[test]
+fn invalid_explicit_static_runtime_path_fails_without_output() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=invalid_explicit_static_runtime_path_fails_without_output count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let missing_runtime = unique_path("missing_runtime_override", "dir");
+    let src = write_program("program p\n  print *, 11\nend program\n", "f90");
+    let out = unique_path("missing_runtime_override", "bin");
+    assert!(!missing_runtime.exists());
+    assert!(!out.exists());
+
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-static",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("AFS_RUNTIME_PATH", &missing_runtime)
+        .output()
+        .expect("invalid runtime override compile failed to spawn");
+
+    assert!(
+        !result.status.success(),
+        "an invalid explicit runtime override must not fall back"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("AFS_RUNTIME_PATH"), "{stderr}");
+    assert!(
+        stderr.contains(&missing_runtime.to_string_lossy().into_owned()),
+        "{stderr}"
+    );
+    assert!(stderr.contains("libarmfortas_rt.a"), "{stderr}");
+    assert!(
+        !out.exists(),
+        "failed runtime discovery published an output"
+    );
+
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
 fn missing_input_file_reports_io_error() {
     let result = Command::new(compiler("armfortas"))
         .args(["/nonexistent/path/source.f90"])
