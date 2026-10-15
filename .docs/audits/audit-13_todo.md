@@ -90,16 +90,16 @@ Status: `[x]`
 
 ## Tranche 6: Separate-compilation and nominal-type truth
 
-Status: `[ ]`
+Status: `[x]`
 
-- `[ ]` A13-08: serialize and import module-variable `ASYNCHRONOUS` and
+- `[x]` A13-08: serialize and import module-variable `ASYNCHRONOUS` and
   `CONTIGUOUS` attributes.
-- `[ ]` Bump the exact `.amod` version and add stale-artifact diagnostics.
-- `[ ]` Compare combined and split compilation for both attributes and the
+- `[x]` Bump the exact `.amod` version and add stale-artifact diagnostics.
+- `[x]` Compare combined and split compilation for both attributes and the
   OpenMP asynchronous safety gate.
-- `[ ]` A13-10: preserve distinct IEEE nominal derived types through semantic
+- `[x]` A13-10: preserve distinct IEEE nominal derived types through semantic
   checking and lower them to integer storage only afterward.
-- `[ ]` Low/U03: decide and test stricter rejection of self-consistent but
+- `[x]` Low/U03: decide and test stricter rejection of self-consistent but
   invalid `.amod` enum/interface records.
 
 ## Tranche 7: Runtime I/O and driver lifecycle
