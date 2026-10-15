@@ -2463,6 +2463,208 @@ fn nonrect_inner_bounds(
     Some((lower, upper))
 }
 
+/// Sum `floor((a * i + b) / modulus)` for `0 <= i < count`.
+///
+/// All inputs are nonnegative and `modulus` is positive. The Euclidean
+/// reduction makes the number of loop iterations logarithmic in the operand
+/// values rather than linear in `count`.
+fn checked_floor_sum_nonnegative(
+    mut count: i128,
+    mut modulus: i128,
+    mut a: i128,
+    mut b: i128,
+) -> Option<i128> {
+    debug_assert!(count >= 0 && modulus > 0 && a >= 0 && b >= 0);
+    let mut sum = 0_i128;
+    loop {
+        if a >= modulus {
+            let quotient = a / modulus;
+            let triangular = if count % 2 == 0 {
+                (count / 2).checked_mul(count.checked_sub(1)?)?
+            } else {
+                count.checked_mul(count.checked_sub(1)? / 2)?
+            };
+            sum = sum.checked_add(triangular.checked_mul(quotient)?)?;
+            a %= modulus;
+        }
+        if b >= modulus {
+            sum = sum.checked_add(count.checked_mul(b / modulus)?)?;
+            b %= modulus;
+        }
+        let maximum = a.checked_mul(count)?.checked_add(b)?;
+        if maximum < modulus {
+            return Some(sum);
+        }
+        count = maximum / modulus;
+        b = maximum % modulus;
+        std::mem::swap(&mut modulus, &mut a);
+    }
+}
+
+/// Count the logical iterations in the first `rows` outer iterations of a
+/// supported direct-bound nonrectangular collapsed loop.
+fn nonrect_prefix_count(
+    rows: i128,
+    outer_lower: i64,
+    outer_step: i64,
+    inner_lower: i64,
+    inner_upper: i64,
+    inner_step: i64,
+    flags: i32,
+) -> Option<i128> {
+    if rows < 0 || outer_step == 0 || inner_step == 0 || !(1..=3).contains(&flags) {
+        return None;
+    }
+    if rows == 0 {
+        return Some(0);
+    }
+
+    let outer_lower = i128::from(outer_lower);
+    let outer_step = i128::from(outer_step);
+    let inner_lower = i128::from(inner_lower);
+    let inner_upper = i128::from(inner_upper);
+    let divisor = i128::from(inner_step).abs();
+    let (base, slope) = if flags == 3 {
+        (0, 0)
+    } else if inner_step > 0 {
+        if flags == 1 {
+            (inner_upper - outer_lower, -outer_step)
+        } else {
+            (outer_lower - inner_lower, outer_step)
+        }
+    } else if flags == 1 {
+        (outer_lower - inner_upper, outer_step)
+    } else {
+        (inner_lower - outer_lower, -outer_step)
+    };
+
+    // A row contributes max(0, floor((base + slope*i) / divisor) + 1).
+    // The nonempty rows form one contiguous interval because the numerator is
+    // affine. Trim the empty prefix or suffix before summing the floors.
+    let (first_row, nonempty_rows) = if slope > 0 {
+        let first = if base >= 0 {
+            0
+        } else {
+            (-base).checked_add(slope.checked_sub(1)?)? / slope
+        };
+        let first = first.min(rows);
+        (first, rows - first)
+    } else if slope < 0 {
+        if base < 0 {
+            return Some(0);
+        }
+        let last = base / -slope;
+        (0, rows.min(last.checked_add(1)?))
+    } else if base >= 0 {
+        (0, rows)
+    } else {
+        return Some(0);
+    };
+    if nonempty_rows == 0 {
+        return Some(0);
+    }
+
+    let first_numerator = base.checked_add(slope.checked_mul(first_row)?)?;
+    debug_assert!(first_numerator >= 0);
+    let (floor_step, floor_base) = if slope < 0 {
+        let last_offset = nonempty_rows.checked_sub(1)?;
+        let last_numerator = first_numerator.checked_add(slope.checked_mul(last_offset)?)?;
+        debug_assert!(last_numerator >= 0);
+        (-slope, last_numerator)
+    } else {
+        (slope, first_numerator)
+    };
+    checked_floor_sum_nonnegative(nonempty_rows, divisor, floor_step, floor_base)?
+        .checked_add(nonempty_rows)
+}
+
+fn nonrect_indices_with_probe_count(
+    flat_index: i64,
+    outer_count: i64,
+    outer_lower: i64,
+    outer_step: i64,
+    inner_lower: i64,
+    inner_upper: i64,
+    inner_step: i64,
+    flags: i32,
+) -> Result<(i64, i64, usize), i32> {
+    if flat_index < 0
+        || outer_count <= 0
+        || outer_step == 0
+        || inner_step == 0
+        || !(1..=3).contains(&flags)
+    {
+        return Err(-AFS_OMP_ERROR_INVALID_LOOP);
+    }
+
+    let outer_count = i128::from(outer_count);
+    let target = i128::from(flat_index);
+    let Some(total) = nonrect_prefix_count(
+        outer_count,
+        outer_lower,
+        outer_step,
+        inner_lower,
+        inner_upper,
+        inner_step,
+        flags,
+    ) else {
+        return Err(-AFS_OMP_ERROR_INVALID_LOOP);
+    };
+    if target >= total {
+        return Err(-AFS_OMP_ERROR_INVALID_LOOP);
+    }
+
+    let mut probes = 1_usize;
+    let mut low = 0_i128;
+    let mut high = outer_count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let Some(prefix) = nonrect_prefix_count(
+            middle + 1,
+            outer_lower,
+            outer_step,
+            inner_lower,
+            inner_upper,
+            inner_step,
+            flags,
+        ) else {
+            return Err(-AFS_OMP_ERROR_INVALID_LOOP);
+        };
+        probes += 1;
+        if prefix <= target {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    let outer_index = low;
+    let Some(prefix_before) = nonrect_prefix_count(
+        outer_index,
+        outer_lower,
+        outer_step,
+        inner_lower,
+        inner_upper,
+        inner_step,
+        flags,
+    ) else {
+        return Err(-AFS_OMP_ERROR_INVALID_LOOP);
+    };
+    probes += 1;
+    let inner_index = target - prefix_before;
+    let outer = i128::from(outer_lower) + outer_index * i128::from(outer_step);
+    let Some((lower, upper)) = nonrect_inner_bounds(outer, inner_lower, inner_upper, flags) else {
+        return Err(-AFS_OMP_ERROR_INVALID_LOOP);
+    };
+    if inner_index >= loop_iteration_count(lower, upper, i128::from(inner_step)) {
+        return Err(-AFS_OMP_ERROR_INVALID_LOOP);
+    }
+    let inner = lower + inner_index * i128::from(inner_step);
+    let (Ok(outer), Ok(inner)) = (i64::try_from(outer), i64::try_from(inner)) else {
+        return Err(-AFS_OMP_ERROR_INVALID_LOOP);
+    };
+    Ok((outer, inner, probes))
+}
+
 /// Compute the logical size of a `collapse(2)` space whose inner lower and/or
 /// upper bound is the outer iteration variable itself.
 ///
@@ -2500,21 +2702,17 @@ pub extern "C" fn afs_omp_collapse2_nonrect_shape(
     let Ok(outer_iterations_i64) = i64::try_from(outer_iterations) else {
         return -AFS_OMP_ERROR_INVALID_LOOP;
     };
-    let mut total_iterations = 0_i128;
-    let mut outer_index = 0_i128;
-    while outer_index < outer_iterations {
-        let outer = i128::from(outer_lower) + outer_index * i128::from(outer_step);
-        let Some((lower, upper)) = nonrect_inner_bounds(outer, inner_lower, inner_upper, flags)
-        else {
-            return -AFS_OMP_ERROR_INVALID_LOOP;
-        };
-        let inner_iterations = loop_iteration_count(lower, upper, i128::from(inner_step));
-        let Some(next_total) = total_iterations.checked_add(inner_iterations) else {
-            return -AFS_OMP_ERROR_INVALID_LOOP;
-        };
-        total_iterations = next_total;
-        outer_index += 1;
-    }
+    let Some(total_iterations) = nonrect_prefix_count(
+        outer_iterations,
+        outer_lower,
+        outer_step,
+        inner_lower,
+        inner_upper,
+        inner_step,
+        flags,
+    ) else {
+        return -AFS_OMP_ERROR_INVALID_LOOP;
+    };
     let Ok(total_iterations) = i64::try_from(total_iterations) else {
         return -AFS_OMP_ERROR_INVALID_LOOP;
     };
@@ -2548,39 +2746,23 @@ pub extern "C" fn afs_omp_collapse2_nonrect_indices(
         *outer_value = 0;
         *inner_value = 0;
     }
-    if flat_index < 0
-        || outer_count <= 0
-        || outer_step == 0
-        || inner_step == 0
-        || !(1..=3).contains(&flags)
-    {
+    let Ok((outer, inner, _)) = nonrect_indices_with_probe_count(
+        flat_index,
+        outer_count,
+        outer_lower,
+        outer_step,
+        inner_lower,
+        inner_upper,
+        inner_step,
+        flags,
+    ) else {
         return -AFS_OMP_ERROR_INVALID_LOOP;
+    };
+    unsafe {
+        *outer_value = outer;
+        *inner_value = inner;
     }
-
-    let mut remaining = i128::from(flat_index);
-    let mut outer_index = 0_i128;
-    while outer_index < i128::from(outer_count) {
-        let outer = i128::from(outer_lower) + outer_index * i128::from(outer_step);
-        let Some((lower, upper)) = nonrect_inner_bounds(outer, inner_lower, inner_upper, flags)
-        else {
-            return -AFS_OMP_ERROR_INVALID_LOOP;
-        };
-        let inner_iterations = loop_iteration_count(lower, upper, i128::from(inner_step));
-        if remaining < inner_iterations {
-            let inner = lower + remaining * i128::from(inner_step);
-            let (Ok(outer), Ok(inner)) = (i64::try_from(outer), i64::try_from(inner)) else {
-                return -AFS_OMP_ERROR_INVALID_LOOP;
-            };
-            unsafe {
-                *outer_value = outer;
-                *inner_value = inner;
-            }
-            return AFS_OMP_SUCCESS;
-        }
-        remaining -= inner_iterations;
-        outer_index += 1;
-    }
-    -AFS_OMP_ERROR_INVALID_LOOP
+    AFS_OMP_SUCCESS
 }
 
 fn loop_iteration_count(lower: i128, upper: i128, step: i128) -> i128 {
@@ -4640,6 +4822,120 @@ mod tests {
         assert_eq!(
             nonrect_indices(0, 0, (1, 1), (0, 4, 1), 1),
             Err(-AFS_OMP_ERROR_INVALID_LOOP)
+        );
+    }
+
+    fn linear_nonrect_indices(
+        flat_index: i128,
+        outer_count: i128,
+        outer: (i64, i64),
+        inner: (i64, i64, i64),
+        flags: i32,
+    ) -> Option<(i64, i64)> {
+        let mut remaining = flat_index;
+        for outer_index in 0..outer_count {
+            let outer_value = i128::from(outer.0) + outer_index * i128::from(outer.1);
+            let (lower, upper) = nonrect_inner_bounds(outer_value, inner.0, inner.1, flags)?;
+            let count = loop_iteration_count(lower, upper, i128::from(inner.2));
+            if remaining < count {
+                let inner_value = lower + remaining * i128::from(inner.2);
+                return Some((
+                    i64::try_from(outer_value).ok()?,
+                    i64::try_from(inner_value).ok()?,
+                ));
+            }
+            remaining -= count;
+        }
+        None
+    }
+
+    #[test]
+    fn collapse2_nonrect_prefix_and_search_match_linear_reference() {
+        for outer_lower in [-3_i64, 0, 3] {
+            for outer_step in [-2_i64, -1, 1, 2] {
+                for outer_count in 0_i128..=8 {
+                    for inner_lower in [-4_i64, -1, 2, 5] {
+                        for inner_upper in [-4_i64, -1, 2, 5] {
+                            for inner_step in [-3_i64, -1, 1, 2] {
+                                for flags in 1..=3 {
+                                    let mut linear_total = 0_i128;
+                                    for outer_index in 0..outer_count {
+                                        let outer = i128::from(outer_lower)
+                                            + outer_index * i128::from(outer_step);
+                                        let (lower, upper) = nonrect_inner_bounds(
+                                            outer,
+                                            inner_lower,
+                                            inner_upper,
+                                            flags,
+                                        )
+                                        .unwrap();
+                                        linear_total += loop_iteration_count(
+                                            lower,
+                                            upper,
+                                            i128::from(inner_step),
+                                        );
+                                    }
+                                    assert_eq!(
+                                        nonrect_prefix_count(
+                                            outer_count,
+                                            outer_lower,
+                                            outer_step,
+                                            inner_lower,
+                                            inner_upper,
+                                            inner_step,
+                                            flags,
+                                        ),
+                                        Some(linear_total)
+                                    );
+                                    for flat_index in 0..linear_total {
+                                        let expected = linear_nonrect_indices(
+                                            flat_index,
+                                            outer_count,
+                                            (outer_lower, outer_step),
+                                            (inner_lower, inner_upper, inner_step),
+                                            flags,
+                                        )
+                                        .unwrap();
+                                        let (actual_outer, actual_inner, _) =
+                                            nonrect_indices_with_probe_count(
+                                                i64::try_from(flat_index).unwrap(),
+                                                i64::try_from(outer_count).unwrap(),
+                                                outer_lower,
+                                                outer_step,
+                                                inner_lower,
+                                                inner_upper,
+                                                inner_step,
+                                                flags,
+                                            )
+                                            .unwrap();
+                                        assert_eq!((actual_outer, actual_inner), expected);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collapse2_nonrect_search_has_logarithmic_probe_bound() {
+        let (outer, inner, probes) =
+            nonrect_indices_with_probe_count(i64::MAX - 1, i64::MAX, i64::MIN, 1, 0, 0, 1, 3)
+                .unwrap();
+        assert_eq!((outer, inner), (-2, -2));
+        assert!(
+            probes <= 65,
+            "initial-team collapse search used {probes} probes"
+        );
+
+        let (outer, inner, probes) =
+            nonrect_indices_with_probe_count(0, i64::MAX, i64::MIN, 1, 0, i64::MIN, 1, 1).unwrap();
+        assert_eq!((outer, inner), (i64::MIN, i64::MIN));
+        assert!(
+            probes <= 65,
+            "collapse search across empty rows used {probes} probes"
         );
     }
 
