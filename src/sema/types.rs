@@ -158,33 +158,115 @@ impl FortranType {
     }
 }
 
-/// F2023 17.11.38 kind selection over the IEC 60559 formats implemented by
-/// ARMFORTAS. Missing P/R are represented by zero; `None` for RADIX means no
-/// radix constraint.
-pub(crate) fn ieee_selected_real_kind_value(
+/// One integer representation implemented by the compiler and runtime.
+///
+/// Keep this table as the authoritative source for kind-selection intrinsics
+/// and `ISO_FORTRAN_ENV`: duplicating the thresholds made constant and runtime
+/// `SELECTED_INT_KIND` calls disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IntegerKindCapability {
+    pub kind: u8,
+    pub decimal_range: i128,
+}
+
+pub(crate) const INTEGER_KIND_CAPABILITIES: &[IntegerKindCapability] = &[
+    IntegerKindCapability {
+        kind: 1,
+        decimal_range: 2,
+    },
+    IntegerKindCapability {
+        kind: 2,
+        decimal_range: 4,
+    },
+    IntegerKindCapability {
+        kind: 4,
+        decimal_range: 9,
+    },
+    IntegerKindCapability {
+        kind: 8,
+        decimal_range: 18,
+    },
+    IntegerKindCapability {
+        kind: 16,
+        decimal_range: 38,
+    },
+];
+
+/// One real representation implemented by the compiler and runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RealKindCapability {
+    pub kind: u8,
+    pub decimal_precision: i128,
+    pub decimal_range: i128,
+    pub radix: i128,
+}
+
+pub(crate) const REAL_KIND_CAPABILITIES: &[RealKindCapability] = &[
+    RealKindCapability {
+        kind: 4,
+        decimal_precision: 6,
+        decimal_range: 37,
+        radix: 2,
+    },
+    RealKindCapability {
+        kind: 8,
+        decimal_precision: 15,
+        decimal_range: 307,
+        radix: 2,
+    },
+];
+
+pub(crate) const CHARACTER_KINDS: &[i32] = &[1];
+pub(crate) const INTEGER_KINDS: &[i32] = &[1, 2, 4, 8, 16];
+pub(crate) const LOGICAL_KINDS: &[i32] = &[1, 2, 4, 8, 16];
+pub(crate) const REAL_KINDS: &[i32] = &[4, 8];
+
+pub(crate) fn intrinsic_kind_array_values(name: &str) -> Option<&'static [i32]> {
+    match name.to_ascii_lowercase().as_str() {
+        "character_kinds" => Some(CHARACTER_KINDS),
+        "integer_kinds" => Some(INTEGER_KINDS),
+        "logical_kinds" => Some(LOGICAL_KINDS),
+        "real_kinds" => Some(REAL_KINDS),
+        _ => None,
+    }
+}
+
+pub(crate) fn selected_int_kind_value(decimal_range: i128) -> i32 {
+    INTEGER_KIND_CAPABILITIES
+        .iter()
+        .find(|capability| decimal_range <= capability.decimal_range)
+        .map_or(-1, |capability| i32::from(capability.kind))
+}
+
+/// F2023 16.9.189 and 17.11.38 kind selection over the real formats
+/// implemented by ARMFORTAS. Missing P/R are represented by zero; `None` for
+/// RADIX means no radix constraint.
+pub(crate) fn selected_real_kind_value(
     precision: i128,
     exponent_range: i128,
     radix: Option<i128>,
 ) -> i32 {
-    if radix.is_some_and(|value| value != 2) {
+    let candidates = || {
+        REAL_KIND_CAPABILITIES
+            .iter()
+            .filter(|capability| radix.is_none_or(|value| capability.radix == value))
+    };
+    if radix.is_some() && candidates().next().is_none() {
         return -5;
     }
-    if precision <= 6 && exponent_range <= 37 {
-        return 4;
-    }
-    if precision <= 15 && exponent_range <= 307 {
-        return 8;
+    if let Some(capability) = candidates().find(|capability| {
+        precision <= capability.decimal_precision && exponent_range <= capability.decimal_range
+    }) {
+        return i32::from(capability.kind);
     }
 
-    let precision_supported = precision <= 15;
-    let range_supported = exponent_range <= 307;
+    let precision_supported =
+        candidates().any(|capability| precision <= capability.decimal_precision);
+    let range_supported = candidates().any(|capability| exponent_range <= capability.decimal_range);
     match (precision_supported, range_supported) {
         (false, true) => -1,
         (true, false) => -2,
         (false, false) => -3,
-        // With nested binary32/binary64 capabilities this cannot occur, but
-        // it is the standard result when separate kinds satisfy P and R
-        // without one kind satisfying both.
         (true, true) => -4,
     }
 }
@@ -553,32 +635,54 @@ fn intrinsic_element_argument<'a>(
         })
 }
 
+pub(crate) fn eval_selected_real_kind_args(
+    args: &[crate::ast::expr::Argument],
+    mut eval: impl FnMut(&crate::ast::expr::SpannedExpr) -> Option<i128>,
+) -> Option<i128> {
+    let mut values = [None, None, None];
+    let mut positional = 0usize;
+    let mut saw_keyword = false;
+
+    for arg in args {
+        let index = if let Some(keyword) = arg.keyword.as_deref() {
+            saw_keyword = true;
+            match keyword.to_ascii_lowercase().as_str() {
+                "p" => 0,
+                "r" => 1,
+                "radix" => 2,
+                _ => return None,
+            }
+        } else {
+            if saw_keyword || positional >= values.len() {
+                return None;
+            }
+            let index = positional;
+            positional += 1;
+            index
+        };
+        if values[index].is_some() {
+            return None;
+        }
+        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+            return None;
+        };
+        values[index] = Some(eval(expr)?);
+    }
+
+    if values.iter().all(Option::is_none) {
+        return None;
+    }
+    Some(i128::from(selected_real_kind_value(
+        values[0].unwrap_or(0),
+        values[1].unwrap_or(0),
+        values[2],
+    )))
+}
+
 pub(crate) fn selected_kind_value(name: &str, argument: i128) -> Option<i128> {
     Some(match name {
-        "selected_int_kind" => {
-            if argument <= 2 {
-                1
-            } else if argument <= 4 {
-                2
-            } else if argument <= 9 {
-                4
-            } else if argument <= 18 {
-                8
-            } else if argument <= 38 {
-                16
-            } else {
-                -1
-            }
-        }
-        "selected_real_kind" => {
-            if argument <= 6 {
-                4
-            } else if argument <= 15 {
-                8
-            } else {
-                -1
-            }
-        }
+        "selected_int_kind" => i128::from(selected_int_kind_value(argument)),
+        "selected_real_kind" => i128::from(selected_real_kind_value(argument, 0, None)),
         "selected_logical_kind" => {
             if argument <= 8 {
                 1
@@ -688,30 +792,9 @@ pub(crate) fn resolve_intrinsic_kind_value(
                         },
                     )
                 }
-                "selected_real_kind" => {
-                    let precision_arg = intrinsic_element_argument(args, 0, "p");
-                    let exponent_range_arg = intrinsic_element_argument(args, 1, "r");
-                    if precision_arg.is_none() && exponent_range_arg.is_none() {
-                        return None;
-                    }
-                    let precision = match precision_arg {
-                        Some(argument) => resolve_intrinsic_kind_value(argument, symtab)?,
-                        None => 0,
-                    };
-                    let exponent_range = match exponent_range_arg {
-                        Some(argument) => resolve_intrinsic_kind_value(argument, symtab)?,
-                        None => 0,
-                    };
-                    let radix = match intrinsic_element_argument(args, 2, "radix") {
-                        Some(argument) => Some(resolve_intrinsic_kind_value(argument, symtab)?),
-                        None => None,
-                    };
-                    Some(i128::from(ieee_selected_real_kind_value(
-                        precision,
-                        exponent_range,
-                        radix,
-                    )))
-                }
+                "selected_real_kind" => eval_selected_real_kind_args(args, |argument| {
+                    resolve_intrinsic_kind_value(argument, symtab)
+                }),
                 _ => None,
             }
         }
@@ -1643,6 +1726,33 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn processor_kind_inventory_and_selection_share_one_model() {
+        assert_eq!(
+            INTEGER_KIND_CAPABILITIES
+                .iter()
+                .map(|capability| i32::from(capability.kind))
+                .collect::<Vec<_>>(),
+            INTEGER_KINDS
+        );
+        assert_eq!(
+            REAL_KIND_CAPABILITIES
+                .iter()
+                .map(|capability| i32::from(capability.kind))
+                .collect::<Vec<_>>(),
+            REAL_KINDS
+        );
+        assert_eq!(selected_int_kind_value(18), 8);
+        assert_eq!(selected_int_kind_value(19), 16);
+        assert_eq!(selected_int_kind_value(39), -1);
+        assert_eq!(selected_real_kind_value(6, 0, None), 4);
+        assert_eq!(selected_real_kind_value(15, 300, Some(2)), 8);
+        assert_eq!(selected_real_kind_value(16, 300, Some(2)), -1);
+        assert_eq!(selected_real_kind_value(15, 308, Some(2)), -2);
+        assert_eq!(selected_real_kind_value(16, 308, Some(2)), -3);
+        assert_eq!(selected_real_kind_value(6, 37, Some(10)), -5);
+    }
 
     // ---- Arithmetic promotion ----
 

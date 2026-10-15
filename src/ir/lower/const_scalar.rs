@@ -212,21 +212,9 @@ pub(super) fn eval_const_scalar(
                     },
                     "selected_int_kind" => {
                         if let Some(ConstScalar::Int(r)) = first_arg {
-                            let r = r as i64;
-                            let kind = if r <= 2 {
-                                1
-                            } else if r <= 4 {
-                                2
-                            } else if r <= 9 {
-                                4
-                            } else if r <= 18 {
-                                8
-                            } else if r <= 38 {
-                                16
-                            } else {
-                                -1
-                            };
-                            Some(ConstScalar::Int(kind as i128))
+                            Some(ConstScalar::Int(i128::from(
+                                crate::sema::types::selected_int_kind_value(r),
+                            )))
                         } else {
                             None
                         }
@@ -284,19 +272,13 @@ pub(super) fn eval_const_scalar(
                         Some(ConstScalar::Int((kind as i128) * 8))
                     }
                     "selected_real_kind" => {
-                        if let Some(ConstScalar::Int(p)) = first_arg {
-                            let p = p as i64;
-                            let kind = if p <= 6 {
-                                4
-                            } else if p <= 15 {
-                                8
-                            } else {
-                                -1
-                            };
-                            Some(ConstScalar::Int(kind as i128))
-                        } else {
-                            None
-                        }
+                        crate::sema::types::eval_selected_real_kind_args(args, |expr| {
+                            match eval_const_scalar(expr, param_consts)? {
+                                ConstScalar::Int(value) => Some(value),
+                                ConstScalar::Float(_) => None,
+                            }
+                        })
+                        .map(ConstScalar::Int)
                     }
                     "selected_char_kind" => {
                         let arg = args.first()?;

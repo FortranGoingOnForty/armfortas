@@ -10031,6 +10031,93 @@ fn logical_intrinsic_kind_argument_compiles_and_runs() {
 }
 
 #[test]
+fn selected_kinds_and_iso_fortran_env_inventory_share_runtime_model() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=selected_kinds_and_iso_fortran_env_inventory_share_runtime_model count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("selected_kind_model");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use, intrinsic :: iso_fortran_env, only : character_kinds, integer_kinds, &
+       logical_kinds, real_kinds, real128
+  implicit none
+  integer(kind=8) :: decimal_range, precision, exponent_range, requested_radix
+
+  decimal_range = 18
+  if (selected_int_kind(decimal_range) /= selected_int_kind(18)) error stop 1
+  decimal_range = 19
+  if (selected_int_kind(decimal_range) /= 16) error stop 2
+  decimal_range = 39
+  if (selected_int_kind(decimal_range) /= -1) error stop 3
+
+  precision = 15
+  exponent_range = 300
+  requested_radix = 2
+  if (selected_real_kind(r=exponent_range, radix=requested_radix, p=precision) /= 8) error stop 4
+  precision = 16
+  if (selected_real_kind(p=precision) /= -1) error stop 5
+  precision = 15
+  exponent_range = 308
+  if (selected_real_kind(r=exponent_range, p=precision) /= -2) error stop 6
+  precision = 16
+  if (selected_real_kind(precision, exponent_range, requested_radix) /= -3) error stop 7
+  requested_radix = 10
+  if (selected_real_kind(radix=requested_radix) /= -5) error stop 8
+
+  if (size(character_kinds) /= 1 .or. any(character_kinds /= [1])) error stop 9
+  if (size(integer_kinds) /= 5 .or. any(integer_kinds /= [1, 2, 4, 8, 16])) error stop 10
+  if (size(logical_kinds) /= 5 .or. any(logical_kinds /= [1, 2, 4, 8, 16])) error stop 11
+  if (size(real_kinds) /= 2 .or. any(real_kinds /= [4, 8])) error stop 12
+  if (real128 >= 0) error stop 13
+  print *, 'ok'
+end program p
+"#,
+    );
+
+    for optimization in ["-O0", "-O3"] {
+        let executable = dir.join(format!(
+            "selected_kind_model_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("selected kind model compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: selected kind model should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("selected kind model executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: selected kind model should run: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

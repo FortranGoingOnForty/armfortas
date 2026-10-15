@@ -12033,7 +12033,7 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
                 );
             }
         }
-        "ieee_selected_real_kind" => {
+        "selected_real_kind" | "ieee_selected_real_kind" => {
             const FORMALS: [&str; 3] = ["p", "r", "radix"];
             validate_intrinsic_argument_associations(ctx, span, &key, args, &FORMALS, 0);
             for (position, formal) in FORMALS.iter().enumerate() {

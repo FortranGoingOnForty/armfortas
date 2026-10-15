@@ -97,6 +97,35 @@ fn insert_param_val(
     );
 }
 
+fn insert_param_array(st: &mut SymbolTable, mod_id: ScopeId, name: &str, values: &[i32]) {
+    let span = builtin_span();
+    let upper = crate::ast::Spanned::new(
+        crate::ast::expr::Expr::IntegerLiteral {
+            text: values.len().to_string(),
+            kind: None,
+        },
+        span,
+    );
+    st.scope_mut(mod_id).symbols.insert(
+        name.to_lowercase(),
+        Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::Parameter,
+            type_info: Some(TypeInfo::Integer { kind: Some(4) }),
+            attrs: SymbolAttrs {
+                parameter: true,
+                array_spec: vec![crate::ast::decl::ArraySpec::Explicit { lower: None, upper }],
+                ..Default::default()
+            },
+            defined_at: span,
+            scope: mod_id,
+            arg_names: vec![],
+            const_value: None,
+            const_char_value: None,
+        },
+    );
+}
+
 fn insert_type(st: &mut SymbolTable, mod_id: ScopeId, name: &str) {
     let span = builtin_span();
     st.scope_mut(mod_id).symbols.insert(
@@ -274,7 +303,7 @@ fn register_iso_fortran_env(st: &mut SymbolTable) {
     insert_param_val(st, m, "int64", ik4.clone(), Some(8));
     insert_param_val(st, m, "real32", ik4.clone(), Some(4));
     insert_param_val(st, m, "real64", ik4.clone(), Some(8));
-    insert_param_val(st, m, "real128", ik4.clone(), Some(16));
+    insert_param_val(st, m, "real128", ik4.clone(), Some(-1));
     // F2023 16.10.2: logical kind constants (kind = bit width / 8) and
     // the 16-bit real constant. armfortas has no 16-bit real, so
     // REAL16 takes the standard's -2 sentinel ("no kind of this size,
@@ -284,10 +313,15 @@ fn register_iso_fortran_env(st: &mut SymbolTable) {
     insert_param_val(st, m, "logical32", ik4.clone(), Some(4));
     insert_param_val(st, m, "logical64", ik4.clone(), Some(8));
     insert_param_val(st, m, "real16", ik4.clone(), Some(-2));
-    insert_param_val(st, m, "character_kinds", ik4.clone(), Some(1));
-    insert_param_val(st, m, "integer_kinds", ik4.clone(), Some(4));
-    insert_param_val(st, m, "logical_kinds", ik4.clone(), Some(4));
-    insert_param_val(st, m, "real_kinds", ik4.clone(), Some(4));
+    insert_param_array(
+        st,
+        m,
+        "character_kinds",
+        crate::sema::types::CHARACTER_KINDS,
+    );
+    insert_param_array(st, m, "integer_kinds", crate::sema::types::INTEGER_KINDS);
+    insert_param_array(st, m, "logical_kinds", crate::sema::types::LOGICAL_KINDS);
+    insert_param_array(st, m, "real_kinds", crate::sema::types::REAL_KINDS);
 
     // Storage size constants (F2008).  Values reflect armfortas's
     // ARM64/macOS layout: one-byte default character (Fortran wide
@@ -542,6 +576,30 @@ mod tests {
     fn recognizes_both_openmp_modules_as_intrinsic() {
         assert!(is_intrinsic_module("OMP_LIB"));
         assert!(is_intrinsic_module("omp_lib_kinds"));
+    }
+
+    #[test]
+    fn iso_fortran_env_kind_inventory_matches_processor_capabilities() {
+        let mut st = SymbolTable::new();
+        register_intrinsic_modules(&mut st);
+
+        let module = st
+            .find_intrinsic_module_scope("iso_fortran_env")
+            .expect("iso_fortran_env scope");
+        let symbols = &st.scope(module).symbols;
+        assert_eq!(symbols["real128"].const_value, Some(-1));
+        for name in [
+            "character_kinds",
+            "integer_kinds",
+            "logical_kinds",
+            "real_kinds",
+        ] {
+            let symbol = &symbols[name];
+            assert!(symbol.attrs.parameter);
+            assert_eq!(symbol.attrs.array_spec.len(), 1, "{name} must be rank one");
+            assert_eq!(symbol.const_value, None, "{name} must not be scalar");
+            assert!(crate::sema::types::intrinsic_kind_array_values(name).is_some());
+        }
     }
 
     #[test]

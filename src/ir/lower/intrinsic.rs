@@ -70,51 +70,65 @@ fn saturating_i32(b: &mut FuncBuilder, value: ValueId) -> ValueId {
     }
 }
 
-pub(crate) fn lower_ieee_selected_real_kind(
+pub(crate) fn lower_selected_int_kind(b: &mut FuncBuilder, range: ValueId) -> ValueId {
+    let range = saturating_i32(b, range);
+    let mut result = b.const_i32(-1);
+    for capability in crate::sema::types::INTEGER_KIND_CAPABILITIES.iter().rev() {
+        let limit = b.const_i32(capability.decimal_range as i32);
+        let supported = b.icmp(CmpOp::Le, range, limit);
+        let kind = b.const_i32(i32::from(capability.kind));
+        result = b.select(supported, kind, result);
+    }
+    result
+}
+
+pub(crate) fn lower_selected_real_kind(
     b: &mut FuncBuilder,
     p: Option<ValueId>,
     r: Option<ValueId>,
     radix: Option<ValueId>,
 ) -> ValueId {
-    // ARMFORTAS exposes the two IEC 60559 binary formats its backend and
-    // runtime implement: binary32 (precision=6, range=37, radix=2) and
-    // binary64 (precision=15, range=307, radix=2). Saturation preserves all
-    // comparisons relevant to those bounds for every supported INTEGER kind,
-    // including kind=16 inputs.
+    // Saturation preserves all comparisons relevant to the capability table
+    // for every supported INTEGER kind, including kind=16 inputs.
     let p = p
         .map(|value| saturating_i32(b, value))
         .unwrap_or_else(|| b.const_i32(0));
     let r = r
         .map(|value| saturating_i32(b, value))
         .unwrap_or_else(|| b.const_i32(0));
-    let radix_supported = match radix {
-        Some(value) => {
-            let value = saturating_i32(b, value);
-            let two = b.const_i32(2);
-            b.icmp(CmpOp::Eq, value, two)
-        }
-        None => b.const_bool(true),
-    };
+    let radix = radix.map(|value| saturating_i32(b, value));
+    let mut radix_supported = b.const_bool(radix.is_none());
+    let mut precision_supported = b.const_bool(false);
+    let mut range_supported = b.const_bool(false);
+    let mut matches = Vec::with_capacity(crate::sema::types::REAL_KIND_CAPABILITIES.len());
+    for capability in crate::sema::types::REAL_KIND_CAPABILITIES {
+        let radix_match = match radix {
+            Some(value) => {
+                let capability_radix = b.const_i32(capability.radix as i32);
+                b.icmp(CmpOp::Eq, value, capability_radix)
+            }
+            None => b.const_bool(true),
+        };
+        radix_supported = b.or(radix_supported, radix_match);
 
-    let p6 = b.const_i32(6);
-    let r37 = b.const_i32(37);
-    let p15 = b.const_i32(15);
-    let r307 = b.const_i32(307);
-    let precision4 = b.icmp(CmpOp::Le, p, p6);
-    let range4 = b.icmp(CmpOp::Le, r, r37);
-    let precision8 = b.icmp(CmpOp::Le, p, p15);
-    let range8 = b.icmp(CmpOp::Le, r, r307);
-    let binary4_criteria = b.and(precision4, range4);
-    let binary8_criteria = b.and(precision8, range8);
-    let binary4 = b.and(radix_supported, binary4_criteria);
-    let binary8 = b.and(radix_supported, binary8_criteria);
+        let precision_limit = b.const_i32(capability.decimal_precision as i32);
+        let range_limit = b.const_i32(capability.decimal_range as i32);
+        let precision_match = b.icmp(CmpOp::Le, p, precision_limit);
+        let range_match = b.icmp(CmpOp::Le, r, range_limit);
+        let candidate_precision = b.and(radix_match, precision_match);
+        let candidate_range = b.and(radix_match, range_match);
+        precision_supported = b.or(precision_supported, candidate_precision);
+        range_supported = b.or(range_supported, candidate_range);
+        let criteria = b.and(candidate_precision, candidate_range);
+        matches.push(criteria);
+    }
 
     // F2023 17.11.38 negative-result lattice. With the nested binary32 /
     // binary64 capabilities, -4 is not reachable today, but retaining the
     // standard branch keeps the decision complete if another IEEE kind is
     // added later.
-    let lacks_precision = b.not(precision8);
-    let lacks_range = b.not(range8);
+    let lacks_precision = b.not(precision_supported);
+    let lacks_range = b.not(range_supported);
     let minus1 = b.const_i32(-1);
     let minus2 = b.const_i32(-2);
     let minus3 = b.const_i32(-3);
@@ -128,10 +142,16 @@ pub(crate) fn lower_ieee_selected_real_kind(
         range_or_combination_failure,
     );
     let failure = b.select(radix_supported, supported_radix_failure, minus5);
-    let kind8 = b.const_i32(8);
-    let kind4 = b.const_i32(4);
-    let binary8_or_failure = b.select(binary8, kind8, failure);
-    b.select(binary4, kind4, binary8_or_failure)
+    let mut result = failure;
+    for (capability, matched) in crate::sema::types::REAL_KIND_CAPABILITIES
+        .iter()
+        .zip(matches)
+        .rev()
+    {
+        let kind = b.const_i32(i32::from(capability.kind));
+        result = b.select(matched, kind, result);
+    }
+    result
 }
 
 /// Lower a Fortran intrinsic function call to IR instructions.
@@ -1651,64 +1671,15 @@ pub(crate) fn lower_intrinsic(
         }
 
         // ---- Kind selection intrinsics ----
-        "selected_int_kind" => {
-            // selected_int_kind(r): smallest integer kind whose range covers [-10^r, 10^r].
-            if let Some(arg) = args.first() {
-                if let Some(r) = extract_const_int_from_value(b, *arg) {
-                    let kind: i32 = if r <= 2 {
-                        1
-                    }
-                    // i8: ±127
-                    else if r <= 4 {
-                        2
-                    }
-                    // i16: ±32767
-                    else if r <= 9 {
-                        4
-                    }
-                    // i32: ±2.1e9
-                    else if r <= 18 {
-                        8
-                    }
-                    // i64: ±9.2e18
-                    else if r <= 38 {
-                        16
-                    }
-                    // i128: ±1.7e38
-                    else {
-                        -1
-                    }; // no kind available
-                    Some(b.const_i32(kind))
-                } else {
-                    Some(b.const_i32(4)) // non-constant: default to 4
-                }
-            } else {
-                None
-            }
-        }
-        "selected_real_kind" => {
-            // selected_real_kind(p[, r]): smallest real kind with ≥p decimal digits.
-            if let Some(arg) = args.first() {
-                if let Some(p) = extract_const_int_from_value(b, *arg) {
-                    let kind: i32 = if p <= 6 {
-                        4
-                    }
-                    // f32: ~7 digits
-                    else if p <= 15 {
-                        8
-                    }
-                    // f64: ~15 digits
-                    else {
-                        -1
-                    }; // no kind available
-                    Some(b.const_i32(kind))
-                } else {
-                    Some(b.const_i32(8)) // non-constant: default to 8
-                }
-            } else {
-                None
-            }
-        }
+        "selected_int_kind" => args
+            .first()
+            .map(|argument| lower_selected_int_kind(b, *argument)),
+        "selected_real_kind" => Some(lower_selected_real_kind(
+            b,
+            args.first().copied(),
+            args.get(1).copied(),
+            args.get(2).copied(),
+        )),
         "selected_logical_kind" => {
             // SELECTED_LOGICAL_KIND(BITS): smallest logical kind whose
             // storage is at least BITS bits

@@ -2383,10 +2383,15 @@ pub(crate) fn lower_expr_full(
                     }
                 }
                 if !has_named_interface
-                    && resolved_intrinsic_name.as_deref() == Some("ieee_selected_real_kind")
+                    && resolved_intrinsic_name.as_deref().is_some_and(|name| {
+                        matches!(name, "selected_real_kind" | "ieee_selected_real_kind")
+                    })
                 {
+                    let intrinsic_name = resolved_intrinsic_name
+                        .as_deref()
+                        .expect("selected-real-kind intrinsic name");
                     let arg_slots =
-                        reorder_args_by_keyword_slots(original_args, "ieee_selected_real_kind", st);
+                        reorder_args_by_keyword_slots(original_args, intrinsic_name, st);
                     let mut values = [None, None, None];
                     for (index, arg) in arg_slots.iter().take(values.len()).enumerate() {
                         let Some(arg) = arg else {
@@ -2406,7 +2411,7 @@ pub(crate) fn lower_expr_full(
                             descriptor_params,
                         ));
                     }
-                    return super::intrinsic::lower_ieee_selected_real_kind(
+                    return super::intrinsic::lower_selected_real_kind(
                         b, values[0], values[1], values[2],
                     );
                 }

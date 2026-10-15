@@ -9056,6 +9056,45 @@ fn install_parameter_inline_const(
     true
 }
 
+fn install_intrinsic_parameter_array(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    local_key: String,
+    symbol: &crate::sema::symtab::Symbol,
+    st: &SymbolTable,
+) -> bool {
+    if locals.contains_key(&local_key)
+        || !symbol.attrs.parameter
+        || !st.scope(symbol.scope).intrinsic_module
+    {
+        return false;
+    }
+    let Some(values) = crate::sema::types::intrinsic_kind_array_values(&symbol.name) else {
+        return false;
+    };
+    let addr = materialize_i32_rank1_descriptor(b, values);
+    locals.insert(
+        local_key,
+        LocalInfo {
+            addr,
+            ty: IrType::Int(IntWidth::I32),
+            dims: vec![(1, values.len() as i64)],
+            allocatable: false,
+            descriptor_arg: true,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+    true
+}
+
 fn module_scope_name_for_symbol(
     st: &SymbolTable,
     scope_id: crate::sema::symtab::ScopeId,
@@ -9221,6 +9260,9 @@ fn install_resolved_global_import(
     st: &SymbolTable,
 ) {
     if locals.contains_key(&local_key) {
+        return;
+    }
+    if install_intrinsic_parameter_array(b, locals, local_key.clone(), symbol, st) {
         return;
     }
     let Some(global_key) = defining_global_key(st, globals, symbol) else {
@@ -10482,7 +10524,7 @@ pub(super) fn eval_const_scalar_with_decl_scope(
             };
             let key = name.to_ascii_lowercase();
             match key.as_str() {
-                "selected_int_kind" | "selected_real_kind" | "selected_logical_kind" => {
+                "selected_int_kind" | "selected_logical_kind" => {
                     let ConstScalar::Int(arg) =
                         const_call_arg_expr(args.first()?).and_then(|e| {
                             eval_const_scalar_with_decl_scope(e, decls, param_consts, st)
@@ -10491,6 +10533,15 @@ pub(super) fn eval_const_scalar_with_decl_scope(
                         return None;
                     };
                     crate::sema::types::selected_kind_value(&key, arg).map(ConstScalar::Int)
+                }
+                "selected_real_kind" => {
+                    crate::sema::types::eval_selected_real_kind_args(args, |expr| {
+                        match eval_const_scalar_with_decl_scope(expr, decls, param_consts, st)? {
+                            ConstScalar::Int(value) => Some(value),
+                            ConstScalar::Float(_) => None,
+                        }
+                    })
+                    .map(ConstScalar::Int)
                 }
                 "selected_char_kind" => {
                     eval_selected_char_kind_with_decl_scope(args, decls, param_consts)
@@ -20415,7 +20466,7 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "eoshift" => Some(&["array", "shift", "boundary", "dim"]),
         "ieee_fma" => Some(&["a", "b", "c"]),
         "ieee_rem" => Some(&["x", "y"]),
-        "ieee_selected_real_kind" => Some(&["p", "r", "radix"]),
+        "selected_real_kind" | "ieee_selected_real_kind" => Some(&["p", "r", "radix"]),
         _ => None,
     }
 }

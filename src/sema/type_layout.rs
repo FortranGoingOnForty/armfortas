@@ -891,29 +891,15 @@ fn eval_const_int_expr(
             match name.to_lowercase().as_str() {
                 "selected_int_kind" => {
                     let r = first_arg_val?;
-                    Some(if r <= 2 {
-                        1
-                    } else if r <= 4 {
-                        2
-                    } else if r <= 9 {
-                        4
-                    } else if r <= 18 {
-                        8
-                    } else if r <= 38 {
-                        16
-                    } else {
-                        -1
-                    })
+                    Some(i64::from(crate::sema::types::selected_int_kind_value(
+                        i128::from(r),
+                    )))
                 }
                 "selected_real_kind" => {
-                    let p = first_arg_val?;
-                    Some(if p <= 6 {
-                        4
-                    } else if p <= 15 {
-                        8
-                    } else {
-                        -1
+                    crate::sema::types::eval_selected_real_kind_args(args, |expr| {
+                        eval_const_int_expr(expr, const_params).map(i128::from)
                     })
+                    .and_then(|value| i64::try_from(value).ok())
                 }
                 "selected_logical_kind" => {
                     let bits = first_arg_val?;
