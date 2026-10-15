@@ -13,12 +13,9 @@ use crate::sema::symtab::{ScopeId, SymbolTable, TypeInfo};
 
 use super::core::{eval_const_int_expr, eval_const_int_expr_in_scope};
 
-/// Integer kind backing an IEEE intrinsic-module opaque type (l09),
-/// or `None` if `name` is not one. The class/round/flag tag types are
-/// small ordinals (default integer); `ieee_status_type` is a 16-byte
-/// save buffer for the FP control+status words, modeled as integer(16).
-/// Case-insensitive; shared by declaration resolution, derived-type
-/// layout, and IR lowering so every path agrees on storage size.
+/// Integer storage kind backing an IEEE intrinsic-module opaque type, or
+/// `None` if `name` is not one. This is a lowering/layout property only:
+/// semantic resolution retains each distinct nominal derived type.
 pub(crate) fn ieee_opaque_int_kind(name: &str) -> Option<u8> {
     match name.to_lowercase().as_str() {
         "ieee_class_type" | "ieee_round_type" | "ieee_flag_type" => Some(4),
@@ -219,16 +216,6 @@ pub(crate) fn type_spec_to_info_in_scope(
             len: extract_char_len_in_scope(sel, st, scope_id),
             kind: extract_char_kind_in_scope(sel, st, scope_id),
         },
-        TypeSpec::Type(name) if ieee_opaque_int_kind(name).is_some() => {
-            // The IEEE_ARITHMETIC/IEEE_EXCEPTIONS opaque types carry a
-            // small enumerated tag (class/round/flag) or an FP-env save
-            // buffer (status). We model them as integer under the hood
-            // (l09 deliverable 2, documented ABI): assignment, `==`/`/=`,
-            // and named-constant equality become plain integer ops.
-            TypeInfo::Integer {
-                kind: ieee_opaque_int_kind(name),
-            }
-        }
         TypeSpec::Type(name) => {
             // TYPE(name) covers derived types AND F2023 enumeration /
             // named-enum types (the standard reuses the spelling —
@@ -238,6 +225,11 @@ pub(crate) fn type_spec_to_info_in_scope(
                 Some(sym)
                     if matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType) =>
                 {
+                    sym.type_info
+                        .clone()
+                        .unwrap_or(TypeInfo::Derived(name.clone()))
+                }
+                Some(sym) if matches!(sym.kind, crate::sema::symtab::SymbolKind::DerivedType) => {
                     sym.type_info
                         .clone()
                         .unwrap_or(TypeInfo::Derived(name.clone()))

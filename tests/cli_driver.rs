@@ -10209,7 +10209,7 @@ fn ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs() {
     let src = write_program_in(
         &dir,
         "main.f90",
-        "program p\n  use, intrinsic :: ieee_arithmetic, only : ieee_value, ieee_quiet_nan, ieee_is_nan\n  implicit none\n  real :: x\n  x = ieee_value(0.0, ieee_quiet_nan)\n  if (.not. ieee_is_nan(x)) error stop 1\n  print *, 'ok'\nend program p\n",
+        "program p\n  use, intrinsic :: ieee_arithmetic, only : ieee_class_type, ieee_round_type, &\n       ieee_value, ieee_class, ieee_quiet_nan, ieee_nearest, ieee_is_nan\n  implicit none\n  real :: x\n  type(ieee_class_type) :: class_value\n  type(ieee_round_type) :: round_value\n  x = ieee_value(0.0, ieee_quiet_nan)\n  class_value = ieee_class(x)\n  round_value = ieee_nearest\n  if (.not. ieee_is_nan(x)) error stop 1\n  if (class_value /= ieee_quiet_nan) error stop 2\n  print *, 'ok'\nend program p\n",
     );
 
     let exe = dir.join("ieee_value_quiet_nan.bin");
@@ -10240,6 +10240,45 @@ fn ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ieee_nominal_types_reject_cross_assignment_without_output() {
+    let src = write_program(
+        "program p
+  use, intrinsic :: ieee_arithmetic, only : ieee_class_type, ieee_round_type
+  implicit none
+  type(ieee_class_type) :: class_value
+  type(ieee_round_type) :: round_value
+  class_value = round_value
+end program p
+",
+        "f90",
+    );
+    let output = unique_path("ieee_nominal_cross_assignment", "ir");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("IEEE nominal-type compile failed to spawn");
+    assert!(
+        !compile.status.success(),
+        "cross-assignment between distinct IEEE nominal types compiled"
+    );
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(
+        stderr.contains("TYPE(ieee_round_type)") && stderr.contains("TYPE(ieee_class_type)"),
+        "unexpected IEEE nominal-type diagnostic: {stderr}"
+    );
+    assert!(
+        !output.exists(),
+        "semantic failure published IEEE nominal-type IR output"
+    );
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]

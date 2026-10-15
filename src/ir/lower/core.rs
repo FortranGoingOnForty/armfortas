@@ -61074,6 +61074,9 @@ pub(super) fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType
     use crate::sema::symtab::TypeInfo;
     if let TypeInfo::Derived(name) | TypeInfo::Class(name) = ti {
         let lower = name.to_lowercase();
+        if let Some(kind) = crate::sema::resolve::type_resolution::ieee_opaque_int_kind(&lower) {
+            return IrType::int_from_kind(kind);
+        }
         if lower == "c_ptr" || lower == "c_funptr" {
             return IrType::Int(IntWidth::I64);
         }

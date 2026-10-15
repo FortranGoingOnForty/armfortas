@@ -798,6 +798,79 @@ end subroutine inspect_memory_attrs
 }
 
 #[test]
+fn ieee_nominal_module_variables_remain_distinct_across_amod() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let provider_source = dir.join("ieee_nominal_provider.f90");
+    let provider_object = dir.join("ieee_nominal_provider.o");
+    let consumer_source = dir.join("ieee_nominal_consumer.f90");
+    let consumer_object = dir.join("ieee_nominal_consumer.o");
+    std::fs::write(
+        &provider_source,
+        "module ieee_nominal_provider
+  use, intrinsic :: ieee_arithmetic, only: ieee_class_type, ieee_round_type
+  implicit none
+  type(ieee_class_type) :: class_value
+  type(ieee_round_type) :: round_value
+end module ieee_nominal_provider
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &consumer_source,
+        "subroutine invalid_cross_assignment()
+  use ieee_nominal_provider, only: class_value, round_value
+  implicit none
+  class_value = round_value
+end subroutine invalid_cross_assignment
+",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &provider_source, &provider_object, None);
+    let amod = std::fs::read_to_string(dir.join("ieee_nominal_provider.amod"))
+        .expect("IEEE nominal provider did not emit its module interface");
+    assert!(
+        amod.lines()
+            .any(|line| { line.starts_with("@var class_value : type(ieee_class_type)") }),
+        "IEEE_CLASS_TYPE identity was erased from .amod:\n{amod}"
+    );
+    assert!(
+        amod.lines()
+            .any(|line| { line.starts_with("@var round_value : type(ieee_round_type)") }),
+        "IEEE_ROUND_TYPE identity was erased from .amod:\n{amod}"
+    );
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            consumer_source.to_str().unwrap(),
+            "-o",
+            consumer_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("IEEE nominal consumer compiler launch failed");
+    assert!(
+        !result.status.success(),
+        "cross-unit assignment between distinct IEEE nominal types compiled"
+    );
+    assert!(
+        !consumer_object.exists(),
+        "cross-unit IEEE semantic failure published an object"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("TYPE(ieee_round_type)") && stderr.contains("TYPE(ieee_class_type)"),
+        "unexpected cross-unit IEEE nominal-type diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn move_alloc_type_identity_survives_amod_round_trip() {
     let compiler = find_compiler();
     let dir = unique_dir();

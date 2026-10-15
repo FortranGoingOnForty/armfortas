@@ -364,7 +364,7 @@ fn register_ieee_modules(st: &mut SymbolTable) {
             "ieee_arithmetic" => {
                 insert_type(st, m, "ieee_class_type");
                 insert_type(st, m, "ieee_round_type");
-                let ik4 = TypeInfo::Integer { kind: Some(4) };
+                let class_type = TypeInfo::Derived("ieee_class_type".into());
                 for (name, value) in [
                     ("ieee_quiet_nan", 1),
                     ("ieee_positive_inf", 2),
@@ -378,10 +378,11 @@ fn register_ieee_modules(st: &mut SymbolTable) {
                     ("ieee_negative_normal", 10),
                     ("ieee_other_value", 11),
                 ] {
-                    insert_param_val(st, m, name, ik4.clone(), Some(value));
+                    insert_param_val(st, m, name, class_type.clone(), Some(value));
                 }
-                // Rounding-mode constants (ieee_round_type, modeled as
-                // integer tags). Values match runtime/src/ieee.rs.
+                // Values lower to runtime integer tags, but remain nominally
+                // IEEE_ROUND_TYPE through semantic checking.
+                let round_type = TypeInfo::Derived("ieee_round_type".into());
                 for (name, value) in [
                     ("ieee_nearest", 0),
                     ("ieee_to_zero", 1),
@@ -390,7 +391,7 @@ fn register_ieee_modules(st: &mut SymbolTable) {
                     ("ieee_away", 4),
                     ("ieee_other", 5),
                 ] {
-                    insert_param_val(st, m, name, ik4.clone(), Some(value));
+                    insert_param_val(st, m, name, round_type.clone(), Some(value));
                 }
                 insert_proc(st, m, "ieee_is_nan");
                 insert_proc(st, m, "ieee_is_finite");
@@ -439,9 +440,9 @@ fn register_ieee_modules(st: &mut SymbolTable) {
             "ieee_exceptions" => {
                 insert_type(st, m, "ieee_flag_type");
                 insert_type(st, m, "ieee_status_type");
-                // Exception-flag constants (ieee_flag_type, integer tags).
-                // Values match the flag bit indices in runtime/src/ieee.rs.
-                let ik4 = TypeInfo::Integer { kind: Some(4) };
+                // Values lower to runtime integer tags, but remain nominally
+                // IEEE_FLAG_TYPE through semantic checking.
+                let flag_type = TypeInfo::Derived("ieee_flag_type".into());
                 for (name, value) in [
                     ("ieee_invalid", 1),
                     ("ieee_divide_by_zero", 2),
@@ -449,7 +450,7 @@ fn register_ieee_modules(st: &mut SymbolTable) {
                     ("ieee_underflow", 4),
                     ("ieee_inexact", 5),
                 ] {
-                    insert_param_val(st, m, name, ik4.clone(), Some(value));
+                    insert_param_val(st, m, name, flag_type.clone(), Some(value));
                 }
                 insert_proc(st, m, "ieee_get_flag");
                 insert_proc(st, m, "ieee_set_flag");
@@ -600,6 +601,33 @@ mod tests {
             assert_eq!(symbol.const_value, None, "{name} must not be scalar");
             assert!(crate::sema::types::intrinsic_kind_array_values(name).is_some());
         }
+    }
+
+    #[test]
+    fn ieee_named_constants_retain_nominal_types() {
+        let mut st = SymbolTable::new();
+        register_intrinsic_modules(&mut st);
+
+        let arithmetic = st
+            .find_intrinsic_module_scope("ieee_arithmetic")
+            .expect("ieee_arithmetic scope");
+        let arithmetic_symbols = &st.scope(arithmetic).symbols;
+        assert_eq!(
+            arithmetic_symbols["ieee_quiet_nan"].type_info,
+            Some(TypeInfo::Derived("ieee_class_type".into()))
+        );
+        assert_eq!(
+            arithmetic_symbols["ieee_nearest"].type_info,
+            Some(TypeInfo::Derived("ieee_round_type".into()))
+        );
+
+        let exceptions = st
+            .find_intrinsic_module_scope("ieee_exceptions")
+            .expect("ieee_exceptions scope");
+        assert_eq!(
+            st.scope(exceptions).symbols["ieee_invalid"].type_info,
+            Some(TypeInfo::Derived("ieee_flag_type".into()))
+        );
     }
 
     #[test]

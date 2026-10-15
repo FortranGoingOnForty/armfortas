@@ -4283,7 +4283,10 @@ fn type_info_to_ir_type(info: Option<&TypeInfo>) -> crate::ir::types::IrType {
     match info {
         Some(TypeInfo::Derived(name)) => {
             let lower = name.to_lowercase();
-            if lower == "c_ptr" || lower == "c_funptr" {
+            if let Some(kind) = crate::sema::resolve::type_resolution::ieee_opaque_int_kind(&lower)
+            {
+                IrType::int_from_kind(kind)
+            } else if lower == "c_ptr" || lower == "c_funptr" {
                 IrType::Int(IntWidth::I64)
             } else {
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))

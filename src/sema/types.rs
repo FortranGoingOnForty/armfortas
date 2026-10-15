@@ -1711,9 +1711,9 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         | "ieee_support_sqrt" | "ieee_support_io" | "ieee_support_rounding"
         | "ieee_support_flag" | "ieee_support_halting" | "ieee_support_standard"
         | "ieee_support_underflow_control" => Some(FortranType::default_logical()),
-        // IEEE_CLASS returns an IEEE_CLASS_TYPE value, modeled as default
-        // integer so `ieee_class(x) == ieee_quiet_nan` (also integer) works.
-        "ieee_class" => Some(FortranType::default_integer()),
+        "ieee_class" => Some(FortranType::Derived {
+            name: "ieee_class_type".into(),
+        }),
         // KIND follows the (first) real argument.
         "ieee_value" | "ieee_copy_sign" | "ieee_logb" | "ieee_rint" | "ieee_scalb"
         | "ieee_next_after" | "ieee_max" | "ieee_min" | "ieee_max_mag" | "ieee_min_mag"

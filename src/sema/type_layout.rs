@@ -800,6 +800,12 @@ impl TypeLayoutRegistry {
 /// threading a layout they cannot consume.
 pub fn size_of_scalar_kind(ti: &TypeInfo) -> Option<(usize, usize)> {
     let defaults = crate::driver::defaults::current();
+    if let TypeInfo::Derived(name) = ti {
+        if let Some(kind) = crate::sema::resolve::type_resolution::ieee_opaque_int_kind(name) {
+            let bytes = usize::from(kind);
+            return Some((bytes, bytes));
+        }
+    }
     match ti {
         // Enumeration values are default-integer ordinals.
         TypeInfo::Enumeration(_) => Some((4, 4)),
@@ -1404,15 +1410,6 @@ fn type_spec_to_type_info(
                 .and_then(|v| u8::try_from(v).ok());
             TypeInfo::Character { len, kind }
         }
-        TypeSpec::Type(name)
-            if crate::sema::resolve::type_resolution::ieee_opaque_int_kind(name).is_some() =>
-        {
-            // IEEE opaque types are integer under the hood (l09); a
-            // derived-type component of one gets integer storage.
-            TypeInfo::Integer {
-                kind: crate::sema::resolve::type_resolution::ieee_opaque_int_kind(name),
-            }
-        }
         TypeSpec::Type(name) => TypeInfo::Derived(name.clone()),
         TypeSpec::Class(name) => TypeInfo::Class(name.clone()),
         TypeSpec::ClassStar => TypeInfo::ClassStar,
@@ -1624,11 +1621,17 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
                     } else if is_allocatable || is_pointer {
                         layout.array_descriptor() // allocatable/pointer array component
                     } else if let TypeInfo::Derived(ref dname) = ti {
-                        owner_scope
-                            .and_then(|scope| registry.get_for_scope(scope, dname))
-                            .or_else(|| registry.get(dname))
-                            .map(|l| (l.size, l.align))
-                            .unwrap_or((layout.ptr_bytes, layout.ptr_align))
+                        if crate::sema::resolve::type_resolution::ieee_opaque_int_kind(dname)
+                            .is_some()
+                        {
+                            size_of_type(&ti, layout)
+                        } else {
+                            owner_scope
+                                .and_then(|scope| registry.get_for_scope(scope, dname))
+                                .or_else(|| registry.get(dname))
+                                .map(|l| (l.size, l.align))
+                                .unwrap_or((layout.ptr_bytes, layout.ptr_align))
+                        }
                     } else {
                         size_of_type(&ti, layout)
                     };

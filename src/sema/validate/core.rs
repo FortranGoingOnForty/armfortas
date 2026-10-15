@@ -14684,6 +14684,38 @@ end program
     }
 
     #[test]
+    fn ieee_opaque_types_keep_distinct_assignment_identities() {
+        let errs = errors_from(
+            "\
+program p
+  use, intrinsic :: ieee_arithmetic, only : ieee_class_type, ieee_round_type, &
+       ieee_quiet_nan, ieee_nearest
+  implicit none
+  type(ieee_class_type) :: class_value
+  type(ieee_round_type) :: round_value
+  class_value = ieee_quiet_nan
+  round_value = ieee_nearest
+  class_value = round_value
+  round_value = class_value
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|error| error.contains("intrinsic assignment cannot convert TYPE("))
+                .count(),
+            2,
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|error| {
+                error.contains("TYPE(ieee_round_type)") && error.contains("TYPE(ieee_class_type)")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
     fn user_ieee_fma_shadows_intrinsic_contract() {
         let errs = errors_from(
             "\
