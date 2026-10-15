@@ -10118,6 +10118,85 @@ end program p
 }
 
 #[test]
+fn c_sizeof_uses_semantic_aggregate_layout_and_runtime_extents() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=c_sizeof_uses_semantic_aggregate_layout_and_runtime_extents count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("c_sizeof_semantic_layout");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use, intrinsic :: iso_c_binding, only : c_int, c_int8_t, c_int64_t, c_size_t, c_sizeof
+  implicit none
+  type, bind(c) :: padded
+    integer(c_int8_t) :: first
+    integer(c_int64_t) :: middle
+    integer(c_int8_t) :: last
+  end type padded
+  integer(c_int) :: scalar
+  integer(c_int) :: values(3)
+  type(padded) :: item
+  type(padded) :: items(2)
+
+  if (c_sizeof(scalar) /= 4_c_size_t) error stop 1
+  if (c_sizeof(values) /= 12_c_size_t) error stop 2
+  if (c_sizeof(item) /= 24_c_size_t) error stop 3
+  if (c_sizeof(items) /= 48_c_size_t) error stop 4
+  call check_runtime_extent(5)
+  print *, 'ok'
+contains
+  subroutine check_runtime_extent(n)
+    integer, intent(in) :: n
+    integer(c_int) :: automatic(n)
+    if (c_sizeof(automatic) /= 20_c_size_t) error stop 5
+  end subroutine check_runtime_extent
+end program p
+"#,
+    );
+
+    for optimization in ["-O0", "-O3"] {
+        let executable = dir.join(format!(
+            "c_sizeof_semantic_layout_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("C_SIZEOF semantic-layout compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: C_SIZEOF semantic-layout source should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("C_SIZEOF semantic-layout executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: C_SIZEOF semantic-layout source should run: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

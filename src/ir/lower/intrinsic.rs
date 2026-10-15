@@ -1622,33 +1622,10 @@ pub(crate) fn lower_intrinsic(
 
         // ---- iso_c_binding functions ----
         "c_loc" => None,
-        "c_sizeof" => {
-            // c_sizeof(x) — return byte size of x's C representation.
-            if let Some(arg) = args.first() {
-                let ty = b
-                    .func()
-                    .value_type(*arg)
-                    .unwrap_or(IrType::Int(IntWidth::I32));
-                let size: i64 = match &ty {
-                    IrType::Int(IntWidth::I8) | IrType::Bool => 1,
-                    IrType::Int(IntWidth::I16) => 2,
-                    IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32) => 4,
-                    IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => 8,
-                    IrType::Int(IntWidth::I128) => 16,
-                    IrType::Ptr(_) => b.layout.ptr_bytes as i64,
-                    // Arrays use element size * count, but we don't have shape info here.
-                    // For now, return element size. Proper impl needs descriptor access.
-                    IrType::Array(elem, count) => {
-                        let elem_size = ir_scalar_byte_size(elem.as_ref(), b.layout);
-                        elem_size * (*count as i64)
-                    }
-                    _ => 8, // default to pointer size for unknown types
-                };
-                Some(b.const_i64(size))
-            } else {
-                None
-            }
-        }
+        // Aggregate shape and derived-type layout are no longer available at
+        // this value-only boundary. Expression lowering handles C_SIZEOF from
+        // its semantic AST before address/descriptor decay.
+        "c_sizeof" => None,
         "c_associated" => {
             // c_associated(p) → p /= null
             // c_associated(p, q) → p == q

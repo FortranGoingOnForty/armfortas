@@ -1663,7 +1663,9 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "precision" | "range" | "digits" | "radix" => Some(FortranType::default_integer()),
         "exponent" => matches!(args.first()?, FortranType::Real { .. })
             .then(FortranType::default_integer),
-        "storage_size" | "c_sizeof" => Some(FortranType::default_integer()),
+        "storage_size" => Some(FortranType::default_integer()),
+        // ISO_C_BINDING defines C_SIZEOF's result as INTEGER(C_SIZE_T).
+        "c_sizeof" => Some(FortranType::Integer { kind: 8 }),
         "iachar" | "ichar" => Some(FortranType::default_integer()),
 
         // System / misc.
