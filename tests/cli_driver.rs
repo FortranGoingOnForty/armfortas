@@ -45926,6 +45926,69 @@ fn invalid_call_designators_fail_without_publishing_output() {
 }
 
 #[test]
+fn invalid_derived_type_syntax_fails_without_publishing_output() {
+    let cases = [
+        (
+            "component_line",
+            "type :: item\n  arbitrary component text\nend type item",
+            "unrecognized statement 'arbitrary' in derived-type component part",
+        ),
+        (
+            "binding_line",
+            "type :: item\ncontains\n  arbitrary binding text\nend type item",
+            "unrecognized statement 'arbitrary' in derived-type binding part",
+        ),
+        (
+            "component_attr",
+            "type :: item\n  procedure(iface), pointer, banana :: callback\nend type item",
+            "unsupported or invalid procedure component attribute 'banana'",
+        ),
+        (
+            "binding_attr",
+            "type :: item\ncontains\n  procedure, banana :: callback\nend type item",
+            "unsupported or invalid type-bound procedure attribute 'banana'",
+        ),
+    ];
+
+    for (name, type_definition, expected) in cases {
+        let source = write_program(
+            &format!("program p\n  {type_definition}\nend program p\n"),
+            "f90",
+        );
+        let output = unique_path(&format!("invalid_type_{name}"), "o");
+        let result = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                source.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("invalid derived type compile failed to start");
+        assert!(
+            !result.status.success(),
+            "invalid derived type unexpectedly compiled: {name}"
+        );
+        assert_eq!(
+            result.status.code(),
+            Some(1),
+            "invalid derived type must be a compile-time parse error: {name}"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected),
+            "missing derived type diagnostic for {name}: {stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "invalid derived type published an object: {name}"
+        );
+        let _ = std::fs::remove_file(source);
+    }
+}
+
+#[test]
 fn utf8_lexer_error_reports_character_and_caret() {
     let src = write_program("program p\n  café = 1\nend program\n", "f90");
     let out = unique_path("utf8", "bin");
