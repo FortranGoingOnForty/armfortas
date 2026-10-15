@@ -37731,9 +37731,12 @@ pub(super) fn lower_internal_read_items(
     buf_len: ValueId,
     iostat: ValueId,
 ) {
-    let zero = b.const_i64(0);
-    let pos = b.alloca(IrType::Int(IntWidth::I64));
-    b.store(zero, pos);
+    let pos = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I64)), 3));
+    b.call(
+        FuncRef::External("afs_internal_list_read_begin".into()),
+        vec![pos],
+        IrType::Void,
+    );
     let done = b.create_block("internal_read_done");
     let mode = ReadMode::Internal {
         buf_ptr,

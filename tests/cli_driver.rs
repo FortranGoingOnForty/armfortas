@@ -52959,6 +52959,48 @@ fn list_directed_read_unit_real_returns_correct_f32_value() {
 }
 
 #[test]
+fn list_directed_repeat_null_and_slash_semantics_run_at_o0_and_o3() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=list_directed_repeat_null_and_slash_semantics_run_at_o0_and_o3 count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=64) :: record\n  integer :: values(7), ios, unit, i\n\n  record = '3*7, 2*, 9, / 99'\n  do i = 1, 7\n    values(i) = -i\n  end do\n  read(record, *, iostat=ios) values\n  if (ios /= 0) error stop 1\n  if (any(values /= [7, 7, 7, -4, -5, 9, -7])) error stop 2\n\n  do i = 1, 7\n    values(i) = -10 - i\n  end do\n  open(newunit=unit, status='scratch', action='readwrite')\n  write(unit, '(a)') trim(record)\n  rewind(unit)\n  read(unit, *, iostat=ios) values\n  close(unit)\n  if (ios /= 0) error stop 3\n  if (any(values /= [7, 7, 7, -14, -15, 9, -17])) error stop 4\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path(&format!("list_repeat_slash_{}", &opt[1..]), "bin");
+        let compile = Command::new(compiler("armfortas"))
+            .args([src.to_str().unwrap(), opt, "-o", out.to_str().unwrap()])
+            .output()
+            .expect("list repeat/slash compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "list repeat/slash compile failed at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&out)
+            .output()
+            .expect("list repeat/slash binary failed to start");
+        assert!(
+            run.status.success(),
+            "list repeat/slash run failed at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(out);
+    }
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
 fn list_directed_complex_input_consumes_parenthesized_values() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
