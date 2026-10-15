@@ -598,19 +598,32 @@ fn execute_command_line(
     cmdmsg: *mut u8,
     cmdmsg_len: i64,
 ) {
-    let cmd = if !command.is_null() && cmd_len > 0 {
-        let slice = unsafe { std::slice::from_raw_parts(command, cmd_len as usize) };
-        String::from_utf8_lossy(slice).trim().to_string()
-    } else {
+    let cmd = if command.is_null() || cmd_len < 0 {
         store_execute_command_failure(
             cmdstat,
             cmdmsg,
             cmdmsg_len,
             1,
-            "command argument is absent or has zero length",
+            "command argument is absent or has invalid length",
         );
         return;
+    } else if cmd_len > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(command, cmd_len as usize) };
+        String::from_utf8_lossy(slice).trim().to_string()
+    } else {
+        String::new()
     };
+
+    // The standard leaves command interpretation processor dependent. Match
+    // the established GNU/Flang behavior: an empty or all-blank command is a
+    // successful no-op and never needs a command-processor child.
+    if cmd.is_empty() {
+        if wait != 0 {
+            store_optional_i32(exitstat, 0);
+        }
+        store_optional_i32(cmdstat, 0);
+        return;
+    }
 
     if wait != 0 {
         match command_process(&cmd).status() {
@@ -1359,6 +1372,32 @@ mod tests {
         assert_eq!(exitstat, 0);
         assert_eq!(cmdstat, 0);
         assert_eq!(&message, b"unchanged");
+    }
+
+    #[test]
+    fn empty_execute_command_line_values_are_successful_noops() {
+        for (command, wait, expected_exitstat) in [
+            (b"".as_slice(), 1, 0),
+            (b"   ".as_slice(), 1, 0),
+            (b"".as_slice(), 0, i32::MIN),
+            (b"   ".as_slice(), 0, i32::MIN),
+        ] {
+            let mut exitstat = i32::MIN;
+            let mut cmdstat = i32::MIN;
+            let mut message = *b"unchanged";
+            afs_execute_command_line_cmdmsg(
+                command.as_ptr(),
+                command.len() as i64,
+                wait,
+                &mut exitstat,
+                &mut cmdstat,
+                message.as_mut_ptr(),
+                message.len() as i64,
+            );
+            assert_eq!(exitstat, expected_exitstat);
+            assert_eq!(cmdstat, 0);
+            assert_eq!(message, *b"unchanged");
+        }
     }
 
     #[cfg(unix)]
