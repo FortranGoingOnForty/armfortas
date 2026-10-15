@@ -45989,6 +45989,61 @@ fn invalid_derived_type_syntax_fails_without_publishing_output() {
 }
 
 #[test]
+fn invalid_statement_labels_fail_without_publishing_output() {
+    let cases = [
+        ("definition", "program p\n100000 continue\nend program p\n"),
+        ("goto", "program p\n  goto 100000\nend program p\n"),
+        (
+            "arithmetic_if",
+            "program p\n  if (1) 1, 100000, 2\n1 continue\n2 continue\nend program p\n",
+        ),
+        (
+            "labeled_do",
+            "program p\n  integer :: i\n  do 100000 i = 1, 2\n100000 continue\nend program p\n",
+        ),
+        ("format", "program p\n  print 100000, 1\nend program p\n"),
+        (
+            "io_branch",
+            "program p\n  integer :: value\n  read(*, *, end=100000) value\nend program p\n",
+        ),
+    ];
+
+    for (name, program) in cases {
+        let source = write_program(program, "f90");
+        let output = unique_path(&format!("invalid_label_{name}"), "o");
+        let result = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                source.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("invalid statement-label compile failed to start");
+        assert!(
+            !result.status.success(),
+            "invalid statement label unexpectedly compiled: {name}"
+        );
+        assert_eq!(
+            result.status.code(),
+            Some(1),
+            "invalid statement label must be a compile-time parse error: {name}"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("statement label must be one to five decimal digits"),
+            "missing statement-label diagnostic for {name}: {stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "invalid statement label published an object: {name}"
+        );
+        let _ = std::fs::remove_file(source);
+    }
+}
+
+#[test]
 fn utf8_lexer_error_reports_character_and_caret() {
     let src = write_program("program p\n  café = 1\nend program\n", "f90");
     let out = unique_path("utf8", "bin");

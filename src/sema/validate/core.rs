@@ -5841,7 +5841,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         check_pure_stmt_expr_calls(ctx, stmt);
     }
     visit_io_branch_labels(&stmt.node, |label| {
-        ctx.labels_referenced.push((label, stmt.span));
+        register_label_reference(ctx, label, stmt.span);
     });
 
     match &stmt.node {
@@ -5982,12 +5982,12 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
 
         // ---- GOTO / labels ----
         Stmt::Goto { label } => {
-            ctx.labels_referenced.push((*label, stmt.span));
+            register_label_reference(ctx, *label, stmt.span);
         }
         Stmt::ComputedGoto { labels, .. } => {
             warn_legacy_feature(ctx, stmt.span, "computed GOTO");
             for label in labels {
-                ctx.labels_referenced.push((*label, stmt.span));
+                register_label_reference(ctx, *label, stmt.span);
             }
         }
         Stmt::ArithmeticIf {
@@ -5998,9 +5998,9 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         } => {
             warn_legacy_feature(ctx, stmt.span, "arithmetic IF");
             validate_arithmetic_if_expr(ctx, expr);
-            ctx.labels_referenced.push((*neg, stmt.span));
-            ctx.labels_referenced.push((*zero, stmt.span));
-            ctx.labels_referenced.push((*pos, stmt.span));
+            register_label_reference(ctx, *neg, stmt.span);
+            register_label_reference(ctx, *zero, stmt.span);
+            register_label_reference(ctx, *pos, stmt.span);
         }
         Stmt::Continue { label: Some(lbl) } => {
             register_label(ctx, *lbl, stmt.span);
@@ -10139,10 +10139,22 @@ fn validate_explicit_interface_call(
 
 /// Register a label as defined.
 fn register_label(ctx: &mut Ctx, label: u64, span: Span) {
+    if !(1..=99_999).contains(&label) {
+        ctx.error(span, "statement label must be in the range 1..99999");
+        return;
+    }
     if ctx.labels_defined.contains(&label) {
         ctx.error(span, format!("duplicate label {}", label));
     } else {
         ctx.labels_defined.push(label);
+    }
+}
+
+fn register_label_reference(ctx: &mut Ctx, label: u64, span: Span) {
+    if !(1..=99_999).contains(&label) {
+        ctx.error(span, "statement label must be in the range 1..99999");
+    } else {
+        ctx.labels_referenced.push((label, span));
     }
 }
 
@@ -19138,6 +19150,41 @@ end program
         ctx.labels_referenced.push((999, span));
         validate_label_consistency(&mut ctx, span);
         assert!(ctx.diags.iter().any(|d| d.msg.contains("label 999")));
+    }
+
+    #[test]
+    fn semantic_label_invariant_rejects_values_outside_one_to_99999() {
+        use crate::ast::Spanned;
+        use crate::lexer::{Position, Span};
+
+        let span = Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
+        let st = SymbolTable::new();
+        let mut ctx = Ctx::new(&st, None, false, false);
+        for stmt in [
+            Spanned::new(Stmt::Goto { label: 100_000 }, span),
+            Spanned::new(
+                Stmt::Labeled {
+                    label: 0,
+                    stmt: Box::new(Spanned::new(Stmt::Continue { label: None }, span)),
+                },
+                span,
+            ),
+        ] {
+            validate_stmt(&mut ctx, &stmt);
+        }
+        assert_eq!(
+            ctx.diags
+                .iter()
+                .filter(|diag| diag.msg == "statement label must be in the range 1..99999")
+                .count(),
+            2,
+            "both invalid AST label values must be rejected: {:?}",
+            ctx.diags
+        );
     }
 
     #[test]
