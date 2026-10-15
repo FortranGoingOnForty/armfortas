@@ -41,55 +41,294 @@ impl Drop for RemoveFileOnDrop {
 }
 
 /// Transaction guard for an object or executable written directly by a
-/// subprocess. Preparing removes any old destination; only a verified,
-/// non-empty regular file survives the guard.
+/// subprocess. The old destination remains published until a verified,
+/// non-empty regular replacement is ready.
 struct PendingExternalOutput {
-    path: PathBuf,
+    tool: String,
+    final_path: PathBuf,
+    staging_dir: PathBuf,
+    staging_path: PathBuf,
     committed: bool,
 }
 
 impl PendingExternalOutput {
     fn prepare(path: &Path, tool: &str) -> Result<Self, String> {
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "cannot remove stale {tool} output '{}': {error}",
-                    path.display()
-                ));
-            }
-        }
+        let (staging_dir, staging_path) = external_staging_path(path, tool)?;
         Ok(Self {
-            path: path.to_path_buf(),
+            tool: tool.to_string(),
+            final_path: path.to_path_buf(),
+            staging_dir,
+            staging_path,
             committed: false,
         })
     }
 
-    fn verify(mut self, tool: &str) -> Result<(), String> {
-        let metadata = fs::symlink_metadata(&self.path).map_err(|error| {
+    fn staging_path(&self) -> &Path {
+        &self.staging_path
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let metadata = fs::symlink_metadata(&self.staging_path).map_err(|error| {
             format!(
-                "{tool} reported success but did not produce output '{}': {error}",
-                self.path.display()
+                "{} reported success but did not produce output '{}': {error}",
+                self.tool,
+                self.staging_path.display()
             )
         })?;
         if !metadata.file_type().is_file() || metadata.len() == 0 {
             return Err(format!(
-                "{tool} reported success but did not produce a non-empty regular output '{}'",
-                self.path.display()
+                "{} reported success but did not produce a non-empty regular output '{}'",
+                self.tool,
+                self.staging_path.display()
             ));
         }
-        self.committed = true;
         Ok(())
+    }
+
+    fn verify(self) -> Result<(), String> {
+        publish_output_transaction(vec![self])
+    }
+
+    fn backup_path(&self) -> PathBuf {
+        self.staging_dir.join("previous-output")
     }
 }
 
 impl Drop for PendingExternalOutput {
     fn drop(&mut self) {
         if !self.committed {
-            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(&self.staging_path);
+            let _ = fs::remove_dir(&self.staging_dir);
         }
     }
+}
+
+fn publish_output_transaction(outputs: Vec<PendingExternalOutput>) -> Result<(), String> {
+    publish_output_transaction_inner(outputs, |_| {})
+}
+
+fn publish_output_transaction_inner<F>(
+    mut outputs: Vec<PendingExternalOutput>,
+    before_publish: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&[PendingExternalOutput]),
+{
+    if outputs.is_empty() {
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot determine current directory: {error}"))?;
+    for (index, output) in outputs.iter().enumerate() {
+        output.validate()?;
+        for other in &outputs[..index] {
+            if paths_refer_to_same_file(&output.final_path, &other.final_path, &cwd) {
+                return Err(format!(
+                    "compiler outputs '{}' and '{}' refer to the same destination",
+                    other.final_path.display(),
+                    output.final_path.display()
+                ));
+            }
+        }
+        if fs::symlink_metadata(&output.final_path)
+            .is_ok_and(|metadata| metadata.file_type().is_dir())
+        {
+            return Err(format!(
+                "cannot publish {} output '{}': destination is a directory",
+                output.tool,
+                output.final_path.display()
+            ));
+        }
+    }
+
+    let mut backed_up = vec![false; outputs.len()];
+    let mut published = vec![false; outputs.len()];
+
+    let rollback = |outputs: &[PendingExternalOutput], backed_up: &[bool], published: &[bool]| {
+        let mut failures = Vec::new();
+        for index in (0..outputs.len()).rev() {
+            let output = &outputs[index];
+            if published[index] {
+                match fs::remove_file(&output.final_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => failures.push(format!(
+                        "cannot remove newly published '{}': {error}",
+                        output.final_path.display()
+                    )),
+                }
+            }
+            if backed_up[index] {
+                let backup = output.backup_path();
+                if published[index] {
+                    if let Err(error) = fs::rename(&backup, &output.final_path) {
+                        failures.push(format!(
+                            "cannot restore previous output '{}' from '{}': {error}",
+                            output.final_path.display(),
+                            backup.display()
+                        ));
+                    }
+                } else if let Err(error) = fs::remove_file(&backup) {
+                    failures.push(format!(
+                        "cannot remove unused output backup '{}': {error}",
+                        backup.display()
+                    ));
+                }
+            }
+        }
+        failures
+    };
+
+    for index in 0..outputs.len() {
+        match fs::symlink_metadata(&outputs[index].final_path) {
+            Ok(_) => {
+                if let Err(error) =
+                    fs::hard_link(&outputs[index].final_path, outputs[index].backup_path())
+                {
+                    let rollback_failures = rollback(&outputs, &backed_up, &published);
+                    let mut message = format!(
+                        "cannot preserve previous {} output '{}': {error}",
+                        outputs[index].tool,
+                        outputs[index].final_path.display()
+                    );
+                    if !rollback_failures.is_empty() {
+                        message.push_str(&format!(
+                            "; rollback also failed: {}",
+                            rollback_failures.join("; ")
+                        ));
+                    }
+                    return Err(message);
+                }
+                backed_up[index] = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let rollback_failures = rollback(&outputs, &backed_up, &published);
+                let mut message = format!(
+                    "cannot inspect previous {} output '{}': {error}",
+                    outputs[index].tool,
+                    outputs[index].final_path.display()
+                );
+                if !rollback_failures.is_empty() {
+                    message.push_str(&format!(
+                        "; rollback also failed: {}",
+                        rollback_failures.join("; ")
+                    ));
+                }
+                return Err(message);
+            }
+        }
+    }
+
+    before_publish(&outputs);
+
+    for index in 0..outputs.len() {
+        if let Err(error) = fs::rename(&outputs[index].staging_path, &outputs[index].final_path) {
+            let rollback_failures = rollback(&outputs, &backed_up, &published);
+            let mut message = format!(
+                "cannot publish {} output '{}' atomically: {error}",
+                outputs[index].tool,
+                outputs[index].final_path.display()
+            );
+            if !rollback_failures.is_empty() {
+                message.push_str(&format!(
+                    "; rollback also failed: {}",
+                    rollback_failures.join("; ")
+                ));
+            }
+            return Err(message);
+        }
+        published[index] = true;
+    }
+
+    for (index, output) in outputs.iter_mut().enumerate() {
+        if backed_up[index] {
+            let _ = fs::remove_file(output.backup_path());
+        }
+        let _ = fs::remove_dir(&output.staging_dir);
+        output.committed = true;
+    }
+    Ok(())
+}
+
+fn external_staging_path(path: &Path, tool: &str) -> Result<(PathBuf, PathBuf), String> {
+    let file_name = path.file_name().ok_or_else(|| {
+        format!(
+            "cannot create {tool} staging output for '{}': output has no file name",
+            path.display()
+        )
+    })?;
+    for _ in 0..32 {
+        let staging_dir = sibling_temporary_path(path, tool);
+        match fs::create_dir(&staging_dir) {
+            Ok(()) => {
+                let staging_path = staging_dir.join(file_name);
+                return Ok((staging_dir, staging_path));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot create {tool} staging directory '{}': {error}",
+                    staging_dir.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "cannot create a unique {tool} staging directory beside '{}'",
+        path.display()
+    ))
+}
+
+fn sibling_temporary_path(path: &Path, purpose: &str) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("output"));
+    let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+    let mut temporary_name = std::ffi::OsString::from(".");
+    temporary_name.push(file_name);
+    temporary_name.push(format!(
+        ".{}.{}.{}.tmp",
+        purpose.replace(|ch: char| !ch.is_ascii_alphanumeric(), "_"),
+        std::process::id(),
+        id
+    ));
+    parent.join(temporary_name)
+}
+
+fn write_primary_output_atomic(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), String> {
+    let temporary = sibling_temporary_path(path, "armfortas");
+    let _cleanup = RemoveFileOnDrop(temporary.clone());
+    fs::write(&temporary, contents).map_err(|error| {
+        format!(
+            "cannot write temporary output '{}': {error}",
+            temporary.display()
+        )
+    })?;
+    fs::rename(&temporary, path).map_err(|error| {
+        format!(
+            "cannot publish output '{}' atomically: {error}",
+            path.display()
+        )
+    })
+}
+
+fn prepare_output_bytes(
+    path: &Path,
+    tool: &str,
+    contents: impl AsRef<[u8]>,
+) -> Result<PendingExternalOutput, String> {
+    let pending = PendingExternalOutput::prepare(path, tool)?;
+    fs::write(pending.staging_path(), contents).map_err(|error| {
+        format!(
+            "cannot write temporary {tool} output '{}': {error}",
+            pending.staging_path().display()
+        )
+    })?;
+    pending.validate()?;
+    Ok(pending)
 }
 
 /// Optimization level requested at the CLI.
@@ -337,6 +576,77 @@ fn terminal_output_collision_key(output: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
+fn paths_refer_to_same_file(left: &Path, right: &Path, cwd: &Path) -> bool {
+    if terminal_output_collision_key(left, cwd) == terminal_output_collision_key(right, cwd) {
+        return true;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) {
+            return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
+
+    false
+}
+
+fn validate_output_against_inputs<'a>(
+    output: &Path,
+    inputs: impl IntoIterator<Item = &'a PathBuf>,
+) -> Result<(), String> {
+    validate_not_module_interface_destination(output, "output")?;
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot determine current directory: {error}"))?;
+    for input in inputs {
+        if paths_refer_to_same_file(output, input, &cwd) {
+            return Err(format!(
+                "output '{}' conflicts with compiler input '{}'; refusing to overwrite an input file",
+                output.display(),
+                input.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_not_module_interface_destination(path: &Path, kind: &str) -> Result<(), String> {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "amod" | "mod" | "smod"
+            )
+        })
+    {
+        return Err(format!(
+            "{kind} '{}' uses a reserved module-interface extension",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_primary_output_destination(
+    opts: &Options,
+    output: &Path,
+    included_files: &[PathBuf],
+) -> Result<(), String> {
+    let preprocesses_to_stdout = opts.preprocess_only
+        && opts
+            .output
+            .as_ref()
+            .is_none_or(|path| path.as_os_str() == "-");
+    if preprocesses_to_stdout {
+        return Ok(());
+    }
+    validate_output_against_inputs(output, all_input_paths(opts).iter().chain(included_files))
+}
+
 fn validate_unique_terminal_outputs(
     inputs: &[PathBuf],
     outputs: &[Option<PathBuf>],
@@ -573,7 +883,7 @@ impl Options {
         } else if self.emit_tokens {
             PathBuf::from(format!("{}.tokens", stem))
         } else {
-            PathBuf::from(stem)
+            PathBuf::from("a.out")
         }
     }
 
@@ -1914,11 +2224,10 @@ fn discard_failed_output(
     // deletion.
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot determine current directory: {error}"))?;
-    let output_key = terminal_output_collision_key(output, &cwd);
     if all_input_paths(opts)
         .iter()
         .chain(included_files)
-        .any(|input| terminal_output_collision_key(input, &cwd) == output_key)
+        .any(|input| paths_refer_to_same_file(output, input, &cwd))
     {
         return Ok(());
     }
@@ -1973,6 +2282,7 @@ fn compile_with_bundled_runtime_inner(
     bundled_runtime: Option<&'static [u8]>,
     dependency_output: Option<&mut Vec<PathBuf>>,
 ) -> Result<(), String> {
+    validate_primary_output_destination(opts, &opts.output_path(), &[])?;
     if TerminalMode::from_options(opts).is_none() {
         validate_dependency_file_destination(opts, &opts.output_path(), &[])?;
     }
@@ -2110,6 +2420,7 @@ fn compile_with_bundled_runtime_inner(
         dependencies.clone_from(&pp_result.included_files);
     }
     let included_files = &pp_result.included_files;
+    validate_primary_output_destination(opts, &opts.output_path(), included_files)?;
     if conformance_warnings_are_errors {
         let depfile_cleanup = prepare_dependency_file(opts, &opts.output_path(), included_files);
         let failure = raw_source_failure(opts, included_files);
@@ -2152,8 +2463,7 @@ fn compile_with_bundled_runtime_inner(
             if out.as_os_str() == "-" {
                 write_stdout_bytes(&preprocessed_bytes)?;
             } else {
-                fs::write(&out, &preprocessed_bytes)
-                    .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+                write_primary_output_atomic(&out, &preprocessed_bytes)?;
             }
             if opts.verbose {
                 eprintln!(" preprocess-only: wrote {}", out.display());
@@ -2201,7 +2511,7 @@ fn compile_with_bundled_runtime_inner(
         for t in &tokens {
             buf.push_str(&format!("{:?}\n", t));
         }
-        fs::write(&out, &buf).map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+        write_primary_output_atomic(&out, &buf)?;
         return Ok(());
     }
 
@@ -2232,7 +2542,7 @@ fn compile_with_bundled_runtime_inner(
         for u in &units {
             buf.push_str(&format!("{:#?}\n", u));
         }
-        fs::write(&out, &buf).map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+        write_primary_output_atomic(&out, &buf)?;
         return Ok(());
     }
 
@@ -2386,8 +2696,7 @@ fn compile_with_bundled_runtime_inner(
     if opts.emit_ir {
         let ir_text = ir_printer::print_module(&ir_module);
         let out = opts.output_path();
-        fs::write(&out, &ir_text)
-            .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+        write_primary_output_atomic(&out, &ir_text)?;
         return Ok(());
     }
 
@@ -2413,10 +2722,21 @@ fn compile_with_bundled_runtime_inner(
     };
     if opts.emit_asm {
         let out = opts.output_path();
-        fs::write(&out, &asm_text)
-            .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
-        write_module_artifacts(opts, &module_artifacts)?;
-        write_dependency_file(opts, &out, included_files)?;
+        let primary = prepare_output_bytes(&out, "compiler", &asm_text)?;
+        let mut modules = prepare_module_artifacts(opts, &module_artifacts)?;
+        validate_compilation_destinations_against_modules(opts, &out, &modules)?;
+        let mut outputs = vec![primary];
+        outputs.append(&mut modules.outputs);
+        if let Some(dependencies) = prepare_dependency_file_for_sources(
+            opts,
+            &out,
+            std::slice::from_ref(&opts.input),
+            included_files,
+        )? {
+            outputs.push(dependencies);
+        }
+        publish_output_transaction(outputs)?;
+        modules.report(opts.verbose);
         if opts.verbose {
             eprintln!(" wrote: {}", out.display());
         }
@@ -2472,8 +2792,6 @@ fn compile_with_bundled_runtime_inner(
     let _obj_cleanup = (!opts.emit_obj).then(|| RemoveFileOnDrop(obj_path.clone()));
     fs::write(&asm_path, &asm_text).map_err(|e| format!("cannot write temp assembly: {}", e))?;
 
-    write_module_artifacts(opts, &module_artifacts)?;
-
     // ELF assembly routing (x14): the in-process afs-as x86 pipeline
     // is the default. AFS_AS_PATH substitutes a subprocess assembler
     // (invoked `<as> --64 -o obj asm`); AFS_AS=0 forces the system
@@ -2499,45 +2817,67 @@ fn compile_with_bundled_runtime_inner(
             }
         }
         let phase = phases.start("assemble");
-        match &route {
-            None => {
-                // In-process: parse + encode + relax, then write the
-                // ELF object directly.
-                let src = fs::read_to_string(&asm_path)
-                    .map_err(|e| format!("cannot read '{}': {}", asm_path.display(), e))?;
-                let osabi = match opts.target.os {
-                    crate::target::Os::FreeBsd => afs_as::elf::ELFOSABI_FREEBSD,
-                    _ => afs_as::elf::ELFOSABI_NONE,
-                };
-                let obj = afs_as::x86::assemble::assemble_x86(&src, osabi)
-                    .map_err(|e| format!("afs-as: {}: {}", asm_path.display(), e))?;
-                let bytes = afs_as::elf::write_elf(&obj)
-                    .map_err(|e| format!("afs-as: elf writer: {}", e))?;
-                fs::write(&obj_path, bytes)
-                    .map_err(|e| format!("cannot write '{}': {}", obj_path.display(), e))?;
-                phase.end(&mut phases);
-            }
-            Some(assembler) => {
-                let pending_output = PendingExternalOutput::prepare(&obj_path, "assembler")?;
-                let as_result = Command::new(assembler)
-                    .args(["--64", "-o"])
-                    .arg(&obj_path)
-                    .arg(&asm_path)
-                    .output()
-                    .map_err(|e| format!("cannot run assembler: {}", e))?;
-                phase.end(&mut phases);
-                if !as_result.status.success() {
-                    return Err(format!(
-                        "assembler failed:\n{}",
-                        String::from_utf8_lossy(&as_result.stderr)
-                    ));
+        let assemble_result = (|| -> Result<PendingExternalOutput, String> {
+            match &route {
+                None => {
+                    // In-process: parse + encode + relax, then write the
+                    // ELF object into the same transaction as module files.
+                    let src = fs::read_to_string(&asm_path)
+                        .map_err(|e| format!("cannot read '{}': {}", asm_path.display(), e))?;
+                    let osabi = match opts.target.os {
+                        crate::target::Os::FreeBsd => afs_as::elf::ELFOSABI_FREEBSD,
+                        _ => afs_as::elf::ELFOSABI_NONE,
+                    };
+                    let obj = afs_as::x86::assemble::assemble_x86(&src, osabi)
+                        .map_err(|e| format!("afs-as: {}: {}", asm_path.display(), e))?;
+                    let bytes = afs_as::elf::write_elf(&obj)
+                        .map_err(|e| format!("afs-as: elf writer: {}", e))?;
+                    prepare_output_bytes(&obj_path, "assembler", bytes)
                 }
-                forward_successful_subprocess_stderr(&as_result.stderr)?;
-                pending_output.verify("assembler")?;
+                Some(assembler) => {
+                    let pending_output = PendingExternalOutput::prepare(&obj_path, "assembler")?;
+                    let as_result = Command::new(assembler)
+                        .args(["--64", "-o"])
+                        .arg(pending_output.staging_path())
+                        .arg(&asm_path)
+                        .output()
+                        .map_err(|e| format!("cannot run assembler: {}", e))?;
+                    if !as_result.status.success() {
+                        return Err(format!(
+                            "assembler failed:\n{}",
+                            String::from_utf8_lossy(&as_result.stderr)
+                        ));
+                    }
+                    forward_successful_subprocess_stderr(&as_result.stderr)?;
+                    pending_output.validate()?;
+                    Ok(pending_output)
+                }
+            }
+        })();
+        phase.end(&mut phases);
+        let pending_object = assemble_result?;
+        let mut modules = prepare_module_artifacts(opts, &module_artifacts)?;
+        let published_primary = if opts.emit_obj {
+            obj_path.clone()
+        } else {
+            opts.output_path()
+        };
+        validate_compilation_destinations_against_modules(opts, &published_primary, &modules)?;
+        let mut outputs = vec![pending_object];
+        outputs.append(&mut modules.outputs);
+        if opts.emit_obj {
+            if let Some(dependencies) = prepare_dependency_file_for_sources(
+                opts,
+                &obj_path,
+                std::slice::from_ref(&opts.input),
+                included_files,
+            )? {
+                outputs.push(dependencies);
             }
         }
+        publish_output_transaction(outputs)?;
+        modules.report(opts.verbose);
         if opts.emit_obj {
-            write_dependency_file(opts, &obj_path, included_files)?;
             if opts.verbose {
                 eprintln!(" assembled: {}", obj_path.display());
             }
@@ -2545,23 +2885,19 @@ fn compile_with_bundled_runtime_inner(
         }
         let binary_path = opts.output_path();
         let phase = phases.start("link");
-        let result = link_inputs(
+        let result = link_inputs_with_dependency_file(
             std::slice::from_ref(&obj_path),
             &binary_path,
             opts,
             bundled_runtime,
+            std::slice::from_ref(&opts.input),
+            included_files,
         );
         phase.end(&mut phases);
         result?;
         if opts.verbose {
             eprintln!(" linked: {}", binary_path.display());
         }
-        write_link_dependency_file(
-            opts,
-            &binary_path,
-            std::slice::from_ref(&opts.input),
-            included_files,
-        )?;
         phases.report();
         return Ok(());
     }
@@ -2572,19 +2908,22 @@ fn compile_with_bundled_runtime_inner(
         host.arch != opts.target.arch || host.object_format() != crate::target::ObjectFormat::MachO;
     let assembler = env_override("AFS_AS_PATH");
     let assemble_result = if cross && assembler.is_none() {
-        afs_as::assemble::assemble_file(&asm_path, &obj_path).map_err(|e| format!("afs-as: {}", e))
+        let pending_output = PendingExternalOutput::prepare(&obj_path, "assembler")?;
+        afs_as::assemble::assemble_file(&asm_path, pending_output.staging_path())
+            .map_err(|e| format!("afs-as: {}", e))?;
+        pending_output.validate().map(|()| pending_output)
     } else {
         let assembler = assembler.unwrap_or_else(|| "as".into());
         let pending_output = PendingExternalOutput::prepare(&obj_path, "assembler")?;
         let result = Command::new(assembler)
             .arg(&asm_path)
             .arg("-o")
-            .arg(&obj_path)
+            .arg(pending_output.staging_path())
             .output()
             .map_err(|e| format!("cannot run assembler: {}", e))?;
         if result.status.success() {
             forward_successful_subprocess_stderr(&result.stderr)?;
-            pending_output.verify("assembler")
+            pending_output.validate().map(|()| pending_output)
         } else {
             Err(format!(
                 "assembler failed:\n{}",
@@ -2593,13 +2932,33 @@ fn compile_with_bundled_runtime_inner(
         }
     };
     phase.end(&mut phases);
-    assemble_result?;
+    let pending_object = assemble_result?;
+    let mut modules = prepare_module_artifacts(opts, &module_artifacts)?;
+    let published_primary = if opts.emit_obj {
+        obj_path.clone()
+    } else {
+        opts.output_path()
+    };
+    validate_compilation_destinations_against_modules(opts, &published_primary, &modules)?;
+    let mut outputs = vec![pending_object];
+    outputs.append(&mut modules.outputs);
+    if opts.emit_obj {
+        if let Some(dependencies) = prepare_dependency_file_for_sources(
+            opts,
+            &obj_path,
+            std::slice::from_ref(&opts.input),
+            included_files,
+        )? {
+            outputs.push(dependencies);
+        }
+    }
+    publish_output_transaction(outputs)?;
+    modules.report(opts.verbose);
     if opts.verbose {
         eprintln!(" assembled: {}", obj_path.display());
     }
 
     if opts.emit_obj {
-        write_dependency_file(opts, &obj_path, included_files)?;
         phases.report();
         return Ok(());
     }
@@ -2607,18 +2966,18 @@ fn compile_with_bundled_runtime_inner(
     // 11. Link.
     let binary_path = opts.output_path();
     let phase = phases.start("link");
-    link(&obj_path, &binary_path, opts, bundled_runtime)?;
+    link_inputs_with_dependency_file(
+        std::slice::from_ref(&obj_path),
+        &binary_path,
+        opts,
+        bundled_runtime,
+        std::slice::from_ref(&opts.input),
+        included_files,
+    )?;
     phase.end(&mut phases);
     if opts.verbose {
         eprintln!(" linked: {}", binary_path.display());
     }
-    write_link_dependency_file(
-        opts,
-        &binary_path,
-        std::slice::from_ref(&opts.input),
-        included_files,
-    )?;
-
     phases.report();
     Ok(())
 }
@@ -2633,10 +2992,59 @@ struct ModuleArtifactContext<'a> {
     ir_module: &'a Module,
 }
 
-fn write_module_artifacts(
+#[derive(Default)]
+struct PendingModuleArtifacts {
+    outputs: Vec<PendingExternalOutput>,
+    reserved_paths: Vec<PathBuf>,
+    reported_paths: Vec<(&'static str, PathBuf)>,
+}
+
+impl PendingModuleArtifacts {
+    fn report(&self, verbose: bool) {
+        if verbose {
+            for (kind, path) in &self.reported_paths {
+                eprintln!(" {kind}: {}", path.display());
+            }
+        }
+    }
+}
+
+fn validate_compilation_destinations_against_modules(
+    opts: &Options,
+    primary_output: &Path,
+    modules: &PendingModuleArtifacts,
+) -> Result<(), String> {
+    if modules.reserved_paths.is_empty() {
+        return Ok(());
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot determine current directory: {error}"))?;
+    let depfile = dependency_file_path(opts, primary_output);
+    for module_path in &modules.reserved_paths {
+        if paths_refer_to_same_file(primary_output, module_path, &cwd) {
+            return Err(format!(
+                "output '{}' conflicts with module interface '{}'",
+                primary_output.display(),
+                module_path.display()
+            ));
+        }
+        if let Some(depfile) = depfile.as_deref() {
+            if paths_refer_to_same_file(depfile, module_path, &cwd) {
+                return Err(format!(
+                    "dependency file '{}' conflicts with module interface '{}'",
+                    depfile.display(),
+                    module_path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prepare_module_artifacts(
     opts: &Options,
     context: &ModuleArtifactContext<'_>,
-) -> Result<(), String> {
+) -> Result<PendingModuleArtifacts, String> {
     let has_module_artifacts = context.units.iter().any(|unit| {
         matches!(
             unit.node,
@@ -2645,8 +3053,10 @@ fn write_module_artifacts(
         )
     });
     if !has_module_artifacts {
-        return Ok(());
+        return Ok(PendingModuleArtifacts::default());
     }
+
+    let mut prepared = PendingModuleArtifacts::default();
 
     let descriptor_params = crate::ir::lower::collect_descriptor_params_for_units(context.units);
     let char_len_star_params =
@@ -2681,17 +3091,21 @@ fn write_module_artifacts(
                     context.ir_module,
                     &descriptor_params,
                     &char_len_star_params,
-                );
+                )?;
                 let amod_path = output_dir.join(format!("{}.amod", mod_key));
-                write_module_file_atomic(&amod_path, &amod_text)?;
+                prepared.reserved_paths.push(amod_path.clone());
+                if let Some(output) = prepare_module_file(&amod_path, &amod_text)? {
+                    prepared.outputs.push(output);
+                }
+                prepared.reported_paths.push(("amod", amod_path));
                 // `.amod` remains the ARMFORTAS module ABI file. A
                 // byte-identical `.mod` alias keeps conventional Fortran
                 // build systems such as CMake able to track module
                 // dependencies for unknown compilers.
                 let mod_path = output_dir.join(format!("{}.mod", mod_key));
-                write_module_file_atomic(&mod_path, &amod_text)?;
-                if opts.verbose {
-                    eprintln!(" amod: {}", amod_path.display());
+                prepared.reserved_paths.push(mod_path.clone());
+                if let Some(output) = prepare_module_file(&mod_path, &amod_text)? {
+                    prepared.outputs.push(output);
                 }
             }
         }
@@ -2732,13 +3146,14 @@ fn write_module_artifacts(
                 context.ir_module,
                 &descriptor_params,
                 &char_len_star_params,
-            );
+            )?;
             let interface_fingerprint = crate::sema::amod::artifact_fingerprint(&interface_text);
             let interface_path = output_dir.join(&interface_name);
-            write_module_file_atomic(&interface_path, &interface_text)?;
-            if opts.verbose {
-                eprintln!(" amod: {}", interface_path.display());
+            prepared.reserved_paths.push(interface_path.clone());
+            if let Some(output) = prepare_module_file(&interface_path, &interface_text)? {
+                prepared.outputs.push(output);
             }
+            prepared.reported_paths.push(("amod", interface_path));
             let smod_text = format!(
                 "#!smod {}\n# compiler: armfortas {}\n# source: {}\n@parent {}\n@submodule {}\n@interface {} fnv1a:{}\n",
                 crate::sema::amod::SMOD_VERSION,
@@ -2750,42 +3165,41 @@ fn write_module_artifacts(
                 interface_fingerprint
             );
             let smod_path = output_dir.join(format!("{}.smod", artifact_stem));
-            write_module_file_atomic(&smod_path, &smod_text)?;
-            if opts.verbose {
-                eprintln!(" smod: {}", smod_path.display());
+            prepared.reserved_paths.push(smod_path.clone());
+            if let Some(output) = prepare_module_file(&smod_path, &smod_text)? {
+                prepared.outputs.push(output);
             }
+            prepared.reported_paths.push(("smod", smod_path));
         }
     }
-    Ok(())
+    Ok(prepared)
 }
 
-fn write_module_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
+fn prepare_module_file(
+    path: &Path,
+    contents: &str,
+) -> Result<Option<PendingExternalOutput>, String> {
     // Build systems use a module artifact's timestamp as the dependency
     // invalidation signal. Preserve its identity when the interface bytes did
-    // not change, while retaining atomic replacement for changed interfaces.
+    // not change, while staging changed interfaces for coherent publication.
     if fs::read(path).is_ok_and(|published| published == contents.as_bytes()) {
-        return Ok(());
+        return Ok(None);
     }
 
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("module");
-    let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(".{}.{}.{}.tmp", file_name, std::process::id(), id));
-
-    fs::write(&tmp, contents)
-        .map_err(|e| format!("cannot write temporary '{}': {}", tmp.display(), e))?;
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!(
-            "cannot replace '{}' atomically: {}",
-            path.display(),
-            e
-        ));
-    }
-    Ok(())
+    let pending = PendingExternalOutput::prepare(path, "module interface").map_err(|error| {
+        format!(
+            "cannot write module interface '{}': {error}",
+            path.display()
+        )
+    })?;
+    fs::write(pending.staging_path(), contents).map_err(|error| {
+        format!(
+            "cannot write temporary module interface '{}': {error}",
+            pending.staging_path().display()
+        )
+    })?;
+    pending.validate()?;
+    Ok(Some(pending))
 }
 
 fn dependency_file_path(opts: &Options, output: &Path) -> Option<PathBuf> {
@@ -2807,10 +3221,10 @@ fn validate_dependency_file_destination(
     let Some(depfile) = dependency_file_path(opts, output) else {
         return Ok(());
     };
+    validate_not_module_interface_destination(&depfile, "dependency file")?;
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot determine current directory: {error}"))?;
-    let depfile_key = terminal_output_collision_key(&depfile, &cwd);
-    if depfile_key == terminal_output_collision_key(output, &cwd) {
+    if paths_refer_to_same_file(&depfile, output, &cwd) {
         return Err(format!(
             "dependency file '{}' conflicts with output '{}'",
             depfile.display(),
@@ -2818,7 +3232,7 @@ fn validate_dependency_file_destination(
         ));
     }
     for input in all_input_paths(opts).iter().chain(included_files) {
-        if depfile_key == terminal_output_collision_key(input, &cwd) {
+        if paths_refer_to_same_file(&depfile, input, &cwd) {
             return Err(format!(
                 "dependency file '{}' conflicts with compiler input '{}'",
                 depfile.display(),
@@ -2848,27 +3262,14 @@ fn prepare_dependency_file(
     }
 }
 
-fn write_dependency_file(
-    opts: &Options,
-    output: &Path,
-    included_files: &[PathBuf],
-) -> Result<(), String> {
-    write_dependency_file_for_sources(
-        opts,
-        output,
-        std::slice::from_ref(&opts.input),
-        included_files,
-    )
-}
-
-fn write_dependency_file_for_sources(
+fn prepare_dependency_file_for_sources(
     opts: &Options,
     output: &Path,
     source_inputs: &[PathBuf],
     included_files: &[PathBuf],
-) -> Result<(), String> {
+) -> Result<Option<PendingExternalOutput>, String> {
     let Some(depfile) = dependency_file_path(opts, output) else {
-        return Ok(());
+        return Ok(None);
     };
     validate_dependency_file_destination(opts, output, included_files)?;
     if let Some(parent) = depfile.parent() {
@@ -2917,54 +3318,7 @@ fn write_dependency_file_for_sources(
         }
     }
 
-    write_dependency_file_atomic(&depfile, &body)
-}
-
-fn write_dependency_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("dependencies");
-    let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), id));
-    let _cleanup = RemoveFileOnDrop(temporary.clone());
-
-    fs::write(&temporary, contents).map_err(|error| {
-        format!(
-            "cannot write temporary dependency file '{}': {error}",
-            temporary.display()
-        )
-    })?;
-    fs::rename(&temporary, path).map_err(|error| {
-        format!(
-            "cannot replace dependency file '{}' atomically: {error}",
-            path.display()
-        )
-    })
-}
-
-fn write_link_dependency_file(
-    opts: &Options,
-    output: &Path,
-    source_inputs: &[PathBuf],
-    included_files: &[PathBuf],
-) -> Result<(), String> {
-    if let Err(error) =
-        write_dependency_file_for_sources(opts, output, source_inputs, included_files)
-    {
-        return match fs::remove_file(output) {
-            Ok(()) => Err(error),
-            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
-                Err(error)
-            }
-            Err(cleanup_error) => Err(format!(
-                "{error}; additionally cannot remove failed link output '{}': {cleanup_error}",
-                output.display()
-            )),
-        };
-    }
-    Ok(())
+    prepare_output_bytes(&depfile, "dependency file", &body).map(Some)
 }
 
 fn escape_make_dep_token(token: &str) -> String {
@@ -2982,16 +3336,22 @@ fn escape_make_dep_token(token: &str) -> String {
     out
 }
 
-/// Link an object file with the runtime library to produce a binary.
-/// `opts` contributes the user-supplied `-L`, `-l`, `-rpath`,
-/// `-shared`, and `-static` flags that need to make it through to the linker.
-fn link(
-    obj: &Path,
+fn link_inputs_with_dependency_file(
+    inputs: &[PathBuf],
     output: &Path,
     opts: &Options,
     bundled_runtime: Option<&'static [u8]>,
+    source_inputs: &[PathBuf],
+    included_files: &[PathBuf],
 ) -> Result<(), String> {
-    link_inputs(&[obj.to_path_buf()], output, opts, bundled_runtime)
+    let pending_link = prepare_link_inputs(inputs, output, opts, bundled_runtime)?;
+    let mut outputs = vec![pending_link];
+    if let Some(dependencies) =
+        prepare_dependency_file_for_sources(opts, output, source_inputs, included_files)?
+    {
+        outputs.push(dependencies);
+    }
+    publish_output_transaction(outputs)
 }
 
 /// Link prebuilt objects and archives with the runtime to produce a
@@ -3006,15 +3366,15 @@ pub(crate) fn link_inputs_elf(
     output: &Path,
     opts: &Options,
 ) -> Result<(), String> {
-    link_inputs_elf_with_bundled_runtime(inputs, output, opts, None)
+    prepare_link_inputs_elf_with_bundled_runtime(inputs, output, opts, None)?.verify()
 }
 
-fn link_inputs_elf_with_bundled_runtime(
+fn prepare_link_inputs_elf_with_bundled_runtime(
     inputs: &[PathBuf],
     output: &Path,
     opts: &Options,
     bundled_runtime: Option<&'static [u8]>,
-) -> Result<(), String> {
+) -> Result<PendingExternalOutput, String> {
     let host = crate::target::TargetSpec::host();
     if host.arch != opts.target.arch
         || host.object_format() != crate::target::ObjectFormat::Elf
@@ -3048,12 +3408,13 @@ fn link_inputs_elf_with_bundled_runtime(
         lib_paths.extend(dirs.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
     }
     let operands = resolve_link_operands(inputs, opts)?;
+    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
     let args = elf_crt::elf_link_args(
         &opts.target,
         &crt,
         &operands,
         runtime.path(),
-        output,
+        pending_output.staging_path(),
         pie,
         &lib_paths,
     )?;
@@ -3065,7 +3426,6 @@ fn link_inputs_elf_with_bundled_runtime(
     if opts.verbose {
         print_verbose_command_line(&linker, &args);
     }
-    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
     let result = Command::new(&linker)
         .args(&args)
         .output()
@@ -3077,7 +3437,8 @@ fn link_inputs_elf_with_bundled_runtime(
         ));
     }
     forward_successful_subprocess_stderr(&result.stderr)?;
-    pending_output.verify("linker")
+    pending_output.validate()?;
+    Ok(pending_output)
 }
 
 fn link_inputs(
@@ -3086,11 +3447,22 @@ fn link_inputs(
     opts: &Options,
     bundled_runtime: Option<&'static [u8]>,
 ) -> Result<(), String> {
+    prepare_link_inputs(inputs, output, opts, bundled_runtime)?.verify()
+}
+
+fn prepare_link_inputs(
+    inputs: &[PathBuf],
+    output: &Path,
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<PendingExternalOutput, String> {
+    let compiler_inputs = all_input_paths(opts);
+    validate_output_against_inputs(output, compiler_inputs.iter().chain(inputs))?;
     if opts.target.object_format() == crate::target::ObjectFormat::Elf {
-        return link_inputs_elf_with_bundled_runtime(inputs, output, opts, bundled_runtime);
+        return prepare_link_inputs_elf_with_bundled_runtime(inputs, output, opts, bundled_runtime);
     }
     if let Some(linker) = afs_ld_override() {
-        return link_inputs_with_afs_ld(&linker, inputs, output, opts, bundled_runtime);
+        return prepare_link_inputs_with_afs_ld(&linker, inputs, output, opts, bundled_runtime);
     }
 
     let runtime = find_macho_runtime(opts, bundled_runtime)?;
@@ -3103,7 +3475,11 @@ fn link_inputs(
     }
     let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
 
-    let mut args: Vec<String> = vec!["-o".into(), output.to_string_lossy().into_owned()];
+    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
+    let mut args: Vec<String> = vec![
+        "-o".into(),
+        pending_output.staging_path().to_string_lossy().into_owned(),
+    ];
     for dir in &opts.library_search_paths {
         args.push(format!("-L{}", dir.display()));
     }
@@ -3127,13 +3503,13 @@ fn link_inputs(
         // executables. The shared runtime is a separate image and unaffected.
         args.push("-dead_strip".into());
     }
+    push_staged_macho_output_identity(&mut args, output, opts);
     push_macho_tail_link_flags(&mut args, opts);
 
     if opts.verbose {
         print_verbose_command_line("ld", &args);
     }
 
-    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
     let ld_result = Command::new("ld")
         .args(&args)
         .output()
@@ -3145,16 +3521,17 @@ fn link_inputs(
     }
 
     forward_successful_subprocess_stderr(&ld_result.stderr)?;
-    pending_output.verify("linker")
+    pending_output.validate()?;
+    Ok(pending_output)
 }
 
-fn link_inputs_with_afs_ld(
+fn prepare_link_inputs_with_afs_ld(
     linker: &str,
     inputs: &[PathBuf],
     output: &Path,
     opts: &Options,
     bundled_runtime: Option<&'static [u8]>,
-) -> Result<(), String> {
+) -> Result<PendingExternalOutput, String> {
     if opts.static_link {
         return Err("AFS_LD override does not yet support static-link mode".into());
     }
@@ -3168,7 +3545,11 @@ fn link_inputs_with_afs_ld(
     } else {
         args.extend(["-e".into(), "_main".into()]);
     }
-    args.extend(["-o".into(), output.to_string_lossy().into_owned()]);
+    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
+    args.extend([
+        "-o".into(),
+        pending_output.staging_path().to_string_lossy().into_owned(),
+    ]);
     args.extend(["-syslibroot".into(), sysroot]);
     for dir in &opts.library_search_paths {
         args.push("-L".into());
@@ -3186,13 +3567,13 @@ fn link_inputs_with_afs_ld(
     push_macho_runtime_link_input(&mut args, &runtime);
     args.push(libsystem_tbd);
     push_macho_runtime_rpath(&mut args, &runtime);
+    push_staged_macho_output_identity(&mut args, output, opts);
     push_afs_ld_tail_link_flags(&mut args, opts);
 
     if opts.verbose {
         print_verbose_command_line(linker, &args);
     }
 
-    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
     let link_result = Command::new(linker)
         .args(&args)
         .output()
@@ -3200,13 +3581,31 @@ fn link_inputs_with_afs_ld(
 
     if link_result.status.success() {
         forward_successful_subprocess_stderr(&link_result.stderr)?;
-        pending_output.verify("linker")
+        pending_output.validate()?;
+        Ok(pending_output)
     } else {
         Err(format!(
             "linker failed:\n{}",
             String::from_utf8_lossy(&link_result.stderr)
         ))
     }
+}
+
+/// Linking through a sibling staging path must not leak that private name into
+/// a dylib's public LC_ID_DYLIB. Apple ld normally derives the omitted install
+/// name from the final `-o` spelling, so make that implicit contract explicit
+/// whenever staging changes the path passed to the linker.
+fn push_staged_macho_output_identity(args: &mut Vec<String>, output: &Path, opts: &Options) {
+    if !opts.shared
+        || opts
+            .extra_link_args
+            .iter()
+            .any(|argument| argument == "-install_name")
+    {
+        return;
+    }
+    args.push("-install_name".into());
+    args.push(output.to_string_lossy().into_owned());
 }
 
 /// Append Mach-O flags that do not participate in the ordered user operand
@@ -3361,16 +3760,6 @@ fn env_override(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// Link multiple object files with the runtime to produce a binary.
-fn link_multi(
-    objs: &[PathBuf],
-    output: &Path,
-    opts: &Options,
-    bundled_runtime: Option<&'static [u8]>,
-) -> Result<(), String> {
-    link_inputs(objs, output, opts, bundled_runtime)
-}
-
 /// Compile multiple Fortran source files while preserving the requested
 /// terminal phase.
 ///
@@ -3407,6 +3796,7 @@ fn compile_multi_with_bundled_runtime(
         .and_then(|output| dependency_file_path(opts, output))
         .is_some();
     if let Some(output) = link_output.as_deref() {
+        validate_output_against_inputs(output, all_inputs.iter())?;
         reject_unsupported_elf_link_mode(opts, output)?;
         validate_dependency_file_destination(opts, output, &[])?;
     }
@@ -3428,6 +3818,9 @@ fn compile_multi_with_bundled_runtime(
     });
     if let Some(outputs) = terminal_outputs.as_deref() {
         validate_unique_terminal_outputs(&source_inputs, outputs)?;
+        for output in outputs.iter().flatten() {
+            validate_output_against_inputs(output, all_inputs.iter())?;
+        }
     }
 
     // A terminal multi-input job owns one default output per source. Remove
@@ -3561,15 +3954,21 @@ fn compile_multi_with_bundled_runtime(
 
     // Link all object files.
     let output = link_output.expect("link output for multi-file link");
+    validate_output_against_inputs(&output, all_inputs.iter().chain(included_files.iter()))?;
     prepare_dependency_file(opts, &output, &included_files)?;
-    link_multi(&link_list, &output, opts, bundled_runtime)?;
+    link_inputs_with_dependency_file(
+        &link_list,
+        &output,
+        opts,
+        bundled_runtime,
+        &source_inputs,
+        &included_files,
+    )?;
 
     // Cleanup.
     if let Some(tmp_dir) = tmp_dir {
         let _ = fs::remove_dir_all(&tmp_dir);
     }
-
-    write_link_dependency_file(opts, &output, &source_inputs, &included_files)?;
 
     Ok(())
 }
@@ -3799,6 +4198,27 @@ mod tests {
     }
 
     #[test]
+    fn staged_macho_dylib_identity_uses_the_final_output_path() {
+        let output = Path::new("build/libanswer.dylib");
+        let shared = Options {
+            shared: true,
+            ..Options::default()
+        };
+        let mut default_args = Vec::new();
+        push_staged_macho_output_identity(&mut default_args, output, &shared);
+        assert_eq!(default_args, ["-install_name", "build/libanswer.dylib"]);
+
+        let explicit = Options {
+            shared: true,
+            extra_link_args: vec!["-install_name".into(), "@rpath/libanswer.dylib".into()],
+            ..Options::default()
+        };
+        let mut explicit_args = Vec::new();
+        push_staged_macho_output_identity(&mut explicit_args, output, &explicit);
+        assert!(explicit_args.is_empty());
+    }
+
+    #[test]
     fn conventional_dynamic_runtime_uses_searchable_link_arguments() {
         let runtime =
             MachoRuntime::Dynamic(PathBuf::from("/opt/armfortas/lib/libarmfortas_rt.dylib"));
@@ -3840,35 +4260,111 @@ mod tests {
 
         let pending =
             PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
-        assert!(!output.exists(), "prepare retained a stale output");
+        assert_eq!(
+            fs::read(&output).expect("prepare removed the published output"),
+            b"stale"
+        );
+        assert_eq!(
+            pending.staging_path().file_name(),
+            output.file_name(),
+            "external staging must preserve the final basename"
+        );
+        let empty_staging_dir = pending.staging_dir.clone();
 
-        fs::write(&output, b"").expect("cannot write empty output");
-        let error = pending
-            .verify("test tool")
-            .expect_err("empty output must not commit");
+        fs::write(pending.staging_path(), b"").expect("cannot write empty output");
+        let error = pending.verify().expect_err("empty output must not commit");
         assert!(
             error.contains("non-empty regular output"),
             "unexpected empty-output diagnostic: {error}"
         );
-        assert!(!output.exists(), "verify retained an empty output");
+        assert_eq!(
+            fs::read(&output).expect("empty verification removed the published output"),
+            b"stale"
+        );
+        assert!(
+            !empty_staging_dir.exists(),
+            "verify retained an empty staging directory"
+        );
 
         let pending =
             PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
-        fs::write(&output, b"partial").expect("cannot write partial output");
+        let staging = pending.staging_path().to_path_buf();
+        let staging_dir = pending.staging_dir.clone();
+        fs::write(&staging, b"partial").expect("cannot write partial output");
         drop(pending);
-        assert!(!output.exists(), "drop retained a partial output");
+        assert_eq!(
+            fs::read(&output).expect("drop removed the published output"),
+            b"stale"
+        );
+        assert!(!staging.exists(), "drop retained a staging output");
+        assert!(!staging_dir.exists(), "drop retained a staging directory");
 
         let pending =
             PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
-        fs::write(&output, b"complete").expect("cannot write complete output");
+        let staging_dir = pending.staging_dir.clone();
+        fs::write(pending.staging_path(), b"complete").expect("cannot write complete output");
+        assert_eq!(
+            fs::read(&output).expect("staging removed the published output"),
+            b"stale",
+            "staging published output before verification"
+        );
         pending
-            .verify("test tool")
+            .verify()
             .expect("non-empty regular output must commit");
         assert_eq!(
             fs::read(&output).expect("cannot read committed output"),
             b"complete"
         );
+        assert!(!staging_dir.exists(), "commit retained a staging directory");
         let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn output_transaction_rolls_back_an_earlier_publication() {
+        let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "armfortas_output_transaction_{}_{}",
+            std::process::id(),
+            id
+        ));
+        fs::create_dir(&dir).expect("cannot create transaction test directory");
+        let first = dir.join("first.out");
+        let second = dir.join("second.out");
+        fs::write(&first, b"old first").expect("cannot seed first output");
+        fs::write(&second, b"old second").expect("cannot seed second output");
+
+        let first_pending = prepare_output_bytes(&first, "test tool", b"new first")
+            .expect("cannot stage first output");
+        let second_pending = prepare_output_bytes(&second, "test tool", b"new second")
+            .expect("cannot stage second output");
+        let staging_dirs = [
+            first_pending.staging_dir.clone(),
+            second_pending.staging_dir.clone(),
+        ];
+        let error =
+            publish_output_transaction_inner(vec![first_pending, second_pending], |outputs| {
+                fs::remove_file(outputs[1].staging_path())
+                    .expect("cannot fault the second staged output");
+            })
+            .expect_err("missing second staging file must fail publication");
+        assert!(
+            error.contains("cannot publish test tool output"),
+            "unexpected transaction failure: {error}"
+        );
+        assert_eq!(
+            fs::read(&first).expect("first output disappeared"),
+            b"old first"
+        );
+        assert_eq!(
+            fs::read(&second).expect("second output disappeared"),
+            b"old second"
+        );
+        assert!(
+            staging_dirs.iter().all(|path| !path.exists()),
+            "failed transaction retained staging directories"
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

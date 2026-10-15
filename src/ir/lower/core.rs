@@ -4911,7 +4911,7 @@ pub(super) fn collect_module_globals(
                 if let Some(value) = sym.const_value {
                     param_consts
                         .entry(name.clone())
-                        .or_insert(ConstScalar::Int(value as i128));
+                        .or_insert(ConstScalar::Int(value));
                 }
             }
         }
@@ -4948,7 +4948,7 @@ pub(super) fn collect_module_globals(
                     if let Some(value) = sym.const_value {
                         param_consts
                             .entry(assoc.local_name)
-                            .or_insert(ConstScalar::Int(value as i128));
+                            .or_insert(ConstScalar::Int(value));
                     }
                 }
             }
@@ -9030,7 +9030,9 @@ fn install_parameter_inline_const(
         .unwrap_or(IrType::Int(IntWidth::I32));
     let addr = b.alloca(ty.clone());
     let logical_kind = symbol.type_info.as_ref().and_then(|ty| match ty {
-        crate::sema::symtab::TypeInfo::Logical { kind } => Some(kind.unwrap_or(4)),
+        crate::sema::symtab::TypeInfo::Logical { kind } => {
+            Some(kind.unwrap_or_else(crate::driver::defaults::default_int_kind))
+        }
         _ => None,
     });
     locals.insert(
@@ -9044,7 +9046,7 @@ fn install_parameter_inline_const(
             by_ref: false,
             char_kind: CharKind::None,
             derived_type: None,
-            inline_const: Some(ConstScalar::Int(value as i128)),
+            inline_const: Some(ConstScalar::Int(value)),
             is_pointer: false,
             runtime_dim_upper: vec![],
             is_class: false,
@@ -9530,7 +9532,7 @@ pub(super) fn eval_const_scalar_with_any_scope(
             let key = name.to_ascii_lowercase();
             param_consts.get(&key).copied().or_else(|| {
                 st.lookup_local_then_any(current_proc_scope(), &key)
-                    .and_then(|sym| sym.const_value.map(|v| ConstScalar::Int(v as i128)))
+                    .and_then(|sym| sym.const_value.map(ConstScalar::Int))
             })
         }
         Expr::ParenExpr { inner } => eval_const_scalar_with_any_scope(inner, param_consts, st),
@@ -10099,7 +10101,7 @@ fn integer_kind_storage_bytes(
             .or_else(|| {
                 st.find_symbol_any_scope(&key)
                     .and_then(|sym| sym.const_value)
-                    .and_then(|value| integer_kind_value_storage_bytes(value as i128))
+                    .and_then(integer_kind_value_storage_bytes)
             }),
     }
 }
@@ -10407,7 +10409,7 @@ pub(super) fn eval_const_scalar_with_decl_scope(
             let key = name.to_ascii_lowercase();
             param_consts.get(&key).copied().or_else(|| {
                 st.lookup_local_then_any(current_proc_scope(), &key)
-                    .and_then(|sym| sym.const_value.map(|v| ConstScalar::Int(v as i128)))
+                    .and_then(|sym| sym.const_value.map(ConstScalar::Int))
             })
         }
         Expr::ParenExpr { inner } => {
@@ -10677,7 +10679,7 @@ pub(super) fn eval_const_int_in_scope_or_any_scope(
 pub(super) fn symbol_table_parameter_const(st: &SymbolTable, name: &str) -> Option<ConstScalar> {
     st.find_symbol_any_scope(name).and_then(|sym| {
         if sym.attrs.parameter {
-            sym.const_value.map(|value| ConstScalar::Int(value as i128))
+            sym.const_value.map(ConstScalar::Int)
         } else {
             None
         }
@@ -14470,20 +14472,68 @@ pub(super) fn generic_candidate_matches_slots_with_proc_elemental(
     actual_is_procedure: &[bool],
     elemental: bool,
 ) -> bool {
+    generic_candidate_matches_slots_with_proc_excluding(
+        b,
+        declared_args,
+        arg_slots,
+        supplied,
+        formal_skip,
+        None,
+        actual_is_procedure,
+        elemental,
+    )
+}
+
+fn generic_candidate_matches_slots_with_proc_omitting(
+    b: &FuncBuilder,
+    declared_args: &[&crate::sema::symtab::Symbol],
+    arg_slots: &[Option<ValueId>],
+    supplied: usize,
+    omitted_formal: usize,
+    actual_is_procedure: &[bool],
+) -> bool {
+    generic_candidate_matches_slots_with_proc_excluding(
+        b,
+        declared_args,
+        arg_slots,
+        supplied,
+        0,
+        Some(omitted_formal),
+        actual_is_procedure,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generic_candidate_matches_slots_with_proc_excluding(
+    b: &FuncBuilder,
+    declared_args: &[&crate::sema::symtab::Symbol],
+    arg_slots: &[Option<ValueId>],
+    supplied: usize,
+    formal_skip: usize,
+    omitted_formal: Option<usize>,
+    actual_is_procedure: &[bool],
+    elemental: bool,
+) -> bool {
     let required = declared_args
         .iter()
         .enumerate()
-        .filter(|(idx, _)| *idx >= formal_skip)
+        .filter(|(idx, _)| *idx >= formal_skip && Some(*idx) != omitted_formal)
         .map(|(_, sym)| *sym)
         .filter(|sym| !sym.attrs.optional)
         .count();
-    let max_supplied = declared_args.len().saturating_sub(formal_skip);
+    let max_supplied = declared_args
+        .len()
+        .saturating_sub(formal_skip)
+        .saturating_sub(usize::from(
+            omitted_formal.is_some_and(|idx| idx >= formal_skip && idx < declared_args.len()),
+        ));
     if supplied < required || supplied > max_supplied || arg_slots.len() > declared_args.len() {
         return false;
     }
 
     for (idx, decl_sym) in declared_args.iter().enumerate() {
-        if idx < formal_skip {
+        if idx < formal_skip || Some(idx) == omitted_formal {
             continue;
         }
         match arg_slots.get(idx) {
@@ -14514,6 +14564,95 @@ pub(super) fn generic_candidate_matches_slots_with_proc_elemental(
     }
 
     true
+}
+
+fn next_unreserved_formal(mut index: usize, len: usize, omitted_formal: usize) -> usize {
+    while index < len && index == omitted_formal {
+        index += 1;
+    }
+    index
+}
+
+fn reorder_optional_payload_slots_omitting<T: Clone>(
+    args: &[crate::ast::expr::Argument],
+    actuals: &[Option<T>],
+    formal_order: &[String],
+    omitted_formal: usize,
+) -> Option<Vec<Option<T>>> {
+    if args.len() != actuals.len() || omitted_formal >= formal_order.len() {
+        return None;
+    }
+    let mut slots = vec![None; formal_order.len()];
+    let mut last_positional = next_unreserved_formal(0, slots.len(), omitted_formal);
+    let mut saw_keyword = false;
+    for (arg, actual) in args.iter().zip(actuals) {
+        if let Some(keyword) = arg.keyword.as_deref() {
+            saw_keyword = true;
+            let index = formal_order
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(keyword))?;
+            if index == omitted_formal || index < last_positional || slots[index].is_some() {
+                return None;
+            }
+            slots[index] = actual.clone();
+            continue;
+        }
+        if saw_keyword {
+            return None;
+        }
+        last_positional = next_unreserved_formal(last_positional, slots.len(), omitted_formal);
+        if last_positional >= slots.len() || slots[last_positional].is_some() {
+            return None;
+        }
+        slots[last_positional] = actual.clone();
+        last_positional = next_unreserved_formal(last_positional + 1, slots.len(), omitted_formal);
+    }
+    Some(slots)
+}
+
+fn reorder_value_slots_omitting_formal(
+    args: &[crate::ast::expr::Argument],
+    actual_vals: &[ValueId],
+    formal_order: &[String],
+    omitted_formal: usize,
+) -> Option<Vec<Option<ValueId>>> {
+    let wrapped: Vec<_> = actual_vals.iter().copied().map(Some).collect();
+    reorder_optional_payload_slots_omitting(args, &wrapped, formal_order, omitted_formal)
+}
+
+fn reorder_semantic_slots_omitting_formal(
+    args: &[crate::ast::expr::Argument],
+    actual_types: &[Option<crate::sema::symtab::TypeInfo>],
+    formal_order: &[String],
+    omitted_formal: usize,
+) -> Option<Vec<Option<crate::sema::symtab::TypeInfo>>> {
+    reorder_optional_payload_slots_omitting(args, actual_types, formal_order, omitted_formal)
+}
+
+fn reorder_bool_slots_omitting_formal(
+    args: &[crate::ast::expr::Argument],
+    actual_bools: &[bool],
+    formal_order: &[String],
+    omitted_formal: usize,
+) -> Option<Vec<bool>> {
+    let wrapped: Vec<_> = actual_bools.iter().copied().map(Some).collect();
+    reorder_optional_payload_slots_omitting(args, &wrapped, formal_order, omitted_formal).map(
+        |slots| {
+            slots
+                .into_iter()
+                .map(|slot| slot.unwrap_or(false))
+                .collect()
+        },
+    )
+}
+
+fn reorder_rank_slots_omitting_formal(
+    args: &[crate::ast::expr::Argument],
+    actual_ranks: &[Option<usize>],
+    formal_order: &[String],
+    omitted_formal: usize,
+) -> Option<Vec<Option<usize>>> {
+    reorder_optional_payload_slots_omitting(args, actual_ranks, formal_order, omitted_formal)
 }
 
 fn declared_arg_accepts_procedure_actual(sym: &crate::sema::symtab::Symbol) -> bool {
@@ -15998,27 +16137,38 @@ fn resolve_bound_proc_by_semantics<'a>(
             continue;
         };
         let declared_args = declared_args_for_scope(scope);
-        let formal_skip = if bp.nopass { 0 } else { 1 };
+        let pass_index = bp.pass_index;
         let required = declared_args
             .iter()
             .enumerate()
-            .filter(|(idx, sym)| *idx >= formal_skip && !sym.attrs.optional)
+            .filter(|(idx, sym)| Some(*idx) != pass_index && !sym.attrs.optional)
             .count();
-        if args.len() < required || args.len() + formal_skip > declared_args.len() {
+        if args.len() < required
+            || args.len() + usize::from(pass_index.is_some()) > declared_args.len()
+        {
             continue;
         }
-        let Some(semantic_slots) = reorder_semantic_type_slots_by_formal_skip(
-            args,
-            &actual_type_infos,
-            &scope.arg_order,
-            formal_skip,
-        ) else {
+        let semantic_slots = match pass_index {
+            Some(index) => reorder_semantic_slots_omitting_formal(
+                args,
+                &actual_type_infos,
+                &scope.arg_order,
+                index,
+            ),
+            None => reorder_semantic_type_slots_by_formal_skip(
+                args,
+                &actual_type_infos,
+                &scope.arg_order,
+                0,
+            ),
+        };
+        let Some(semantic_slots) = semantic_slots else {
             continue;
         };
         let semantic_match = declared_args
             .iter()
             .enumerate()
-            .filter(|(idx, _)| *idx >= formal_skip)
+            .filter(|(idx, _)| Some(*idx) != pass_index)
             .all(|(idx, declared_arg)| {
                 let Some(declared_type) = declared_arg.type_info.as_ref() else {
                     return true;
@@ -16036,12 +16186,17 @@ fn resolve_bound_proc_by_semantics<'a>(
         if !semantic_match {
             continue;
         }
-        let rank_slots =
-            reorder_actual_ranks_by_formal_skip(args, &actual_ranks, &scope.arg_order, formal_skip);
+        let rank_slots = match pass_index {
+            Some(index) => {
+                reorder_rank_slots_omitting_formal(args, &actual_ranks, &scope.arg_order, index)
+                    .unwrap_or_default()
+            }
+            None => reorder_actual_ranks_by_formal_skip(args, &actual_ranks, &scope.arg_order, 0),
+        };
         let rank_match = declared_args
             .iter()
             .enumerate()
-            .filter(|(idx, _)| *idx >= formal_skip)
+            .filter(|(idx, _)| Some(*idx) != pass_index)
             .all(|(idx, declared_arg)| {
                 let formal_rank = formal_declared_rank(declared_arg);
                 let actual_rank = rank_slots.get(idx).copied().flatten();
@@ -16101,35 +16256,55 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
             continue;
         };
         let declared_args = declared_args_for_scope(scope);
-        let formal_skip = if bp.nopass { 0 } else { 1 };
-        let Some(arg_slots) =
-            reorder_value_slots_by_formal_skip(args, actual_vals, &scope.arg_order, formal_skip)
-        else {
+        let pass_index = bp.pass_index;
+        let arg_slots = match pass_index {
+            Some(index) => {
+                reorder_value_slots_omitting_formal(args, actual_vals, &scope.arg_order, index)
+            }
+            None => reorder_value_slots_by_formal_skip(args, actual_vals, &scope.arg_order, 0),
+        };
+        let Some(arg_slots) = arg_slots else { continue };
+        let semantic_slots = match pass_index {
+            Some(index) => reorder_semantic_slots_omitting_formal(
+                args,
+                &actual_type_infos,
+                &scope.arg_order,
+                index,
+            ),
+            None => reorder_semantic_type_slots_by_formal_skip(
+                args,
+                &actual_type_infos,
+                &scope.arg_order,
+                0,
+            ),
+        };
+        let Some(semantic_slots) = semantic_slots else {
             continue;
         };
-        let Some(semantic_slots) = reorder_semantic_type_slots_by_formal_skip(
-            args,
-            &actual_type_infos,
-            &scope.arg_order,
-            formal_skip,
-        ) else {
-            continue;
+        let actual_is_procedure_slots = match pass_index {
+            Some(index) => reorder_bool_slots_omitting_formal(
+                args,
+                &actual_is_procedure,
+                &scope.arg_order,
+                index,
+            )
+            .unwrap_or_default(),
+            None => reorder_actual_bool_slots_by_formal_skip(
+                args,
+                &actual_is_procedure,
+                &scope.arg_order,
+                0,
+            ),
         };
-        let actual_is_procedure_slots = reorder_actual_bool_slots_by_formal_skip(
-            args,
-            &actual_is_procedure,
-            &scope.arg_order,
-            formal_skip,
-        );
         let supplied = arg_slots
             .iter()
             .enumerate()
-            .filter(|(idx, slot)| *idx >= formal_skip && slot.is_some())
+            .filter(|(idx, slot)| Some(*idx) != pass_index && slot.is_some())
             .count();
         let semantic_match = declared_args
             .iter()
             .enumerate()
-            .filter(|(idx, _)| *idx >= formal_skip)
+            .filter(|(idx, _)| Some(*idx) != pass_index)
             .all(|(idx, declared_arg)| {
                 let actual_supplied = arg_slots.get(idx).is_some_and(Option::is_some);
                 if !actual_supplied {
@@ -16161,14 +16336,24 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
                     None => true,
                 }
             });
-        let ir_match = generic_candidate_matches_slots_with_proc(
-            b,
-            &declared_args,
-            &arg_slots,
-            supplied,
-            formal_skip,
-            &actual_is_procedure_slots,
-        );
+        let ir_match = match pass_index {
+            Some(index) => generic_candidate_matches_slots_with_proc_omitting(
+                b,
+                &declared_args,
+                &arg_slots,
+                supplied,
+                index,
+                &actual_is_procedure_slots,
+            ),
+            None => generic_candidate_matches_slots_with_proc(
+                b,
+                &declared_args,
+                &arg_slots,
+                supplied,
+                0,
+                &actual_is_procedure_slots,
+            ),
+        };
         if semantic_match && ir_match {
             matched.push(bp);
         }
@@ -16205,13 +16390,18 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
             continue;
         };
         let declared_args = declared_args_for_scope(scope);
-        let formal_skip = if bp.nopass { 0 } else { 1 };
-        let rank_slots =
-            reorder_actual_ranks_by_formal_skip(args, &actual_ranks, &scope.arg_order, formal_skip);
+        let pass_index = bp.pass_index;
+        let rank_slots = match pass_index {
+            Some(index) => {
+                reorder_rank_slots_omitting_formal(args, &actual_ranks, &scope.arg_order, index)
+                    .unwrap_or_default()
+            }
+            None => reorder_actual_ranks_by_formal_skip(args, &actual_ranks, &scope.arg_order, 0),
+        };
         let mut all_match = true;
         let mut any_constraint = false;
         for (idx, declared_arg) in declared_args.iter().enumerate() {
-            if idx < formal_skip {
+            if Some(idx) == pass_index {
                 continue;
             }
             let Some(actual) = rank_slots.get(idx).copied().flatten() else {
@@ -20012,6 +20202,25 @@ pub(super) fn reorder_args_by_keyword_slots_with_formal_skip(
     st: &SymbolTable,
     formal_skip: usize,
 ) -> Vec<Option<crate::ast::expr::Argument>> {
+    reorder_args_by_keyword_slots_excluding(args, callee_key, st, formal_skip, None)
+}
+
+fn reorder_args_by_keyword_slots_omitting_formal(
+    args: &[crate::ast::expr::Argument],
+    callee_key: &str,
+    st: &SymbolTable,
+    omitted_formal: usize,
+) -> Vec<Option<crate::ast::expr::Argument>> {
+    reorder_args_by_keyword_slots_excluding(args, callee_key, st, 0, Some(omitted_formal))
+}
+
+fn reorder_args_by_keyword_slots_excluding(
+    args: &[crate::ast::expr::Argument],
+    callee_key: &str,
+    st: &SymbolTable,
+    formal_skip: usize,
+    omitted_formal: Option<usize>,
+) -> Vec<Option<crate::ast::expr::Argument>> {
     // Fast path: no keyword args anywhere → pass through.
     // Look up the callee's declared param order. NamedInterface
     // symbols live in scope.symbols keyed by lowercase name and
@@ -20068,6 +20277,12 @@ pub(super) fn reorder_args_by_keyword_slots_with_formal_skip(
     };
     let Some(mut arg_order) = arg_order else {
         let mut slots: Vec<Option<crate::ast::expr::Argument>> = vec![None; formal_skip];
+        if let Some(index) = omitted_formal {
+            while slots.len() < index {
+                slots.push(None);
+            }
+            slots.push(None);
+        }
         slots.extend(args.iter().cloned().map(Some));
         return slots;
     };
@@ -20082,10 +20297,17 @@ pub(super) fn reorder_args_by_keyword_slots_with_formal_skip(
     // hidden-arg logic).
     let mut slots: Vec<Option<crate::ast::expr::Argument>> = vec![None; arg_order.len()];
     let mut last_positional = formal_skip.min(slots.len());
+    if Some(last_positional) == omitted_formal {
+        last_positional += 1;
+    }
     for a in args {
         if let Some(kw) = &a.keyword {
             let key = kw.to_lowercase();
             if let Some(idx) = arg_order.iter().position(|n| n.to_lowercase() == key) {
+                if Some(idx) == omitted_formal {
+                    slots.push(Some(a.clone()));
+                    continue;
+                }
                 slots[idx] = Some(a.clone());
                 continue;
             }
@@ -20098,6 +20320,9 @@ pub(super) fn reorder_args_by_keyword_slots_with_formal_skip(
         if last_positional < slots.len() {
             slots[last_positional] = Some(a.clone());
             last_positional += 1;
+            if Some(last_positional) == omitted_formal {
+                last_positional += 1;
+            }
         } else {
             slots.push(Some(a.clone()));
         }
@@ -22057,7 +22282,7 @@ pub(super) fn emit_resolved_bound_proc_call(
 ) -> Option<ValueId> {
     let target = bp.target_name.clone();
     let target_key = abi_key_for_link_name(st, &target).unwrap_or_else(|| bp.abi_name.clone());
-    let nopass = bp.nopass;
+    let pass_index = bp.pass_index;
     let mut abi_seed_keys = vec![target.clone(), target_key.clone(), bp.abi_name.clone()];
     abi_seed_keys.extend(module_procedure_link_name_candidates(&target));
     let abi_seed_refs: Vec<&str> = abi_seed_keys.iter().map(String::as_str).collect();
@@ -22071,12 +22296,12 @@ pub(super) fn emit_resolved_bound_proc_call(
         .find(|key| callee_scope_for_lookup(st, key).is_some())
         .map(String::as_str)
         .unwrap_or(target_key.as_str());
-    let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
-        args,
-        callee_lookup_key,
-        st,
-        if nopass { 0 } else { 1 },
-    );
+    let arg_slots = match pass_index {
+        Some(index) => {
+            reorder_args_by_keyword_slots_omitting_formal(args, callee_lookup_key, st, index)
+        }
+        None => reorder_args_by_keyword_slots_with_formal_skip(args, callee_lookup_key, st, 0),
+    };
     let callee_value_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
     let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
@@ -22109,8 +22334,7 @@ pub(super) fn emit_resolved_bound_proc_call(
         callee_sequence_array_copy_back_mask(st, k)
     });
 
-    let mut call_args =
-        Vec::with_capacity(arg_slots.len() + hidden_result.is_some() as usize + (!nopass) as usize);
+    let mut call_args = Vec::with_capacity(arg_slots.len() + hidden_result.is_some() as usize);
     let mut arg_presence = Vec::with_capacity(arg_slots.len());
     let mut call_arg_array_temps = Vec::new();
     let mut call_arg_sequence_temps = Vec::new();
@@ -22119,33 +22343,19 @@ pub(super) fn emit_resolved_bound_proc_call(
     if let Some(result) = hidden_result {
         call_args.push(result);
     }
-    if !nopass {
-        let wants_bind_c_char = callee_bind_c_char_args
-            .as_ref()
-            .map(|mask| mask.first().copied().unwrap_or(false))
-            .unwrap_or(false);
-        let mask_wants_descriptor = callee_descriptor_args
-            .as_ref()
-            .map(|mask| mask.first().copied().unwrap_or(false))
-            .unwrap_or(false);
-        let pass_dummy_is_class = callee_class_args
-            .as_ref()
-            .map(|mask| mask.first().copied().unwrap_or(false))
-            .unwrap_or(false);
-        let wants_descriptor = (mask_wants_descriptor || pass_dummy_is_class) && !wants_bind_c_char;
-        call_args.push(if wants_descriptor {
-            pass_desc_addr.unwrap_or(obj_addr)
-        } else {
-            obj_addr
-        });
-        arg_presence.push(b.const_bool(true));
-    }
-
-    for (i, slot) in arg_slots
-        .iter()
-        .enumerate()
-        .skip(if nopass { 0 } else { 1 })
-    {
+    for (i, slot) in arg_slots.iter().enumerate() {
+        if Some(i) == pass_index {
+            // F2018 C760 requires the passed-object dummy of an extensible
+            // type to be polymorphic. A type with a type-bound procedure is
+            // extensible, and sema plus current-schema `.amod` validation
+            // enforce CLASS(owner). Treat that binding contract as
+            // authoritative: an inherited private target may have no local
+            // procedure record, while an unrelated local procedure can share
+            // a suffix of its mangled name and advertise a raw scalar ABI.
+            call_args.push(pass_desc_addr.unwrap_or(obj_addr));
+            arg_presence.push(b.const_bool(true));
+            continue;
+        }
         let is_value = callee_value_args
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
@@ -22456,7 +22666,7 @@ pub(super) fn emit_resolved_bound_proc_call(
 
     if let Some(cls_flags) = &callee_char_len_star_args {
         for (i, flag) in cls_flags.iter().enumerate() {
-            if !*flag || i >= arg_slots.len() || (!nopass && i == 0) {
+            if !*flag || i >= arg_slots.len() || Some(i) == pass_index {
                 continue;
             }
             if let Some(arg) = &arg_slots[i] {
@@ -29914,7 +30124,12 @@ pub(super) fn type_spec_logical_kind(
     st: Option<&SymbolTable>,
 ) -> Option<u8> {
     if let TypeSpec::Logical(sel) = ts {
-        Some(extract_kind_with_context(sel, 4, param_consts, st))
+        Some(extract_kind_with_context(
+            sel,
+            crate::driver::defaults::default_int_kind(),
+            param_consts,
+            st,
+        ))
     } else {
         None
     }
@@ -29974,7 +30189,12 @@ pub(super) fn lower_type_spec_with_param_consts(
             // Without this, `logical(int8) :: a(N) = .true.` allocated
             // 4 N bytes on the stack while the .data path used N bytes,
             // and `all(a)` walked the descriptor at the wrong stride.
-            match extract_kind_with_context(sel, 4, param_consts, st) {
+            match extract_kind_with_context(
+                sel,
+                crate::driver::defaults::default_int_kind(),
+                param_consts,
+                st,
+            ) {
                 1 => IrType::Int(IntWidth::I8),
                 2 => IrType::Int(IntWidth::I16),
                 8 => IrType::Int(IntWidth::I64),
@@ -40901,11 +41121,21 @@ fn parse_intrinsic_class_star_guard(
         return Some(IntrinsicClassStarGuard::Real(kind));
     }
     if let Some(selector) = intrinsic_guard_selector(&compact, "complex") {
-        let kind = intrinsic_guard_kind_value(selector, 4, true, st);
+        let kind = intrinsic_guard_kind_value(
+            selector,
+            crate::driver::defaults::default_real_kind(),
+            true,
+            st,
+        );
         return Some(IntrinsicClassStarGuard::Complex(kind));
     }
     if let Some(selector) = intrinsic_guard_selector(&compact, "logical") {
-        let kind = intrinsic_guard_kind_value(selector, 4, true, st);
+        let kind = intrinsic_guard_kind_value(
+            selector,
+            crate::driver::defaults::default_int_kind(),
+            true,
+            st,
+        );
         return Some(IntrinsicClassStarGuard::Logical(kind));
     }
     if let Some(selector) = intrinsic_guard_selector(&compact, "character") {
@@ -40931,11 +41161,11 @@ pub(super) fn intrinsic_class_star_type_tag_for_type_info(
         TypeInfo::DoublePrecision => Some(class_star_intrinsic_tag(CLASS_STAR_TAG_REAL_BASE, 8)),
         TypeInfo::Complex { kind } => Some(class_star_intrinsic_tag(
             CLASS_STAR_TAG_COMPLEX_BASE,
-            kind.unwrap_or(4),
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
         )),
         TypeInfo::Logical { kind } => Some(class_star_intrinsic_tag(
             CLASS_STAR_TAG_LOGICAL_BASE,
-            kind.unwrap_or(4),
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
         )),
         TypeInfo::Character { kind, .. } => Some(class_star_intrinsic_tag(
             CLASS_STAR_TAG_CHARACTER_BASE,
@@ -45506,9 +45736,13 @@ pub(super) fn lower_transfer_array_expr_descriptor(
     // descriptor-shape handling we don't emit here.
     let mold_ti = operator_expr_type_info(mold_expr, Some(locals), st, type_layouts)?;
     let mold_kind = match &mold_ti {
-        TypeInfo::Integer { kind } => kind.unwrap_or(4),
-        TypeInfo::Real { kind } => kind.unwrap_or(4),
-        TypeInfo::Logical { kind } => kind.unwrap_or(4),
+        TypeInfo::Integer { kind } => {
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind)
+        }
+        TypeInfo::Real { kind } => kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
+        TypeInfo::Logical { kind } => {
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind)
+        }
         _ => return None,
     } as i64;
     if mold_kind <= 0 {
@@ -45576,9 +45810,15 @@ pub(super) fn lower_transfer_array_expr_descriptor(
                 operator_expr_type_info(e, Some(locals), st, type_layouts)
             })?;
             let src_elem_bytes: i64 = match elem_ti {
-                TypeInfo::Integer { kind } => kind.unwrap_or(4) as i64,
-                TypeInfo::Real { kind } => kind.unwrap_or(4) as i64,
-                TypeInfo::Logical { kind } => kind.unwrap_or(4) as i64,
+                TypeInfo::Integer { kind } => {
+                    kind.unwrap_or_else(crate::driver::defaults::default_int_kind) as i64
+                }
+                TypeInfo::Real { kind } => {
+                    kind.unwrap_or_else(crate::driver::defaults::default_real_kind) as i64
+                }
+                TypeInfo::Logical { kind } => {
+                    kind.unwrap_or_else(crate::driver::defaults::default_int_kind) as i64
+                }
                 _ => return None,
             };
             let total_const = n_elems * src_elem_bytes;
@@ -48364,7 +48604,7 @@ pub(super) fn try_lower_complex_part_assignment(
         return false;
     };
 
-    let kind_bytes = kind.unwrap_or(4) as i64;
+    let kind_bytes = kind.unwrap_or_else(crate::driver::defaults::default_real_kind) as i64;
     let lane_ty = if kind_bytes == 8 {
         IrType::Float(FloatWidth::F64)
     } else {
@@ -60790,8 +61030,13 @@ pub(super) fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType
             return IrType::Int(IntWidth::I64);
         }
     }
-    if let TypeInfo::Complex { kind } = ti {
-        let fw = if kind.unwrap_or(4) == 8 {
+    if let TypeInfo::Complex { .. } = ti {
+        let kind = crate::sema::type_layout::concrete_intrinsic_kind(
+            ti,
+            crate::driver::defaults::current(),
+        )
+        .expect("COMPLEX has an intrinsic kind");
+        let fw = if kind == 8 {
             FloatWidth::F64
         } else {
             FloatWidth::F32
@@ -65212,6 +65457,11 @@ pub(super) fn type_layout_vtable_symbol(
         bp.target_name.to_lowercase().hash(&mut hasher);
         bp.abi_name.to_lowercase().hash(&mut hasher);
         bp.nopass.hash(&mut hasher);
+        bp.pass_name
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .hash(&mut hasher);
+        bp.pass_index.hash(&mut hasher);
     }
     for final_proc in &layout.final_procs {
         final_proc.name.to_lowercase().hash(&mut hasher);
@@ -67056,9 +67306,15 @@ pub(super) fn try_lower_transfer_into_array(
     let mold_ti =
         operator_expr_type_info(mold_expr, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts));
     let scalar_size: i64 = match mold_ti {
-        Some(crate::sema::symtab::TypeInfo::Integer { kind }) => kind.unwrap_or(4) as i64,
-        Some(crate::sema::symtab::TypeInfo::Real { kind }) => kind.unwrap_or(4) as i64,
-        Some(crate::sema::symtab::TypeInfo::Logical { kind }) => kind.unwrap_or(4) as i64,
+        Some(crate::sema::symtab::TypeInfo::Integer { kind }) => {
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind) as i64
+        }
+        Some(crate::sema::symtab::TypeInfo::Real { kind }) => {
+            kind.unwrap_or_else(crate::driver::defaults::default_real_kind) as i64
+        }
+        Some(crate::sema::symtab::TypeInfo::Logical { kind }) => {
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind) as i64
+        }
         Some(crate::sema::symtab::TypeInfo::Character { len: Some(len), .. }) => len,
         Some(crate::sema::symtab::TypeInfo::Character { .. }) => {
             let Some(len) =
@@ -67159,9 +67415,15 @@ pub(super) fn try_lower_transfer_into_array(
                 operator_expr_type_info(expr, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
             });
             let src_elem_size: i64 = match elem_ti {
-                Some(crate::sema::symtab::TypeInfo::Integer { kind }) => kind.unwrap_or(4) as i64,
-                Some(crate::sema::symtab::TypeInfo::Real { kind }) => kind.unwrap_or(4) as i64,
-                Some(crate::sema::symtab::TypeInfo::Logical { kind }) => kind.unwrap_or(4) as i64,
+                Some(crate::sema::symtab::TypeInfo::Integer { kind }) => {
+                    kind.unwrap_or_else(crate::driver::defaults::default_int_kind) as i64
+                }
+                Some(crate::sema::symtab::TypeInfo::Real { kind }) => {
+                    kind.unwrap_or_else(crate::driver::defaults::default_real_kind) as i64
+                }
+                Some(crate::sema::symtab::TypeInfo::Logical { kind }) => {
+                    kind.unwrap_or_else(crate::driver::defaults::default_int_kind) as i64
+                }
                 _ => return false,
             };
             let total_bytes = n_elems * src_elem_size;
@@ -67534,9 +67796,15 @@ pub(super) fn lower_transfer_intrinsic(
     // Scalar mold: bit-cast SOURCE into one mold-sized value.
     let mold_ti = operator_expr_type_info(mold_expr, Some(locals), st, type_layouts)?;
     let mold_ty = match &mold_ti {
-        crate::sema::symtab::TypeInfo::Integer { kind } => IrType::int_from_kind(kind.unwrap_or(4)),
-        crate::sema::symtab::TypeInfo::Real { kind } => IrType::float_from_kind(kind.unwrap_or(4)),
-        crate::sema::symtab::TypeInfo::Logical { kind } => IrType::int_from_kind(kind.unwrap_or(4)),
+        crate::sema::symtab::TypeInfo::Integer { kind } => {
+            IrType::int_from_kind(kind.unwrap_or_else(crate::driver::defaults::default_int_kind))
+        }
+        crate::sema::symtab::TypeInfo::Real { kind } => {
+            IrType::float_from_kind(kind.unwrap_or_else(crate::driver::defaults::default_real_kind))
+        }
+        crate::sema::symtab::TypeInfo::Logical { kind } => {
+            IrType::int_from_kind(kind.unwrap_or_else(crate::driver::defaults::default_int_kind))
+        }
         _ => return None,
     };
 

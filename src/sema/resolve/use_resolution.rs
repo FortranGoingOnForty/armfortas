@@ -861,6 +861,7 @@ fn install_external_interface(
             pointer: var.pointer,
             target: var.target,
             volatile: var.volatile,
+            protected: var.protected,
             openmp_threadprivate: var.openmp_threadprivate,
             parameter: var.is_parameter,
             external: var.proc_pointer,
@@ -921,7 +922,7 @@ fn install_external_interface(
                 defined_at: dummy_span,
                 scope: scope_id,
                 arg_names: vec![],
-                const_value: Some((i + 1) as i64),
+                const_value: Some((i + 1) as i128),
                 const_char_value: None,
             });
         }

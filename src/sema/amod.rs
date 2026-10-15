@@ -16,12 +16,15 @@ use std::fmt::Write;
 use std::path::Path;
 
 use crate::ast::decl::UseNature;
+use crate::driver::defaults::DefaultKinds;
 use crate::ir::inst::Module as IrModule;
 use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
-use crate::sema::type_layout::{TypeLayout, TypeLayoutRegistry};
+use crate::sema::type_layout::{
+    concretize_intrinsic_type_info, BoundProc, TypeLayout, TypeLayoutRegistry,
+};
 
-const AMOD_VERSION: u32 = 16;
+const AMOD_VERSION: u32 = 17;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
 const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
 const AMOD_FINAL_ELEMENTAL_VERSION: u32 = 12;
@@ -342,10 +345,11 @@ pub fn write_amod(
     ir_module: &IrModule,
     descriptor_params: &HashMap<String, Vec<bool>>,
     char_len_star_params: &HashMap<String, Vec<bool>>,
-) -> String {
+) -> Result<String, String> {
     let mut out = String::new();
     let mod_key = module_name.to_lowercase();
     let scope = st.scope(mod_scope_id);
+    let provider_defaults = crate::driver::defaults::current();
 
     // ---- Header ----
     writeln!(out, "#!amod {}", AMOD_VERSION).unwrap();
@@ -558,7 +562,7 @@ pub fn write_amod(
         })
         .collect();
     for (name, sym) in &vars {
-        emit_variable(&mut out, &mod_key, name, sym, globals);
+        emit_variable(&mut out, &mod_key, name, sym, globals, provider_defaults);
     }
     if !vars.is_empty() {
         writeln!(out).unwrap();
@@ -570,7 +574,7 @@ pub fn write_amod(
         .filter(|(_, sym)| sym.attrs.parameter || matches!(sym.kind, SymbolKind::Parameter))
         .collect();
     for (name, sym) in &params {
-        emit_parameter(&mut out, &mod_key, name, sym, globals);
+        emit_parameter(&mut out, &mod_key, name, sym, globals, provider_defaults);
     }
     if !params.is_empty() {
         writeln!(out).unwrap();
@@ -669,6 +673,7 @@ pub fn write_amod(
             ir_module,
             descriptor_params,
             char_len_star_params,
+            provider_defaults,
         );
     }
 
@@ -739,7 +744,13 @@ pub fn write_amod(
         {
             let canonical = type_layouts.canonical_key_for_layout(layout);
             let access = serialized_type_access(scope, layout);
-            emit_type(&mut out, &canonical, access, type_layouts);
+            emit_type(
+                &mut out,
+                &canonical,
+                access,
+                type_layouts,
+                provider_defaults,
+            )?;
         }
     }
 
@@ -765,7 +776,7 @@ pub fn write_amod(
         emit_interface(&mut out, name, sym, scope);
     }
 
-    add_integrity_headers(out)
+    Ok(add_integrity_headers(out))
 }
 
 fn is_public(sym: &Symbol, scope: &Scope) -> bool {
@@ -807,6 +818,7 @@ fn emit_variable(
     name: &str,
     sym: &Symbol,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    provider_defaults: DefaultKinds,
 ) {
     let global_key = (mod_key.to_string(), name.to_lowercase());
     let global_info = globals.get(&global_key);
@@ -824,9 +836,9 @@ fn emit_variable(
         }),
     ) = (sym.type_info.as_ref(), global_info)
     {
-        character_type_to_string(Some(*n), *kind)
+        character_type_to_string(Some(*n), Some(kind.unwrap_or(1)))
     } else {
-        type_info_to_string(sym.type_info.as_ref())
+        type_info_to_string(sym.type_info.as_ref(), provider_defaults)
     };
     write!(out, "@var {} : {}", name, type_str).unwrap();
 
@@ -848,6 +860,9 @@ fn emit_variable(
     }
     if sym.attrs.volatile {
         attrs.push("volatile");
+    }
+    if sym.attrs.protected {
+        attrs.push("protected");
     }
     if sym.attrs.openmp_threadprivate {
         attrs.push("threadprivate");
@@ -883,6 +898,7 @@ fn emit_parameter(
     name: &str,
     sym: &Symbol,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    provider_defaults: DefaultKinds,
 ) {
     let global_key = (mod_key.to_string(), name.to_lowercase());
     let global_info = globals.get(&global_key);
@@ -894,9 +910,9 @@ fn emit_parameter(
         }),
     ) = (sym.type_info.as_ref(), global_info)
     {
-        character_type_to_string(Some(*n), *kind)
+        character_type_to_string(Some(*n), Some(kind.unwrap_or(1)))
     } else {
-        type_info_to_string(sym.type_info.as_ref())
+        type_info_to_string(sym.type_info.as_ref(), provider_defaults)
     };
     let is_private = sym.attrs.access == Access::Private;
     let const_char_hex = sym
@@ -905,7 +921,6 @@ fn emit_parameter(
         .map(|value| hex_encode_bytes(&crate::source_bytes::from_source_view(value)));
     let const_int = sym
         .const_value
-        .map(i128::from)
         .or_else(|| global_info.and_then(|info| info.const_value));
     let const_real = global_info.and_then(|info| info.const_real_value);
     if let Some(rv) = const_real {
@@ -1018,6 +1033,7 @@ fn emit_procedure(
     ir_module: &IrModule,
     descriptor_params: &HashMap<String, Vec<bool>>,
     char_len_star_params: &HashMap<String, Vec<bool>>,
+    provider_defaults: DefaultKinds,
 ) {
     let is_func = matches!(sym.kind, SymbolKind::Function);
     let kind_str = if is_func { "function" } else { "subroutine" };
@@ -1027,7 +1043,7 @@ fn emit_procedure(
         // RESULT identity is semantic state, not something reconstructed from
         // whichever same-typed local happens to sort first.
         let result_var = proc_scope.and_then(Scope::procedure_result_symbol);
-        let ret_str = type_info_to_string(sym.type_info.as_ref());
+        let ret_str = type_info_to_string(sym.type_info.as_ref(), provider_defaults);
         write!(out, "@function {} -> {}", sym.name, ret_str).unwrap();
         if sym.attrs.allocatable {
             write!(out, ", result_allocatable").unwrap();
@@ -1160,7 +1176,7 @@ fn emit_procedure(
     if let Some(pscope) = proc_scope {
         for (arg_idx, arg_name) in pscope.arg_order.iter().enumerate() {
             if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
-                let type_str = type_info_to_string(arg_sym.type_info.as_ref());
+                let type_str = type_info_to_string(arg_sym.type_info.as_ref(), provider_defaults);
                 write!(out, "  @arg {} : {}", arg_name, type_str).unwrap();
                 let mut arg_attrs = Vec::new();
                 if let Some(intent) = &arg_sym.attrs.intent {
@@ -1309,7 +1325,13 @@ fn emit_procedure(
     writeln!(out).unwrap();
 }
 
-fn emit_type(out: &mut String, name: &str, access: Access, type_layouts: &TypeLayoutRegistry) {
+fn emit_type(
+    out: &mut String,
+    name: &str,
+    access: Access,
+    type_layouts: &TypeLayoutRegistry,
+    provider_defaults: DefaultKinds,
+) -> Result<(), String> {
     if let Some(layout) = type_layouts.get(&name.to_lowercase()) {
         let access = match access {
             Access::Private => "private",
@@ -1324,7 +1346,7 @@ fn emit_type(out: &mut String, name: &str, access: Access, type_layouts: &TypeLa
             writeln!(out, "  @abstract").unwrap();
         }
         for field in &layout.fields {
-            let ft = type_info_to_string(Some(&field.type_info));
+            let ft = type_info_to_string(Some(&field.type_info), provider_defaults);
             let dims = if field.dims.is_empty() {
                 String::new()
             } else {
@@ -1385,28 +1407,37 @@ fn emit_type(out: &mut String, name: &str, access: Access, type_layouts: &TypeLa
             } else {
                 String::new()
             };
-            if bp.method_name == bp.target_name {
-                if bp.nopass {
-                    writeln!(out, "  @binds {}, nopass{}", bp.method_name, abi_suffix).unwrap();
-                } else {
-                    writeln!(out, "  @binds {}{}", bp.method_name, abi_suffix).unwrap();
-                }
+            let pass_suffix = if bp.nopass {
+                " @nopass".to_string()
             } else {
-                if bp.nopass {
-                    writeln!(
-                        out,
-                        "  @binds {} => {}, nopass{}",
-                        bp.method_name, bp.target_name, abi_suffix
+                let pass_name = bp.pass_name.as_deref().ok_or_else(|| {
+                    format!(
+                        "cannot emit .amod binding '{}': passed-object dummy is unresolved",
+                        bp.method_name
                     )
-                    .unwrap();
-                } else {
-                    writeln!(
-                        out,
-                        "  @binds {} => {}{}",
-                        bp.method_name, bp.target_name, abi_suffix
+                })?;
+                let pass_index = bp.pass_index.ok_or_else(|| {
+                    format!(
+                        "cannot emit .amod binding '{}': passed-object index is unresolved",
+                        bp.method_name
                     )
-                    .unwrap();
-                }
+                })?;
+                format!(" @pass-name {pass_name} @pass-index {pass_index}")
+            };
+            if bp.method_name == bp.target_name {
+                writeln!(
+                    out,
+                    "  @binds {}{}{}",
+                    bp.method_name, pass_suffix, abi_suffix
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    out,
+                    "  @binds {} => {}{}{}",
+                    bp.method_name, bp.target_name, pass_suffix, abi_suffix
+                )
+                .unwrap();
             }
         }
 
@@ -1451,6 +1482,7 @@ fn emit_type(out: &mut String, name: &str, access: Access, type_layouts: &TypeLa
     }
     writeln!(out, "@end type").unwrap();
     writeln!(out).unwrap();
+    Ok(())
 }
 
 fn collect_exported_type_info_closure(
@@ -1512,8 +1544,9 @@ fn emit_interface(out: &mut String, name: &str, sym: &Symbol, scope: &Scope) {
 // Helpers
 // =====================================================================
 
-fn type_info_to_string(info: Option<&TypeInfo>) -> String {
-    match info {
+fn type_info_to_string(info: Option<&TypeInfo>, provider_defaults: DefaultKinds) -> String {
+    let concrete = info.map(|info| concretize_intrinsic_type_info(info, provider_defaults));
+    match concrete.as_ref() {
         Some(TypeInfo::Integer { kind }) => match kind {
             Some(k) => format!("integer({})", k),
             None => "integer".to_string(),
@@ -1703,12 +1736,13 @@ pub struct AmodVar {
     pub proc_pointer: bool,
     pub target: bool,
     pub volatile: bool,
+    pub protected: bool,
     pub openmp_threadprivate: bool,
     pub ir_symbol: Option<String>,
     pub deferred_char: bool,
     pub rank: usize,
     pub dims: Vec<(i64, i64)>,
-    pub const_value: Option<i64>,
+    pub const_value: Option<i128>,
     pub const_real_value: Option<f64>,
     pub const_char_value: Option<String>,
     /// Access level. F2008 §11.2.3 requires private parent symbols to
@@ -2137,11 +2171,16 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             // `@use_rename <local> = <original> from <module>`
             renames.push(parse_use_binding(rest, "@use_rename", path)?);
         } else if trimmed.starts_with("@var ") {
-            variables.push(parse_var(trimmed, false));
+            variables.push(parse_var(trimmed, false, version, path)?);
         } else if trimmed.starts_with("@param ") {
-            variables.push(parse_var(&trimmed.replacen("@param", "@var", 1), true));
+            variables.push(parse_var(
+                &trimmed.replacen("@param", "@var", 1),
+                true,
+                version,
+                path,
+            )?);
         } else if trimmed.starts_with("@function ") || trimmed.starts_with("@subroutine ") {
-            let proc = parse_proc(trimmed, &mut lines);
+            let proc = parse_proc(trimmed, &mut lines, version, path)?;
             procedures.push(proc);
         } else if let Some(rest) = trimmed.strip_prefix("@enumtype ") {
             // `@enumtype <public|private> <name> <e1> <e2> ...`
@@ -2218,6 +2257,10 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
         }
     }
 
+    if version >= 17 {
+        validate_bound_proc_metadata(&types, &procedures, &module_name, path)?;
+    }
+
     Ok(ModuleInterface {
         module_name,
         default_access,
@@ -2237,7 +2280,248 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     })
 }
 
-fn parse_var(line: &str, is_param: bool) -> AmodVar {
+fn validate_bound_proc_metadata(
+    types: &[AmodType],
+    procedures: &[AmodProc],
+    module_name: &str,
+    path: &Path,
+) -> Result<(), String> {
+    fn same_optional_name(left: Option<&str>, right: Option<&str>) -> bool {
+        match (left, right) {
+            (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn same_binding(left: &BoundProc, right: &BoundProc) -> bool {
+        left.method_name.eq_ignore_ascii_case(&right.method_name)
+            && left.target_name.eq_ignore_ascii_case(&right.target_name)
+            && left.abi_name.eq_ignore_ascii_case(&right.abi_name)
+            && left.nopass == right.nopass
+            && same_optional_name(left.pass_name.as_deref(), right.pass_name.as_deref())
+            && left.pass_index == right.pass_index
+    }
+
+    fn type_ref_parts(name: &str) -> (Option<&str>, &str) {
+        name.rsplit_once("::")
+            .map_or((None, name), |(owner, local)| (Some(owner), local))
+    }
+
+    fn type_ref_matches_layout(name: &str, layout: &TypeLayout) -> bool {
+        let (owner, local) = type_ref_parts(name);
+        local.eq_ignore_ascii_case(&layout.name)
+            && owner.is_none_or(|owner| {
+                layout
+                    .owner_module
+                    .as_deref()
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(owner))
+            })
+    }
+
+    fn find_type_for_ref<'a>(
+        types: &'a [AmodType],
+        name: &str,
+        fallback_owner: Option<&str>,
+    ) -> Option<&'a AmodType> {
+        let (owner, local) = type_ref_parts(name);
+        let expected_owner = owner.or(fallback_owner);
+        types.iter().find(|candidate| {
+            candidate.layout.name.eq_ignore_ascii_case(local)
+                && expected_owner.is_none_or(|expected| {
+                    candidate
+                        .layout
+                        .owner_module
+                        .as_deref()
+                        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+                })
+        })
+    }
+
+    fn binding_defining_type<'a>(
+        types: &'a [AmodType],
+        carrying_type: &'a AmodType,
+        binding: &BoundProc,
+    ) -> (&'a AmodType, bool) {
+        let mut defining_type = carrying_type;
+        let mut inherited = false;
+        let mut seen = HashSet::new();
+        loop {
+            let key = format!(
+                "{}::{}",
+                defining_type.layout.owner_module.as_deref().unwrap_or(""),
+                defining_type.layout.name
+            )
+            .to_ascii_lowercase();
+            if !seen.insert(key) {
+                break;
+            }
+            let Some(parent_name) = defining_type.layout.parent.as_deref() else {
+                break;
+            };
+            let Some(parent_type) = find_type_for_ref(
+                types,
+                parent_name,
+                defining_type.layout.owner_module.as_deref(),
+            ) else {
+                break;
+            };
+            if !parent_type
+                .layout
+                .bound_procs
+                .iter()
+                .any(|parent_binding| same_binding(parent_binding, binding))
+            {
+                break;
+            }
+            defining_type = parent_type;
+            inherited = true;
+        }
+        (defining_type, inherited)
+    }
+
+    fn target_matches_procedure(
+        binding: &BoundProc,
+        defining_type: &TypeLayout,
+        procedure: &AmodProc,
+    ) -> bool {
+        if binding.target_name.eq_ignore_ascii_case(&procedure.name) {
+            return true;
+        }
+        let Some(owner) = defining_type.owner_module.as_deref() else {
+            return false;
+        };
+        let prefix = format!("afs_modproc_{}_", owner.to_ascii_lowercase());
+        binding
+            .target_name
+            .get(..prefix.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
+            && binding.target_name[prefix.len()..].eq_ignore_ascii_case(&procedure.name)
+    }
+
+    for amod_type in types {
+        if amod_type
+            .layout
+            .owner_module
+            .as_deref()
+            .is_some_and(|owner| !owner.eq_ignore_ascii_case(module_name))
+        {
+            // Imported ancestor layouts are redundant closure records. Their
+            // locally declared bindings were validated in the owning module.
+            continue;
+        }
+        for binding in &amod_type.layout.bound_procs {
+            if binding.nopass {
+                continue;
+            }
+            let (defining_type, inherited) = binding_defining_type(types, amod_type, binding);
+            if inherited
+                && !same_optional_name(
+                    defining_type.layout.owner_module.as_deref(),
+                    amod_type.layout.owner_module.as_deref(),
+                )
+            {
+                // This binding was inherited from a type owned by another
+                // module. Its procedure contract was validated when that
+                // provider published its own artifact. Do not correlate it
+                // with this module's procedure table: a local procedure may
+                // legitimately have the same source or ABI name.
+                continue;
+            }
+            let pass_name = binding.pass_name.as_deref().ok_or_else(|| {
+                format!(
+                    "{}: corrupt .amod file (missing passed-object name for binding '{}'); rebuild the provider module",
+                    path.display(),
+                    binding.method_name
+                )
+            })?;
+            let pass_index = binding.pass_index.ok_or_else(|| {
+                format!(
+                    "{}: corrupt .amod file (missing passed-object index for binding '{}'); rebuild the provider module",
+                    path.display(),
+                    binding.method_name
+                )
+            })?;
+            let procedure = procedures
+                .iter()
+                .find(|procedure| {
+                    target_matches_procedure(binding, &defining_type.layout, procedure)
+                })
+                .or_else(|| {
+                    procedures
+                        .iter()
+                        .find(|procedure| procedure.name.eq_ignore_ascii_case(&binding.abi_name))
+                });
+            let Some(procedure) = procedure else {
+                return Err(format!(
+                    "{}: corrupt .amod file (missing procedure metadata for binding '{}'); rebuild the provider module",
+                    path.display(),
+                    binding.method_name
+                ));
+            };
+            let visible_args: Vec<_> = procedure.args.iter().filter(|arg| !arg.hidden).collect();
+            let Some(argument) = visible_args.get(pass_index) else {
+                return Err(format!(
+                    "{}: corrupt .amod file (passed-object index {} is out of range for binding '{}'); rebuild the provider module",
+                    path.display(),
+                    pass_index,
+                    binding.method_name
+                ));
+            };
+            if !argument.name.eq_ignore_ascii_case(pass_name) {
+                return Err(format!(
+                    "{}: corrupt .amod file (passed-object name/index disagree for binding '{}'); rebuild the provider module",
+                    path.display(),
+                    binding.method_name
+                ));
+            }
+            if argument.rank != 0 {
+                return Err(format!(
+                    "{}: corrupt .amod file (passed-object dummy for binding '{}' is not scalar); rebuild the provider module",
+                    path.display(),
+                    binding.method_name
+                ));
+            }
+            if argument.pointer {
+                return Err(format!(
+                    "{}: corrupt .amod file (passed-object dummy for binding '{}' has the POINTER attribute); rebuild the provider module",
+                    path.display(),
+                    binding.method_name
+                ));
+            }
+            if argument.allocatable {
+                return Err(format!(
+                    "{}: corrupt .amod file (passed-object dummy for binding '{}' has the ALLOCATABLE attribute); rebuild the provider module",
+                    path.display(),
+                    binding.method_name
+                ));
+            }
+            if argument.value {
+                return Err(format!(
+                    "{}: corrupt .amod file (passed-object dummy for binding '{}' has the VALUE attribute); rebuild the provider module",
+                    path.display(),
+                    binding.method_name
+                ));
+            }
+            let has_required_type = matches!(
+                argument.type_info.as_ref(),
+                Some(TypeInfo::Class(dummy_type))
+                    if type_ref_matches_layout(dummy_type, &defining_type.layout)
+            );
+            if !has_required_type {
+                return Err(format!(
+                    "{}: corrupt .amod file (passed-object dummy for binding '{}' is not CLASS({})); rebuild the provider module",
+                    path.display(),
+                    binding.method_name,
+                    defining_type.layout.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_var(line: &str, is_param: bool, version: u32, path: &Path) -> Result<AmodVar, String> {
     // @var name : type[, attrs...] [@ir symbol] [@charhex hex] [@deferred_char] [@dims ...]
     let rest = line.strip_prefix("@var ").unwrap_or(line);
     let (name_type, meta_part) = if let Some(idx) = rest.find(" @") {
@@ -2246,9 +2530,12 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         (rest, None)
     };
 
-    let (name, type_and_attrs) = name_type
-        .split_once(" : ")
-        .unwrap_or((name_type, "unknown"));
+    let (name, type_and_attrs) = name_type.split_once(" : ").ok_or_else(|| {
+        format!(
+            "{}: corrupt .amod file (malformed variable record); rebuild the provider module",
+            path.display()
+        )
+    })?;
     let name = name.trim().to_string();
 
     // Split type from attrs on comma.
@@ -2258,16 +2545,13 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         (type_and_attrs, "")
     };
 
-    let mut const_value = None;
-    let mut const_real_value = None;
+    let mut encoded_value = None;
     let mut const_char_value = None;
     // For @param with `= value`, strip the value suffix from the
     // type string before parsing the type.
     let clean_type_str = if is_param {
         if let Some(eq_idx) = type_str.rfind(" = ") {
-            let val_str = type_str[eq_idx + 3..].trim();
-            const_value = val_str.parse::<i64>().ok();
-            const_real_value = val_str.parse::<f64>().ok();
+            encoded_value = Some(type_str[eq_idx + 3..].trim());
             &type_str[..eq_idx]
         } else {
             type_str
@@ -2276,17 +2560,85 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         type_str
     };
 
-    let type_info = parse_type_info(clean_type_str.trim());
-    let attrs: HashSet<_> = attr_str
-        .split(", ")
-        .filter(|attr| !attr.is_empty())
-        .collect();
+    let type_info = parse_type_info_for_version(
+        clean_type_str.trim(),
+        version,
+        path,
+        if is_param { "parameter" } else { "variable" },
+    )?;
+    let mut const_value = None;
+    let mut const_real_value = None;
+    if let Some(value) = encoded_value {
+        match type_info.as_ref() {
+            Some(TypeInfo::Integer { .. })
+            | Some(TypeInfo::Logical { .. })
+            | Some(TypeInfo::Enumeration(_)) => {
+                const_value = Some(value.parse::<i128>().map_err(|_| {
+                    format!(
+                        "{}: corrupt .amod file (invalid integer parameter value for '{}'); rebuild the provider module",
+                        path.display(),
+                        name
+                    )
+                })?);
+            }
+            Some(TypeInfo::Real { .. }) | Some(TypeInfo::DoublePrecision) => {
+                const_real_value = Some(value.parse::<f64>().map_err(|_| {
+                    format!(
+                        "{}: corrupt .amod file (invalid real parameter value for '{}'); rebuild the provider module",
+                        path.display(),
+                        name
+                    )
+                })?);
+            }
+            _ => {
+                return Err(format!(
+                    "{}: corrupt .amod file (unexpected parameter value for '{}'); rebuild the provider module",
+                    path.display(),
+                    name
+                ));
+            }
+        }
+    }
+    let mut attrs = HashSet::new();
+    for attr in attr_str.split(", ").filter(|attr| !attr.is_empty()) {
+        if version >= 17
+            && !matches!(
+                attr,
+                "allocatable"
+                    | "save"
+                    | "pointer"
+                    | "procptr"
+                    | "target"
+                    | "volatile"
+                    | "protected"
+                    | "threadprivate"
+                    | "private"
+            )
+        {
+            return Err(format!(
+                "{}: corrupt .amod file (unknown variable attribute '{}' for '{}'); rebuild the provider module",
+                path.display(),
+                attr,
+                name
+            ));
+        }
+        if version >= 17 && !attrs.insert(attr) {
+            return Err(format!(
+                "{}: corrupt .amod file (duplicate variable attribute '{}' for '{}'); rebuild the provider module",
+                path.display(),
+                attr,
+                name
+            ));
+        }
+        attrs.insert(attr);
+    }
     let allocatable = attrs.contains("allocatable");
     let save = attrs.contains("save");
     let pointer = attrs.contains("pointer");
     let proc_pointer = attrs.contains("procptr");
     let target = attrs.contains("target");
     let volatile = attrs.contains("volatile");
+    let protected = attrs.contains("protected");
     let openmp_threadprivate = attrs.contains("threadprivate");
     let access = if attrs.contains("private") {
         Access::Private
@@ -2310,8 +2662,23 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
                 i += 2;
             } else if parts[i] == "@charhex" {
                 if let Some(hex) = parts.get(i + 1) {
-                    const_char_value = hex_decode_bytes(hex)
-                        .map(|bytes| crate::source_bytes::to_source_view(&bytes));
+                    const_char_value = Some(
+                        hex_decode_bytes(hex)
+                            .map(|bytes| crate::source_bytes::to_source_view(&bytes))
+                            .ok_or_else(|| {
+                                format!(
+                                    "{}: corrupt .amod file (malformed @charhex value for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    name
+                                )
+                            })?,
+                    );
+                } else if version >= 17 {
+                    return Err(format!(
+                        "{}: corrupt .amod file (missing @charhex value for '{}'); rebuild the provider module",
+                        path.display(),
+                        name
+                    ));
                 }
                 i += 2;
             } else if parts[i] == "@deferred_char" {
@@ -2323,9 +2690,19 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
                     // A parse failure means a corrupt or version-mismatched
                     // .amod; defaulting to 0 would silently demote an array to
                     // a scalar and miscompile every use (audit T3).
-                    rank = value.parse().unwrap_or_else(|_| {
-                        panic!(".amod: malformed @rank value {value:?} — corrupt or version-mismatched module interface")
-                    });
+                    rank = value.parse().map_err(|_| {
+                        format!(
+                            "{}: corrupt .amod file (malformed @rank value for '{}'); rebuild the provider module",
+                            path.display(),
+                            name
+                        )
+                    })?;
+                } else {
+                    return Err(format!(
+                        "{}: corrupt .amod file (missing @rank value for '{}'); rebuild the provider module",
+                        path.display(),
+                        name
+                    ));
                 }
                 i += 2;
             } else if parts[i] == "@dims" {
@@ -2336,22 +2713,40 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
                 while i < parts.len() && parts[i].contains(':') && !parts[i].starts_with('@') {
                     let pair = parts[i];
                     if let Some((lo_s, ext_s)) = pair.split_once(':') {
-                        let bound = |s: &str, what: &str| -> i64 {
-                            s.parse::<i64>().unwrap_or_else(|_| {
-                                panic!(".amod: malformed @dims {what} {s:?} — corrupt or version-mismatched module interface")
+                        let bound = |s: &str, what: &str| -> Result<i64, String> {
+                            s.parse::<i64>().map_err(|_| {
+                                format!(
+                                    "{}: corrupt .amod file (malformed @dims {what} for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    name
+                                )
                             })
                         };
-                        dims.push((bound(lo_s, "lower bound"), bound(ext_s, "extent")));
+                        dims.push((bound(lo_s, "lower bound")?, bound(ext_s, "extent")?));
+                    } else {
+                        return Err(format!(
+                            "{}: corrupt .amod file (malformed @dims entry for '{}'); rebuild the provider module",
+                            path.display(),
+                            name
+                        ));
                     }
                     i += 1;
                 }
             } else {
+                if version >= 17 {
+                    return Err(format!(
+                        "{}: corrupt .amod file (unknown variable metadata '{}' for '{}'); rebuild the provider module",
+                        path.display(),
+                        parts[i],
+                        name
+                    ));
+                }
                 i += 1;
             }
         }
     }
 
-    AmodVar {
+    Ok(AmodVar {
         name,
         type_info,
         is_parameter: is_param,
@@ -2361,6 +2756,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         proc_pointer,
         target,
         volatile,
+        protected,
         openmp_threadprivate,
         ir_symbol,
         deferred_char,
@@ -2370,7 +2766,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         const_real_value,
         const_char_value,
         access,
-    }
+    })
 }
 
 /// Split a comma-separated attribute list while honoring paren depth and
@@ -2421,7 +2817,12 @@ fn parse_module_nature_token(token: &str) -> Option<UseNature> {
     }
 }
 
-fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) -> AmodProc {
+fn parse_proc(
+    header: &str,
+    lines: &mut std::iter::Peekable<std::str::Lines>,
+    version: u32,
+    path: &Path,
+) -> Result<AmodProc, String> {
     let is_func = header.starts_with("@function ");
     let rest = if is_func {
         header.strip_prefix("@function ").unwrap()
@@ -2462,7 +2863,12 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
 
     let (name, return_type) = if let Some(arrow_idx) = name_and_ret.find(" -> ") {
         let n = &name_and_ret[..arrow_idx];
-        let rt = parse_type_info(name_and_ret[arrow_idx + 4..].trim());
+        let rt = parse_type_info_for_version(
+            name_and_ret[arrow_idx + 4..].trim(),
+            version,
+            path,
+            "function result",
+        )?;
         (n.trim().to_string(), rt)
     } else {
         (name_and_ret.trim().to_string(), None)
@@ -2499,11 +2905,27 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
             source_nature,
         })
     });
-    let result_rank = attr_chunks
+    let result_rank_values: Vec<_> = attr_chunks
         .iter()
-        .find_map(|attr| attr.strip_prefix("result_rank="))
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or(0);
+        .filter_map(|attr| attr.strip_prefix("result_rank="))
+        .collect();
+    let result_rank = match result_rank_values.as_slice() {
+        [] => 0,
+        [value] => value.parse::<u8>().map_err(|_| {
+            format!(
+                "{}: corrupt .amod file (invalid function result rank '{}'); rebuild the provider module",
+                path.display(),
+                value
+            )
+        })?,
+        _ if version >= 17 => {
+            return Err(format!(
+                "{}: corrupt .amod file (duplicate function result rank); rebuild the provider module",
+                path.display()
+            ));
+        }
+        _ => 0,
+    };
     // Sprint35-SMP Phase 2: optional `result_name=NAME` when the
     // source used a `result(NAME)` clause that differs from the
     // function name. Otherwise the result variable shares the name.
@@ -2530,13 +2952,15 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
     let mut args = Vec::new();
 
     // Parse body lines until @end.
+    let mut saw_end = false;
     for line in lines.by_ref() {
         let trimmed = line.trim();
         if trimmed.starts_with("@end ") {
+            saw_end = true;
             break;
         }
         if trimmed.starts_with("@arg ") {
-            args.push(parse_arg(trimmed));
+            args.push(parse_arg(trimmed, version, path)?);
         }
         // Skip @abi and legacy @hint lines; explicit @arg records carry the
         // ABI-relevant metadata used by the reader.
@@ -2547,7 +2971,15 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         .find_map(|attr| attr.strip_prefix("result_array_bounds="))
         .map(|s| s.trim_matches('"').to_string());
 
-    AmodProc {
+    if version >= 17 && !saw_end {
+        return Err(format!(
+            "{}: corrupt .amod file (unterminated procedure '{}'); rebuild the provider module",
+            path.display(),
+            name
+        ));
+    }
+
+    Ok(AmodProc {
         name,
         kind,
         return_type,
@@ -2568,10 +3000,10 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         bind_c,
         binding_label,
         args,
-    }
+    })
 }
 
-fn parse_arg(line: &str) -> AmodArg {
+fn parse_arg(line: &str, version: u32, path: &Path) -> Result<AmodArg, String> {
     // @arg name : type[, intent(in/out/inout)][, optional][, value][, ...]
     let rest = line.strip_prefix("@arg ").unwrap_or(line);
 
@@ -2590,7 +3022,7 @@ fn parse_arg(line: &str) -> AmodArg {
         (type_and_attrs, "")
     };
 
-    let type_info = parse_type_info(type_str.trim());
+    let type_info = parse_type_info_for_version(type_str.trim(), version, path, "procedure dummy")?;
     let intent = if attr_str.contains("intent(in)") && !attr_str.contains("intent(inout)") {
         Some(Intent::In)
     } else if attr_str.contains("intent(out)") {
@@ -2620,11 +3052,27 @@ fn parse_arg(line: &str) -> AmodArg {
     let assumed_rank = has_attr("assumed-rank");
     // Sprint35-SMP Phase 1: parse `rank=N` if present. Emitted only when
     // the dummy is array-shaped; absence means rank 0 (scalar).
-    let rank = attr_chunks
+    let rank_values: Vec<_> = attr_chunks
         .iter()
-        .find_map(|attr| attr.strip_prefix("rank="))
-        .and_then(|s| s.trim().parse::<u8>().ok())
-        .unwrap_or(0);
+        .filter_map(|attr| attr.strip_prefix("rank="))
+        .collect();
+    let rank = match rank_values.as_slice() {
+        [] => 0,
+        [value] => value.trim().parse::<u8>().map_err(|_| {
+            format!(
+                "{}: corrupt .amod file (invalid procedure dummy rank '{}'); rebuild the provider module",
+                path.display(),
+                value
+            )
+        })?,
+        _ if version >= 17 => {
+            return Err(format!(
+                "{}: corrupt .amod file (duplicate procedure dummy rank); rebuild the provider module",
+                path.display()
+            ));
+        }
+        _ => 0,
+    };
     let procedure_iface = attr_chunks.iter().find_map(|attr| {
         let inner = attr.strip_prefix("procedure(")?;
         inner.strip_suffix(')').map(|s| s.trim().to_string())
@@ -2647,13 +3095,35 @@ fn parse_arg(line: &str) -> AmodArg {
             source_nature,
         })
     });
-    let array_spec = attr_chunks
+    let encoded_array_specs: Vec<_> = attr_chunks
         .iter()
-        .find_map(|attr| attr.strip_prefix("array_spec="))
-        .map(|spec| spec.trim_matches('"'))
-        .and_then(parse_dummy_array_spec);
+        .filter_map(|attr| attr.strip_prefix("array_spec="))
+        .collect();
+    let array_spec = match encoded_array_specs.as_slice() {
+        [] => None,
+        [spec] => {
+            let spec = spec.strip_prefix('"').and_then(|s| s.strip_suffix('"'));
+            match spec.and_then(parse_dummy_array_spec) {
+                Some(parsed) => Some(parsed),
+                None if version >= 17 => {
+                    return Err(format!(
+                        "{}: corrupt .amod file (invalid procedure dummy array specification); rebuild the provider module",
+                        path.display()
+                    ));
+                }
+                None => None,
+            }
+        }
+        _ if version >= 17 => {
+            return Err(format!(
+                "{}: corrupt .amod file (duplicate procedure dummy array specification); rebuild the provider module",
+                path.display()
+            ));
+        }
+        _ => None,
+    };
 
-    AmodArg {
+    Ok(AmodArg {
         name,
         type_info,
         intent,
@@ -2673,7 +3143,7 @@ fn parse_arg(line: &str) -> AmodArg {
         assumed_rank,
         rank,
         array_spec,
-    }
+    })
 }
 
 fn parse_type(
@@ -2730,32 +3200,107 @@ fn parse_type(
     let mut owner_module = None;
     let mut type_tag = 0u64;
     let mut is_abstract = false;
+    let mut saw_end = false;
+    let mut saw_layout = false;
+    let mut saw_tag = false;
 
     for line in lines.by_ref() {
         let trimmed = line.trim();
-        if trimmed.starts_with("@end type") {
+        if trimmed == "@end type" {
+            saw_end = true;
             break;
         }
 
         if let Some(rest) = trimmed.strip_prefix("@layout ") {
+            if version >= 17 && saw_layout {
+                return Err(format!(
+                    "{}: corrupt .amod file (duplicate @layout for type '{}'); rebuild the provider module",
+                    path.display(),
+                    name
+                ));
+            }
+            saw_layout = true;
+            let mut parsed_size = None;
+            let mut parsed_align = None;
+            let mut saw_size = false;
+            let mut saw_align = false;
             for part in rest.split_whitespace() {
                 if let Some(v) = part.strip_prefix("size=") {
-                    size = v.parse().unwrap_or(0);
+                    if version >= 17 && saw_size {
+                        return Err(format!(
+                            "{}: corrupt .amod file (duplicate @layout size for type '{}'); rebuild the provider module",
+                            path.display(),
+                            name
+                        ));
+                    }
+                    saw_size = true;
+                    parsed_size = v.parse::<usize>().ok();
                 } else if let Some(v) = part.strip_prefix("align=") {
-                    align = v.parse().unwrap_or(1);
+                    if version >= 17 && saw_align {
+                        return Err(format!(
+                            "{}: corrupt .amod file (duplicate @layout alignment for type '{}'); rebuild the provider module",
+                            path.display(),
+                            name
+                        ));
+                    }
+                    saw_align = true;
+                    parsed_align = v.parse::<usize>().ok();
+                } else if version >= 17 {
+                    return Err(format!(
+                        "{}: corrupt .amod file (unknown @layout metadata '{}' for type '{}'); rebuild the provider module",
+                        path.display(),
+                        part,
+                        name
+                    ));
                 }
+            }
+            if version >= 17 && (parsed_size.is_none() || parsed_align.is_none()) {
+                return Err(format!(
+                    "{}: corrupt .amod file (malformed @layout for type '{}'); rebuild the provider module",
+                    path.display(),
+                    name
+                ));
+            }
+            size = parsed_size.unwrap_or(0);
+            align = parsed_align.unwrap_or(1);
+            if version >= 17 && (align == 0 || !align.is_power_of_two()) {
+                return Err(format!(
+                    "{}: corrupt .amod file (invalid @layout alignment '{}' for type '{}'); rebuild the provider module",
+                    path.display(),
+                    align,
+                    name
+                ));
             }
         } else if let Some(rest) = trimmed.strip_prefix("@extends ") {
             parent = Some(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("@field ") {
             // @field name : type @offset N @size M [@allocatable] [@pointer] [@target]
             if let Some((name_type, offset_part)) = rest.split_once(" @offset ") {
-                let (fname, ftype_str) = name_type
-                    .split_once(" : ")
-                    .unwrap_or((name_type, "unknown"));
+                let (fname, ftype_str) = match name_type.split_once(" : ") {
+                    Some((fname, ftype))
+                        if !fname.trim().is_empty() && !ftype.trim().is_empty() =>
+                    {
+                        (fname, ftype)
+                    }
+                    _ if version >= 17 => {
+                        return Err(format!(
+                            "{}: corrupt .amod file (malformed @field record in type '{}'); rebuild the provider module",
+                            path.display(),
+                            name
+                        ));
+                    }
+                    _ => (name_type, "unknown"),
+                };
                 // Split off the size and any trailing attribute flags.
                 let (offset_str, after_offset) = match offset_part.find(" @size ") {
                     Some(idx) => (&offset_part[..idx], &offset_part[idx + 7..]),
+                    None if version >= 17 => {
+                        return Err(format!(
+                            "{}: corrupt .amod file (missing @field size for '{}'); rebuild the provider module",
+                            path.display(),
+                            fname.trim()
+                        ));
+                    }
                     None => (offset_part, "0"),
                 };
                 let mut size_str = after_offset;
@@ -2769,15 +3314,33 @@ fn parse_type(
                     } else {
                         (dims_part, "")
                     };
-                    for dim in dims_str
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|dim| !dim.is_empty())
-                    {
-                        if let Some((lower_str, upper_str)) = dim.split_once(':') {
-                            let lower = lower_str.trim().parse().unwrap_or(1);
-                            let upper = upper_str.trim().parse().unwrap_or(lower - 1);
-                            dims.push((lower, (upper - lower + 1).max(0)));
+                    if version >= 17 && dims_str.trim().is_empty() {
+                        return Err(format!(
+                            "{}: corrupt .amod file (empty @field dimensions for '{}'); rebuild the provider module",
+                            path.display(),
+                            fname.trim()
+                        ));
+                    }
+                    for dim in dims_str.split(',').map(str::trim) {
+                        let parsed = dim.split_once(':').and_then(|(lower_str, upper_str)| {
+                            if upper_str.contains(':') {
+                                return None;
+                            }
+                            let lower = lower_str.trim().parse::<i64>().ok()?;
+                            let upper = upper_str.trim().parse::<i64>().ok()?;
+                            let extent = upper.checked_sub(lower)?.checked_add(1)?.max(0);
+                            Some((lower, extent))
+                        });
+                        match parsed {
+                            Some(dim) => dims.push(dim),
+                            None if version >= 17 => {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (malformed @field dimensions for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    fname.trim()
+                                ));
+                            }
+                            None => {}
                         }
                     }
                     flag_tail = tail;
@@ -2795,17 +3358,32 @@ fn parse_type(
                 let mut default_init = None;
                 let mut access = None;
                 let mut field_owner_module = None;
+                let mut flag_names = HashSet::new();
                 let tokens: Vec<&str> = flag_tail.split_whitespace().collect();
                 let mut token_index = 0;
                 while token_index < tokens.len() {
                     match tokens[token_index] {
-                        "@allocatable" => allocatable = true,
-                        "@pointer" => pointer = true,
-                        "@deferred_char" => deferred_char = true,
-                        "@procptr" => procedure_pointer = true,
-                        "@nopass" => procedure_pointer_nopass = true,
-                        "@target" => target = true,
-                        "@declared_array" => declared_array = true,
+                        flag @ ("@allocatable" | "@pointer" | "@deferred_char" | "@procptr"
+                        | "@nopass" | "@target" | "@declared_array") => {
+                            if version >= 17 && !flag_names.insert(flag) {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (duplicate @field metadata '{}' for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    flag,
+                                    fname.trim()
+                                ));
+                            }
+                            match flag {
+                                "@allocatable" => allocatable = true,
+                                "@pointer" => pointer = true,
+                                "@deferred_char" => deferred_char = true,
+                                "@procptr" => procedure_pointer = true,
+                                "@nopass" => procedure_pointer_nopass = true,
+                                "@target" => target = true,
+                                "@declared_array" => declared_array = true,
+                                _ => unreachable!(),
+                            }
+                        }
                         "@access" => {
                             if access.is_some() {
                                 return Err(format!(
@@ -2863,12 +3441,35 @@ fn parse_type(
                             token_index += 2;
                             continue;
                         }
-                        _ => {
-                            if let Some(init) = parse_field_default_init_token(tokens[token_index])
-                            {
-                                default_init = Some(init);
+                        token if token.starts_with("@init=") => {
+                            if version >= 17 && default_init.is_some() {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (duplicate @field initializer for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    fname.trim()
+                                ));
+                            }
+                            match parse_field_default_init_token(token) {
+                                Some(init) => default_init = Some(init),
+                                None if version >= 17 => {
+                                    return Err(format!(
+                                        "{}: corrupt .amod file (invalid @field initializer for '{}'); rebuild the provider module",
+                                        path.display(),
+                                        fname.trim()
+                                    ));
+                                }
+                                None => {}
                             }
                         }
+                        token if version >= 17 => {
+                            return Err(format!(
+                                "{}: corrupt .amod file (unknown @field metadata '{}' for '{}'); rebuild the provider module",
+                                path.display(),
+                                token,
+                                fname.trim()
+                            ));
+                        }
+                        _ => {}
                     }
                     token_index += 1;
                 }
@@ -2891,13 +3492,32 @@ fn parse_type(
                     ));
                 }
                 declared_array |= !dims.is_empty();
-                let ftype = parse_type_info(ftype_str.trim());
+                let ftype = parse_type_info_for_version(
+                    ftype_str.trim(),
+                    version,
+                    path,
+                    "derived-type field",
+                )?;
+                let offset = offset_str.trim().parse::<usize>().map_err(|_| {
+                    format!(
+                        "{}: corrupt .amod file (invalid @field offset for '{}'); rebuild the provider module",
+                        path.display(),
+                        fname.trim()
+                    )
+                })?;
+                let field_size = size_str.trim().parse::<usize>().map_err(|_| {
+                    format!(
+                        "{}: corrupt .amod file (invalid @field size for '{}'); rebuild the provider module",
+                        path.display(),
+                        fname.trim()
+                    )
+                })?;
                 fields.push(FieldLayout {
                     name: fname.trim().to_string(),
                     access,
                     owner_module: field_owner_module,
-                    offset: offset_str.trim().parse().unwrap_or(0),
-                    size: size_str.trim().parse().unwrap_or(0),
+                    offset,
+                    size: field_size,
                     dims,
                     declared_array,
                     type_info: ftype.unwrap_or(TypeInfo::Integer { kind: None }),
@@ -2909,32 +3529,133 @@ fn parse_type(
                     procedure_pointer_nopass,
                     default_init,
                 });
+            } else if version >= 17 {
+                return Err(format!(
+                    "{}: corrupt .amod file (malformed @field record in type '{}'); rebuild the provider module",
+                    path.display(),
+                    name
+                ));
             }
         } else if let Some(rest) = trimmed.strip_prefix("@binds ") {
-            let (clean, abi_name) = if let Some((bind_part, abi_part)) = rest.split_once(" @abi ") {
-                (bind_part.trim().to_string(), abi_part.trim().to_lowercase())
+            if version >= 17 {
+                let (binding, metadata) = rest.find(" @").map_or((rest.trim(), ""), |index| {
+                    (rest[..index].trim(), rest[index + 1..].trim())
+                });
+                let (method, target) = if let Some((method, target)) = binding.split_once(" => ") {
+                    (method.trim().to_string(), target.trim().to_string())
+                } else {
+                    let method = binding.trim().to_string();
+                    (method.clone(), method)
+                };
+                if method.is_empty() || target.is_empty() {
+                    return Err(format!(
+                        "{}: corrupt .amod file (malformed @binds record); rebuild the provider module",
+                        path.display()
+                    ));
+                }
+                let tokens: Vec<_> = metadata.split_whitespace().collect();
+                let mut abi_name = None;
+                let mut nopass = false;
+                let mut pass_name = None;
+                let mut pass_index = None;
+                let mut index = 0;
+                while index < tokens.len() {
+                    match tokens[index] {
+                        "@nopass" if !nopass => {
+                            nopass = true;
+                            index += 1;
+                        }
+                        "@abi" if abi_name.is_none() => {
+                            let value = tokens.get(index + 1).ok_or_else(|| {
+                                format!(
+                                    "{}: corrupt .amod file (missing @binds ABI name); rebuild the provider module",
+                                    path.display()
+                                )
+                            })?;
+                            abi_name = Some((*value).to_ascii_lowercase());
+                            index += 2;
+                        }
+                        "@pass-name" if pass_name.is_none() => {
+                            let value = tokens.get(index + 1).ok_or_else(|| {
+                                format!(
+                                    "{}: corrupt .amod file (missing @binds passed-object name); rebuild the provider module",
+                                    path.display()
+                                )
+                            })?;
+                            pass_name = Some((*value).to_string());
+                            index += 2;
+                        }
+                        "@pass-index" if pass_index.is_none() => {
+                            let value = tokens.get(index + 1).ok_or_else(|| {
+                                format!(
+                                    "{}: corrupt .amod file (missing @binds passed-object index); rebuild the provider module",
+                                    path.display()
+                                )
+                            })?;
+                            pass_index = Some(value.parse::<usize>().map_err(|_| {
+                                format!(
+                                    "{}: corrupt .amod file (invalid @binds passed-object index '{}'); rebuild the provider module",
+                                    path.display(),
+                                    value
+                                )
+                            })?);
+                            index += 2;
+                        }
+                        token => {
+                            return Err(format!(
+                                "{}: corrupt .amod file (invalid or duplicate @binds metadata '{}'); rebuild the provider module",
+                                path.display(),
+                                token
+                            ));
+                        }
+                    }
+                }
+                if nopass == (pass_name.is_some() || pass_index.is_some())
+                    || (!nopass && (pass_name.is_none() || pass_index.is_none()))
+                {
+                    return Err(format!(
+                        "{}: corrupt .amod file (@binds '{}' must encode exactly one of NOPASS or a passed-object name/index); rebuild the provider module",
+                        path.display(),
+                        method
+                    ));
+                }
+                bound_procs.push(BoundProc {
+                    method_name: method.clone(),
+                    target_name: target,
+                    abi_name: abi_name.unwrap_or_else(|| method.to_ascii_lowercase()),
+                    nopass,
+                    pass_name,
+                    pass_index,
+                });
             } else {
-                (rest.trim().to_string(), String::new())
-            };
-            let nopass = clean.contains(", nopass");
-            let clean = clean.replace(", nopass", "");
-            let (method, target) = if let Some((m, t)) = clean.split_once(" => ") {
-                (m.trim().to_string(), t.trim().to_string())
-            } else {
-                let m = clean.trim().to_string();
-                (m.clone(), m)
-            };
-            let parsed_abi_name = if abi_name.is_empty() {
-                method.to_lowercase()
-            } else {
-                abi_name
-            };
-            bound_procs.push(BoundProc {
-                method_name: method,
-                target_name: target,
-                abi_name: parsed_abi_name,
-                nopass,
-            });
+                let (clean, abi_name) =
+                    if let Some((bind_part, abi_part)) = rest.split_once(" @abi ") {
+                        (bind_part.trim().to_string(), abi_part.trim().to_lowercase())
+                    } else {
+                        (rest.trim().to_string(), String::new())
+                    };
+                let nopass = clean.contains(", nopass");
+                let clean = clean.replace(", nopass", "");
+                let (method, target) = if let Some((m, t)) = clean.split_once(" => ") {
+                    (m.trim().to_string(), t.trim().to_string())
+                } else {
+                    let m = clean.trim().to_string();
+                    (m.clone(), m)
+                };
+                let parsed_abi_name = if abi_name.is_empty() {
+                    method.to_lowercase()
+                } else {
+                    abi_name
+                };
+                bound_procs.push(BoundProc {
+                    method_name: method,
+                    target_name: target,
+                    abi_name: parsed_abi_name,
+                    nopass,
+                    pass_name: None,
+                    pass_index: (!nopass).then_some(0),
+                });
+            }
         } else if let Some(rest) = trimmed.strip_prefix("@final ") {
             let mut parts = rest.split_whitespace();
             let name = parts.next().unwrap_or_default().to_string();
@@ -2943,9 +3664,13 @@ fn parse_type(
                 .iter()
                 .find_map(|part| part.strip_prefix("rank="))
             {
-                Some(rank) => rank
-                    .parse()
-                    .unwrap_or_else(|_| panic!("malformed @final rank '{}'", rank)),
+                Some(rank) => rank.parse().map_err(|_| {
+                    format!(
+                        "{}: corrupt .amod file (malformed @final rank '{}'); rebuild the provider module",
+                        path.display(),
+                        rank
+                    )
+                })?,
                 None => usize::MAX,
             };
             let elemental = match attributes
@@ -2977,9 +3702,29 @@ fn parse_type(
         } else if let Some(rest) = trimmed.strip_prefix("@owner ") {
             owner_module = Some(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("@tag ") {
-            type_tag = rest.trim().parse().unwrap_or(0);
+            if version >= 17 && saw_tag {
+                return Err(format!(
+                    "{}: corrupt .amod file (duplicate @tag for type '{}'); rebuild the provider module",
+                    path.display(),
+                    name
+                ));
+            }
+            type_tag = rest.trim().parse().map_err(|_| {
+                format!(
+                    "{}: corrupt .amod file (invalid @tag for type '{}'); rebuild the provider module",
+                    path.display(),
+                    name
+                )
+            })?;
+            saw_tag = true;
         } else if trimmed == "@abstract" {
             is_abstract = true;
+        } else if version >= 17 {
+            return Err(format!(
+                "{}: corrupt .amod file (unknown derived-type directive '{}'); rebuild the provider module",
+                path.display(),
+                trimmed
+            ));
         }
     }
 
@@ -2989,6 +3734,46 @@ fn parse_type(
     for field in &mut fields {
         if field.owner_module.is_none() {
             field.owner_module.clone_from(&owner_module);
+        }
+    }
+    if version >= 17 && !saw_end {
+        return Err(format!(
+            "{}: corrupt .amod file (unterminated derived type '{}'); rebuild the provider module",
+            path.display(),
+            name
+        ));
+    }
+    if version >= 17 && !saw_layout {
+        return Err(format!(
+            "{}: corrupt .amod file (missing @layout for type '{}'); rebuild the provider module",
+            path.display(),
+            name
+        ));
+    }
+    if version >= 17 && !saw_tag {
+        return Err(format!(
+            "{}: corrupt .amod file (missing @tag for type '{}'); rebuild the provider module",
+            path.display(),
+            name
+        ));
+    }
+    if version >= 17 {
+        for field in &fields {
+            let field_end = field.offset.checked_add(field.size).ok_or_else(|| {
+                format!(
+                    "{}: corrupt .amod file (@field '{}' layout overflows); rebuild the provider module",
+                    path.display(),
+                    field.name
+                )
+            })?;
+            if field_end > size {
+                return Err(format!(
+                    "{}: corrupt .amod file (@field '{}' exceeds type '{}' layout); rebuild the provider module",
+                    path.display(),
+                    field.name,
+                    name
+                ));
+            }
         }
     }
     Ok(TypeLayout {
@@ -3100,6 +3885,103 @@ fn parse_type_info(s: &str) -> Option<TypeInfo> {
     }
 
     None
+}
+
+fn parse_type_info_for_version(
+    encoded: &str,
+    version: u32,
+    path: &Path,
+    record: &str,
+) -> Result<Option<TypeInfo>, String> {
+    if version < 17 {
+        return Ok(parse_type_info(encoded));
+    }
+
+    let corrupt = || {
+        format!(
+            "{}: corrupt .amod file (invalid {record} type '{}'); rebuild the provider module",
+            path.display(),
+            encoded
+        )
+    };
+    let parse_kind = |prefix: &str| -> Result<u8, String> {
+        let value = encoded
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(')'))
+            .ok_or_else(corrupt)?;
+        if value.is_empty() || value.bytes().any(|byte| !byte.is_ascii_digit()) {
+            return Err(corrupt());
+        }
+        let kind = value.parse::<u8>().map_err(|_| corrupt())?;
+        if kind == 0 {
+            return Err(corrupt());
+        }
+        Ok(kind)
+    };
+
+    let parsed = if encoded.starts_with("integer") {
+        Some(TypeInfo::Integer {
+            kind: Some(parse_kind("integer(")?),
+        })
+    } else if encoded.starts_with("real") {
+        Some(TypeInfo::Real {
+            kind: Some(parse_kind("real(")?),
+        })
+    } else if encoded.starts_with("complex") {
+        Some(TypeInfo::Complex {
+            kind: Some(parse_kind("complex(")?),
+        })
+    } else if encoded.starts_with("logical") {
+        Some(TypeInfo::Logical {
+            kind: Some(parse_kind("logical(")?),
+        })
+    } else if encoded == "double precision" {
+        Some(TypeInfo::DoublePrecision)
+    } else if let Some(inner) = encoded
+        .strip_prefix("character(len=")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let (len, kind) = inner.split_once(",kind=").ok_or_else(corrupt)?;
+        let len = if len == ":" {
+            None
+        } else {
+            Some(len.parse::<i64>().map_err(|_| corrupt())?)
+        };
+        if kind.is_empty() || kind.bytes().any(|byte| !byte.is_ascii_digit()) {
+            return Err(corrupt());
+        }
+        let kind = kind.parse::<u8>().map_err(|_| corrupt())?;
+        if kind == 0 {
+            return Err(corrupt());
+        }
+        Some(TypeInfo::Character {
+            len,
+            kind: Some(kind),
+        })
+    } else if encoded == "class(*)" {
+        Some(TypeInfo::ClassStar)
+    } else if encoded == "type(*)" {
+        Some(TypeInfo::TypeStar)
+    } else if let Some(inner) = encoded
+        .strip_prefix("type(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        (!inner.trim().is_empty()).then(|| TypeInfo::Derived(inner.to_string()))
+    } else if let Some(inner) = encoded
+        .strip_prefix("class(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        (!inner.trim().is_empty()).then(|| TypeInfo::Class(inner.to_string()))
+    } else if let Some(inner) = encoded
+        .strip_prefix("enumeration(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        (!inner.trim().is_empty()).then(|| TypeInfo::Enumeration(inner.to_string()))
+    } else {
+        None
+    };
+
+    parsed.map(Some).ok_or_else(corrupt)
 }
 
 fn extract_kind(s: &str) -> Option<u8> {
@@ -3221,10 +4103,12 @@ pub fn extract_module_globals(
                         _ => crate::ir::lower::CharKind::None,
                     },
                     logical_kind: match var.type_info.as_ref() {
-                        Some(TypeInfo::Logical { kind }) => Some(kind.unwrap_or(4)),
+                        Some(TypeInfo::Logical { kind }) => {
+                            Some(kind.unwrap_or_else(crate::driver::defaults::default_int_kind))
+                        }
                         _ => None,
                     },
-                    const_value: var.const_value.map(i128::from),
+                    const_value: var.const_value,
                     const_real_value: var.const_real_value,
                     external: true,
                     private: var.access == Access::Private,
@@ -3333,6 +4217,12 @@ pub fn extract_descriptor_params(iface: &ModuleInterface) -> HashMap<String, Vec
 
 fn type_info_to_ir_type(info: Option<&TypeInfo>) -> crate::ir::types::IrType {
     use crate::ir::types::{FloatWidth, IntWidth, IrType};
+    let concrete_kind = info.and_then(|type_info| {
+        crate::sema::type_layout::concrete_intrinsic_kind(
+            type_info,
+            crate::driver::defaults::current(),
+        )
+    });
     match info {
         Some(TypeInfo::Derived(name)) => {
             let lower = name.to_lowercase();
@@ -3342,32 +4232,34 @@ fn type_info_to_ir_type(info: Option<&TypeInfo>) -> crate::ir::types::IrType {
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
             }
         }
-        Some(TypeInfo::Integer { kind }) => IrType::Int(match kind {
+        Some(TypeInfo::Integer { .. }) => IrType::Int(match concrete_kind {
             Some(1) => IntWidth::I8,
             Some(2) => IntWidth::I16,
             Some(8) => IntWidth::I64,
             Some(16) => IntWidth::I128,
             _ => IntWidth::I32,
         }),
-        Some(TypeInfo::Real { kind }) => IrType::Float(match kind {
+        Some(TypeInfo::Real { .. }) => IrType::Float(match concrete_kind {
             Some(8) => FloatWidth::F64,
             _ => FloatWidth::F32,
         }),
         Some(TypeInfo::DoublePrecision) => IrType::Float(FloatWidth::F64),
-        Some(TypeInfo::Complex { kind }) => {
-            let fw = match kind {
+        Some(TypeInfo::Complex { .. }) => {
+            let fw = match concrete_kind {
                 Some(8) => FloatWidth::F64,
                 _ => FloatWidth::F32,
             };
             IrType::Array(Box::new(IrType::Float(fw)), 2)
         }
-        Some(TypeInfo::Logical { kind }) => match kind.unwrap_or(4) {
-            1 => IrType::Int(IntWidth::I8),
-            2 => IrType::Int(IntWidth::I16),
-            8 => IrType::Int(IntWidth::I64),
-            16 => IrType::Int(IntWidth::I128),
-            _ => IrType::Bool,
-        },
+        Some(TypeInfo::Logical { .. }) => {
+            match concrete_kind.expect("LOGICAL has an intrinsic kind") {
+                1 => IrType::Int(IntWidth::I8),
+                2 => IrType::Int(IntWidth::I16),
+                8 => IrType::Int(IntWidth::I64),
+                16 => IrType::Int(IntWidth::I128),
+                _ => IrType::Bool,
+            }
+        }
         Some(TypeInfo::Character { .. }) => IrType::Int(IntWidth::I8),
         _ => IrType::Int(IntWidth::I32),
     }
@@ -3380,15 +4272,51 @@ mod tests {
     // Audit T3: a corrupt @rank/@dims in a .amod (the writer only ever emits
     // integers) must fail loudly, not silently demote the array's shape.
     #[test]
-    #[should_panic(expected = "malformed @rank")]
     fn parse_var_rejects_corrupt_rank() {
-        parse_var("@var a : integer @rank notanumber", false);
+        let error = parse_var(
+            "@var a : integer(4) @rank notanumber",
+            false,
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap_err();
+        assert!(error.contains("malformed @rank"), "{error}");
     }
 
     #[test]
-    #[should_panic(expected = "malformed @dims")]
     fn parse_var_rejects_corrupt_dims() {
-        parse_var("@var a : integer @dims 1:oops", false);
+        let error = parse_var(
+            "@var a : integer(4) @dims 1:oops",
+            false,
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap_err();
+        assert!(error.contains("malformed @dims"), "{error}");
+    }
+
+    #[test]
+    fn parse_var_preserves_full_width_integer_parameter() {
+        let var = parse_var(
+            "@var big : integer(16) = 170141183460469231731687303715884105727",
+            true,
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap();
+        assert_eq!(var.const_value, Some(i128::MAX));
+    }
+
+    #[test]
+    fn parse_var_rejects_invalid_integer_parameter() {
+        let error = parse_var(
+            "@var big : integer(16) = 170141183460469231731687303715884105728",
+            true,
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap_err();
+        assert!(error.contains("invalid integer parameter value"), "{error}");
     }
 
     #[test]
@@ -3403,7 +4331,7 @@ mod tests {
                 kind: Some(4),
             },
         ] {
-            let encoded = type_info_to_string(Some(&info));
+            let encoded = type_info_to_string(Some(&info), DefaultKinds::new(4, 4));
             assert_eq!(parse_type_info(&encoded), Some(info));
             assert!(encoded.contains("kind=4"), "{encoded}");
         }
@@ -3429,7 +4357,13 @@ mod tests {
 
     #[test]
     fn character_kind_survives_all_type_record_parsers() {
-        let var = parse_var("@var text : character(len=8,kind=4)", false);
+        let var = parse_var(
+            "@var text : character(len=8,kind=4)",
+            false,
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap();
         assert_eq!(
             var.type_info,
             Some(TypeInfo::Character {
@@ -3438,7 +4372,12 @@ mod tests {
             })
         );
 
-        let arg = parse_arg("  @arg text : character(len=:,kind=4), intent(in)");
+        let arg = parse_arg(
+            "  @arg text : character(len=:,kind=4), intent(in)",
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap();
         assert_eq!(
             arg.type_info,
             Some(TypeInfo::Character {
@@ -3448,7 +4387,13 @@ mod tests {
         );
 
         let mut lines = "@end function\n".lines().peekable();
-        let proc = parse_proc("@function make_text -> character(len=8,kind=4)", &mut lines);
+        let proc = parse_proc(
+            "@function make_text -> character(len=8,kind=4)",
+            &mut lines,
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap();
         assert_eq!(
             proc.return_type,
             Some(TypeInfo::Character {
@@ -3456,6 +4401,199 @@ mod tests {
                 kind: Some(4),
             })
         );
+    }
+
+    #[test]
+    fn current_schema_rejects_ambiguous_intrinsic_types_in_every_record_family() {
+        let bodies = [
+            "@var value : integer\n".to_string(),
+            "@param value : real = 1.0\n".to_string(),
+            "@function value -> complex\n@end function\n".to_string(),
+            "@subroutine consume\n  @arg value : logical\n@end subroutine\n".to_string(),
+            "@type item_t, public\n  @layout size=4 align=4\n  @field value : integer @offset 0 @size 4 @access public @owner schema_test\n  @owner schema_test\n  @tag 1\n@end type\n".to_string(),
+        ];
+        for body in bodies {
+            let text = add_integrity_headers(format!(
+                "#!amod {AMOD_VERSION}\n# module: schema_test\n# default-access: public\n\n{body}"
+            ));
+            let error = read_amod_content(&text, Path::new("schema_test.amod"))
+                .expect_err("ambiguous current-version intrinsic type was accepted");
+            assert!(
+                error.contains("corrupt .amod file")
+                    && error.contains("invalid")
+                    && error.contains("type")
+                    && error.contains("rebuild the provider module"),
+                "{body:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_schema_rejects_malformed_intrinsic_selectors() {
+        for encoded in [
+            "integer(foo)",
+            "real()",
+            "complex(garbage)",
+            "logical(kind=bad)",
+            "character(len=4)",
+        ] {
+            let error = parse_type_info_for_version(
+                encoded,
+                AMOD_VERSION,
+                Path::new("schema_test.amod"),
+                "variable",
+            )
+            .expect_err("malformed current-version type was accepted");
+            assert!(
+                error.contains("invalid variable type"),
+                "{encoded}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_schema_rejects_malformed_abi_layout_metadata() {
+        let valid_type = "@type item_t, public\n  @layout size=8 align=4\n  @field value : integer(4) @offset 4 @size 4 @dims 1:1 @access public @owner schema_test\n  @owner schema_test\n  @tag 1\n@end type\n";
+        let malformed = [
+            valid_type.replace("size=8", "size=oops"),
+            valid_type.replace("align=4", "align=0"),
+            valid_type.replace("@offset 4", "@offset oops"),
+            valid_type.replace("@size 4", "@size oops"),
+            valid_type.replace("@dims 1:1", "@dims 1:oops"),
+            valid_type.replace("@access public", "@unknown"),
+            valid_type.replace("@access public", "@init=int:oops @access public"),
+            valid_type.replace("@tag 1", "@tag oops"),
+            valid_type.replace("@offset 4", "@offset 8"),
+        ];
+        for body in malformed {
+            let text = add_integrity_headers(format!(
+                "#!amod {AMOD_VERSION}\n# module: schema_test\n# default-access: public\n\n{body}"
+            ));
+            let error = read_amod_content(&text, Path::new("schema_test.amod"))
+                .expect_err("malformed current-version ABI layout metadata was accepted");
+            assert!(
+                error.contains("corrupt .amod file")
+                    && error.contains("rebuild the provider module"),
+                "{body:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_schema_rejects_malformed_procedure_shape_metadata() {
+        let bodies = [
+            "@function make -> integer(4), result_rank=oops\n@end function\n",
+            "@subroutine take\n  @arg value : integer(4), rank=oops\n@end subroutine\n",
+            "@subroutine take\n  @arg value : integer(4), rank=1, array_spec=\"broken\"\n@end subroutine\n",
+        ];
+        for body in bodies {
+            let text = add_integrity_headers(format!(
+                "#!amod {AMOD_VERSION}\n# module: schema_test\n# default-access: public\n\n{body}"
+            ));
+            let error = read_amod_content(&text, Path::new("schema_test.amod"))
+                .expect_err("malformed current-version procedure shape metadata was accepted");
+            assert!(
+                error.contains("corrupt .amod file")
+                    && error.contains("rebuild the provider module"),
+                "{body:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_schema_cross_checks_pass_name_and_index() {
+        let source = format!(
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine apply\n  @arg delta : integer(4), intent(in)\n  @arg self : class(item_t), intent(inout)\n@end subroutine\n\n@type item_t, public\n  @layout size=4 align=4\n  @field value : integer(4) @offset 0 @size 4 @access public @owner pass_schema\n  @binds run => apply @pass-name self @pass-index 0 @abi apply\n  @owner pass_schema\n  @tag 1\n@end type\n"
+        );
+        let text = add_integrity_headers(source.clone());
+        let error = read_amod_content(&text, Path::new("pass_schema.amod"))
+            .expect_err("disagreeing PASS name/index was accepted");
+        assert!(
+            error.contains("passed-object name/index disagree"),
+            "{error}"
+        );
+
+        let missing = add_integrity_headers(source.replace(" @pass-name self @pass-index 0", ""));
+        let error = read_amod_content(&missing, Path::new("pass_schema.amod"))
+            .expect_err("binding without a PASS form was accepted");
+        assert!(error.contains("must encode exactly one"), "{error}");
+    }
+
+    #[test]
+    fn current_schema_validates_passed_object_characteristics() {
+        let source = format!(
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine apply\n  @arg self : class(item_t), intent(inout)\n@end subroutine\n\n@type item_t, public\n  @layout size=4 align=4\n  @field value : integer(4) @offset 0 @size 4 @access public @owner pass_schema\n  @binds run => apply @pass-name self @pass-index 0 @abi apply\n  @owner pass_schema\n  @tag 1\n@end type\n"
+        );
+        let malformed = [
+            ("class(item_t)", "integer(4)"),
+            ("class(item_t)", "class(other_t)"),
+            (
+                "class(item_t), intent(inout)",
+                "class(item_t), intent(inout), rank=1, array_spec=\"(:)\"",
+            ),
+            (
+                "class(item_t), intent(inout)",
+                "class(item_t), intent(inout), pointer",
+            ),
+            (
+                "class(item_t), intent(inout)",
+                "class(item_t), intent(inout), allocatable",
+            ),
+            (
+                "class(item_t), intent(inout)",
+                "class(item_t), intent(inout), value",
+            ),
+        ];
+        for (from, to) in malformed {
+            let text = add_integrity_headers(source.replacen(from, to, 1));
+            let error = read_amod_content(&text, Path::new("pass_schema.amod"))
+                .expect_err("malformed passed-object characteristics were accepted");
+            assert!(
+                error.contains("passed-object dummy")
+                    && error.contains("corrupt .amod file")
+                    && error.contains("rebuild the provider module"),
+                "{error}"
+            );
+        }
+
+        let optional = add_integrity_headers(source.replacen(
+            "class(item_t), intent(inout)",
+            "class(item_t), intent(inout), optional",
+            1,
+        ));
+        read_amod_content(&optional, Path::new("pass_schema.amod"))
+            .expect("OPTIONAL passed-object dummy is valid");
+    }
+
+    #[test]
+    fn current_schema_validates_passed_object_against_defining_type() {
+        let source = format!(
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine base_touch\n  @arg self : class(base_t), intent(inout)\n@end subroutine\n\n@subroutine child_touch\n  @arg self : class(override_t), intent(inout)\n@end subroutine\n\n@type inherited_t, public\n  @layout size=0 align=1\n  @extends pass_schema::base_t\n  @binds touch => base_touch @pass-name self @pass-index 0 @abi base_touch\n  @owner pass_schema\n  @tag 2\n@end type\n\n@type override_t, public\n  @layout size=0 align=1\n  @extends pass_schema::base_t\n  @binds touch => child_touch @pass-name self @pass-index 0 @abi child_touch\n  @owner pass_schema\n  @tag 3\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => base_touch @pass-name self @pass-index 0 @abi base_touch\n  @owner pass_schema\n  @tag 1\n@end type\n"
+        );
+        let text = add_integrity_headers(source);
+        read_amod_content(&text, Path::new("pass_schema.amod"))
+            .expect("inherited and overridden bindings have truthful defining types");
+    }
+
+    #[test]
+    fn current_schema_requires_local_binding_procedure_metadata() {
+        let source = format!(
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@type item_t, public\n  @layout size=0 align=1\n  @binds run => apply @pass-name self @pass-index 0 @abi apply\n  @owner pass_schema\n  @tag 1\n@end type\n"
+        );
+        let text = add_integrity_headers(source);
+        let error = read_amod_content(&text, Path::new("pass_schema.amod"))
+            .expect_err("local binding without procedure metadata was accepted");
+        assert!(error.contains("missing procedure metadata"), "{error}");
+    }
+
+    #[test]
+    fn current_schema_allows_external_inherited_binding_metadata() {
+        let source = format!(
+            "#!amod {AMOD_VERSION}\n# module: child_schema\n# default-access: public\n\n@subroutine touch\n  @arg value : integer(4), intent(inout)\n@end subroutine\n\n@type child_t, public\n  @layout size=0 align=1\n  @extends ancestor_schema::base_t\n  @binds touch => afs_modproc_ancestor_schema_touch @pass-name self @pass-index 0 @abi touch\n  @owner child_schema\n  @tag 2\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => afs_modproc_ancestor_schema_touch @pass-name self @pass-index 0 @abi touch\n  @owner ancestor_schema\n  @tag 1\n@end type\n"
+        );
+        let text = add_integrity_headers(source);
+        read_amod_content(&text, Path::new("child_schema.amod"))
+            .expect("external inherited binding may rely on its provider artifact");
     }
 
     #[test]
@@ -3554,7 +4692,7 @@ mod tests {
 
     #[test]
     fn current_default_access_header_is_required_and_preserved() {
-        let private = r#"#!amod 16
+        let private = r#"#!amod 17
 # module: private_facade
 # default-access: private
 
@@ -3572,7 +4710,7 @@ mod tests {
             ]
         );
 
-        let missing = r#"#!amod 16
+        let missing = r#"#!amod 17
 # module: missing_default_access
 
 @uses provider
@@ -3597,7 +4735,7 @@ mod tests {
 
     #[test]
     fn dotted_relational_operator_interface_loads_with_canonical_name() {
-        let text = r#"#!amod 16
+        let text = r#"#!amod 17
 # module: operators
 # default-access: public
 
@@ -3856,12 +4994,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "malformed @final rank")]
     fn malformed_final_proc_rank_is_rejected() {
         let mut lines = "  @final afs_modproc_m_finish rank=oops\n@end type\n"
             .lines()
             .peekable();
-        let _ = parse_type("@type item", &mut lines, 2, Path::new("legacy.amod"));
+        let error = parse_type("@type item", &mut lines, 2, Path::new("legacy.amod"))
+            .expect_err("malformed @final rank was accepted");
+        assert!(error.contains("malformed @final rank 'oops'"), "{error}");
     }
 
     #[test]
@@ -3970,13 +5109,16 @@ mod tests {
     #[test]
     fn procedure_characteristic_metadata_round_trips() {
         let arg = parse_arg(
-            "@arg values : integer, intent(inout), optional, value, descriptor, \
+            "@arg values : integer(4), intent(inout), optional, value, descriptor, \
              allocatable, pointer, target, asynchronous, contiguous, volatile, \
              external, procedure(callback), rank=6, \
              procedure_original=remote_callback, procedure_module=callback_shapes, \
              procedure_nature=non_intrinsic, \
              array_spec=\"(count; 0:max(count, 1); :; 1:*; deferred; ..)\"",
-        );
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap();
         assert_eq!(arg.intent, Some(Intent::InOut));
         assert!(arg.optional);
         assert!(arg.value);
@@ -4014,7 +5156,10 @@ mod tests {
              result_procedure_module=callback_shapes, \
              result_procedure_nature=non_intrinsic, result_name=result",
             &mut lines,
-        );
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap();
         assert!(procedure.result_pointer);
         assert!(!procedure.abstract_interface);
         assert_eq!(
@@ -4029,7 +5174,13 @@ mod tests {
         assert_eq!(procedure.result_name.as_deref(), Some("result"));
 
         let mut lines = "@end subroutine\n".lines().peekable();
-        let abstract_procedure = parse_proc("@subroutine callback, abstract_interface", &mut lines);
+        let abstract_procedure = parse_proc(
+            "@subroutine callback, abstract_interface",
+            &mut lines,
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap();
         assert!(abstract_procedure.abstract_interface);
     }
 
@@ -4041,12 +5192,12 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 16
+            r#"#!amod 17
 # module: cache_test
 # default-access: public
 # source: cache_test.f90
 
-@param k : integer = 7
+@param k : integer(4) = 7
 "#
             .to_string(),
         );
@@ -4074,12 +5225,12 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 16
+            r#"#!amod 17
 # module: cached_parent
 # default-access: public
 # source: cached_parent.f90
 
-@param cached : integer = 1
+@param cached : integer(4) = 1
 "#
             .to_string(),
         );
@@ -4088,7 +5239,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 16
+            r#"#!amod 17
 # module: supplied_parent
 # default-access: private
 # ancestor-module: supplied_root
@@ -4096,7 +5247,7 @@ mod tests {
 # host-association: only kept local_value
 # source: supplied_parent.f90
 
-@function implemented -> integer, module_procedure
+@function implemented -> integer(4), module_procedure
 @end function
 "#
             .to_string(),
@@ -4122,7 +5273,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 16
+            r#"#!amod 17
 # module: child
 # default-access: public
 # ancestor-module: root
@@ -4130,18 +5281,18 @@ mod tests {
 # source: child.f90
 
 @subroutine compute, module_procedure
-  @arg values : integer, intent(in), descriptor, rank=1
+  @arg values : integer(4), intent(in), descriptor, rank=1
     @abi pass=x0 width=8
-  @arg text : character(*), intent(in)
+  @arg text : character(len=:,kind=1), intent(in)
     @abi pass=x1 width=8
-  @arg bias : integer, intent(in), optional
+  @arg bias : integer(4), intent(in), optional
     @abi pass=x2 width=8
-  @arg text@len : integer, hidden
+  @arg text@len : integer(8), hidden
     @abi pass=x3 width=8
 @end subroutine
 
 @subroutine required, module_procedure
-  @arg value : integer, intent(in)
+  @arg value : integer(4), intent(in)
     @abi pass=x0 width=8
 @end subroutine
 "#
@@ -4208,7 +5359,7 @@ mod tests {
             std::process::id()
         ));
         let text = add_integrity_headers(
-            r#"#!amod 6
+            r#"#!amod 16
 # module: stale_test
 # source: stale_test.f90
 
@@ -4222,7 +5373,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 6 (compiler requires 16)")
+            err.contains("incompatible .amod version 16 (compiler requires 17)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

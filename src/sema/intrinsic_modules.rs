@@ -69,7 +69,7 @@ fn insert_param_val(
     mod_id: ScopeId,
     name: &str,
     ti: TypeInfo,
-    val: Option<i64>,
+    val: Option<i128>,
 ) {
     let span = builtin_span();
     let const_char_value = match (&ti, val) {
@@ -157,7 +157,7 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
         ("c_intptr_t", 8),
         ("c_ptrdiff_t", 8),
     ] {
-        insert_param_val(st, m, name, ik(4), Some(kind as i64));
+        insert_param_val(st, m, name, ik(4), Some(i128::from(kind)));
     }
 
     // ---- Real kind parameters ----
@@ -167,7 +167,7 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
             m,
             name,
             TypeInfo::Integer { kind: Some(4) },
-            Some(kind as i64),
+            Some(i128::from(kind)),
         );
     }
 
@@ -182,7 +182,7 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
             m,
             name,
             TypeInfo::Integer { kind: Some(4) },
-            Some(kind as i64),
+            Some(i128::from(kind)),
         );
     }
 
@@ -213,7 +213,7 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
         ("c_form_feed", 12),
         ("c_carriage_return", 13),
     ] {
-        insert_param_val(st, m, name, ck.clone(), Some(ascii));
+        insert_param_val(st, m, name, ck.clone(), Some(i128::from(ascii)));
     }
 
     // ---- Pointer types ----

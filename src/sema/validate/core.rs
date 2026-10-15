@@ -782,7 +782,6 @@ fn character_literal_kind(ctx: &Ctx<'_>, kind: &str) -> Option<i128> {
     kind.parse::<i128>().ok().or_else(|| {
         ctx.lookup_lexical(kind)
             .and_then(|symbol| symbol.const_value)
-            .map(i128::from)
     })
 }
 
@@ -826,7 +825,7 @@ fn eval_const_int_expr_checked(
             let Some(kind) = const_int_kind_of_symbol(sym) else {
                 return Ok(None);
             };
-            let Some(value) = sym.const_value.map(i128::from) else {
+            let Some(value) = sym.const_value else {
                 return Ok(None);
             };
             checked_int_value(value, kind, expr.span).map(Some)
@@ -5872,6 +5871,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             // F2023 10.2.2.2 bounds remapping from an array constructor
             // (`q([2, 3]) => t`) lowers via remap_bounds_args.
             validate_pointer_assignment(ctx, target, value, stmt.span);
+            reject_nondefinable_target(ctx, target, true, "pointer assignment");
             reject_pure_nonlocal_definition(ctx, target, stmt.span, "pointer assignment");
         }
 
@@ -5901,6 +5901,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             validate_distinct_allocation_objects(ctx, items, "ALLOCATE");
             for item in items {
                 validate_allocatable_item(ctx, item, "allocate");
+                reject_nondefinable_target(ctx, item, true, "ALLOCATE");
                 reject_pure_nonlocal_definition(ctx, item, item.span, "ALLOCATE");
                 if !has_source && !has_mold && allocate_item_needs_explicit_shape(ctx, item) {
                     ctx.error(item.span, "array ALLOCATE requires bounds or SOURCE=/MOLD=");
@@ -5922,15 +5923,26 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             validate_distinct_allocation_objects(ctx, items, "DEALLOCATE");
             for item in items {
                 validate_allocatable_item(ctx, item, "deallocate");
+                reject_nondefinable_target(ctx, item, true, "DEALLOCATE");
                 reject_pure_nonlocal_definition(ctx, item, item.span, "DEALLOCATE");
             }
         }
 
         // ---- I/O in pure ----
-        Stmt::Write { controls, .. } | Stmt::Read { controls, .. }
+        Stmt::Write { controls, .. }
             if ctx.in_pure && !uses_internal_character_file(ctx, controls) =>
         {
             ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
+        }
+        Stmt::Read {
+            controls, items, ..
+        } => {
+            if ctx.in_pure && !uses_internal_character_file(ctx, controls) {
+                ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
+            }
+            for item in items {
+                reject_nondefinable_target(ctx, item, false, "READ input item");
+            }
         }
         Stmt::Print { .. }
         | Stmt::Open { .. }
@@ -6271,6 +6283,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         // Nullify: items must be pointers.
         Stmt::Nullify { items } => {
             for item in items {
+                reject_nondefinable_target(ctx, item, true, "NULLIFY");
                 if expr_selects_component(item) {
                     if let Some(leaf) = leaf_field_layout(ctx, item) {
                         if !leaf.field.pointer {
@@ -6594,7 +6607,7 @@ fn component_call_result_metadata(
         else {
             continue;
         };
-        let passed_object = (!binding.nopass).then_some(base.as_ref());
+        let passed_object = binding.pass_index.map(|index| (index, base.as_ref()));
         if !call_candidate_matches(ctx, scope, symbol, args, passed_object) {
             continue;
         }
@@ -7494,26 +7507,32 @@ fn call_candidate_matches(
     scope: &Scope,
     symbol: &Symbol,
     args: &[Argument],
-    passed_object: Option<&SpannedExpr>,
+    passed_object: Option<(usize, &SpannedExpr)>,
 ) -> bool {
-    let mut actuals: Vec<(Option<&str>, Option<&SpannedExpr>)> = Vec::with_capacity(args.len() + 1);
-    if let Some(object) = passed_object {
-        actuals.push((None, Some(object)));
+    let mut actuals: Vec<(Option<usize>, Option<&str>, Option<&SpannedExpr>)> =
+        Vec::with_capacity(args.len() + 1);
+    if let Some((index, object)) = passed_object {
+        actuals.push((Some(index), None, Some(object)));
     }
     actuals.extend(args.iter().map(|arg| {
         let expr = match &arg.value {
             SectionSubscript::Element(expr) => Some(expr),
             SectionSubscript::Range { .. } => None,
         };
-        (arg.keyword.as_deref(), expr)
+        (None, arg.keyword.as_deref(), expr)
     }));
 
     let mut matched = vec![false; scope.arg_order.len()];
     let mut position = 0;
     let mut seen_keyword = false;
     let mut elemental_rank = None;
-    for (keyword, actual) in actuals {
-        let dummy_index = if let Some(keyword) = keyword {
+    for (forced_index, keyword, actual) in actuals {
+        let dummy_index = if let Some(index) = forced_index {
+            if index >= scope.arg_order.len() {
+                return false;
+            }
+            index
+        } else if let Some(keyword) = keyword {
             seen_keyword = true;
             let Some(index) = scope
                 .arg_order
@@ -7611,7 +7630,7 @@ fn candidate_result_metadata(
     scope: &Scope,
     symbol: &Symbol,
     args: &[Argument],
-    passed_object: Option<&SpannedExpr>,
+    passed_object: Option<(usize, &SpannedExpr)>,
 ) -> Option<(TypeInfo, usize)> {
     let result_symbol = result_symbol_in_procedure_scope(scope);
     let type_info = symbol
@@ -7625,7 +7644,7 @@ fn candidate_result_metadata(
     let rank = if symbol.attrs.elemental && declared_rank == 0 {
         max_elemental_actual_rank(ctx, args)
             .into_iter()
-            .chain(passed_object.and_then(|object| validation_expr_rank(ctx, object)))
+            .chain(passed_object.and_then(|(_, object)| validation_expr_rank(ctx, object)))
             .max()
             .unwrap_or(0)
     } else {
@@ -8600,9 +8619,9 @@ fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedE
         if ctx.is_associate_name(&name) {
             return;
         }
-        let (is_intent_in, is_parameter, is_pointer) =
+        let (is_intent_in, is_parameter, is_pointer, is_protected_use) =
             if let Some(attrs) = ctx.block_binding_attrs(&name) {
-                (attrs.intent_in, attrs.parameter, attrs.pointer)
+                (attrs.intent_in, attrs.parameter, attrs.pointer, false)
             } else {
                 ctx.lookup(&name)
                     .map(|sym| {
@@ -8610,9 +8629,13 @@ fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedE
                             matches!(sym.attrs.intent, Some(Intent::In)),
                             sym.attrs.parameter,
                             sym.attrs.pointer,
+                            sym.attrs.protected
+                                && ctx
+                                    .st
+                                    .name_is_use_associated_in(ctx.lexical_scope_id(), &name),
                         )
                     })
-                    .unwrap_or((false, false, false))
+                    .unwrap_or((false, false, false, false))
             };
         let writes_through_pointer_target = is_pointer && !matches!(target.node, Expr::Name { .. });
         if is_intent_in && !writes_through_pointer_target {
@@ -8624,6 +8647,49 @@ fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedE
         if is_parameter {
             ctx.error(span, format!("cannot assign to named constant '{}'", name));
         }
+        let path_has_pointer = match &target.node {
+            Expr::ComponentAccess { .. } => leaf_field_layout(ctx, target)
+                .is_some_and(|leaf| leaf.field.pointer || leaf.ancestor_is_pointer),
+            _ => false,
+        };
+        if is_protected_use && !(is_pointer || path_has_pointer) {
+            ctx.error(
+                span,
+                format!("cannot define PROTECTED use-associated entity '{}'", name),
+            );
+        }
+    }
+}
+
+fn reject_nondefinable_target(
+    ctx: &mut Ctx<'_>,
+    target: &SpannedExpr,
+    defines_association: bool,
+    role: &str,
+) {
+    let Some(base_name) = extract_base_name(target) else {
+        return;
+    };
+    if ctx.is_associate_name(&base_name) || ctx.block_binding_attrs(&base_name).is_some() {
+        return;
+    }
+    let is_protected_use = ctx.lookup_lexical(&base_name).is_some_and(|symbol| {
+        symbol.attrs.protected
+            && ctx
+                .st
+                .name_is_use_associated_in(ctx.lexical_scope_id(), &base_name)
+    });
+    if !is_protected_use {
+        return;
+    }
+    if matches!(
+        actual_is_definable(ctx, target, defines_association),
+        Some(false)
+    ) {
+        ctx.error(
+            target.span,
+            format!("{role} target must be a definable variable"),
+        );
     }
 }
 
@@ -9713,10 +9779,15 @@ fn named_actual_is_definable(
     if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter) {
         return Some(false);
     }
+    let defines_pointer_target = !defines_association && (path_has_pointer || symbol.attrs.pointer);
+    let protected_use = symbol.attrs.protected
+        && ctx
+            .st
+            .name_is_use_associated_in(ctx.lexical_scope_id(), name);
     Some(
         !symbol.attrs.parameter
-            && (!matches!(symbol.attrs.intent, Some(Intent::In))
-                || (!defines_association && (path_has_pointer || symbol.attrs.pointer))),
+            && (!matches!(symbol.attrs.intent, Some(Intent::In)) || defines_pointer_target)
+            && (!protected_use || defines_pointer_target),
     )
 }
 
@@ -10380,6 +10451,160 @@ fn validate_derived_type(
                     tbp.name
                 ),
             );
+        }
+
+        if !tbp.is_generic && !has_nopass {
+            let target = tbp.binding.as_deref().unwrap_or(&tbp.name);
+            let interface = tbp.interface.as_deref();
+            let find_procedure_scope = |name: &str| {
+                ctx.st.all_scopes().iter().find_map(|scope| {
+                    let name_matches = matches!(
+                        &scope.kind,
+                        ScopeKind::Function(scope_name) | ScopeKind::Subroutine(scope_name)
+                            if scope_name.eq_ignore_ascii_case(name)
+                    );
+                    (name_matches
+                        && (scope.parent == Some(ctx.scope_id)
+                            || scope.parent.is_some_and(|parent| {
+                                ctx.st.scope(parent).parent == Some(ctx.scope_id)
+                                    && matches!(ctx.st.scope(parent).kind, ScopeKind::Interface)
+                            })))
+                    .then_some(scope.id)
+                })
+            };
+            // A deferred binding names its contract explicitly. Resolve only
+            // that interface: an override later in the module can legitimately
+            // share the binding name while taking CLASS(derived), not
+            // CLASS(base).
+            let procedure_scope_id = if let Some(interface) = interface {
+                find_procedure_scope(interface)
+            } else {
+                find_procedure_scope(target)
+            };
+
+            if let Some(procedure_scope_id) = procedure_scope_id {
+                let procedure_scope = ctx.st.scope(procedure_scope_id);
+                let pass_name = if let Some(pass_name) = tbp.pass_name.as_deref() {
+                    procedure_scope
+                        .arg_order
+                        .iter()
+                        .find(|dummy| dummy.eq_ignore_ascii_case(pass_name))
+                        .cloned()
+                } else {
+                    procedure_scope.arg_order.first().cloned()
+                };
+
+                let Some(pass_name) = pass_name else {
+                    if let Some(pass_name) = tbp.pass_name.as_deref() {
+                        ctx.error(
+                            span,
+                            format!(
+                                "PASS dummy '{}' is not a dummy argument of type-bound procedure '{}'",
+                                pass_name, tbp.name
+                            ),
+                        );
+                    } else {
+                        ctx.error(
+                            span,
+                            format!(
+                                "type-bound procedure '{}' has no first dummy argument for its passed object",
+                                tbp.name
+                            ),
+                        );
+                    }
+                    continue;
+                };
+                let Some(dummy) = procedure_scope
+                    .symbols
+                    .get(&pass_name.to_ascii_lowercase())
+                    .cloned()
+                else {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' is not a data object",
+                            pass_name, tbp.name
+                        ),
+                    );
+                    continue;
+                };
+
+                if dummy.kind != SymbolKind::Variable {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' must be a data object",
+                            pass_name, tbp.name
+                        ),
+                    );
+                }
+                if !dummy.attrs.array_spec.is_empty() {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' must be scalar",
+                            pass_name, tbp.name
+                        ),
+                    );
+                }
+                if dummy.attrs.pointer {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' may not have the POINTER attribute",
+                            pass_name, tbp.name
+                        ),
+                    );
+                }
+                if dummy.attrs.allocatable {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' may not have the ALLOCATABLE attribute",
+                            pass_name, tbp.name
+                        ),
+                    );
+                }
+                if dummy.attrs.value {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' may not have the VALUE attribute",
+                            pass_name, tbp.name
+                        ),
+                    );
+                }
+                let has_required_type = matches!(
+                    dummy.type_info.as_ref(),
+                    Some(TypeInfo::Class(dummy_type))
+                        if generic_same_derived_type(
+                            ctx,
+                            procedure_scope_id,
+                            dummy_type,
+                            ctx.scope_id,
+                            name,
+                        )
+                );
+                if !has_required_type {
+                    ctx.error(
+                        span,
+                        format!(
+                            "passed-object dummy '{}' of type-bound procedure '{}' must be declared CLASS({})",
+                            pass_name, tbp.name, name
+                        ),
+                    );
+                }
+            } else if let Some(pass_name) = tbp.pass_name.as_deref() {
+                // Preserve the declaration-local diagnostic even when the
+                // binding target could not be resolved to a procedure scope.
+                ctx.error(
+                    span,
+                    format!(
+                        "PASS dummy '{}' is not a dummy argument of type-bound procedure '{}'",
+                        pass_name, tbp.name
+                    ),
+                );
+            }
         }
     }
 }
@@ -19107,6 +19332,289 @@ end module
 ",
         );
         assert!(errs.iter().any(|e| e.contains("both PASS and NOPASS")));
+    }
+
+    #[test]
+    fn named_pass_dummy_must_exist_in_bound_procedure() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+  type :: thing
+  contains
+    procedure, pass(missing) :: method
+  end type
+contains
+  subroutine method(value, self)
+    integer, intent(in) :: value
+    class(thing), intent(inout) :: self
+  end subroutine
+end module
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|error| error.contains("PASS dummy 'missing'")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn passed_object_dummy_characteristics_are_validated() {
+        let cases = [
+            (
+                "declared type",
+                "integer, intent(inout) :: self",
+                "must be declared CLASS(thing)",
+            ),
+            (
+                "declared derived-type identity",
+                "class(other), intent(inout) :: self",
+                "must be declared CLASS(thing)",
+            ),
+            (
+                "polymorphism",
+                "type(thing), intent(inout) :: self",
+                "must be declared CLASS(thing)",
+            ),
+            (
+                "rank",
+                "class(thing), intent(inout) :: self(:)",
+                "must be scalar",
+            ),
+            (
+                "pointer",
+                "class(thing), pointer, intent(inout) :: self",
+                "may not have the POINTER attribute",
+            ),
+            (
+                "allocatable",
+                "class(thing), allocatable, intent(inout) :: self",
+                "may not have the ALLOCATABLE attribute",
+            ),
+            (
+                "value",
+                "class(thing), value :: self",
+                "may not have the VALUE attribute",
+            ),
+        ];
+
+        for (case, declaration, expected) in cases {
+            let source = format!(
+                "module m\n  implicit none\n  type :: other\n  end type\n  type :: thing\n  contains\n    procedure :: method\n  end type\ncontains\n  subroutine method(self)\n    {declaration}\n  end subroutine\nend module\n"
+            );
+            let errs = errors_from(&source);
+            assert!(
+                errs.iter().any(|error| error.contains(expected)),
+                "{case}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_pass_requires_a_first_dummy_argument() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+  type :: thing
+  contains
+    procedure :: method
+  end type
+contains
+  subroutine method()
+  end subroutine
+end module
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|error| error.contains("has no first dummy argument")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn optional_named_nonfirst_passed_object_is_valid() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+  type :: thing
+  contains
+    procedure, pass(self) :: method
+  end type
+contains
+  subroutine method(value, self)
+    integer, intent(in) :: value
+    class(thing), optional, intent(inout) :: self
+  end subroutine
+end module
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|error| error.contains("passed-object") || error.contains("PASS dummy")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn deferred_binding_uses_its_named_interface_over_same_named_override() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+  type, abstract :: base_t
+  contains
+    procedure(base_get), deferred :: get
+  end type
+  abstract interface
+    subroutine base_get(self)
+      import base_t
+      class(base_t), intent(inout) :: self
+    end subroutine
+  end interface
+  type, extends(base_t) :: child_t
+  contains
+    procedure :: get
+  end type
+contains
+  subroutine get(self)
+    class(child_t), intent(inout) :: self
+  end subroutine
+end module
+",
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn protected_entity_is_definable_only_in_its_module_hierarchy() {
+        let errs = errors_from(
+            "\
+module protected_m
+  implicit none
+  integer, protected :: guarded = 1
+contains
+  subroutine owner_update()
+    guarded = 2
+  end subroutine
+end module
+program p
+  use protected_m, only : local_guard => guarded
+  implicit none
+  local_guard = 3
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|error| error.contains("PROTECTED use-associated entity"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn protected_pointer_target_definition_does_not_change_association() {
+        let errs = errors_from(
+            "\
+module protected_pointer_m
+  implicit none
+  integer, pointer, protected :: view
+end module
+program p
+  use protected_pointer_m
+  implicit none
+  integer, target :: storage
+  view = 1
+  view => storage
+  nullify(view)
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|error| {
+                    error.contains("pointer assignment target must be a definable variable")
+                        || error.contains("NULLIFY target must be a definable variable")
+                })
+                .count(),
+            2,
+            "{errs:?}"
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|error| error.contains("cannot define PROTECTED") && error.contains("view")),
+            "ordinary assignment through the protected pointer target was rejected: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn protected_use_association_rejects_other_definition_contexts() {
+        let errs = errors_from(
+            "\
+module protected_defs_m
+  implicit none
+  integer, protected :: scalar = 1
+  integer, allocatable, protected :: values(:)
+end module
+program p
+  use protected_defs_m
+  implicit none
+  call overwrite(scalar)
+  read (*, *) scalar
+  allocate(values(1))
+  deallocate(values)
+contains
+  subroutine overwrite(value)
+    integer, intent(out) :: value
+    value = 4
+  end subroutine
+end program
+",
+        );
+        for expected in [
+            "actual argument for INTENT(OUT/INOUT)",
+            "READ input item target must be a definable variable",
+            "ALLOCATE target must be a definable variable",
+            "DEALLOCATE target must be a definable variable",
+        ] {
+            assert!(
+                errs.iter().any(|error| error.contains(expected)),
+                "missing {expected:?}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_origin_survives_transitive_use_association() {
+        let errs = errors_from(
+            "\
+module origin_m
+  implicit none
+  integer, protected :: guarded = 1
+end module
+module reexport_m
+  use origin_m
+  implicit none
+end module
+program p
+  use reexport_m
+  implicit none
+  guarded = 2
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|error| error.contains("PROTECTED use-associated entity 'guarded'")),
+            "{errs:?}"
+        );
     }
 
     // ---- Standard conformance (--std=) ----

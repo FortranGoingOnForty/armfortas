@@ -18,6 +18,22 @@
 
 use std::cell::Cell;
 
+/// Immutable snapshot of the intrinsic defaults selected for one provider
+/// compilation.  Artifact emission must use the provider's snapshot rather
+/// than consulting whichever defaults happen to be active in a later
+/// consumer compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultKinds {
+    pub integer: u8,
+    pub real: u8,
+}
+
+impl DefaultKinds {
+    pub const fn new(integer: u8, real: u8) -> Self {
+        Self { integer, real }
+    }
+}
+
 thread_local! {
     /// Default kind for unsuffixed `integer` declarations.  4 (the
     /// Fortran standard's processor default) unless
@@ -51,4 +67,8 @@ pub fn default_int_kind() -> u8 {
 
 pub fn default_real_kind() -> u8 {
     DEFAULT_REAL_KIND.with(|c| c.get())
+}
+
+pub fn current() -> DefaultKinds {
+    DefaultKinds::new(default_int_kind(), default_real_kind())
 }

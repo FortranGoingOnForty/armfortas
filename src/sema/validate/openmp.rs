@@ -450,7 +450,10 @@ fn atomic_scalar_type_supported(
     allow_logical: bool,
 ) -> bool {
     match validation_expr_type_info(ctx, expr) {
-        Some(TypeInfo::Integer { kind }) => matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8),
+        Some(TypeInfo::Integer { kind }) => matches!(
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
+            1 | 2 | 4 | 8
+        ),
         Some(TypeInfo::Real { kind }) => matches!(
             kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
             4 | 8
@@ -461,7 +464,10 @@ fn atomic_scalar_type_supported(
             4 | 8
         ),
         Some(TypeInfo::Logical { kind }) if allow_logical => {
-            matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8)
+            matches!(
+                kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
+                1 | 2 | 4 | 8
+            )
         }
         _ => false,
     }
@@ -506,7 +512,10 @@ fn validate_atomic_update(ctx: &mut Ctx<'_>, _span: Span, assignment: &SpannedSt
         return;
     }
     let supported_type = match validation_expr_type_info(ctx, target) {
-        Some(TypeInfo::Integer { kind }) => matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8),
+        Some(TypeInfo::Integer { kind }) => matches!(
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
+            1 | 2 | 4 | 8
+        ),
         Some(TypeInfo::Real { kind }) => matches!(
             kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
             4 | 8
@@ -1987,7 +1996,10 @@ fn validate_reduction_object(
             | OpenMpReductionOperator::Ior
             | OpenMpReductionOperator::Ieor,
             Some(TypeInfo::Integer { kind }),
-        ) => matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8),
+        ) => matches!(
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
+            1 | 2 | 4 | 8
+        ),
         (
             OpenMpReductionOperator::Add
             | OpenMpReductionOperator::Multiply
@@ -2018,7 +2030,10 @@ fn validate_reduction_object(
             | OpenMpReductionOperator::Eqv
             | OpenMpReductionOperator::Neqv,
             Some(TypeInfo::Logical { kind }),
-        ) => matches!(kind.unwrap_or(4), 1 | 2 | 4 | 8),
+        ) => matches!(
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
+            1 | 2 | 4 | 8
+        ),
         _ => false,
     };
     if !valid {

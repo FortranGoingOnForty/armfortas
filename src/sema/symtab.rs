@@ -1121,6 +1121,89 @@ impl SymbolTable {
         self.lookup_in_guarded(scope_id, key.as_ref(), &mut visited, &mut cache)
     }
 
+    /// Whether `name`, as visible from `scope_id`, arrives through ordinary
+    /// USE association. Host association, including a submodule's semantic
+    /// parent edge, is deliberately not classified as USE association.
+    pub(crate) fn name_is_use_associated_in(&self, scope_id: ScopeId, name: &str) -> bool {
+        fn visit(
+            st: &SymbolTable,
+            scope_id: ScopeId,
+            key: &str,
+            visited: &mut Vec<ScopeId>,
+        ) -> bool {
+            if visited.contains(&scope_id) {
+                return false;
+            }
+            visited.push(scope_id);
+            let scope = st.scope(scope_id);
+            if scope.symbols.contains_key(key) {
+                return false;
+            }
+            for association in &scope.use_associations {
+                if association.local_name != key
+                    || !st.association_allowed_from_scope(scope_id, association, key)
+                {
+                    continue;
+                }
+                if association.from_bare_use
+                    && association.local_name == association.original_name
+                    && st.use_name_is_fully_renamed(scope_id, association.source_scope, key)
+                {
+                    continue;
+                }
+                if st.resolve_use_candidate(association).is_some() {
+                    return !association.is_submodule_access;
+                }
+            }
+
+            // A bare USE retains one empty sentinel edge even when all of the
+            // provider's visible names are themselves re-exports.  Mirror
+            // ordinary lookup's transitive-USE walk so origin-sensitive
+            // attributes (notably PROTECTED) do not disappear at a facade
+            // module boundary.
+            let mut seen_use_scopes = Vec::new();
+            for association in &scope.use_associations {
+                if !association.from_bare_use
+                    || association.local_name != association.original_name
+                    || seen_use_scopes.contains(&association.source_scope)
+                    || st.use_name_is_fully_renamed(scope_id, association.source_scope, key)
+                    || !st.association_allowed_from_scope(scope_id, association, key)
+                {
+                    continue;
+                }
+                seen_use_scopes.push(association.source_scope);
+                let mut lookup_visited = Vec::new();
+                let mut lookup_cache = HashMap::new();
+                let candidate = if association.is_submodule_access {
+                    st.lookup_in_guarded(
+                        association.source_scope,
+                        key,
+                        &mut lookup_visited,
+                        &mut lookup_cache,
+                    )
+                } else {
+                    st.lookup_exported_in_guarded(
+                        association.source_scope,
+                        key,
+                        &mut lookup_visited,
+                        &mut lookup_cache,
+                    )
+                };
+                if candidate.is_some() {
+                    return !association.is_submodule_access;
+                }
+            }
+
+            scope.host_association.allows(key)
+                && scope.parent.is_some_and(|parent| {
+                    st.scopes[parent].kind != ScopeKind::Global && visit(st, parent, key, visited)
+                })
+        }
+
+        let key = ensure_ascii_lowercase(name);
+        visit(self, scope_id, key.as_ref(), &mut Vec::new())
+    }
+
     /// Return the distinct providers that make a referenced local name
     /// ambiguous through USE association. Ordinary lookup remains first-match
     /// for resolution-time compatibility; validation calls this query before
@@ -2383,7 +2466,11 @@ pub struct Symbol {
     /// Ordered dummy argument names (for functions/subroutines).
     pub arg_names: Vec<String>,
     /// Compile-time constant value (for PARAMETERs like c_int=4).
-    pub const_value: Option<i64>,
+    /// Exact value of an integer named constant.  Keep the full language
+    /// width here: INTEGER(16) parameters cross this semantic boundary and
+    /// must not be narrowed merely because most kind/shape consumers use
+    /// machine-sized values.
+    pub const_value: Option<i128>,
     /// Compile-time character value for character PARAMETERs.
     pub const_char_value: Option<String>,
 }
@@ -2455,6 +2542,9 @@ pub struct SymbolAttrs {
     pub asynchronous: bool,
     pub contiguous: bool,
     pub volatile: bool,
+    /// A module entity with the PROTECTED attribute may be defined in its
+    /// defining module hierarchy but not through ordinary USE association.
+    pub protected: bool,
     /// The module variable has OpenMP THREADPRIVATE storage duration.
     pub openmp_threadprivate: bool,
     /// The entity is a `character(len=*)` dummy and therefore carries a
@@ -2526,6 +2616,7 @@ impl Default for SymbolAttrs {
             asynchronous: false,
             contiguous: false,
             volatile: false,
+            protected: false,
             openmp_threadprivate: false,
             assumed_length_character: false,
             bind_c: false,

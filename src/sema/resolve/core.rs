@@ -1720,7 +1720,7 @@ fn exported_const_int_params(
 
     for (name, sym) in &scope.symbols {
         if sym.attrs.parameter && sym.attrs.access != Access::Private {
-            if let Some(value) = sym.const_value {
+            if let Some(value) = sym.const_value.and_then(|value| i64::try_from(value).ok()) {
                 out.entry(name.clone()).or_insert(value);
             }
         }
@@ -1747,6 +1747,7 @@ fn exported_const_int_params(
                     && (sym.attrs.access != Access::Private || assoc.is_submodule_access))
                     .then_some(sym.const_value)
                     .flatten()
+                    .and_then(|value| i64::try_from(value).ok())
             });
         if let Some(value) = direct_value {
             out.entry(assoc.local_name.clone()).or_insert(value);
@@ -1755,7 +1756,8 @@ fn exported_const_int_params(
         if assoc.is_submodule_access {
             if let Some(sym) = st.lookup_in(assoc.source_scope, &assoc.original_name) {
                 if sym.attrs.parameter {
-                    if let Some(value) = sym.const_value {
+                    if let Some(value) = sym.const_value.and_then(|value| i64::try_from(value).ok())
+                    {
                         out.entry(assoc.local_name.clone()).or_insert(value);
                     }
                 }
@@ -1889,7 +1891,7 @@ fn visible_const_int_params(
 
     for (name, sym) in &scope.symbols {
         if sym.attrs.parameter {
-            if let Some(value) = sym.const_value {
+            if let Some(value) = sym.const_value.and_then(|value| i64::try_from(value).ok()) {
                 out.entry(name.clone()).or_insert(value);
             }
         }
@@ -1911,6 +1913,7 @@ fn visible_const_int_params(
                     && (sym.attrs.access != Access::Private || assoc.is_submodule_access))
                     .then_some(sym.const_value)
                     .flatten()
+                    .and_then(|value| i64::try_from(value).ok())
             });
         if let Some(value) = direct_value {
             out.insert(assoc.local_name.clone(), value);
@@ -1919,7 +1922,8 @@ fn visible_const_int_params(
         if assoc.is_submodule_access {
             if let Some(sym) = st.lookup_in(assoc.source_scope, &assoc.original_name) {
                 if sym.attrs.parameter {
-                    if let Some(value) = sym.const_value {
+                    if let Some(value) = sym.const_value.and_then(|value| i64::try_from(value).ok())
+                    {
                         out.insert(assoc.local_name.clone(), value);
                     }
                 }
@@ -2169,6 +2173,21 @@ fn parse_boz_i64(text: &str, base: crate::ast::expr::BozBase) -> Option<i64> {
     i64::from_str_radix(&digits, radix).ok()
 }
 
+fn parse_boz_i128(text: &str, base: crate::ast::expr::BozBase) -> Option<i128> {
+    let radix = match base {
+        crate::ast::expr::BozBase::Binary => 2,
+        crate::ast::expr::BozBase::Octal => 8,
+        crate::ast::expr::BozBase::Hex => 16,
+    };
+    let digits: String = text
+        .chars()
+        .skip_while(|c| !matches!(c, '\'' | '"'))
+        .skip(1)
+        .take_while(|c| !matches!(c, '\'' | '"'))
+        .collect();
+    i128::from_str_radix(&digits, radix).ok()
+}
+
 fn selected_char_kind_value(name: &str) -> i64 {
     let name = name.trim_end_matches(' ');
     if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("ascii") {
@@ -2351,6 +2370,52 @@ fn eval_ieee_selected_real_kind_args(
             i128::from(values[0].unwrap_or(0)),
             i128::from(values[1].unwrap_or(0)),
             values[2].map(i128::from),
+        ),
+    ))
+}
+
+fn eval_ieee_selected_real_kind_args_i128(
+    args: &[crate::ast::expr::Argument],
+    mut eval: impl FnMut(&crate::ast::expr::SpannedExpr) -> Option<i128>,
+) -> Option<i128> {
+    let mut values = [None, None, None];
+    let mut positional = 0usize;
+    let mut saw_keyword = false;
+
+    for arg in args {
+        let index = if let Some(keyword) = arg.keyword.as_deref() {
+            saw_keyword = true;
+            match keyword.to_ascii_lowercase().as_str() {
+                "p" => 0,
+                "r" => 1,
+                "radix" => 2,
+                _ => return None,
+            }
+        } else {
+            if saw_keyword || positional >= values.len() {
+                return None;
+            }
+            let index = positional;
+            positional += 1;
+            index
+        };
+        if values[index].is_some() {
+            return None;
+        }
+        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+            return None;
+        };
+        values[index] = Some(eval(expr)?);
+    }
+
+    if values.iter().all(Option::is_none) {
+        return None;
+    }
+    Some(i128::from(
+        crate::sema::types::ieee_selected_real_kind_value(
+            values[0].unwrap_or(0),
+            values[1].unwrap_or(0),
+            values[2],
         ),
     ))
 }
@@ -2779,6 +2844,13 @@ fn register_local_type_layouts(
                 final_proc.rank = final_procedure_rank(st, scope_id, source_name).unwrap_or(0);
                 final_proc.elemental = final_procedure_is_elemental(st, scope_id, source_name);
             }
+            resolve_bound_proc_pass_metadata(
+                st,
+                scope_id,
+                host_module,
+                parent.as_ref(),
+                &mut layout,
+            );
             // Don't overwrite a layout that has bound_procs or final_procs with one that doesn't.
             // This handles the case where a subroutine redefines a type without CONTAINS.
             let dominated = layouts
@@ -2793,6 +2865,78 @@ fn register_local_type_layouts(
             if !dominated {
                 layouts.insert(layout);
             }
+        }
+    }
+}
+
+fn resolve_bound_proc_pass_metadata(
+    st: &SymbolTable,
+    owner_scope: ScopeId,
+    host_module: Option<&str>,
+    parent_layout: Option<&crate::sema::type_layout::TypeLayout>,
+    layout: &mut crate::sema::type_layout::TypeLayout,
+) {
+    let module_prefix = host_module.map(|module| format!("afs_modproc_{}_", module.to_lowercase()));
+    for binding in &mut layout.bound_procs {
+        if binding.nopass {
+            binding.pass_name = None;
+            binding.pass_index = None;
+            continue;
+        }
+
+        let inherited_unchanged = parent_layout.is_some_and(|parent| {
+            parent.bound_procs.iter().any(|parent_binding| {
+                parent_binding.method_name == binding.method_name
+                    && parent_binding.target_name == binding.target_name
+                    && parent_binding.abi_name == binding.abi_name
+                    && parent_binding.nopass == binding.nopass
+                    && parent_binding.pass_name == binding.pass_name
+                    && parent_binding.pass_index == binding.pass_index
+            })
+        });
+        if inherited_unchanged {
+            // Parent layouts have already resolved or imported truthful PASS
+            // metadata. Preserve an unchanged inherited binding verbatim;
+            // mangled module prefixes are not an ownership boundary because
+            // module names can overlap (for example `a` and `a_b`).
+            continue;
+        }
+
+        let target_source_name = module_prefix
+            .as_deref()
+            .and_then(|prefix| binding.target_name.strip_prefix(prefix))
+            .unwrap_or(&binding.target_name);
+        let procedure_scope = st.all_scopes().iter().find(|scope| {
+            let name_matches = match &scope.kind {
+                ScopeKind::Function(name) | ScopeKind::Subroutine(name) => {
+                    name.eq_ignore_ascii_case(target_source_name)
+                        || name.eq_ignore_ascii_case(&binding.abi_name)
+                }
+                _ => false,
+            };
+            name_matches
+                && (scope.parent == Some(owner_scope)
+                    || scope.parent.is_some_and(|parent| {
+                        st.scope(parent).parent == Some(owner_scope)
+                            && matches!(st.scope(parent).kind, ScopeKind::Interface)
+                    }))
+        });
+        let Some(procedure_scope) = procedure_scope else {
+            continue;
+        };
+        let pass_index = binding
+            .pass_name
+            .as_ref()
+            .and_then(|name| {
+                procedure_scope
+                    .arg_order
+                    .iter()
+                    .position(|dummy| dummy.eq_ignore_ascii_case(name))
+            })
+            .unwrap_or(0);
+        if let Some(name) = procedure_scope.arg_order.get(pass_index) {
+            binding.pass_name = Some(name.clone());
+            binding.pass_index = Some(pass_index);
         }
     }
 }
@@ -3587,7 +3731,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         const_char_value: None,
                     })?;
                 }
-                let mut next_value = 0i64;
+                let mut next_value = 0i128;
                 for (name, value_expr) in enumerators {
                     let const_value = if let Some(expr) = value_expr {
                         eval_const_int_expr(expr, st).unwrap_or(next_value)
@@ -3647,7 +3791,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         defined_at: decl.span,
                         scope: st.current_scope(),
                         arg_names: vec![],
-                        const_value: Some((i + 1) as i64),
+                        const_value: Some((i + 1) as i128),
                         const_char_value: None,
                     })?;
                 }
@@ -3993,14 +4137,15 @@ fn process_contains(
 // ---- Helpers ----
 
 /// Extract a compile-time integer kind value from a KindSelector.
-/// Try to evaluate a PARAMETER initializer to a compile-time i64.
+/// Try to evaluate a PARAMETER initializer to the full compile-time integer
+/// width supported by the language model.
 /// Handles integer literals, negation, binary ops, parenthesized
 /// expressions, and Name references that resolve to PARAMETERs
 /// with known const_value in the current scope chain.
 pub(super) fn eval_const_int_expr(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
-) -> Option<i64> {
+) -> Option<i128> {
     eval_const_int_expr_in_scope(expr, st, st.current_scope())
 }
 
@@ -4008,14 +4153,14 @@ pub(super) fn eval_const_int_expr_in_scope(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
     scope_id: ScopeId,
-) -> Option<i64> {
+) -> Option<i128> {
     use crate::ast::expr::Expr;
     match &expr.node {
         Expr::IntegerLiteral { text, .. } => {
             let clean = text.split('_').next().unwrap_or(text);
-            clean.parse::<i64>().ok()
+            clean.parse::<i128>().ok()
         }
-        Expr::BozLiteral { text, base } => parse_boz_i64(text, *base),
+        Expr::BozLiteral { text, base } => parse_boz_i128(text, *base),
         Expr::Name { name } => {
             let sym = st.lookup_in(scope_id, &name.to_lowercase())?;
             if sym.attrs.parameter {
@@ -4024,22 +4169,27 @@ pub(super) fn eval_const_int_expr_in_scope(
                 None
             }
         }
-        Expr::UnaryOp { op, operand } => {
-            let v = eval_const_int_expr_in_scope(operand, st, scope_id)?;
-            match op {
-                crate::ast::expr::UnaryOp::Minus => Some(-v),
-                crate::ast::expr::UnaryOp::Plus => Some(v),
-                _ => None,
+        Expr::UnaryOp { op, operand } => match op {
+            crate::ast::expr::UnaryOp::Minus => {
+                if let Expr::IntegerLiteral { text, .. } = &operand.node {
+                    let clean = text.split('_').next().unwrap_or(text);
+                    if clean == "170141183460469231731687303715884105728" {
+                        return Some(i128::MIN);
+                    }
+                }
+                eval_const_int_expr_in_scope(operand, st, scope_id)?.checked_neg()
             }
-        }
+            crate::ast::expr::UnaryOp::Plus => eval_const_int_expr_in_scope(operand, st, scope_id),
+            _ => None,
+        },
         Expr::BinaryOp { op, left, right } => {
             let l = eval_const_int_expr_in_scope(left, st, scope_id)?;
             let r = eval_const_int_expr_in_scope(right, st, scope_id)?;
             match op {
-                crate::ast::expr::BinaryOp::Add => Some(l + r),
-                crate::ast::expr::BinaryOp::Sub => Some(l - r),
-                crate::ast::expr::BinaryOp::Mul => Some(l * r),
-                crate::ast::expr::BinaryOp::Div if r != 0 => Some(l / r),
+                crate::ast::expr::BinaryOp::Add => l.checked_add(r),
+                crate::ast::expr::BinaryOp::Sub => l.checked_sub(r),
+                crate::ast::expr::BinaryOp::Mul => l.checked_mul(r),
+                crate::ast::expr::BinaryOp::Div if r != 0 => l.checked_div(r),
                 crate::ast::expr::BinaryOp::Pow => u32::try_from(r)
                     .ok()
                     .and_then(|exponent| l.checked_pow(exponent)),
@@ -4058,9 +4208,11 @@ pub(super) fn eval_const_int_expr_in_scope(
                     }
                 });
                 match key.as_str() {
-                    "ieee_selected_real_kind" => eval_ieee_selected_real_kind_args(args, |expr| {
-                        eval_const_int_expr_in_scope(expr, st, scope_id)
-                    }),
+                    "ieee_selected_real_kind" => {
+                        eval_ieee_selected_real_kind_args_i128(args, |expr| {
+                            eval_const_int_expr_in_scope(expr, st, scope_id)
+                        })
+                    }
                     "selected_int_kind" => {
                         let r = first_arg_val?;
                         Some(if r <= 2 {
@@ -4105,7 +4257,7 @@ pub(super) fn eval_const_int_expr_in_scope(
                     }
                     "max" | "min" => {
                         let is_max = key == "max";
-                        let mut acc: Option<i64> = None;
+                        let mut acc: Option<i128> = None;
                         for arg in args {
                             let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
                                 return None;
@@ -4125,14 +4277,14 @@ pub(super) fn eval_const_int_expr_in_scope(
                             return None;
                         };
                         eval_const_char_expr_in_scope(e, st, scope_id)
-                            .map(|value| selected_char_kind_value(&value))
+                            .map(|value| i128::from(selected_char_kind_value(&value)))
                     }
                     "kind" => {
                         if let Some(arg) = args.first() {
                             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                                 let literal_kind =
                                     |kind: &Option<String>, default| match kind.as_deref() {
-                                        Some(name) => name.parse::<i64>().ok().or_else(|| {
+                                        Some(name) => name.parse::<i128>().ok().or_else(|| {
                                             st.lookup_in(scope_id, &name.to_lowercase())
                                                 .filter(|symbol| symbol.attrs.parameter)
                                                 .and_then(|symbol| symbol.const_value)
@@ -4145,13 +4297,13 @@ pub(super) fn eval_const_int_expr_in_scope(
                                         if text.contains('d') || text.contains('D') {
                                             8
                                         } else {
-                                            i64::from(crate::driver::defaults::default_real_kind())
+                                            i128::from(crate::driver::defaults::default_real_kind())
                                         },
                                     ),
                                     Expr::IntegerLiteral { kind, .. }
                                     | Expr::LogicalLiteral { kind, .. } => literal_kind(
                                         kind,
-                                        i64::from(crate::driver::defaults::default_int_kind()),
+                                        i128::from(crate::driver::defaults::default_int_kind()),
                                     ),
                                     Expr::StringLiteral { kind, .. } => literal_kind(kind, 1),
                                     Expr::Name { name } => st
@@ -4160,7 +4312,7 @@ pub(super) fn eval_const_int_expr_in_scope(
                                         .and_then(|type_info| {
                                             crate::sema::types::type_info_to_fortran_type(type_info)
                                                 .kind()
-                                                .map(i64::from)
+                                                .map(i128::from)
                                         }),
                                     _ => None,
                                 }
@@ -4185,7 +4337,7 @@ pub(super) fn eval_const_int_expr_in_scope(
                                 .unwrap_or(text)
                                 .parse::<f64>()
                                 .ok()
-                                .map(|v| v.trunc() as i64),
+                                .map(|v| v.trunc() as i128),
                             _ => eval_const_int_expr_in_scope(e, st, scope_id),
                         }
                     }
@@ -4250,6 +4402,7 @@ fn attrs_to_symbol_attrs(attrs: &[Attribute], default_access: Access) -> SymbolA
             Attribute::Asynchronous => sa.asynchronous = true,
             Attribute::Contiguous => sa.contiguous = true,
             Attribute::Volatile => sa.volatile = true,
+            Attribute::Protected => sa.protected = true,
             Attribute::OpenMpThreadPrivate => sa.openmp_threadprivate = true,
             Attribute::Target => sa.target = true,
             Attribute::Optional => sa.optional = true,
@@ -4405,6 +4558,27 @@ mod tests {
                 "standalone PARAMETER {name} did not fold"
             );
         }
+    }
+
+    #[test]
+    fn integer16_parameter_values_retain_full_width() {
+        let st = resolve_source(
+            "module wide_parameters\n\
+               integer(16), parameter :: beyond_i64 = 9223372036854775808_16\n\
+               integer(16), parameter :: power_100 = 2_16**100\n\
+             end module wide_parameters\n",
+        );
+        let scope = st.find_module_scope("wide_parameters").unwrap();
+        assert_eq!(
+            st.lookup_in(scope, "beyond_i64")
+                .and_then(|symbol| symbol.const_value),
+            Some(9_223_372_036_854_775_808)
+        );
+        assert_eq!(
+            st.lookup_in(scope, "power_100")
+                .and_then(|symbol| symbol.const_value),
+            Some(1_267_650_600_228_229_401_496_703_205_376)
+        );
     }
 
     #[test]

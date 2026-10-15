@@ -625,8 +625,7 @@ pub(crate) fn resolve_intrinsic_kind_value(
         }
         Expr::Name { name } => symtab
             .find_symbol_any_scope(name)
-            .and_then(|sym| sym.const_value)
-            .map(i128::from),
+            .and_then(|sym| sym.const_value),
         Expr::UnaryOp { op, operand } => {
             let value = resolve_intrinsic_kind_value(operand, symtab)?;
             match op {

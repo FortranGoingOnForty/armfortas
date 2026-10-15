@@ -3964,7 +3964,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 16\n", "#!amod 15\n", 1);
+        .replacen("#!amod 17\n", "#!amod 16\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -3991,7 +3991,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 15 (compiler requires 16)")
+        stderr.contains("incompatible .amod version 16 (compiler requires 17)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -4941,7 +4941,7 @@ fn imported_character_star_parameter_array_preserves_shape_and_length() {
     let amod = std::fs::read_to_string(dir.join("provider.amod"))
         .expect("provider .amod should be emitted");
     assert!(
-        amod.contains("@param table : character(len=4)")
+        amod.contains("@param table : character(len=4,kind=1)")
             && amod.contains("@rank 2")
             && amod.contains("@dims 1:2 1:3"),
         "provider .amod should preserve table length and shape: {}",
@@ -11454,7 +11454,7 @@ end program p
     let amod = fs::read_to_string(dir.join("callback_impl.amod"))
         .expect("callback implementation did not publish its .amod");
     assert!(
-        amod.contains("@param kp : integer = 8") && amod.contains("@arg x : real(8)"),
+        amod.contains("@param kp : integer(4) = 8") && amod.contains("@arg x : real(8)"),
         "literal KIND inquiries did not preserve the named kind suffix:\n{amod}"
     );
     let run = Command::new(&executable)
@@ -14817,7 +14817,7 @@ fn automatic_component_array_bound_size_lowers_without_raw_symbol() {
         return;
     }
     let src = write_program(
-        "module m\n  implicit none\n  type :: state_set_t\n    integer(8) :: bits(4) = 0_8\n  contains\n    procedure :: f\n  end type\ncontains\n  subroutine f(state_set)\n    type(state_set_t), intent(inout) :: state_set\n    integer(8) :: original_bits(size(state_set%bits))\n    original_bits = state_set%bits\n    print *, size(original_bits)\n  end subroutine\nend module\n",
+        "module m\n  implicit none\n  type :: state_set_t\n    integer(8) :: bits(4) = 0_8\n  contains\n    procedure :: f\n  end type\ncontains\n  subroutine f(state_set)\n    class(state_set_t), intent(inout) :: state_set\n    integer(8) :: original_bits(size(state_set%bits))\n    original_bits = state_set%bits\n    print *, size(original_bits)\n  end subroutine\nend module\n",
         "f90",
     );
     let out = unique_path("auto_component_bound_size", "o");
@@ -17470,6 +17470,199 @@ fn dash_o_equals_form_sets_output_path() {
 }
 
 #[test]
+fn single_source_default_link_uses_a_out_without_replacing_extensionless_source() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=single_source_default_link_uses_a_out_without_replacing_extensionless_source count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("default_a_out");
+    let source_text = "program p\n  print *, 17\nend program p\n";
+    let source = write_program_in(&dir, "prog", source_text);
+
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .arg("prog")
+        .output()
+        .expect("default-output compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "default-output compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source).expect("extensionless source disappeared"),
+        source_text,
+        "default linking replaced the extensionless source"
+    );
+    let executable = dir.join("a.out");
+    assert!(executable.exists(), "default link did not publish a.out");
+    let run = Command::new(&executable)
+        .output()
+        .expect("default a.out failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("17"),
+        "default a.out produced the wrong result: {:?}",
+        run
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn explicit_primary_output_aliases_are_rejected_without_touching_source() {
+    let dir = unique_dir("primary_output_alias");
+    let source_text = "program p\n  print *, 23\nend program p\n";
+    let source = write_program_in(&dir, "source.f90", source_text);
+
+    for mode in ["-E", "--emit-tokens", "--emit-ast", "--emit-ir", "-S", "-c"] {
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([mode, "source.f90", "-o", "source.f90"])
+            .output()
+            .expect("aliased-output compile failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{mode} unexpectedly accepted an input/output alias"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("output 'source.f90' conflicts with compiler input 'source.f90'")
+                && stderr.contains("refusing to overwrite an input file"),
+            "{mode} emitted the wrong alias diagnostic: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&source).expect("source disappeared"),
+            source_text,
+            "{mode} modified the source before rejecting the alias"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn linked_output_cannot_alias_source_input() {
+    let dir = unique_dir("linked_output_source_alias");
+    let source_text = "program p\n  print *, 29\nend program p\n";
+    let source = write_program_in(&dir, "source.f90", source_text);
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["source.f90", "-o", "source.f90"])
+        .env("AFS_LD_PATH", "false")
+        .output()
+        .expect("aliased linked-output compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "linking unexpectedly accepted a source/output alias"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("output 'source.f90' conflicts with compiler input 'source.f90'")
+            && stderr.contains("refusing to overwrite an input file"),
+        "linked output emitted the wrong alias diagnostic: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source).expect("source disappeared"),
+        source_text,
+        "linking modified the source before rejecting the alias"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn linked_output_cannot_alias_link_input() {
+    let dir = unique_dir("linked_output_link_input_alias");
+    let object = write_program_in(&dir, "input.o", "object sentinel\n");
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["input.o", "-o", "input.o"])
+        .env("AFS_LD_PATH", "false")
+        .output()
+        .expect("aliased link-only command failed to spawn");
+    assert!(
+        !result.status.success(),
+        "linking unexpectedly accepted a link-input/output alias"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("output 'input.o' conflicts with compiler input 'input.o'")
+            && stderr.contains("refusing to overwrite an input file"),
+        "link-only output emitted the wrong alias diagnostic: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&object).expect("link input disappeared"),
+        "object sentinel\n",
+        "linking modified its input before rejecting the alias"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn primary_output_hardlink_alias_is_rejected_by_file_identity() {
+    let dir = unique_dir("primary_output_hardlink");
+    let source_text = "program p\nend program p\n";
+    let source = write_program_in(&dir, "source.f90", source_text);
+    let alias = dir.join("output.s");
+    std::fs::hard_link(&source, &alias).expect("cannot create hardlink alias");
+
+    let result = Command::new(compiler("armfortas"))
+        .arg("-S")
+        .arg(&source)
+        .arg("-o")
+        .arg(&alias)
+        .output()
+        .expect("hardlink-alias compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "hardlink alias unexpectedly compiled"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("refusing to overwrite an input file"),
+        "missing hardlink alias diagnostic: {stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), source_text);
+    assert_eq!(std::fs::read_to_string(&alias).unwrap(), source_text);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn preprocess_output_cannot_alias_an_included_file() {
+    let dir = unique_dir("include_output_alias");
+    write_program_in(&dir, "main.F90", "#include \"payload.inc\"\n");
+    let include_text = "integer, parameter :: answer = 42\n";
+    let include = write_program_in(&dir, "payload.inc", include_text);
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-E", "main.F90", "-o", "payload.inc"])
+        .output()
+        .expect("include-alias preprocess failed to spawn");
+    assert!(
+        !result.status.success(),
+        "preprocessing unexpectedly overwrote an included input"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("output 'payload.inc' conflicts with compiler input")
+            && stderr.contains("payload.inc"),
+        "missing included-input alias diagnostic: {stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(include).unwrap(), include_text);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn duplicate_o_is_rejected() {
     let src = write_program("program p\n  print *, 1\nend program\n", "f90");
     let out_a = unique_path("dup_a", "bin");
@@ -17921,6 +18114,240 @@ fn multi_input_terminal_mode_failure_removes_only_the_failed_stale_output() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn failed_assembler_or_module_publication_preserves_compilation_outputs() {
+    let dir = unique_dir("assembler_publish_guard");
+    let module_dir = dir.join("modules");
+    fs::create_dir(&module_dir).expect("cannot create module output directory");
+    let source = write_program_in(
+        &dir,
+        "guarded_publish.f90",
+        "module guarded_publish\n  implicit none\n  integer :: value = 7\ncontains\n  integer function get_value()\n    get_value = value\n  end function get_value\nend module guarded_publish\n",
+    );
+    let object = dir.join("guarded_publish.o");
+    let compile = Command::new(compiler("armfortas"))
+        .arg("-c")
+        .arg("-J")
+        .arg(&module_dir)
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .env_remove("AFS_AS")
+        .env_remove("AFS_AS_PATH")
+        .output()
+        .expect("initial module compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "initial module compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let amod = module_dir.join("guarded_publish.amod");
+    let conventional_mod = module_dir.join("guarded_publish.mod");
+    let published_object = fs::read(&object).expect("missing initial object");
+    let published_amod = fs::read(&amod).expect("missing initial .amod");
+    let published_mod = fs::read(&conventional_mod).expect("missing initial .mod");
+
+    for reserved_depfile in [
+        amod.clone(),
+        conventional_mod.clone(),
+        module_dir.join("guarded_publish.smod"),
+    ] {
+        let aliased = Command::new(compiler("armfortas"))
+            .args(["-c", "-MD", "-MF"])
+            .arg(&reserved_depfile)
+            .arg("-J")
+            .arg(&module_dir)
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .env_remove("AFS_AS")
+            .env_remove("AFS_AS_PATH")
+            .output()
+            .expect("reserved depfile rejection failed to spawn");
+        assert!(
+            !aliased.status.success(),
+            "reserved depfile destination '{}' was accepted",
+            reserved_depfile.display()
+        );
+        let stderr = String::from_utf8_lossy(&aliased.stderr);
+        assert!(
+            stderr.contains("conflicts with module interface")
+                || stderr.contains("reserved module-interface extension"),
+            "missing reserved depfile diagnostic for '{}': {}",
+            reserved_depfile.display(),
+            stderr
+        );
+    }
+    assert_eq!(
+        fs::read(&object).expect("depfile alias rejection removed the object"),
+        published_object,
+        "depfile alias rejection replaced the object"
+    );
+    assert_eq!(
+        fs::read(&amod).expect("depfile alias rejection removed the .amod"),
+        published_amod,
+        "depfile alias rejection replaced the .amod"
+    );
+    assert_eq!(
+        fs::read(&conventional_mod).expect("depfile alias rejection removed the .mod"),
+        published_mod,
+        "depfile alias rejection replaced the .mod"
+    );
+    assert!(
+        !module_dir.join("guarded_publish.smod").exists(),
+        "reserved .smod depfile was published"
+    );
+
+    for reserved_output in [
+        amod.clone(),
+        conventional_mod.clone(),
+        module_dir.join("guarded_publish.smod"),
+    ] {
+        let aliased = Command::new(compiler("armfortas"))
+            .arg("-c")
+            .arg("-J")
+            .arg(&module_dir)
+            .arg(&source)
+            .arg("-o")
+            .arg(&reserved_output)
+            .env_remove("AFS_AS")
+            .env_remove("AFS_AS_PATH")
+            .output()
+            .expect("reserved primary-output rejection failed to spawn");
+        assert!(
+            !aliased.status.success(),
+            "reserved primary destination '{}' was accepted",
+            reserved_output.display()
+        );
+        let stderr = String::from_utf8_lossy(&aliased.stderr);
+        assert!(
+            stderr.contains("conflicts with module interface")
+                || stderr.contains("reserved module-interface extension"),
+            "missing reserved output diagnostic for '{}': {}",
+            reserved_output.display(),
+            stderr
+        );
+    }
+
+    let identity_alias = module_dir.join("interface-identity-alias.o");
+    fs::hard_link(&amod, &identity_alias).expect("cannot hard-link interface identity alias");
+    let identity_collision = Command::new(compiler("armfortas"))
+        .arg("-c")
+        .arg("-J")
+        .arg(&module_dir)
+        .arg(&source)
+        .arg("-o")
+        .arg(&identity_alias)
+        .env_remove("AFS_AS")
+        .env_remove("AFS_AS_PATH")
+        .output()
+        .expect("module-interface identity collision failed to spawn");
+    assert!(
+        !identity_collision.status.success(),
+        "hard-link alias of the module interface was accepted as the primary output"
+    );
+    assert!(
+        String::from_utf8_lossy(&identity_collision.stderr)
+            .contains("conflicts with module interface"),
+        "missing module-interface identity diagnostic: {}",
+        String::from_utf8_lossy(&identity_collision.stderr)
+    );
+    assert_eq!(
+        fs::read(&amod).expect("identity collision removed the .amod"),
+        published_amod,
+        "identity collision replaced the .amod"
+    );
+    fs::remove_file(identity_alias).expect("cannot remove interface identity alias");
+
+    fs::write(
+        &source,
+        "module guarded_publish\n  implicit none\n  real :: value = 9.5\ncontains\n  real function get_value()\n    get_value = value\n  end function get_value\nend module guarded_publish\n",
+    )
+    .expect("cannot replace module source");
+    let failed = Command::new(compiler("armfortas"))
+        .arg("-c")
+        .arg("-J")
+        .arg(&module_dir)
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .env_remove("AFS_AS")
+        .env("AFS_AS_PATH", "false")
+        .output()
+        .expect("failing assembler compile failed to spawn");
+    assert!(
+        !failed.status.success(),
+        "the forced assembler failure unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("assembler failed"),
+        "unexpected forced-assembler diagnostic: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&object).expect("assembler failure removed the published object"),
+        published_object,
+        "assembler failure replaced the published object"
+    );
+    assert_eq!(
+        fs::read(&amod).expect("assembler failure removed the published .amod"),
+        published_amod,
+        "assembler failure replaced the published .amod"
+    );
+    assert_eq!(
+        fs::read(&conventional_mod).expect("assembler failure removed the published .mod"),
+        published_mod.clone(),
+        "assembler failure replaced the published .mod"
+    );
+
+    fs::write(
+        &source,
+        "module guarded_publish\n  implicit none\n  real :: value = 9.5\ncontains\n  real function get_value()\n    get_value = value\n  end function get_value\nend module guarded_publish\nmodule blocked_publish\n  implicit none\n  integer :: other = 11\nend module blocked_publish\n",
+    )
+    .expect("cannot add blocked module source");
+    fs::create_dir(module_dir.join("blocked_publish.amod"))
+        .expect("cannot create module-interface destination blocker");
+    let module_failure = Command::new(compiler("armfortas"))
+        .arg("-c")
+        .arg("-J")
+        .arg(&module_dir)
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .env_remove("AFS_AS")
+        .env_remove("AFS_AS_PATH")
+        .output()
+        .expect("module-publication failure compile failed to spawn");
+    assert!(
+        !module_failure.status.success(),
+        "the forced module-publication failure unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&module_failure.stderr);
+    assert!(
+        stderr.contains("module interface") && stderr.contains("destination is a directory"),
+        "unexpected module-publication diagnostic: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&object).expect("module failure removed the published object"),
+        published_object,
+        "module failure replaced the published object"
+    );
+    assert_eq!(
+        fs::read(&amod).expect("module failure removed the published .amod"),
+        published_amod,
+        "module failure replaced the published .amod"
+    );
+    assert_eq!(
+        fs::read(&conventional_mod).expect("module failure removed the published .mod"),
+        published_mod,
+        "module failure replaced the published .mod"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn compile_only_explicit_object_path_keeps_module_in_current_dir() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
@@ -18277,6 +18704,7 @@ fn elf_link_preserves_object_and_dash_l_operand_order() {
 
     let stale_wrong = dir.join("stale-wrong-order");
     std::fs::copy(&correct, &stale_wrong).expect("failed to seed stale executable");
+    let stale_wrong_bytes = std::fs::read(&stale_wrong).expect("failed to read stale executable");
     let stale_wrong_link = Command::new(compiler("armfortas"))
         .env("AFS_LD", "0")
         .args([
@@ -18294,9 +18722,10 @@ fn elf_link_preserves_object_and_dash_l_operand_order() {
         !stale_wrong_link.status.success(),
         "a stale output must not turn an order-sensitive link failure into success"
     );
-    assert!(
-        !stale_wrong.exists(),
-        "a failed order-sensitive link must not preserve a stale executable"
+    assert_eq!(
+        std::fs::read(&stale_wrong).expect("failed link removed the published executable"),
+        stale_wrong_bytes,
+        "a failed order-sensitive link replaced the published executable"
     );
 
     // The sources are deliberately supplied consumer-last even though the
@@ -31000,8 +31429,8 @@ fn imported_named_char_component_lengths_round_trip_through_amod_and_run() {
     let amod = dir.join("m.amod");
     let amod_text = std::fs::read_to_string(&amod).expect("missing m.amod");
     assert!(
-        amod_text.contains("@field assignments : character(len=16)")
-            && amod_text.contains("@field heredoc_delimiter : character(len=16)"),
+        amod_text.contains("@field assignments : character(len=16,kind=1)")
+            && amod_text.contains("@field heredoc_delimiter : character(len=16,kind=1)"),
         "fixed imported character component lengths should survive into .amod: {}",
         amod_text
     );
@@ -46111,7 +46540,7 @@ fn fdefault_integer_8_changes_default_kind() {
         return;
     }
     let src = write_program(
-        "program p\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  interface assignment(=)\n    procedure :: assign_integer\n  end interface\n  integer :: x\n  type(box_t) :: box\n  x = 5\n  box = x\n  if (box%value /= 5) error stop 1\n  print *, kind(x)\ncontains\n  subroutine assign_integer(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    integer, intent(in) :: rhs\n    lhs%value = rhs\n  end subroutine\nend program\n",
+        "program p\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  type :: state_t\n    logical :: enabled = .false.\n    integer :: guard = 0\n  end type\n  interface assignment(=)\n    procedure :: assign_integer\n  end interface\n  integer :: x\n  logical :: flag\n  type(box_t) :: box\n  type(state_t) :: state\n  x = 5\n  flag = .true.\n  box = x\n  state%enabled = flag\n  state%guard = 37\n  if (box%value /= 5) error stop 1\n  if (kind(flag) /= 8 .or. .not. state%enabled) error stop 2\n  if (state%guard /= 37) error stop 3\n  print *, kind(x)\ncontains\n  subroutine assign_integer(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    integer, intent(in) :: rhs\n    lhs%value = rhs\n  end subroutine\nend program\n",
         "f90",
     );
     let out = unique_path("defint", "bin");
@@ -48802,7 +49231,7 @@ fn imported_char_parameter_component_default_round_trips_through_amod() {
     let constants_amod =
         std::fs::read_to_string(dir.join("path_constants.amod")).expect("read path_constants.amod");
     assert!(
-        constants_amod.contains("@param dot : character(len=1) @ir")
+        constants_amod.contains("@param dot : character(len=1,kind=1) @ir")
             && constants_amod.contains("@charhex 2e"),
         "character parameter value should be exported through .amod:\n{}",
         constants_amod
@@ -48810,7 +49239,7 @@ fn imported_char_parameter_component_default_round_trips_through_amod() {
     let type_amod =
         std::fs::read_to_string(dir.join("path_state.amod")).expect("read path_state.amod");
     assert!(
-        type_amod.contains("@field sep : character(len=1)")
+        type_amod.contains("@field sep : character(len=1,kind=1)")
             && type_amod.contains("@init=charhex:2e"),
         "imported character parameter default should fold into type layout:\n{}",
         type_amod
@@ -48889,17 +49318,17 @@ fn char_parameter_substrings_keep_fixed_len_through_amod_import() {
 
     let amod = std::fs::read_to_string(dir.join("ascii_like.amod")).expect("read ascii_like.amod");
     assert!(
-        amod.contains("@param uppercase : character(len=3)"),
+        amod.contains("@param uppercase : character(len=3,kind=1)"),
         "uppercase parameter length should be fixed in .amod:\n{}",
         amod
     );
     assert!(
-        amod.contains("@param lowercase : character(len=3)"),
+        amod.contains("@param lowercase : character(len=3,kind=1)"),
         "lowercase parameter length should be fixed in .amod:\n{}",
         amod
     );
     assert!(
-        amod.contains("@param octal_digits : character(len=8)"),
+        amod.contains("@param octal_digits : character(len=8,kind=1)"),
         "octal_digits parameter length should be fixed in .amod:\n{}",
         amod
     );
@@ -49350,7 +49779,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 16\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 17\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))
@@ -67784,7 +68213,7 @@ fn amod_result_bounds_follow_selected_result_deterministically() {
     let dir = unique_dir("amod_result_bounds_determinism");
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("test_programs/defined_unary_array_result_assignment.f90");
-    let expected_record = "@function flip_matrix -> real, result_rank=2, result_name=out, result_array_bounds=\"(size(a, 2); size(a, 1))\"";
+    let expected_record = "@function flip_matrix -> real(4), result_rank=2, result_name=out, result_array_bounds=\"(size(a, 2); size(a, 1))\"";
     let mut first_amod = None;
 
     for iteration in 0..16 {
@@ -67968,6 +68397,83 @@ fn user_op_dispatch_rank_filters_scalar_actual_to_scalar_specific() {
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
+}
+
+#[test]
+fn named_nonfirst_pass_dummy_controls_type_bound_call_slot() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=named_nonfirst_pass_dummy_controls_type_bound_call_slot count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module named_pass_m\n  implicit none\n  type :: box_t\n    integer :: tag = 0\n  contains\n    procedure, pass(self) :: encode\n  end type\ncontains\n  integer function encode(other, self, scale)\n    class(box_t), intent(in) :: other\n    class(box_t), intent(in) :: self\n    integer, intent(in), optional :: scale\n    integer :: factor\n    factor = 10\n    if (present(scale)) factor = scale\n    encode = factor * self%tag + other%tag\n  end function\nend module\nprogram p\n  use named_pass_m\n  implicit none\n  type(box_t) :: box, other\n  box%tag = 1\n  other%tag = 2\n  if (box%encode(other) /= 12) error stop 1\n  if (box%encode(other=other, scale=100) /= 102) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    for level in ["-O0", "-O3"] {
+        let out = unique_path(
+            &format!("named_nonfirst_pass_{}", level.trim_start_matches('-')),
+            "bin",
+        );
+        let compile = Command::new(compiler("armfortas"))
+            .args([level, src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("named PASS compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{level} named PASS compile failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("named PASS run failed");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{level} named PASS: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_file(out);
+    }
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
+fn invalid_passed_object_type_is_a_hard_error() {
+    let src = write_program(
+        "module invalid_pass_m\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  contains\n    procedure, pass(self) :: mutate\n  end type\ncontains\n  subroutine mutate(delta, self)\n    integer, intent(in) :: delta\n    integer, intent(inout) :: self\n    self = delta\n  end subroutine\nend module\n",
+        "f90",
+    );
+    for level in ["-O0", "-O3"] {
+        let obj = unique_path(
+            &format!("invalid_pass_type_{}", level.trim_start_matches('-')),
+            "o",
+        );
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                level,
+                "-c",
+                src.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("invalid PASS compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        assert!(
+            !compile.status.success()
+                && stderr.contains("passed-object dummy 'self'")
+                && stderr.contains("must be declared CLASS(box_t)"),
+            "{level}: status={:?} stdout={} stderr={stderr}",
+            compile.status,
+            String::from_utf8_lossy(&compile.stdout)
+        );
+        assert!(!obj.exists(), "{level}: invalid source produced an object");
+        let _ = std::fs::remove_file(obj);
+    }
+    let _ = std::fs::remove_file(src);
 }
 
 #[test]
@@ -68289,9 +68795,9 @@ fn storage_size_parameter_values_round_trip_through_amod() {
     let amod = std::fs::read_to_string(dir.join("storage_size_provider.amod"))
         .expect("missing storage_size_provider.amod");
     assert!(
-        amod.contains("@param int_bits : integer = 32")
-            && amod.contains("@param logical_bits : integer = 32")
-            && amod.contains("@param real_bits : integer = 64"),
+        amod.contains("@param int_bits : integer(4) = 32")
+            && amod.contains("@param logical_bits : integer(4) = 32")
+            && amod.contains("@param real_bits : integer(4) = 64"),
         "storage_size parameter values must be concrete across translation units: {amod}"
     );
 

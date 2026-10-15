@@ -597,12 +597,12 @@ fn failed_link_removes_stale_dependency_file() {
 
 #[test]
 #[cfg(unix)]
-fn failed_dependency_publication_removes_fresh_executable() {
+fn failed_dependency_publication_preserves_only_prior_executables() {
     use std::os::unix::fs::PermissionsExt;
 
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=driver_link_compat test=failed_dependency_publication_removes_fresh_executable count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=driver_link_compat test=failed_dependency_publication_preserves_only_prior_executables count=1 reason=\"{}\"",
             reason
         );
         return;
@@ -661,6 +661,35 @@ fn failed_dependency_publication_removes_fresh_executable() {
         std::fs::read_to_string(&blocked_parent).expect("depfile parent blocker disappeared"),
         "preserve this blocker\n",
         "dependency failure mutated its blocking destination"
+    );
+
+    std::fs::remove_file(&blocked_parent).expect("cannot remove first depfile blocker");
+    std::fs::create_dir(&blocked_parent).expect("cannot recreate depfile directory");
+    let published = b"previous executable";
+    std::fs::write(&output, published).expect("cannot seed previous executable");
+    let stale_result = Command::new(compiler("armfortas"))
+        .env("AFS_LD_PATH", &linker)
+        .env("DEPFILE_PARENT_TO_BLOCK", &blocked_parent)
+        .args(["-MD", "-MF"])
+        .arg(&depfile)
+        .arg(&src)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("stale-output depfile publication probe failed to spawn");
+    assert!(
+        !stale_result.status.success(),
+        "compile-and-link succeeded without publishing its requested depfile"
+    );
+    assert!(
+        String::from_utf8_lossy(&stale_result.stderr).contains("cannot create depfile directory"),
+        "missing stale-output depfile diagnostic: {}",
+        String::from_utf8_lossy(&stale_result.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&output).expect("dependency failure removed the previous executable"),
+        published,
+        "dependency failure replaced the previous executable"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
