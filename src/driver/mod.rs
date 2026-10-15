@@ -28,8 +28,10 @@ use crate::sema::{resolve, validate};
 
 static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
-/// OpenMP language level advertised through the `_OPENMP` predefined macro.
-/// `202111` denotes OpenMP 5.2.
+/// OpenMP language baseline selected by the `_OPENMP` predefined macro.
+/// `202111` denotes OpenMP 5.2. During the preview this is paired with the
+/// machine-readable `__ARMFORTAS_OPENMP_*__` capability policy below and is
+/// not a claim of complete OpenMP 5.2 conformance.
 pub const OPENMP_VERSION: u32 = 202111;
 
 struct RemoveFileOnDrop(PathBuf);
@@ -2013,6 +2015,24 @@ fn preproc_config_for_input(
         include_paths: opts.module_search_paths.clone(),
         ..crate::preprocess::PreprocConfig::for_target(&opts.target)
     };
+    if opts.openmp || opts.openmp_simd {
+        for (name, value) in [
+            ("__ARMFORTAS_OPENMP_PREVIEW__", "1"),
+            ("__ARMFORTAS_OPENMP_CONFORMING__", "0"),
+            (
+                "__ARMFORTAS_OPENMP_HOST_PARALLEL__",
+                if opts.openmp { "1" } else { "0" },
+            ),
+            ("__ARMFORTAS_OPENMP_SIMD__", "0"),
+            ("__ARMFORTAS_OPENMP_TASKING__", "0"),
+            ("__ARMFORTAS_OPENMP_OFFLOAD__", "0"),
+            ("__ARMFORTAS_OPENMP_TOOLS__", "0"),
+        ] {
+            config
+                .defines
+                .insert(name.into(), crate::preprocess::MacroDef::object(value));
+        }
+    }
     if opts.openmp {
         config.defines.insert(
             "_OPENMP".into(),
@@ -4607,6 +4627,24 @@ mod tests {
                 .map(|definition| definition.body.as_str()),
             Some("202111")
         );
+        for (name, expected) in [
+            ("__ARMFORTAS_OPENMP_PREVIEW__", "1"),
+            ("__ARMFORTAS_OPENMP_CONFORMING__", "0"),
+            ("__ARMFORTAS_OPENMP_HOST_PARALLEL__", "1"),
+            ("__ARMFORTAS_OPENMP_SIMD__", "0"),
+            ("__ARMFORTAS_OPENMP_TASKING__", "0"),
+            ("__ARMFORTAS_OPENMP_OFFLOAD__", "0"),
+            ("__ARMFORTAS_OPENMP_TOOLS__", "0"),
+        ] {
+            assert_eq!(
+                config
+                    .defines
+                    .get(name)
+                    .map(|definition| definition.body.as_str()),
+                Some(expected),
+                "unexpected OpenMP preview capability macro {name}"
+            );
+        }
 
         let simd = Options {
             openmp_simd: true,
@@ -4617,6 +4655,29 @@ mod tests {
             !config.defines.contains_key("_OPENMP"),
             "the SIMD-only mode must not advertise full OpenMP"
         );
+        assert_eq!(
+            config
+                .defines
+                .get("__ARMFORTAS_OPENMP_PREVIEW__")
+                .map(|definition| definition.body.as_str()),
+            Some("1")
+        );
+        assert_eq!(
+            config
+                .defines
+                .get("__ARMFORTAS_OPENMP_HOST_PARALLEL__")
+                .map(|definition| definition.body.as_str()),
+            Some("0")
+        );
+
+        let disabled = preproc_config_for_input(
+            &Options::default(),
+            Path::new("input.F90"),
+            SourceForm::FreeForm,
+        );
+        assert!(!disabled
+            .defines
+            .contains_key("__ARMFORTAS_OPENMP_PREVIEW__"));
     }
 
     #[test]
