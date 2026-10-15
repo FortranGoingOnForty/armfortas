@@ -157,10 +157,10 @@ pub(super) struct Ctx<'a> {
     /// worksharing constructs bind dynamically, so this tracks only the data
     /// environment that semantic validation can prove from the source tree.
     pub(super) openmp_parallel_depth: usize,
-    /// Nearest enclosing OpenMP regions, used for close-nesting rules such as
-    /// MASTER being directly bound to a PARALLEL region. Ordinary Fortran
-    /// control constructs do not alter this stack.
-    pub(super) openmp_construct_stack: Vec<&'static str>,
+    /// Enclosing OpenMP regions with the categories, binding boundaries, and
+    /// identities needed by the centralized nesting-relation checks. Ordinary
+    /// Fortran control constructs do not alter this stack.
+    pub(super) openmp_construct_stack: Vec<super::openmp::OpenMpRegionFrame>,
     /// Number of enclosing worksharing loops that carry a bare ORDERED clause.
     /// The construct stack separately enforces close nesting.
     pub(super) openmp_ordered_binding_depth: usize,
@@ -6209,7 +6209,9 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                     ctx.openmp_parallel_depth += 1;
                     ctx.openmp_parallel_private_frames.push(frame);
                 }
-                ctx.openmp_construct_stack.push(construct.name());
+                let region_frame = super::openmp::region_frame(construct)
+                    .expect("OpenMP structured-block construct must define a region frame");
+                ctx.openmp_construct_stack.push(region_frame);
                 validate_stmts(ctx, body);
                 ctx.openmp_construct_stack.pop();
                 if enters_parallel {
@@ -6230,7 +6232,9 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 if enters_doacross_binding {
                     ctx.openmp_doacross_binding_depth += 1;
                 }
-                ctx.openmp_construct_stack.push(construct.name());
+                let region_frame = super::openmp::region_frame(construct)
+                    .expect("OpenMP loop construct must define a region frame");
+                ctx.openmp_construct_stack.push(region_frame);
                 validate_stmt(ctx, loop_stmt);
                 ctx.openmp_construct_stack.pop();
                 if enters_doacross_binding {

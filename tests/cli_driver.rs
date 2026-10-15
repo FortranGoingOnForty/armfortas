@@ -24588,6 +24588,118 @@ fn fopenmp_barrier_rejects_illegal_close_nesting() {
 }
 
 #[test]
+fn fopenmp_region_model_rejects_all_prohibited_audit_nesting() {
+    let cases = [
+        (
+            "barrier_single",
+            "program p\n!$omp parallel\n!$omp single\n!$omp barrier\n!$omp end single nowait\n!$omp end parallel\nend program p\n",
+            "OpenMP BARRIER may not be closely nested inside an OpenMP SINGLE region",
+        ),
+        (
+            "barrier_ordered",
+            "program p\ninteger :: i\n!$omp parallel\n!$omp do ordered\ndo i=1,4\n!$omp ordered\n!$omp barrier\n!$omp end ordered\nend do\n!$omp end do\n!$omp end parallel\nend program p\n",
+            "OpenMP BARRIER may not be closely nested inside an OpenMP ORDERED region",
+        ),
+        (
+            "do_single",
+            "program p\ninteger :: i\n!$omp parallel\n!$omp single\n!$omp do\ndo i=1,4\nend do\n!$omp end do nowait\n!$omp end single\n!$omp end parallel\nend program p\n",
+            "OpenMP DO may not be closely nested inside an OpenMP SINGLE region",
+        ),
+        (
+            "loop_single",
+            "program p\ninteger :: i\n!$omp parallel\n!$omp single\n!$omp loop\ndo i=1,4\nend do\n!$omp end loop\n!$omp end single\n!$omp end parallel\nend program p\n",
+            "OpenMP LOOP may not be closely nested inside an OpenMP SINGLE region",
+        ),
+        (
+            "critical_named",
+            "program p\n!$omp critical(same_name)\n!$omp critical(same_name)\n!$omp end critical(same_name)\n!$omp end critical(same_name)\nend program p\n",
+            "may not be nested inside an OpenMP CRITICAL region with the same name",
+        ),
+        (
+            "critical_case_across_parallel",
+            "program p\n!$omp critical(Mixed_Name)\n!$omp parallel num_threads(1)\n!$omp critical(mIxEd_NaMe)\n!$omp end critical(MIXED_NAME)\n!$omp end parallel\n!$omp end critical(mixed_name)\nend program p\n",
+            "may not be nested inside an OpenMP CRITICAL region with the same name",
+        ),
+        (
+            "critical_unnamed",
+            "program p\n!$omp critical\n!$omp critical\n!$omp end critical\n!$omp end critical\nend program p\n",
+            "OpenMP CRITICAL region without a name may not be nested inside an OpenMP CRITICAL region with the same name",
+        ),
+        (
+            "masked_through_critical",
+            "program p\n!$omp parallel\n!$omp single\n!$omp critical(helper)\n!$omp master\ncontinue\n!$omp end master\n!$omp end critical(helper)\n!$omp end single\n!$omp end parallel\nend program p\n",
+            "OpenMP MASTER may not be closely nested inside an OpenMP SINGLE region",
+        ),
+    ];
+
+    for (stem, source, expected) in cases {
+        let src = write_program(source, "f90");
+        let out = unique_path(stem, "s");
+        let result = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                "-S",
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("prohibited OpenMP nesting compile failed to spawn");
+        assert!(
+            !result.status.success(),
+            "prohibited OpenMP nesting case {stem} compiled"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected),
+            "unexpected diagnostic for {stem}: {stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "prohibited OpenMP nesting case {stem} published assembly"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
+fn fopenmp_region_model_preserves_parallel_boundaries_and_distinct_critical_names() {
+    for (stem, source) in [
+        (
+            "barrier_nested_parallel",
+            "program p\n!$omp parallel num_threads(1)\n!$omp single\n!$omp parallel num_threads(1)\n!$omp barrier\n!$omp end parallel\n!$omp end single\n!$omp end parallel\nend program p\n",
+        ),
+        (
+            "distinct_nested_critical",
+            "program p\n!$omp critical(first)\n!$omp critical(second)\n!$omp end critical(second)\n!$omp end critical(first)\nend program p\n",
+        ),
+    ] {
+        let src = write_program(source, "f90");
+        let out = unique_path(stem, "s");
+        let result = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                "-S",
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("valid OpenMP nesting compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "valid OpenMP nesting case {stem} failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(out.exists(), "valid OpenMP nesting case {stem} emitted no assembly");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
 fn fopenmp_flush_publishes_shared_storage() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

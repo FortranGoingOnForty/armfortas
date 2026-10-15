@@ -53,7 +53,200 @@ impl WorksharingLoopKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenMpRegionKind {
+    Parallel,
+    WorksharingLoop,
+    Loop,
+    Worksharing,
+    Critical,
+    Masked,
+    Ordered,
+    Atomic,
+}
+
+/// Semantic ancestry retained while recursively validating executable OpenMP
+/// regions. The directive spelling alone cannot express combined constructs,
+/// parallel binding boundaries, or the identity of a CRITICAL region.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct OpenMpRegionFrame {
+    kind: OpenMpRegionKind,
+    directive_name: &'static str,
+    opens_parallel_region: bool,
+    critical_name: Option<String>,
+}
+
+impl OpenMpRegionFrame {
+    fn is_worksharing(&self) -> bool {
+        matches!(
+            self.kind,
+            OpenMpRegionKind::WorksharingLoop
+                | OpenMpRegionKind::Loop
+                | OpenMpRegionKind::Worksharing
+        )
+    }
+}
+
+pub(super) fn region_frame(construct: &OpenMpConstruct) -> Option<OpenMpRegionFrame> {
+    let (kind, opens_parallel_region, critical_name) = match construct {
+        OpenMpConstruct::Parallel { .. } => (OpenMpRegionKind::Parallel, true, None),
+        OpenMpConstruct::Do { .. } => (OpenMpRegionKind::WorksharingLoop, false, None),
+        OpenMpConstruct::Loop { .. } => (OpenMpRegionKind::Loop, false, None),
+        OpenMpConstruct::ParallelDo { .. } => (OpenMpRegionKind::WorksharingLoop, true, None),
+        OpenMpConstruct::Critical { name, .. } => (
+            OpenMpRegionKind::Critical,
+            false,
+            Some(
+                name.as_deref()
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_else(|| "<unnamed>".into()),
+            ),
+        ),
+        OpenMpConstruct::Master { .. } => (OpenMpRegionKind::Masked, false, None),
+        OpenMpConstruct::Single { .. } | OpenMpConstruct::Sections { .. } => {
+            (OpenMpRegionKind::Worksharing, false, None)
+        }
+        OpenMpConstruct::Ordered { .. } => (OpenMpRegionKind::Ordered, false, None),
+        OpenMpConstruct::AtomicRead { .. }
+        | OpenMpConstruct::AtomicWrite { .. }
+        | OpenMpConstruct::AtomicUpdate { .. } => (OpenMpRegionKind::Atomic, false, None),
+        OpenMpConstruct::OrderedDoacross { .. }
+        | OpenMpConstruct::Barrier
+        | OpenMpConstruct::Flush { .. } => return None,
+    };
+    Some(OpenMpRegionFrame {
+        kind,
+        directive_name: construct.name(),
+        opens_parallel_region,
+        critical_name,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum NestedRegionKind {
+    Worksharing,
+    Barrier,
+    Masked,
+    Ordered,
+}
+
+fn nested_region_kind(construct: &OpenMpConstruct) -> Option<NestedRegionKind> {
+    match construct {
+        OpenMpConstruct::Do { .. }
+        | OpenMpConstruct::Loop { .. }
+        | OpenMpConstruct::Single { .. }
+        | OpenMpConstruct::Sections { .. } => Some(NestedRegionKind::Worksharing),
+        OpenMpConstruct::Barrier => Some(NestedRegionKind::Barrier),
+        OpenMpConstruct::Master { .. } => Some(NestedRegionKind::Masked),
+        OpenMpConstruct::Ordered { .. } | OpenMpConstruct::OrderedDoacross { .. } => {
+            Some(NestedRegionKind::Ordered)
+        }
+        // The worksharing region of a combined PARALLEL DO is nested inside
+        // its newly generated parallel region, so it is not closely nested in
+        // the construct that encloses the combined directive.
+        OpenMpConstruct::Parallel { .. }
+        | OpenMpConstruct::ParallelDo { .. }
+        | OpenMpConstruct::Critical { .. }
+        | OpenMpConstruct::Flush { .. }
+        | OpenMpConstruct::AtomicRead { .. }
+        | OpenMpConstruct::AtomicWrite { .. }
+        | OpenMpConstruct::AtomicUpdate { .. } => None,
+    }
+}
+
+fn prohibited_close_parent(nested: NestedRegionKind, parent: &OpenMpRegionFrame) -> bool {
+    match nested {
+        NestedRegionKind::Worksharing | NestedRegionKind::Barrier => {
+            parent.is_worksharing()
+                || matches!(
+                    parent.kind,
+                    OpenMpRegionKind::Critical
+                        | OpenMpRegionKind::Ordered
+                        | OpenMpRegionKind::Atomic
+                        | OpenMpRegionKind::Masked
+                )
+        }
+        NestedRegionKind::Masked => {
+            parent.is_worksharing() || parent.kind == OpenMpRegionKind::Atomic
+        }
+        NestedRegionKind::Ordered => matches!(
+            parent.kind,
+            OpenMpRegionKind::Critical
+                | OpenMpRegionKind::Ordered
+                | OpenMpRegionKind::Loop
+                | OpenMpRegionKind::Atomic
+        ),
+    }
+}
+
+fn closely_enclosing_worksharing_loop(ctx: &Ctx<'_>) -> bool {
+    for frame in ctx.openmp_construct_stack.iter().rev() {
+        if frame.kind == OpenMpRegionKind::WorksharingLoop {
+            return true;
+        }
+        if frame.opens_parallel_region {
+            break;
+        }
+    }
+    false
+}
+
+/// Apply the OpenMP 5.2 region-nesting relations once for every implemented
+/// construct. "Closely nested" crosses ordinary OpenMP regions and stops only
+/// at a parallel binding boundary; same-name CRITICAL ancestry crosses even
+/// that boundary.
+fn validate_region_nesting(ctx: &mut Ctx<'_>, span: Span, construct: &OpenMpConstruct) -> bool {
+    if let OpenMpConstruct::Critical { name, .. } = construct {
+        let identity = name
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "<unnamed>".into());
+        if ctx.openmp_construct_stack.iter().any(|frame| {
+            frame.kind == OpenMpRegionKind::Critical
+                && frame.critical_name.as_deref() == Some(identity.as_str())
+        }) {
+            let display = name
+                .as_deref()
+                .map(|name| format!("'{name}'"))
+                .unwrap_or_else(|| "without a name".into());
+            ctx.error(
+                span,
+                format!(
+                    "OpenMP CRITICAL region {display} may not be nested inside an OpenMP CRITICAL region with the same name"
+                ),
+            );
+            return false;
+        }
+    }
+
+    let Some(nested) = nested_region_kind(construct) else {
+        return true;
+    };
+    let mut violation = None;
+    for frame in ctx.openmp_construct_stack.iter().rev() {
+        if prohibited_close_parent(nested, frame) {
+            violation = Some(frame.directive_name);
+            break;
+        }
+        if frame.opens_parallel_region {
+            break;
+        }
+    }
+    if let Some(enclosing) = violation {
+        ctx.error(
+            span,
+            format!(
+                "OpenMP {} may not be closely nested inside an OpenMP {enclosing} region",
+                construct.name()
+            ),
+        );
+        return false;
+    }
+    true
+}
+
 pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &OpenMpConstruct) {
+    let nesting_valid = validate_region_nesting(ctx, span, construct);
     match construct {
         OpenMpConstruct::Parallel { clauses, body } => {
             reject_in_pure(ctx, span, "PARALLEL");
@@ -134,43 +327,10 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
         }
         OpenMpConstruct::Master { body } => {
             reject_in_pure(ctx, span, "MASTER");
-            if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
-                if matches!(
-                    enclosing,
-                    "DO" | "LOOP" | "PARALLEL DO" | "SECTIONS" | "ATOMIC UPDATE"
-                ) {
-                    ctx.error(
-                        span,
-                        format!(
-                            "OpenMP MASTER may not be closely nested inside an OpenMP {enclosing} region"
-                        ),
-                    );
-                }
-            }
             validate_structured_block(ctx, body);
         }
         OpenMpConstruct::Single { clauses, body } => {
             reject_in_pure(ctx, span, "SINGLE");
-            if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
-                if matches!(
-                    enclosing,
-                    "DO" | "LOOP"
-                        | "PARALLEL DO"
-                        | "CRITICAL"
-                        | "MASTER"
-                        | "SINGLE"
-                        | "SECTIONS"
-                        | "ORDERED"
-                        | "ATOMIC UPDATE"
-                ) {
-                    ctx.error(
-                        span,
-                        format!(
-                            "OpenMP SINGLE may not be closely nested inside an OpenMP {enclosing} region"
-                        ),
-                    );
-                }
-            }
             for clause in clauses {
                 if !matches!(clause, OpenMpClause::Nowait) {
                     ctx.error(
@@ -190,26 +350,6 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
             section_starts,
         } => {
             reject_in_pure(ctx, span, "SECTIONS");
-            if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
-                if matches!(
-                    enclosing,
-                    "DO" | "LOOP"
-                        | "PARALLEL DO"
-                        | "CRITICAL"
-                        | "MASTER"
-                        | "SINGLE"
-                        | "SECTIONS"
-                        | "ORDERED"
-                        | "ATOMIC UPDATE"
-                ) {
-                    ctx.error(
-                        span,
-                        format!(
-                            "OpenMP SECTIONS may not be closely nested inside an OpenMP {enclosing} region"
-                        ),
-                    );
-                }
-            }
             for clause in clauses {
                 if !matches!(clause, OpenMpClause::Nowait) {
                     ctx.error(
@@ -228,10 +368,7 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
         }
         OpenMpConstruct::Ordered { body } => {
             reject_in_pure(ctx, span, "ORDERED");
-            if !matches!(
-                ctx.openmp_construct_stack.last().copied(),
-                Some("DO" | "PARALLEL DO")
-            ) {
+            if nesting_valid && !closely_enclosing_worksharing_loop(ctx) {
                 ctx.error(
                     span,
                     "OpenMP ORDERED must be closely nested inside an OpenMP DO or PARALLEL DO region",
@@ -246,10 +383,7 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
         }
         OpenMpConstruct::OrderedDoacross { dependence } => {
             reject_in_pure(ctx, span, "ORDERED DOACROSS");
-            if !matches!(
-                ctx.openmp_construct_stack.last().copied(),
-                Some("DO" | "PARALLEL DO")
-            ) {
+            if nesting_valid && !closely_enclosing_worksharing_loop(ctx) {
                 ctx.error(
                     span,
                     "OpenMP ORDERED DOACROSS must be closely nested inside an OpenMP DO or PARALLEL DO region",
@@ -276,24 +410,6 @@ pub(super) fn validate_construct(ctx: &mut Ctx<'_>, span: Span, construct: &Open
         }
         OpenMpConstruct::Barrier => {
             reject_in_pure(ctx, span, "BARRIER");
-            if let Some(enclosing) = ctx.openmp_construct_stack.last().copied() {
-                if matches!(
-                    enclosing,
-                    "DO" | "LOOP"
-                        | "PARALLEL DO"
-                        | "CRITICAL"
-                        | "MASTER"
-                        | "SECTIONS"
-                        | "ATOMIC UPDATE"
-                ) {
-                    ctx.error(
-                        span,
-                        format!(
-                            "OpenMP BARRIER may not be closely nested inside an OpenMP {enclosing} region"
-                        ),
-                    );
-                }
-            }
         }
         OpenMpConstruct::Flush { variables } => {
             reject_in_pure(ctx, span, "FLUSH");
