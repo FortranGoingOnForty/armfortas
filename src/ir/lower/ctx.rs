@@ -151,6 +151,10 @@ pub(super) struct LoopScope {
     pub(super) exit_name: Option<String>,
     pub(super) header: BlockId, // CYCLE target
     pub(super) exit: BlockId,   // EXIT target
+    /// Number of active lexical cleanup scopes owned outside this loop.
+    /// EXIT and CYCLE must clean every later scope before reaching their
+    /// respective loop target while retaining scopes that enclose the loop.
+    pub(super) cleanup_depth: usize,
 }
 
 /// Non-loop construct target for named EXIT statements.
@@ -535,6 +539,7 @@ impl<'a> LowerCtx<'a> {
             exit_name,
             header,
             exit,
+            cleanup_depth: self.lexical_cleanups.len(),
         });
     }
 

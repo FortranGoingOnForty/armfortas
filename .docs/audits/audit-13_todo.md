@@ -24,13 +24,13 @@ Status: `[~]`
 
 ## Tranche 1: Lexical cleanup on loop control edges
 
-Status: `[ ]`
+Status: `[x]`
 
-- `[ ]` A13-01: retain the owning lexical-cleanup depth in every loop scope.
-- `[ ]` Route named and unnamed `EXIT` and `CYCLE` through cleanup-aware edges.
-- `[ ]` Test finalization and allocatable cleanup across one and multiple
+- `[x]` A13-01: retain the owning lexical-cleanup depth in every loop scope.
+- `[x]` Route named and unnamed `EXIT` and `CYCLE` through cleanup-aware edges.
+- `[x]` Test finalization and allocatable cleanup across one and multiple
   nested `BLOCK` constructs at O0 and O3.
-- `[ ]` Confirm ordinary loop branches with no crossed cleanup remain stable.
+- `[x]` Confirm ordinary loop branches with no crossed cleanup remain stable.
 
 ## Tranche 2: Fail-closed parser boundaries
 
