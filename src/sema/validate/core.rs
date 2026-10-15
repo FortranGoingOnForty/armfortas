@@ -10427,6 +10427,33 @@ fn validate_derived_type(
     span: Span,
 ) {
     let is_abstract = type_attrs.iter().any(|a| matches!(a, TypeAttr::Abstract));
+    let is_sequence = type_attrs.iter().any(|a| matches!(a, TypeAttr::Sequence));
+    if is_sequence && is_abstract {
+        ctx.error(
+            span,
+            format!("SEQUENCE derived type '{}' must not be ABSTRACT", name),
+        );
+    }
+    if is_sequence
+        && type_attrs
+            .iter()
+            .any(|attr| matches!(attr, TypeAttr::Bind(_)))
+    {
+        ctx.error(
+            span,
+            format!("SEQUENCE derived type '{}' must not be BIND(C)", name),
+        );
+    }
+    if is_sequence
+        && type_attrs
+            .iter()
+            .any(|attr| matches!(attr, TypeAttr::Extends(_)))
+    {
+        ctx.error(
+            span,
+            format!("SEQUENCE derived type '{}' must not use EXTENDS", name),
+        );
+    }
 
     for tbp in type_bound_procs {
         // Deferred procedures only allowed in abstract types.
@@ -12586,6 +12613,33 @@ end program local_types
             "{errors:?}"
         );
         assert_eq!(errors.len(), 3, "{errors:?}");
+    }
+
+    #[test]
+    fn sequence_types_reject_incompatible_header_attributes() {
+        for (header, expected) in [
+            (
+                "type, abstract :: item",
+                "SEQUENCE derived type 'item' must not be ABSTRACT",
+            ),
+            (
+                "type, bind(c) :: item",
+                "SEQUENCE derived type 'item' must not be BIND(C)",
+            ),
+            (
+                "type, extends(parent) :: item",
+                "SEQUENCE derived type 'item' must not use EXTENDS",
+            ),
+        ] {
+            let source = format!(
+                "program p\n  type :: parent\n    integer :: value\n  end type parent\n  {header}\n    sequence\n    integer :: value\n  end type item\nend program p\n"
+            );
+            let errors = errors_from(&source);
+            assert!(
+                errors.iter().any(|error| error == expected),
+                "missing SEQUENCE constraint diagnostic {expected:?}: {errors:?}"
+            );
+        }
     }
 
     #[test]

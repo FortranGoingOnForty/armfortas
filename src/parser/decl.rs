@@ -1048,6 +1048,11 @@ impl<'a> Parser<'a> {
             let text = self.peek_text().to_lowercase();
 
             if text == "contains" {
+                if attrs.iter().any(|attr| matches!(attr, TypeAttr::Sequence)) {
+                    return Err(self.error(
+                        "SEQUENCE derived type must not have a CONTAINS section".to_string(),
+                    ));
+                }
                 self.advance();
                 self.skip_newlines();
                 // Parse type-bound procedures until 'end type'.
@@ -1143,9 +1148,25 @@ impl<'a> Parser<'a> {
                 ));
             }
             if text == "sequence" {
-                return Err(self.error(
-                    "SEQUENCE derived types are recognized but not yet implemented".to_string(),
-                ));
+                if !self.at_stmt_end_after(1) {
+                    return Err(
+                        self.error("SEQUENCE statement in a derived type must be bare".to_string())
+                    );
+                }
+                if saw_component {
+                    return Err(self.error(
+                        "SEQUENCE statement must precede derived-type components".to_string(),
+                    ));
+                }
+                if attrs.iter().any(|attr| matches!(attr, TypeAttr::Sequence)) {
+                    return Err(self.error(
+                        "duplicate SEQUENCE statement in derived type definition".to_string(),
+                    ));
+                }
+                self.advance();
+                attrs.push(TypeAttr::Sequence);
+                self.skip_newlines();
+                continue;
             }
 
             // PROCEDURE(interface_name) [, attrs] :: name [=> initial-target]
@@ -2127,17 +2148,41 @@ end type item",
                 "unrecognized statement 'arbitrary' in derived-type binding part",
             ),
             (
-                "type :: item\n  sequence\nend type item",
-                "SEQUENCE derived types are recognized but not yet implemented",
-            ),
-            (
                 "type :: item\ncontains\n  private\nend type item",
                 "binding PRIVATE statement is recognized but not yet implemented",
+            ),
+            (
+                "type :: item\n  integer :: value\n  sequence\nend type item",
+                "SEQUENCE statement must precede derived-type components",
+            ),
+            (
+                "type :: item\n  sequence\n  sequence\nend type item",
+                "duplicate SEQUENCE statement in derived type definition",
+            ),
+            (
+                "type :: item\n  sequence\ncontains\nend type item",
+                "SEQUENCE derived type must not have a CONTAINS section",
             ),
         ] {
             let error = parse_derived_type_error(source);
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn derived_type_preserves_a_well_placed_sequence_statement() {
+        let tokens = Lexer::tokenize(
+            "type :: item\n  sequence\n  integer :: value\nend type item",
+            0,
+        )
+        .unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.advance();
+        let decl = parser.parse_derived_type_def().unwrap();
+        let Decl::DerivedTypeDef { attrs, .. } = decl.node else {
+            panic!("not a derived type definition");
+        };
+        assert!(attrs.contains(&TypeAttr::Sequence));
     }
 
     #[test]
