@@ -45876,6 +45876,40 @@ fn time_report_prints_phase_table() {
 }
 
 #[test]
+fn time_report_covers_token_ast_and_ir_terminal_modes() {
+    let src = write_program("program p\n  print *, 1\nend program\n", "f90");
+    for (flag, extension, final_phase) in [
+        ("--emit-tokens", "tokens", "lex"),
+        ("--emit-ast", "ast", "parse"),
+        ("--emit-ir", "ir", "opt"),
+    ] {
+        let out = unique_path("terminal_timer", extension);
+        let result = Command::new(compiler("armfortas"))
+            .args([
+                "--time-report",
+                flag,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("terminal time-report compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "{flag} failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(out.is_file(), "{flag} did not publish its artifact");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains("Phase"), "{flag}: {stderr}");
+        assert!(stderr.contains(final_phase), "{flag}: {stderr}");
+        assert!(stderr.contains("Total"), "{flag}: {stderr}");
+        let _ = std::fs::remove_file(out);
+    }
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
 fn time_report_prints_phase_table_on_error() {
     let src = write_program("program p\n  error stop 'oops'\nend program\n", "f90");
     let out = unique_path("timer_err", "bin");

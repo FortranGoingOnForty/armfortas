@@ -2532,6 +2532,7 @@ fn compile_with_bundled_runtime_inner(
             buf.push_str(&format!("{:?}\n", t));
         }
         write_primary_output_atomic(&out, &buf)?;
+        phases.report();
         return Ok(());
     }
 
@@ -2563,6 +2564,7 @@ fn compile_with_bundled_runtime_inner(
             buf.push_str(&format!("{:#?}\n", u));
         }
         write_primary_output_atomic(&out, &buf)?;
+        phases.report();
         return Ok(());
     }
 
@@ -2717,6 +2719,7 @@ fn compile_with_bundled_runtime_inner(
         let ir_text = ir_printer::print_module(&ir_module);
         let out = opts.output_path();
         write_primary_output_atomic(&out, &ir_text)?;
+        phases.report();
         return Ok(());
     }
 
