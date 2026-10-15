@@ -30068,6 +30068,29 @@ fn accepted_but_unimplemented_flags_emit_warnings() {
 }
 
 #[test]
+fn warning_suppression_cannot_hide_unsupported_debug_flags() {
+    let src = write_program("program p\nend program p\n", "f90");
+    let out = unique_path("unsupported_debug", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-w", "-garbage", "-c"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("compiler launch failed");
+
+    assert_eq!(result.status.code(), Some(1), "unexpected driver status");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("unsupported debug option: -garbage"),
+        "missing unsupported-debug diagnostic:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!out.exists(), "unsupported debug flag produced an object");
+
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fpm_gnu_debug_probe_flags_compile_link_and_run_hello_world() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

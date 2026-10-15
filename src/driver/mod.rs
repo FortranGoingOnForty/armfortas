@@ -1279,8 +1279,11 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             }
 
             // ---- Debug / introspection ----
-            "-g" | "-g1" | "-g2" | "-g3" | "-g0" => opts.debug_info = true,
-            arg if arg.starts_with("-g") => opts.debug_info = true,
+            "-g" | "-g1" | "-g2" | "-g3" => opts.debug_info = true,
+            "-g0" => opts.debug_info = false,
+            arg if arg.starts_with("-g") => {
+                return Err(format!("unsupported debug option: {arg}"));
+            }
             "-v" | "--verbose" => opts.verbose = true,
             "--time-report" => opts.time_report = true,
             arg if arg.starts_with("--diagnostics-format=") => {
@@ -4523,6 +4526,39 @@ mod tests {
         assert_eq!(parse_level(&["-O3", "-O"]), OptLevel::O1);
         assert_eq!(parse_level(&["-O", "-O0"]), OptLevel::O0);
         assert_eq!(parse_level(&["-O", "-O2"]), OptLevel::O2);
+    }
+
+    #[test]
+    fn debug_flags_accept_only_explicit_levels_and_obey_last_option_wins() {
+        let parse_debug = |flags: &[&str]| {
+            let mut args = flags
+                .iter()
+                .map(|flag| (*flag).to_string())
+                .collect::<Vec<_>>();
+            args.push("hello.f90".to_string());
+            let ParsedCli::Compile(opts) = parse_cli(&args).expect("debug flags must parse") else {
+                panic!("debug flags unexpectedly produced an information action");
+            };
+            opts.debug_info
+        };
+
+        for flag in ["-g", "-g1", "-g2", "-g3"] {
+            assert!(
+                parse_debug(&[flag]),
+                "{flag} must request debug information"
+            );
+        }
+        assert!(!parse_debug(&["-g0"]), "-g0 must disable debug information");
+        assert!(!parse_debug(&["-g", "-g0"]));
+        assert!(parse_debug(&["-g0", "-g"]));
+
+        for flag in ["-g4", "-ggdb", "-garbage"] {
+            let error = match parse_cli(&[flag.to_string(), "hello.f90".to_string()]) {
+                Ok(_) => panic!("unsupported debug suffix must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(error, format!("unsupported debug option: {flag}"));
+        }
     }
 
     #[test]
