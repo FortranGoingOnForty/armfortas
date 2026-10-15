@@ -6603,6 +6603,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
                     deallocate_owned_string_bases(b, &call_arg_character_temps);
                 }
+            } else {
+                unreachable!("CALL callee must be a procedure designator after validation");
             }
         }
 

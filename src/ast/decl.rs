@@ -304,6 +304,10 @@ pub enum TypeAttr {
     Public,
     Private,
     Abstract,
+    /// The standalone `SEQUENCE` statement in a derived-type component part.
+    /// Retained explicitly so semantic checks and module-boundary work do not
+    /// have to infer a non-extensible layout contract from source order.
+    Sequence,
     Bind(Option<String>),
     Extends(String),
 }

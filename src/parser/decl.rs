@@ -974,9 +974,11 @@ impl<'a> Parser<'a> {
         // Already consumed 'type'. Next could be :: or , attrs.
 
         let mut attrs = Vec::new();
+        let mut saw_type_attr = false;
 
         // Parse type attributes: abstract, bind(c), extends(parent), public, private
         while self.eat(&TokenKind::Comma) {
+            saw_type_attr = true;
             let text = self.peek_text().to_lowercase();
             match text.as_str() {
                 "abstract" => {
@@ -999,15 +1001,33 @@ impl<'a> Parser<'a> {
                 "extends" => {
                     self.advance();
                     self.expect(&TokenKind::LParen)?;
+                    if self.peek() != &TokenKind::Identifier {
+                        return Err(self.error(format!(
+                            "expected parent type name in EXTENDS, got {}",
+                            self.peek()
+                        )));
+                    }
                     let parent = self.advance().clone().text;
                     self.expect(&TokenKind::RParen)?;
                     attrs.push(TypeAttr::Extends(parent));
                 }
-                _ => break,
+                _ => {
+                    return Err(self.error(format!(
+                        "unsupported or invalid derived-type attribute '{}'",
+                        self.peek_text()
+                    )));
+                }
             }
         }
 
-        self.eat(&TokenKind::ColonColon);
+        if saw_type_attr {
+            self.expect(&TokenKind::ColonColon)?;
+        } else {
+            self.eat(&TokenKind::ColonColon);
+        }
+        if self.peek() != &TokenKind::Identifier {
+            return Err(self.error(format!("expected derived type name, got {}", self.peek())));
+        }
         let name = self.advance().clone().text;
         if self.peek() == &TokenKind::LParen {
             return Err(
@@ -1028,6 +1048,11 @@ impl<'a> Parser<'a> {
             let text = self.peek_text().to_lowercase();
 
             if text == "contains" {
+                if attrs.iter().any(|attr| matches!(attr, TypeAttr::Sequence)) {
+                    return Err(self.error(
+                        "SEQUENCE derived type must not have a CONTAINS section".to_string(),
+                    ));
+                }
                 self.advance();
                 self.skip_newlines();
                 // Parse type-bound procedures until 'end type'.
@@ -1053,16 +1078,27 @@ impl<'a> Parser<'a> {
                         self.advance();
                         self.eat(&TokenKind::ColonColon);
                         loop {
+                            if self.peek() != &TokenKind::Identifier {
+                                return Err(self.error(format!(
+                                    "expected final subroutine name, got {}",
+                                    self.peek()
+                                )));
+                            }
                             final_procs.push(self.advance().clone().text);
                             if !self.eat(&TokenKind::Comma) {
                                 break;
                             }
                         }
+                    } else if proc_text == "private" {
+                        return Err(self.error(
+                            "binding PRIVATE statement is recognized but not yet implemented"
+                                .to_string(),
+                        ));
                     } else {
-                        // Skip unknown lines in contains section.
-                        while !self.at_stmt_end() {
-                            self.advance();
-                        }
+                        return Err(self.error(format!(
+                            "unrecognized statement '{}' in derived-type binding part",
+                            self.peek_text()
+                        )));
                     }
                     self.skip_newlines();
                 }
@@ -1111,6 +1147,27 @@ impl<'a> Parser<'a> {
                     "PUBLIC statement is not permitted in a derived type definition".to_string(),
                 ));
             }
+            if text == "sequence" {
+                if !self.at_stmt_end_after(1) {
+                    return Err(
+                        self.error("SEQUENCE statement in a derived type must be bare".to_string())
+                    );
+                }
+                if saw_component {
+                    return Err(self.error(
+                        "SEQUENCE statement must precede derived-type components".to_string(),
+                    ));
+                }
+                if attrs.iter().any(|attr| matches!(attr, TypeAttr::Sequence)) {
+                    return Err(self.error(
+                        "duplicate SEQUENCE statement in derived type definition".to_string(),
+                    ));
+                }
+                self.advance();
+                attrs.push(TypeAttr::Sequence);
+                self.skip_newlines();
+                continue;
+            }
 
             // PROCEDURE(interface_name) [, attrs] :: name [=> initial-target]
             // Procedure pointer components inside a derived type.
@@ -1120,24 +1177,43 @@ impl<'a> Parser<'a> {
                     let comp_start = self.current_span();
                     self.advance(); // consume 'procedure'
                     self.advance(); // consume '('
-                    let iface_name = if self.peek() == &TokenKind::Identifier {
-                        self.advance().clone().text
-                    } else {
-                        String::new()
-                    };
+                    if self.peek() != &TokenKind::Identifier {
+                        return Err(self.error(format!(
+                            "expected procedure interface name, got {}",
+                            self.peek()
+                        )));
+                    }
+                    let iface_name = self.advance().clone().text;
                     self.expect(&TokenKind::RParen)?;
 
                     let mut comp_attrs = Vec::new();
+                    let mut saw_pointer = false;
+                    let mut saw_pass = false;
+                    let mut saw_nopass = false;
                     while self.eat(&TokenKind::Comma) {
                         let attr_text = self.peek_text().to_lowercase();
                         match attr_text.as_str() {
                             "pointer" => {
+                                if saw_pointer {
+                                    return Err(self.error(
+                                        "duplicate POINTER procedure component attribute"
+                                            .to_string(),
+                                    ));
+                                }
                                 self.advance();
                                 comp_attrs.push(crate::ast::decl::Attribute::Pointer);
+                                saw_pointer = true;
                             }
                             "nopass" => {
+                                if saw_pass || saw_nopass {
+                                    return Err(self.error(
+                                        "PASS and NOPASS procedure component attributes conflict"
+                                            .to_string(),
+                                    ));
+                                }
                                 self.advance();
                                 comp_attrs.push(crate::ast::decl::Attribute::NoPass);
+                                saw_nopass = true;
                             }
                             "public" => {
                                 self.advance();
@@ -1147,26 +1223,53 @@ impl<'a> Parser<'a> {
                                 self.advance();
                                 comp_attrs.push(crate::ast::decl::Attribute::Private);
                             }
-                            "pass" | "deferred" | "non_overridable" => {
+                            "pass" => {
+                                if saw_pass || saw_nopass {
+                                    return Err(self.error(
+                                        "PASS and NOPASS procedure component attributes conflict"
+                                            .to_string(),
+                                    ));
+                                }
                                 self.advance();
+                                saw_pass = true;
+                                if self.peek() == &TokenKind::LParen {
+                                    return Err(self.error(
+                                        "named PASS on a procedure pointer component is recognized but not yet implemented"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                            "deferred" | "non_overridable" => {
+                                return Err(self.error(format!(
+                                    "{} is not a procedure component attribute",
+                                    self.peek_text().to_ascii_uppercase()
+                                )));
                             }
                             _ => {
-                                self.advance();
+                                return Err(self.error(format!(
+                                    "unsupported or invalid procedure component attribute '{}'",
+                                    self.peek_text()
+                                )));
                             }
                         }
                     }
 
-                    if self.peek() == &TokenKind::ColonColon {
-                        self.advance();
+                    if !saw_pointer {
+                        return Err(self.error(
+                            "procedure component declaration requires POINTER".to_string(),
+                        ));
                     }
+                    self.expect(&TokenKind::ColonColon)?;
 
                     let mut entities = Vec::new();
                     loop {
-                        let entity_name = if self.peek() == &TokenKind::Identifier {
-                            self.advance().clone().text
-                        } else {
-                            String::new()
-                        };
+                        if self.peek() != &TokenKind::Identifier {
+                            return Err(self.error(format!(
+                                "expected procedure component name, got {}",
+                                self.peek()
+                            )));
+                        }
+                        let entity_name = self.advance().clone().text;
 
                         // F2008 §4.5.4.5: a procedure pointer component may
                         // carry a default initial association.
@@ -1228,11 +1331,10 @@ impl<'a> Parser<'a> {
                 components.push(comp);
                 saw_component = true;
             } else {
-                // Skip unrecognized lines.
-                while !self.at_stmt_end() {
-                    self.advance();
-                }
-                self.skip_newlines();
+                return Err(self.error(format!(
+                    "unrecognized statement '{}' in derived-type component part",
+                    self.peek_text()
+                )));
             }
         }
 
@@ -1272,6 +1374,12 @@ impl<'a> Parser<'a> {
         // interface and attrs prefix is shared across the whole list, so
         // `procedure :: a, b, c` binds all three.
         let interface = if self.eat(&TokenKind::LParen) {
+            if self.peek() != &TokenKind::Identifier {
+                return Err(self.error(format!(
+                    "expected type-bound procedure interface name, got {}",
+                    self.peek()
+                )));
+            }
             let iface = self.advance().clone().text;
             self.expect(&TokenKind::RParen)?;
             Some(iface)
@@ -1280,7 +1388,9 @@ impl<'a> Parser<'a> {
         };
         let mut proc_attrs = Vec::new();
         let mut pass_name = None;
+        let mut saw_attr = false;
         while self.eat(&TokenKind::Comma) {
+            saw_attr = true;
             let text = self.peek_text().to_lowercase();
             match text.as_str() {
                 "pass" => {
@@ -1299,14 +1409,35 @@ impl<'a> Parser<'a> {
                 "nopass" | "deferred" | "non_overridable" | "public" | "private" => {
                     proc_attrs.push(self.advance().clone().text);
                 }
-                _ => break,
+                _ => {
+                    return Err(self.error(format!(
+                        "unsupported or invalid type-bound procedure attribute '{}'",
+                        self.peek_text()
+                    )));
+                }
             }
         }
-        self.eat(&TokenKind::ColonColon);
+        if saw_attr {
+            self.expect(&TokenKind::ColonColon)?;
+        } else {
+            self.eat(&TokenKind::ColonColon);
+        }
         let mut procs = Vec::new();
         loop {
+            if self.peek() != &TokenKind::Identifier {
+                return Err(self.error(format!(
+                    "expected type-bound procedure name, got {}",
+                    self.peek()
+                )));
+            }
             let name = self.advance().clone().text;
             let binding = if self.eat(&TokenKind::Arrow) {
+                if self.peek() != &TokenKind::Identifier {
+                    return Err(self.error(format!(
+                        "expected type-bound procedure target, got {}",
+                        self.peek()
+                    )));
+                }
                 Some(self.advance().clone().text)
             } else {
                 None
@@ -1343,10 +1474,21 @@ impl<'a> Parser<'a> {
                 "public" | "private" => {
                     proc_attrs.push(self.advance().clone().text);
                 }
-                _ => break,
+                _ => {
+                    return Err(self.error(format!(
+                        "unsupported or invalid generic binding attribute '{}'",
+                        self.peek_text()
+                    )));
+                }
             }
         }
-        self.eat(&TokenKind::ColonColon);
+        self.expect(&TokenKind::ColonColon)?;
+        if self.peek() != &TokenKind::Identifier {
+            return Err(self.error(format!(
+                "expected generic binding name, got {}",
+                self.peek()
+            )));
+        }
         let mut name = self.advance().clone().text;
         // Handle operator(...) form.
         if name.eq_ignore_ascii_case("operator") || name.eq_ignore_ascii_case("assignment") {
@@ -1357,10 +1499,24 @@ impl<'a> Parser<'a> {
         }
         let mut bindings = Vec::new();
         if self.eat(&TokenKind::Arrow) {
+            if self.peek() != &TokenKind::Identifier {
+                return Err(self.error(format!(
+                    "expected specific binding name, got {}",
+                    self.peek()
+                )));
+            }
             bindings.push(self.advance().clone().text);
             while self.eat(&TokenKind::Comma) {
+                if self.peek() != &TokenKind::Identifier {
+                    return Err(self.error(format!(
+                        "expected specific binding name, got {}",
+                        self.peek()
+                    )));
+                }
                 bindings.push(self.advance().clone().text);
             }
+        } else {
+            return Err(self.error("generic binding requires '=>' and a specific name".into()));
         }
         let binding = bindings.first().cloned();
         Ok(TypeBoundProc {
@@ -1768,6 +1924,15 @@ mod tests {
         panic!("could not parse as declaration error: {}", src);
     }
 
+    fn parse_derived_type_error(src: &str) -> ParseError {
+        let tokens = Lexer::tokenize(src, 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.advance();
+        parser
+            .parse_derived_type_def()
+            .expect_err("invalid derived type syntax was accepted")
+    }
+
     // ---- Type declarations ----
 
     #[test]
@@ -1969,6 +2134,105 @@ end type item",
                 .expect_err("invalid component access statement was accepted");
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn derived_type_rejects_unrecognized_component_and_binding_lines() {
+        for (source, expected) in [
+            (
+                "type :: item\n  arbitrary component text\nend type item",
+                "unrecognized statement 'arbitrary' in derived-type component part",
+            ),
+            (
+                "type :: item\ncontains\n  arbitrary binding text\nend type item",
+                "unrecognized statement 'arbitrary' in derived-type binding part",
+            ),
+            (
+                "type :: item\ncontains\n  private\nend type item",
+                "binding PRIVATE statement is recognized but not yet implemented",
+            ),
+            (
+                "type :: item\n  integer :: value\n  sequence\nend type item",
+                "SEQUENCE statement must precede derived-type components",
+            ),
+            (
+                "type :: item\n  sequence\n  sequence\nend type item",
+                "duplicate SEQUENCE statement in derived type definition",
+            ),
+            (
+                "type :: item\n  sequence\ncontains\nend type item",
+                "SEQUENCE derived type must not have a CONTAINS section",
+            ),
+        ] {
+            let error = parse_derived_type_error(source);
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn derived_type_preserves_a_well_placed_sequence_statement() {
+        let tokens = Lexer::tokenize(
+            "type :: item\n  sequence\n  integer :: value\nend type item",
+            0,
+        )
+        .unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.advance();
+        let decl = parser.parse_derived_type_def().unwrap();
+        let Decl::DerivedTypeDef { attrs, .. } = decl.node else {
+            panic!("not a derived type definition");
+        };
+        assert!(attrs.contains(&TypeAttr::Sequence));
+    }
+
+    #[test]
+    fn derived_type_rejects_invalid_attributes_and_incomplete_bindings() {
+        for (source, expected) in [
+            (
+                "type, banana :: item\nend type item",
+                "invalid derived-type attribute 'banana'",
+            ),
+            (
+                "type :: item\n  procedure(iface), pointer, banana :: callback\nend type item",
+                "invalid procedure component attribute 'banana'",
+            ),
+            (
+                "type :: item\n  procedure(iface), deferred, pointer :: callback\nend type item",
+                "DEFERRED is not a procedure component attribute",
+            ),
+            (
+                "type :: item\n  procedure(iface), nopass :: callback\nend type item",
+                "procedure component declaration requires POINTER",
+            ),
+            (
+                "type :: item\ncontains\n  procedure, banana :: callback\nend type item",
+                "invalid type-bound procedure attribute 'banana'",
+            ),
+            (
+                "type :: item\ncontains\n  generic, banana :: visit => visit_one\nend type item",
+                "invalid generic binding attribute 'banana'",
+            ),
+            (
+                "type :: item\ncontains\n  generic :: visit\nend type item",
+                "generic binding requires '=>' and a specific name",
+            ),
+        ] {
+            let error = parse_derived_type_error(source);
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn type_bound_named_pass_remains_supported() {
+        let tokens =
+            Lexer::tokenize("procedure(iface), pass(self) :: apply => apply_impl", 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.advance();
+        let tbps = parser.parse_type_bound_proc().unwrap();
+        assert_eq!(tbps.len(), 1);
+        assert_eq!(tbps[0].name, "apply");
+        assert_eq!(tbps[0].binding.as_deref(), Some("apply_impl"));
+        assert_eq!(tbps[0].pass_name.as_deref(), Some("self"));
     }
 
     #[test]

@@ -15,7 +15,7 @@ Legend:
 
 ## Tranche 0: Preserve the audit baseline
 
-Status: `[~]`
+Status: `[x]`
 
 - `[x]` Record the baseline-pinned Audit 13 report.
 - `[x]` Record all confirmed, Low, policy, coverage, and plausible items in
@@ -34,14 +34,14 @@ Status: `[x]`
 
 ## Tranche 2: Fail-closed parser boundaries
 
-Status: `[ ]`
+Status: `[x]`
 
-- `[ ]` A13-04: restrict explicit `CALL` to procedure-designator forms.
-- `[ ]` Retain semantic and lowering invariant checks for invalid call shapes.
-- `[ ]` A13-05: diagnose unrecognized derived-type component/binding lines and
+- `[x]` A13-04: restrict explicit `CALL` to procedure-designator forms.
+- `[x]` Retain semantic and lowering invariant checks for invalid call shapes.
+- `[x]` A13-05: diagnose unrecognized derived-type component/binding lines and
   invalid attributes before recovery.
-- `[ ]` Low L05: reject statement labels outside the Fortran five-digit range.
-- `[ ]` Assert diagnostics, exit status, and no output publication for each
+- `[x]` Low L05: reject statement labels outside the Fortran five-digit range.
+- `[x]` Assert diagnostics, exit status, and no output publication for each
   invalid-source family.
 
 ## Tranche 3: One truthful processor-kind model

@@ -10,7 +10,41 @@ use crate::ast::expr::{Expr, SpannedExpr};
 use crate::ast::openmp::OpenMpConstruct;
 use crate::ast::stmt::*;
 use crate::ast::Spanned;
-use crate::lexer::TokenKind;
+use crate::lexer::{Span, TokenKind};
+
+/// F2018 R611: a statement label is one to five decimal digits and at least
+/// one digit must be nonzero.  Keep this lexical rule centralized so label
+/// definitions and every label-reference syntax cannot drift apart.
+fn statement_label_value(text: &str, span: Span) -> Result<u64, ParseError> {
+    if text.is_empty()
+        || text.len() > 5
+        || !text.bytes().all(|byte| byte.is_ascii_digit())
+        || text.bytes().all(|byte| byte == b'0')
+    {
+        return Err(ParseError {
+            span,
+            msg:
+                "statement label must be one to five decimal digits with at least one nonzero digit"
+                    .into(),
+        });
+    }
+    Ok(text
+        .parse()
+        .expect("validated statement label must fit in u64"))
+}
+
+fn validate_statement_label_expr(expr: &SpannedExpr) -> Result<(), ParseError> {
+    if let Expr::IntegerLiteral { text, kind } = &expr.node {
+        if kind.is_some() {
+            return Err(ParseError {
+                span: expr.span,
+                msg: "statement label must not have a kind suffix".into(),
+            });
+        }
+        statement_label_value(text, expr.span)?;
+    }
+    Ok(())
+}
 
 impl<'a> Parser<'a> {
     /// Parse a single statement.
@@ -36,8 +70,7 @@ impl<'a> Parser<'a> {
                     next_kind,
                     TokenKind::Identifier | TokenKind::IntegerLiteral | TokenKind::LParen
                 ) {
-                    let label_text = self.advance().clone().text;
-                    let label: u64 = label_text.parse().unwrap_or(0);
+                    let label = self.parse_statement_label()?;
                     let inner = self.parse_stmt()?;
                     let span = span_from_to(start, self.prev_span());
                     return Ok(Spanned::new(
@@ -246,6 +279,14 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_statement_label(&mut self) -> Result<u64, ParseError> {
+        if self.peek() != &TokenKind::IntegerLiteral {
+            return Err(self.error(format!("expected statement label, got {}", self.peek())));
+        }
+        let token = self.advance().clone();
+        statement_label_value(&token.text, token.span)
+    }
+
     /// Parse a block of statements until a terminating keyword.
     pub fn parse_stmt_block(
         &mut self,
@@ -305,11 +346,11 @@ impl<'a> Parser<'a> {
 
         // Arithmetic IF: if (expr) label, label, label
         if self.peek() == &TokenKind::IntegerLiteral {
-            let neg: u64 = self.advance().clone().text.parse().unwrap_or(0);
+            let neg = self.parse_statement_label()?;
             self.expect(&TokenKind::Comma)?;
-            let zero: u64 = self.advance().clone().text.parse().unwrap_or(0);
+            let zero = self.parse_statement_label()?;
             self.expect(&TokenKind::Comma)?;
-            let pos: u64 = self.advance().clone().text.parse().unwrap_or(0);
+            let pos = self.parse_statement_label()?;
             let span = span_from_to(start, self.prev_span());
             return Ok(Spanned::new(
                 Stmt::ArithmeticIf {
@@ -888,7 +929,7 @@ impl<'a> Parser<'a> {
         }
         // Plain GOTO label.
         if self.peek() == &TokenKind::IntegerLiteral {
-            let label: u64 = self.advance().clone().text.parse().unwrap_or(0);
+            let label = self.parse_statement_label()?;
             let span = span_from_to(start, self.prev_span());
             return Ok(Spanned::new(Stmt::Goto { label }, span));
         }
@@ -897,7 +938,7 @@ impl<'a> Parser<'a> {
             self.advance();
             let mut labels = Vec::new();
             loop {
-                let l: u64 = self.advance().clone().text.parse().unwrap_or(0);
+                let l = self.parse_statement_label()?;
                 labels.push(l);
                 if !self.eat(&TokenKind::Comma) {
                     break;
@@ -917,28 +958,23 @@ impl<'a> Parser<'a> {
         let span = span_from_to(start, self.prev_span());
         // The expression parser handles the (args) part as FunctionCall.
         // Extract the args from the FunctionCall if present.
-        if let Expr::FunctionCall {
+        let (callee, args) = if let Expr::FunctionCall {
             callee: inner,
             args,
         } = callee.node
         {
-            Ok(Spanned::new(
-                Stmt::Call {
-                    callee: *inner,
-                    args,
-                },
-                span,
-            ))
+            (*inner, args)
         } else {
             // Call with no arguments: call sub
-            Ok(Spanned::new(
-                Stmt::Call {
-                    callee,
-                    args: Vec::new(),
-                },
-                span,
-            ))
+            (callee, Vec::new())
+        };
+        if !callee.node.is_procedure_designator_shape() {
+            return Err(ParseError {
+                span: callee.span,
+                msg: "CALL requires a procedure designator".into(),
+            });
         }
+        Ok(Spanned::new(Stmt::Call { callee, args }, span))
     }
 
     fn parse_print(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
@@ -949,6 +985,7 @@ impl<'a> Parser<'a> {
         } else {
             self.parse_expr()?
         };
+        validate_statement_label_expr(&format)?;
         let mut items = Vec::new();
         if self.eat(&TokenKind::Comma) {
             // Share the WRITE/READ item-list parser so a PRINT output list
@@ -1473,7 +1510,7 @@ impl<'a> Parser<'a> {
 
         // Classic labeled DO (F77): DO 10 I = 1, N
         let terminating_label = if self.peek() == &TokenKind::IntegerLiteral {
-            Some(self.advance().clone().text.parse().unwrap_or(0))
+            Some(self.parse_statement_label()?)
         } else {
             None
         };
@@ -1656,6 +1693,7 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::LParen)?;
         let controls = self.parse_io_control_list()?;
         self.expect(&TokenKind::RParen)?;
+        Self::validate_positional_format_label(&controls)?;
         let items = self.parse_io_item_list()?;
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Write { controls, items }, span))
@@ -1670,6 +1708,7 @@ impl<'a> Parser<'a> {
             self.advance();
             let controls = self.parse_io_control_list()?;
             self.expect(&TokenKind::RParen)?;
+            Self::validate_positional_format_label(&controls)?;
             let items = self.parse_io_item_list()?;
             let span = span_from_to(start, self.prev_span());
             Ok(Spanned::new(Stmt::Read { controls, items }, span))
@@ -1681,6 +1720,7 @@ impl<'a> Parser<'a> {
             } else {
                 self.parse_expr()?
             };
+            validate_statement_label_expr(&format)?;
             let controls = vec![IoControl {
                 keyword: None,
                 value: format,
@@ -1779,6 +1819,12 @@ impl<'a> Parser<'a> {
                     } else {
                         self.parse_expr()?
                     };
+                    if matches!(
+                        kw.to_ascii_lowercase().as_str(),
+                        "fmt" | "err" | "end" | "eor"
+                    ) {
+                        validate_statement_label_expr(&val)?;
+                    }
                     controls.push(IoControl {
                         keyword: Some(kw),
                         value: val,
@@ -1805,6 +1851,21 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(controls)
+    }
+
+    fn validate_positional_format_label(controls: &[IoControl]) -> Result<(), ParseError> {
+        let mut positional = 0;
+        for control in controls {
+            if control.keyword.is_some() {
+                continue;
+            }
+            positional += 1;
+            if positional == 2 {
+                validate_statement_label_expr(&control.value)?;
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Parse I/O item list after the control list (for WRITE/READ/INQUIRE).
@@ -2551,9 +2612,81 @@ mod tests {
     }
 
     #[test]
+    fn statement_labels_accept_one_to_five_digits_and_leading_zeroes() {
+        for (source, expected) in [
+            ("1 continue\n", 1),
+            ("99999 continue\n", 99_999),
+            ("00010 continue\n", 10),
+        ] {
+            let stmt = parse_one(source);
+            let Stmt::Labeled { label, .. } = stmt.node else {
+                panic!("valid label was not retained: {source}");
+            };
+            assert_eq!(label, expected, "wrong value for {source}");
+        }
+    }
+
+    #[test]
+    fn statement_label_grammar_is_enforced_at_every_parser_site() {
+        for source in [
+            "100000 continue\n",
+            "000000 continue\n",
+            "0 continue\n",
+            "10_8 continue\n",
+            "goto 100000\n",
+            "goto (1, 100000), choice\n",
+            "if (value) 1, 100000, 2\n",
+            "do 100000 i = 1, 2\n",
+            "print 100000, value\n",
+            "read 100000, value\n",
+            "write(10, 100000) value\n",
+            "read(10, end=100000) value\n",
+        ] {
+            let error = parse_error(source);
+            assert!(
+                error.to_string().contains("statement label must"),
+                "unexpected diagnostic for {source}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn call_stmt() {
         let s = parse_one("call sub(a, b)\n");
         assert!(matches!(s.node, Stmt::Call { .. }));
+    }
+
+    #[test]
+    fn call_accepts_name_and_component_procedure_designators() {
+        for source in [
+            "call sub\n",
+            "call sub(a, b)\n",
+            "call object%method()\n",
+            "call objects(i)%method(a)\n",
+        ] {
+            assert!(
+                matches!(parse_one(source).node, Stmt::Call { .. }),
+                "valid CALL was rejected: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_rejects_non_procedure_designator_expressions() {
+        for source in [
+            "call 1 + 2\n",
+            "call (sub)\n",
+            "call sub() + 1\n",
+            "call (object)%method()\n",
+        ] {
+            let error = parse_error(source);
+            assert!(
+                error
+                    .to_string()
+                    .contains("CALL requires a procedure designator"),
+                "unexpected diagnostic for {source}: {error}"
+            );
+        }
     }
 
     #[test]
