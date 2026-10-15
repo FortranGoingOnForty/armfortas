@@ -15,11 +15,11 @@
 ! CHECK: class-star=ok
 ! CHECK: class-assign=ok
 ! CHECK: actual-calls=20
-! IR_CHECK: call @afs_modproc_deferred_char_result_temp_dealloc_mod_make_text
+! IR_CHECK: call @afs_modproc$v2$m$deferred_char_result_temp_dealloc_mod$p$make_text
 ! IR_CHECK: rt_call @__afs_deallocate
-! IR_CHECK: call @afs_modproc_deferred_char_result_temp_dealloc_mod_make_text
+! IR_CHECK: call @afs_modproc$v2$m$deferred_char_result_temp_dealloc_mod$p$make_text
 ! IR_CHECK: rt_call @__afs_deallocate
-! IR_CHECK: call @afs_modproc_deferred_char_result_temp_dealloc_mod_make_text
+! IR_CHECK: call @afs_modproc$v2$m$deferred_char_result_temp_dealloc_mod$p$make_text
 ! IR_CHECK: rt_call @__afs_deallocate
 module deferred_char_result_temp_dealloc_mod
   implicit none

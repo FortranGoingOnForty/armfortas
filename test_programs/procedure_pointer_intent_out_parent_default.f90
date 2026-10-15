@@ -1,5 +1,5 @@
 ! CHECK: ok
-! IR_CHECK: afs_modproc_m_default_fn
+! IR_CHECK: afs_modproc$v2$m$m$p$default_fn
 ! REPRO_CHECK: run
 module m
   implicit none

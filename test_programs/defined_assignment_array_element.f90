@@ -1,5 +1,5 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_modproc_m_assign_log
+! IR_CHECK: call @afs_modproc$v2$m$m$p$assign_log
 ! REPRO_CHECK: run
 module m
   implicit none

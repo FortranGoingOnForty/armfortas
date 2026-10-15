@@ -7,7 +7,7 @@
 ! IR_CHECK: if_end
 ! IR_CHECK: select_end
 ! IR_CHECK: construct_exit_cleanup
-! IR_CHECK: call @afs_modproc_ar43_named_if_select_exit_m_finish_guard
+! IR_CHECK: call @afs_modproc$v2$m$ar43_named_if_select_exit_m$p$finish_guard
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj
 ! REPRO_CHECK: run

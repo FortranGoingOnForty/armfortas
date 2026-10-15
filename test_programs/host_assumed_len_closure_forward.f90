@@ -1,6 +1,6 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_internal_afs_modproc_host_assumed_len_closure_forward_m_outer_0(%7, %6)
-! IR_CHECK: func @afs_internal_afs_modproc_host_assumed_len_closure_forward_m_outer_0(%0: ptr<ptr<i8>>, %1: i64) -> void
+! IR_CHECK: call @afs_internal_afs_modproc$v2$m$host_assumed_len_closure_forward_m$p$outer_0(%7, %6)
+! IR_CHECK: func @afs_internal_afs_modproc$v2$m$host_assumed_len_closure_forward_m$p$outer_0(%0: ptr<ptr<i8>>, %1: i64) -> void
 ! REPRO_CHECK: run
 module host_assumed_len_closure_forward_m
   implicit none

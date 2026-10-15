@@ -1,5 +1,5 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_modproc_defined_unary_minus_derived_m_neg_delta
+! IR_CHECK: call @afs_modproc$v2$m$defined_unary_minus_derived_m$p$neg_delta
 ! REPRO_CHECK: run
 module defined_unary_minus_derived_m
   implicit none

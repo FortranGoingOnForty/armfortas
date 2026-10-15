@@ -1,5 +1,5 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_internal_afs_modproc_m_second
+! IR_CHECK: call @afs_internal_afs_modproc$v2$m$m$p$second
 ! IR_CHECK: : f32
 ! REPRO_CHECK: run
 module m

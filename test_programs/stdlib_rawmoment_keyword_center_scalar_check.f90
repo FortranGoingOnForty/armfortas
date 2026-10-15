@@ -1,6 +1,6 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_modproc_stats_like_moment_all_c2
-! IR_NOT: call @afs_modproc_stats_like_moment_dim_c2
+! IR_CHECK: call @afs_modproc$v2$m$stats_like$p$moment_all_c2
+! IR_NOT: call @afs_modproc$v2$m$stats_like$p$moment_dim_c2
 ! REPRO_CHECK: run
 module stats_like
   implicit none

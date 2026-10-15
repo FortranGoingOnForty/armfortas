@@ -1,6 +1,6 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_modproc_defined_assignment_logical_kind_allocatable_m_log2_assign(
-! IR_CHECK: call @afs_modproc_defined_assignment_logical_kind_allocatable_m_log8_assign(
+! IR_CHECK: call @afs_modproc$v2$m$defined_assignment_logical_kind_allocatable_m$p$log2_assign(
+! IR_CHECK: call @afs_modproc$v2$m$defined_assignment_logical_kind_allocatable_m$p$log8_assign(
 ! REPRO_CHECK: run
 module defined_assignment_logical_kind_allocatable_m
   implicit none

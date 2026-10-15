@@ -3,9 +3,9 @@
 ! first, followed by its enclosing BLOCK object and the procedure object.
 !
 ! CHECK: 3 321
-! IR_CHECK: call @afs_modproc_ar43_block_return_cleanup_m_finish_guard
-! IR_CHECK: call @afs_modproc_ar43_block_return_cleanup_m_finish_guard
-! IR_CHECK: call @afs_modproc_ar43_block_return_cleanup_m_finish_guard
+! IR_CHECK: call @afs_modproc$v2$m$ar43_block_return_cleanup_m$p$finish_guard
+! IR_CHECK: call @afs_modproc$v2$m$ar43_block_return_cleanup_m$p$finish_guard
+! IR_CHECK: call @afs_modproc$v2$m$ar43_block_return_cleanup_m$p$finish_guard
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj
 ! REPRO_CHECK: run

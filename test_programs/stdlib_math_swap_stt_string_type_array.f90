@@ -1,8 +1,8 @@
 ! CHECK: ok
-! IR_CHECK: afs_modproc_string_m_assign_string_char
-! IR_CHECK: afs_modproc_string_m_eq_string_char
-! IR_CHECK: afs_modproc_string_m_gt_string_char
-! IR_CHECK: afs_modproc_string_m_gt_char_string
+! IR_CHECK: afs_modproc$v2$m$string_m$p$assign_string_char
+! IR_CHECK: afs_modproc$v2$m$string_m$p$eq_string_char
+! IR_CHECK: afs_modproc$v2$m$string_m$p$gt_string_char
+! IR_CHECK: afs_modproc$v2$m$string_m$p$gt_char_string
 ! REPRO_CHECK: run
 module string_m
   implicit none

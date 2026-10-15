@@ -11,8 +11,8 @@
 ! PHASE_TRIANGULATE: ir|asm|obj|repro
 ! IR_CHECK: pointer_dealloc_cleanup
 ! IR_CHECK: call @afs_deallocate_pointer
-! IR_CHECK: call @afs_modproc_ar56_scalar_pointer_deallocate_lifecycle_m_finish_owner
-! IR_CHECK: call @afs_modproc_ar56_scalar_pointer_deallocate_lifecycle_m_finish_child
+! IR_CHECK: call @afs_modproc$v2$m$ar56_scalar_pointer_deallocate_lifecycle_m$p$finish_owner
+! IR_CHECK: call @afs_modproc$v2$m$ar56_scalar_pointer_deallocate_lifecycle_m$p$finish_child
 module ar56_scalar_pointer_deallocate_lifecycle_m
   implicit none
 

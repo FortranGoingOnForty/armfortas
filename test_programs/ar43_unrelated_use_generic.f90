@@ -4,7 +4,7 @@
 !
 ! CHECK: 42 101
 ! IR_CHECK: func @unrelated_importer(
-! IR_CHECK: call @afs_modproc_ar43_generic_owner_module_g(
+! IR_CHECK: call @afs_modproc$v2$m$ar43_generic_owner$p$module_g(
 ! IR_CHECK: func @g(
 ! IR_CHECK: func @__prog_ar43_unrelated_use_generic(
 ! IR_CHECK: call @g(
