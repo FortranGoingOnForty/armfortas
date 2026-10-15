@@ -2194,14 +2194,48 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             // `@enumtype <public|private> <name> <e1> <e2> ...`
             let mut it = rest.split_whitespace();
             let access = match it.next() {
+                Some("public") => Access::Public,
                 Some("private") => Access::Private,
+                Some(_) | None if version >= 19 => {
+                    return Err(format!(
+                        "{}: corrupt .amod file (malformed @enumtype access); rebuild the provider module",
+                        path.display()
+                    ));
+                }
                 _ => Access::Public,
             };
-            if let Some(name) = it.next() {
-                let enums: Vec<String> = it.map(|e| e.to_string()).collect();
-                if !enums.is_empty() {
-                    enum_types.push((name.to_string(), enums, access));
+            let name = it.next();
+            let enums: Vec<String> = it.map(str::to_string).collect();
+            if version >= 19 {
+                let Some(name) = name else {
+                    return Err(format!(
+                        "{}: corrupt .amod file (missing @enumtype name); rebuild the provider module",
+                        path.display()
+                    ));
+                };
+                if enums.is_empty() {
+                    return Err(format!(
+                        "{}: corrupt .amod file (@enumtype '{}' has no enumerators); rebuild the provider module",
+                        path.display(),
+                        name
+                    ));
                 }
+                let mut unique = HashSet::new();
+                if let Some(duplicate) = enums
+                    .iter()
+                    .map(|enumerator| enumerator.to_ascii_lowercase())
+                    .find(|enumerator| !unique.insert(enumerator.clone()))
+                {
+                    return Err(format!(
+                        "{}: corrupt .amod file (@enumtype '{}' repeats enumerator '{}'); rebuild the provider module",
+                        path.display(),
+                        name,
+                        duplicate
+                    ));
+                }
+                enum_types.push((name.to_string(), enums, access));
+            } else if let Some(name) = name.filter(|_| !enums.is_empty()) {
+                enum_types.push((name.to_string(), enums, access));
             }
         } else if trimmed.starts_with("@type ") {
             types.push(parse_amod_type(trimmed, &mut lines, version, path)?);
@@ -2209,24 +2243,78 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             // Generic interface block: header is `@interface <name>[, private]`,
             // body lists `@specific <proc>` until `@end interface`.
             let header = name.trim();
-            let (iface_name, access) = match header.split_once(", ") {
-                Some((n, attr)) if attr.split(", ").any(|a| a == "private") => (
-                    crate::ast::canonical_generic_spec_name(n.trim()),
-                    Access::Private,
-                ),
-                _ => (
-                    crate::ast::canonical_generic_spec_name(header),
-                    Access::Public,
-                ),
+            let header_parts = split_attrs_top_level(header);
+            let malformed_header = header_parts.is_empty()
+                || header_parts[0].trim().is_empty()
+                || header_parts.len() > 2
+                || (header_parts.len() == 2 && header_parts[1] != "private");
+            if version >= 19 && malformed_header {
+                return Err(format!(
+                    "{}: corrupt .amod file (malformed @interface header); rebuild the provider module",
+                    path.display()
+                ));
+            }
+            let raw_name = header_parts.first().map_or(header, String::as_str).trim();
+            let iface_name = crate::ast::canonical_generic_spec_name(raw_name);
+            let access = if header_parts.get(1).is_some_and(|attr| attr == "private") {
+                Access::Private
+            } else {
+                Access::Public
             };
             let mut specifics = Vec::new();
+            let mut saw_end = false;
             for iline in lines.by_ref() {
                 let t = iline.trim();
-                if t.starts_with("@end interface") {
+                if t == "@end interface" {
+                    saw_end = true;
                     break;
                 }
                 if let Some(spec) = t.strip_prefix("@specific ") {
-                    specifics.push(spec.trim().to_string());
+                    let spec = spec.trim();
+                    if version >= 19 && (spec.is_empty() || spec.split_whitespace().count() != 1) {
+                        return Err(format!(
+                            "{}: corrupt .amod file (malformed @specific in interface '{}'); rebuild the provider module",
+                            path.display(),
+                            iface_name
+                        ));
+                    }
+                    specifics.push(spec.to_string());
+                } else if version >= 19 {
+                    return Err(format!(
+                        "{}: corrupt .amod file (unknown interface record '{}' in '{}'); rebuild the provider module",
+                        path.display(),
+                        t,
+                        iface_name
+                    ));
+                }
+            }
+            if version >= 19 && !saw_end {
+                return Err(format!(
+                    "{}: corrupt .amod file (unterminated @interface '{}'); rebuild the provider module",
+                    path.display(),
+                    iface_name
+                ));
+            }
+            if version >= 19 && specifics.is_empty() {
+                return Err(format!(
+                    "{}: corrupt .amod file (@interface '{}' has no specifics); rebuild the provider module",
+                    path.display(),
+                    iface_name
+                ));
+            }
+            if version >= 19 {
+                let mut unique = HashSet::new();
+                if let Some(duplicate) = specifics
+                    .iter()
+                    .map(|specific| specific.to_ascii_lowercase())
+                    .find(|specific| !unique.insert(specific.clone()))
+                {
+                    return Err(format!(
+                        "{}: corrupt .amod file (@interface '{}' repeats specific '{}'); rebuild the provider module",
+                        path.display(),
+                        iface_name,
+                        duplicate
+                    ));
                 }
             }
             interfaces.push(AmodInterface {
@@ -4529,6 +4617,32 @@ mod tests {
             assert!(
                 error.contains("invalid variable type"),
                 "{encoded}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_schema_rejects_malformed_enum_and_interface_records() {
+        let bodies = [
+            "@enumtype friend color red green\n",
+            "@enumtype public color\n",
+            "@enumtype public color red RED\n",
+            "@interface pick, public\n  @specific pick_i\n@end interface\n",
+            "@interface pick\n@end interface\n",
+            "@interface pick\n  @specific pick_i\n  @specific PICK_I\n@end interface\n",
+            "@interface pick\n  @specific pick_i\n",
+            "@interface pick\n  @unknown pick_i\n@end interface\n",
+        ];
+        for body in bodies {
+            let text = add_integrity_headers(format!(
+                "#!amod {AMOD_VERSION}\n# module: schema_test\n# default-access: public\n\n{body}"
+            ));
+            let error = read_amod_content(&text, Path::new("schema_test.amod"))
+                .expect_err("malformed current-version enum/interface record was accepted");
+            assert!(
+                error.contains("corrupt .amod file")
+                    && error.contains("rebuild the provider module"),
+                "{body:?}: {error}"
             );
         }
     }
