@@ -1344,7 +1344,8 @@ fn reduce_real<T: RealReductionValue>(
         })
     });
     let Some((thread_num, team_size, barrier, reduction)) = context else {
-        return Err(AFS_OMP_ERROR_NO_TEAM);
+        return T::combine(operator, original_value, private_value)
+            .ok_or(AFS_OMP_ERROR_INVALID_REDUCTION);
     };
 
     {
@@ -1450,7 +1451,8 @@ fn reduce_complex<T: ComplexReductionValue>(
         })
     });
     let Some((thread_num, team_size, barrier, reduction)) = context else {
-        return Err(AFS_OMP_ERROR_NO_TEAM);
+        return T::combine(operator, original_value, private_value)
+            .ok_or(AFS_OMP_ERROR_INVALID_REDUCTION);
     };
 
     {
@@ -1570,7 +1572,12 @@ pub extern "C" fn afs_omp_reduce_i64(
         })
     });
     let Some((thread_num, team_size, barrier, reduction)) = context else {
-        return AFS_OMP_ERROR_NO_TEAM;
+        let combined = combine_i64_reduction(operator, original_value, private_value)
+            .expect("validated OpenMP reduction operator became invalid");
+        unsafe {
+            *result = combined;
+        }
+        return AFS_OMP_SUCCESS;
     };
 
     {
@@ -1663,13 +1670,11 @@ pub extern "C" fn afs_omp_reduce_i64_nowait(
             .last()
             .map(|team| Arc::clone(&team.reduction))
     });
-    let Some(reduction) = reduction else {
-        return AFS_OMP_ERROR_NO_TEAM;
-    };
-
-    let _workspace = reduction
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _workspace = reduction.as_ref().map(|reduction| {
+        reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
     let original = unsafe { read_i64_reduction_storage(original_storage, storage_bytes) };
     let combined = combine_i64_reduction(operator, original, private_value)
         .expect("validated OpenMP reduction operator became invalid");
@@ -1694,13 +1699,11 @@ fn reduce_real_nowait<T: RealReductionValue>(
             .last()
             .map(|team| Arc::clone(&team.reduction))
     });
-    let Some(reduction) = reduction else {
-        return AFS_OMP_ERROR_NO_TEAM;
-    };
-
-    let _workspace = reduction
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _workspace = reduction.as_ref().map(|reduction| {
+        reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
     let original = unsafe { original_storage.read_unaligned() };
     let combined = T::combine(operator, original, private_value)
         .expect("validated OpenMP REAL reduction operator became invalid");
@@ -1751,13 +1754,11 @@ fn reduce_complex_nowait<T: ComplexReductionValue>(
             .last()
             .map(|team| Arc::clone(&team.reduction))
     });
-    let Some(reduction) = reduction else {
-        return AFS_OMP_ERROR_NO_TEAM;
-    };
-
-    let _workspace = reduction
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _workspace = reduction.as_ref().map(|reduction| {
+        reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
     let private_value = unsafe { private_value.read_unaligned() };
     let original = unsafe { original_storage.read_unaligned() };
     let combined = T::combine(operator, original, private_value)
@@ -2054,7 +2055,17 @@ pub extern "C" fn afs_omp_reduce_array(
         })
     });
     let Some((thread_num, team_size, barrier, reduction)) = context else {
-        return AFS_OMP_ERROR_NO_TEAM;
+        let original =
+            unsafe { std::slice::from_raw_parts(original_storage.cast::<u8>(), byte_len) };
+        let private = unsafe { std::slice::from_raw_parts(private_storage.cast::<u8>(), byte_len) };
+        let mut combined = original.to_vec();
+        if !combine_reduction_arrays(operator, kind, &mut combined, private) {
+            return AFS_OMP_ERROR_INVALID_REDUCTION;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(combined.as_ptr(), result_storage.cast::<u8>(), byte_len)
+        };
+        return AFS_OMP_SUCCESS;
     };
     {
         let mut workspace = reduction
@@ -2135,12 +2146,11 @@ pub extern "C" fn afs_omp_reduce_array_nowait(
             .last()
             .map(|team| Arc::clone(&team.reduction))
     });
-    let Some(reduction) = reduction else {
-        return AFS_OMP_ERROR_NO_TEAM;
-    };
-    let _workspace = reduction
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _workspace = reduction.as_ref().map(|reduction| {
+        reduction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
     let original =
         unsafe { std::slice::from_raw_parts_mut(original_storage.cast::<u8>(), byte_len) };
     let private = unsafe { std::slice::from_raw_parts(private_storage.cast::<u8>(), byte_len) };
@@ -4069,9 +4079,10 @@ mod tests {
     }
 
     #[test]
-    fn reduction_runtime_rejects_invalid_context_or_arguments() {
+    fn reduction_runtime_uses_one_thread_implicit_initial_team() {
         reset_thread_state();
         let mut result = -1;
+        let mut nowait_result = 3_i32;
         let mut real32_result = -1.0;
         let mut real64_result = -1.0;
         let complex32_private = [1.0_f32, 2.0];
@@ -4079,14 +4090,95 @@ mod tests {
         let mut complex32_result = [-1.0_f32, -1.0];
         let complex64_private = [1.0_f64, 2.0];
         let complex64_original = [3.0_f64, 4.0];
-        let mut complex64_result = [-1.0_f64, -1.0];
+        let mut complex64_result = complex64_original;
         let private_array = [1_i32, 2];
         let original_array = [3_i32, 4];
         let mut result_array = [-1_i32; 2];
         assert_eq!(
             afs_omp_reduce_i64(AFS_OMP_REDUCTION_ADD, 1, 2, &mut result),
-            AFS_OMP_ERROR_NO_TEAM
+            AFS_OMP_SUCCESS
         );
+        assert_eq!(
+            afs_omp_reduce_i64_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                1,
+                std::ptr::addr_of_mut!(nowait_result).cast(),
+                4,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_f32(AFS_OMP_REDUCTION_ADD, 1.0, 2.0, &mut real32_result),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_f64(AFS_OMP_REDUCTION_ADD, 1.0, 2.0, &mut real64_result),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_f32_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                1.0,
+                std::ptr::addr_of_mut!(real32_result),
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_c32(
+                AFS_OMP_REDUCTION_ADD,
+                &complex32_private,
+                &complex32_original,
+                &mut complex32_result,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_c64_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                &complex64_private,
+                &mut complex64_result,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_array(
+                AFS_OMP_REDUCTION_ADD,
+                AFS_OMP_REDUCTION_KIND_I32,
+                private_array.as_ptr().cast(),
+                original_array.as_ptr().cast(),
+                2,
+                result_array.as_mut_ptr().cast(),
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(
+            afs_omp_reduce_array_nowait(
+                AFS_OMP_REDUCTION_ADD,
+                AFS_OMP_REDUCTION_KIND_I32,
+                private_array.as_ptr().cast(),
+                result_array.as_mut_ptr().cast(),
+                2,
+            ),
+            AFS_OMP_SUCCESS
+        );
+        assert_eq!(result, 3);
+        assert_eq!(nowait_result, 4);
+        assert_eq!(real32_result, 4.0);
+        assert_eq!(real64_result, 3.0);
+        assert_eq!(complex32_result, [4.0, 6.0]);
+        assert_eq!(complex64_result, [4.0, 6.0]);
+        assert_eq!(result_array, [5, 8]);
+    }
+
+    #[test]
+    fn reduction_runtime_rejects_invalid_arguments() {
+        reset_thread_state();
+        let mut result = -1_i64;
+        let mut real64_result = -1.0;
+        let complex32_private = [1.0_f32, 2.0];
+        let complex32_original = [3.0_f32, 4.0];
+        let mut complex32_result = [-1.0_f32, -1.0];
+        let mut result_array = [-1_i32; 2];
         assert_eq!(
             afs_omp_reduce_i64(99, 1, 2, &mut result),
             AFS_OMP_ERROR_INVALID_REDUCTION
@@ -4100,30 +4192,9 @@ mod tests {
                 AFS_OMP_REDUCTION_ADD,
                 1,
                 std::ptr::addr_of_mut!(result).cast(),
-                4,
-            ),
-            AFS_OMP_ERROR_NO_TEAM
-        );
-        assert_eq!(
-            afs_omp_reduce_i64_nowait(99, 1, std::ptr::addr_of_mut!(result).cast(), 4,),
-            AFS_OMP_ERROR_INVALID_REDUCTION
-        );
-        assert_eq!(
-            afs_omp_reduce_i64_nowait(
-                AFS_OMP_REDUCTION_ADD,
-                1,
-                std::ptr::addr_of_mut!(result).cast(),
                 3,
             ),
             AFS_OMP_ERROR_INVALID_REDUCTION
-        );
-        assert_eq!(
-            afs_omp_reduce_i64_nowait(AFS_OMP_REDUCTION_ADD, 1, std::ptr::null_mut(), 4,),
-            AFS_OMP_ERROR_INVALID_REDUCTION
-        );
-        assert_eq!(
-            afs_omp_reduce_f32(AFS_OMP_REDUCTION_ADD, 1.0, 2.0, &mut real32_result),
-            AFS_OMP_ERROR_NO_TEAM
         );
         assert_eq!(
             afs_omp_reduce_f64(99, 1.0, 2.0, &mut real64_result),
@@ -4134,40 +4205,6 @@ mod tests {
             AFS_OMP_ERROR_INVALID_REDUCTION
         );
         assert_eq!(
-            afs_omp_reduce_f32_nowait(
-                AFS_OMP_REDUCTION_ADD,
-                1.0,
-                std::ptr::addr_of_mut!(real32_result),
-            ),
-            AFS_OMP_ERROR_NO_TEAM
-        );
-        assert_eq!(
-            afs_omp_reduce_f64_nowait(99, 1.0, std::ptr::addr_of_mut!(real64_result),),
-            AFS_OMP_ERROR_INVALID_REDUCTION
-        );
-        assert_eq!(
-            afs_omp_reduce_f64_nowait(AFS_OMP_REDUCTION_ADD, 1.0, std::ptr::null_mut()),
-            AFS_OMP_ERROR_INVALID_REDUCTION
-        );
-        assert_eq!(
-            afs_omp_reduce_c32(
-                AFS_OMP_REDUCTION_ADD,
-                &complex32_private,
-                &complex32_original,
-                &mut complex32_result,
-            ),
-            AFS_OMP_ERROR_NO_TEAM
-        );
-        assert_eq!(
-            afs_omp_reduce_c64(
-                AFS_OMP_REDUCTION_MAX,
-                &complex64_private,
-                &complex64_original,
-                &mut complex64_result,
-            ),
-            AFS_OMP_ERROR_INVALID_REDUCTION
-        );
-        assert_eq!(
             afs_omp_reduce_c32(
                 AFS_OMP_REDUCTION_ADD,
                 std::ptr::null(),
@@ -4175,14 +4212,6 @@ mod tests {
                 &mut complex32_result,
             ),
             AFS_OMP_ERROR_INVALID_REDUCTION
-        );
-        assert_eq!(
-            afs_omp_reduce_c64_nowait(
-                AFS_OMP_REDUCTION_ADD,
-                &complex64_private,
-                &mut complex64_result,
-            ),
-            AFS_OMP_ERROR_NO_TEAM
         );
         assert_eq!(
             afs_omp_reduce_c32_nowait(
@@ -4211,32 +4240,15 @@ mod tests {
             AFS_OMP_ERROR_INVALID_REDUCTION
         );
         assert_eq!(
-            afs_omp_reduce_array(
-                AFS_OMP_REDUCTION_ADD,
-                AFS_OMP_REDUCTION_KIND_I32,
-                private_array.as_ptr().cast(),
-                original_array.as_ptr().cast(),
-                2,
-                result_array.as_mut_ptr().cast(),
-            ),
-            AFS_OMP_ERROR_NO_TEAM
-        );
-        assert_eq!(
             afs_omp_reduce_array_nowait(
                 AFS_OMP_REDUCTION_ADD,
                 AFS_OMP_REDUCTION_KIND_I32,
-                private_array.as_ptr().cast(),
+                result_array.as_ptr().cast(),
                 result_array.as_mut_ptr().cast(),
                 0,
             ),
             AFS_OMP_ERROR_INVALID_REDUCTION
         );
-        assert_eq!(result, -1);
-        assert_eq!(real32_result, -1.0);
-        assert_eq!(real64_result, -1.0);
-        assert_eq!(complex32_result, [-1.0, -1.0]);
-        assert_eq!(complex64_result, [-1.0, -1.0]);
-        assert_eq!(result_array, [-1, -1]);
     }
 
     fn static_bounds(

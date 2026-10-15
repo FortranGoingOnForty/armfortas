@@ -23036,6 +23036,89 @@ end program
 }
 
 #[test]
+fn fopenmp_initial_team_reductions_run_without_explicit_parallel_region() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_initial_team_reductions_run_without_explicit_parallel_region count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: i, isum, empty_sum, nowait_sum
+  integer :: values(3)
+  real(kind=4) :: rsum
+  complex(kind=8) :: csum
+  isum = 10
+  values = [10, 20, 30]
+  rsum = 1.5_4
+  csum = cmplx(1.0_8, 2.0_8, kind=8)
+!$omp do reduction(+:isum,values,rsum,csum)
+  do i = 1, 3
+    isum = isum + i
+    values(i) = values(i) + i
+    rsum = rsum + real(i, kind=4)
+    csum = csum + cmplx(real(i, kind=8), -real(i, kind=8), kind=8)
+  end do
+!$omp end do
+  empty_sum = 7
+!$omp do reduction(+:empty_sum)
+  do i = 1, 0
+    empty_sum = empty_sum + i
+  end do
+!$omp end do
+  nowait_sum = 4
+!$omp do reduction(+:nowait_sum)
+  do i = 1, 2
+    nowait_sum = nowait_sum + i
+  end do
+!$omp end do nowait
+  if (isum /= 16 .or. any(values /= [11, 22, 33])) error stop 1
+  if (abs(rsum - 7.5_4) > 0.001_4) error stop 2
+  if (abs(real(csum, kind=8) - 7.0_8) > 0.000001_8) error stop 3
+  if (abs(aimag(csum) + 4.0_8) > 0.000001_8) error stop 4
+  if (empty_sum /= 7 .or. nowait_sum /= 7) error stop 5
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_initial_team_reductions", "bin");
+        let runtime_cache = unique_dir("openmp_initial_team_reductions_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "initial-team OpenMP reductions should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "initial-team OpenMP reductions failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_standalone_do_scalar_reductions_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
