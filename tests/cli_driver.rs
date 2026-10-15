@@ -47339,6 +47339,39 @@ fn invalid_explicit_static_runtime_path_fails_without_output() {
 }
 
 #[test]
+fn missing_linker_launch_uses_linker_exit_category() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=missing_linker_launch_uses_linker_exit_category count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let missing_linker = unique_path("missing_linker", "tool");
+    let src = write_program("program p\nend program p\n", "f90");
+    let out = unique_path("missing_linker", "bin");
+    assert!(!missing_linker.exists());
+
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("AFS_LD_PATH", &missing_linker)
+        .output()
+        .expect("missing-linker compile failed to spawn");
+
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "linker launch must use the documented linker exit category: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("cannot run linker"), "{stderr}");
+    assert!(!out.exists(), "linker launch failure published an output");
+
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
 fn missing_input_file_reports_io_error() {
     let result = Command::new(compiler("armfortas"))
         .args(["/nonexistent/path/source.f90"])
