@@ -77,15 +77,15 @@ Status: `[x]`
 
 ## Tranche 5: OpenMP initial team and collapsed-loop scaling
 
-Status: `[ ]`
+Status: `[x]`
 
-- `[ ]` A13-15: represent the implicit initial team consistently for scalar,
+- `[x]` A13-15: represent the implicit initial team consistently for scalar,
   array, real, complex, blocking, and `NOWAIT` reductions.
-- `[ ]` Cover standalone reduction loops outside explicit parallel regions at
+- `[x]` Cover standalone reduction loops outside explicit parallel regions at
   O0 and O3, including empty loops.
-- `[ ]` A13-16: replace linear-per-iteration triangular index reconstruction
+- `[x]` A13-16: replace linear-per-iteration triangular index reconstruction
   with checked constant- or logarithmic-time inversion.
-- `[ ]` Verify first/middle/last indices, both stride signs, empty rows, and
+- `[x]` Verify first/middle/last indices, both stride signs, empty rows, and
   near-limit arithmetic with operation-count tests rather than timing.
 
 ## Tranche 6: Separate-compilation and nominal-type truth
