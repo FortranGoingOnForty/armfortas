@@ -7404,7 +7404,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         Stmt::Exit { name } => {
             if let Some(lp) = ctx.find_exit_loop(name) {
                 let exit = lp.exit;
-                b.branch(exit, vec![]);
+                let cleanup_depth = lp.cleanup_depth;
+                let exit_edge =
+                    lexical_cleanup_edge_to_depth(b, ctx, exit, cleanup_depth, "loop_exit_cleanup");
+                b.branch(exit_edge, vec![]);
             } else if let Some((exit, cleanup_depth)) = ctx.find_construct_exit(name) {
                 let exit_edge = lexical_cleanup_edge_to_depth(
                     b,
@@ -7420,7 +7423,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         Stmt::Cycle { name } => {
             if let Some(lp) = ctx.find_cycle_loop(name) {
                 let header = lp.header;
-                b.branch(header, vec![]);
+                let cleanup_depth = lp.cleanup_depth;
+                let cycle_edge = lexical_cleanup_edge_to_depth(
+                    b,
+                    ctx,
+                    header,
+                    cleanup_depth,
+                    "loop_cycle_cleanup",
+                );
+                b.branch(cycle_edge, vec![]);
             }
         }
 
