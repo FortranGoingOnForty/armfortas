@@ -46,17 +46,17 @@ Status: `[x]`
 
 ## Tranche 3: One truthful processor-kind model
 
-Status: `[ ]`
+Status: `[x]`
 
-- `[ ]` A13-02: share one complete `SELECTED_INT_KIND` /
+- `[x]` A13-02: share one complete `SELECTED_INT_KIND` /
   `SELECTED_REAL_KIND` algorithm between constant and runtime paths.
-- `[ ]` Preserve optional/keyword positions, including absent `P`, `R`, and
+- `[x]` Preserve optional/keyword positions, including absent `P`, `R`, and
   `RADIX`, reordered keywords, and all defined negative results.
-- `[ ]` A13-09: make `*_KINDS` rank-one arrays populated from the same model.
-- `[ ]` Make `REAL128` negative while kind 16 is unsupported.
-- `[ ]` A13-03: lower aggregate `C_SIZEOF` from semantic interoperable layout
+- `[x]` A13-09: make `*_KINDS` rank-one arrays populated from the same model.
+- `[x]` Make `REAL128` negative while kind 16 is unsupported.
+- `[x]` A13-03: lower aggregate `C_SIZEOF` from semantic interoperable layout
   before pointer decay.
-- `[ ]` Test scalar/array kinds, padded `BIND(C)` records, runtime extents, and
+- `[x]` Test scalar/array kinds, padded `BIND(C)` records, runtime extents, and
   literal/runtime equivalence at O0 and O3.
 
 ## Tranche 4: Central OpenMP nesting model
