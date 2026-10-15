@@ -104,22 +104,22 @@ Status: `[x]`
 
 ## Tranche 7: Runtime I/O and driver lifecycle
 
-Status: `[ ]`
+Status: `[x]`
 
-- `[ ]` A13-11: reject invalid `OPEN` enumerated values before file/unit state
+- `[x]` A13-11: reject invalid `OPEN` enumerated values before file/unit state
   changes and report through `IOSTAT`/`IOMSG`.
-- `[ ]` A13-12: implement common list-directed repeat counts, null values, and
+- `[x]` A13-12: implement common list-directed repeat counts, null values, and
   successful slash termination for every typed reader.
-- `[ ]` A13-13: make an explicit invalid `AFS_RUNTIME_PATH` fail closed.
-- `[ ]` Low L01: define and consistently implement the empty
+- `[x]` A13-13: make an explicit invalid `AFS_RUNTIME_PATH` fail closed.
+- `[x]` Low L01: define and consistently implement the empty
   `EXECUTE_COMMAND_LINE` policy.
-- `[ ]` Low L02: emit `--time-report` for successful token/AST/IR terminal
+- `[x]` Low L02: emit `--time-report` for successful token/AST/IR terminal
   modes.
-- `[ ]` Low L03: use the documented linker exit category when linker launch
+- `[x]` Low L03: use the documented linker exit category when linker launch
   fails.
-- `[ ]` Low L04: give multi-input temporary directories ownership guards and
+- `[x]` Low L04: give multi-input temporary directories ownership guards and
   clean partial objects on failure.
-- `[ ]` Historical residual R01: narrow broad `-g*` parsing so unsupported
+- `[x]` Historical residual R01: narrow broad `-g*` parsing so unsupported
   suffixes cannot become only a suppressible generic warning under `-w`.
 
 ## Tranche 8: ELF group and extended-index correctness
