@@ -967,6 +967,50 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     let iomsg_len = cb.iomsg_len;
     let missing_filename = fname.is_empty();
 
+    let invalid_specifier = [
+        (
+            "STATUS",
+            status,
+            &["old", "new", "replace", "scratch", "unknown"] as &[&str],
+        ),
+        (
+            "ACTION",
+            action_str.trim(),
+            &["read", "write", "readwrite"] as &[&str],
+        ),
+        (
+            "ACCESS",
+            access_str.trim(),
+            &["sequential", "direct", "stream"] as &[&str],
+        ),
+        (
+            "FORM",
+            form_str.trim(),
+            &["formatted", "unformatted"] as &[&str],
+        ),
+        (
+            "POSITION",
+            position_str.trim(),
+            &["asis", "rewind", "append"] as &[&str],
+        ),
+    ]
+    .into_iter()
+    .find(|(_, value, allowed)| {
+        !value.is_empty() && !allowed.iter().any(|candidate| candidate == value)
+    });
+    if let Some((name, value, _)) = invalid_specifier {
+        let message = format!("OPEN: invalid {name}= value '{value}'");
+        assign_iomsg(iomsg, iomsg_len, &message);
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+            return;
+        }
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+
     if is_scratch && !cb.filename.is_null() {
         let message = "OPEN: FILE= must not be specified with STATUS='SCRATCH'";
         assign_iomsg(iomsg, iomsg_len, message);
@@ -8386,6 +8430,98 @@ mod tests {
         drop(state);
 
         std::fs::remove_file(path).expect("remove scratch FILE sentinel");
+    }
+
+    #[test]
+    fn invalid_open_enum_values_fail_before_file_or_unit_state_changes() {
+        let path = format!(
+            "/tmp/afs_open_invalid_enum_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        let _ = std::fs::remove_file(&path);
+        let cases = [
+            ("STATUS", "invalid-status"),
+            ("ACTION", "invalid-action"),
+            ("ACCESS", "invalid-access"),
+            ("FORM", "invalid-form"),
+            ("POSITION", "invalid-position"),
+        ];
+
+        for (index, (specifier, invalid_value)) in cases.into_iter().enumerate() {
+            let unit = 47_100 + index as i32;
+            let mut iostat = -99i32;
+            let mut iomsg = [b'?'; 128];
+            let mut newunit = 12_345i32;
+            let mut cb = OpenControlBlock {
+                unit,
+                filename: path.as_ptr(),
+                filename_len: path.len() as i64,
+                status: "replace".as_ptr(),
+                status_len: 7,
+                action: "readwrite".as_ptr(),
+                action_len: 9,
+                access: "sequential".as_ptr(),
+                access_len: 10,
+                form: "formatted".as_ptr(),
+                form_len: 9,
+                recl: 0,
+                iostat: &mut iostat,
+                newunit: &mut newunit,
+                position: "rewind".as_ptr(),
+                position_len: 6,
+                leading_zero: std::ptr::null(),
+                leading_zero_len: 0,
+                iomsg: iomsg.as_mut_ptr(),
+                iomsg_len: iomsg.len() as i64,
+            };
+            match specifier {
+                "STATUS" => {
+                    cb.status = invalid_value.as_ptr();
+                    cb.status_len = invalid_value.len() as i64;
+                }
+                "ACTION" => {
+                    cb.action = invalid_value.as_ptr();
+                    cb.action_len = invalid_value.len() as i64;
+                }
+                "ACCESS" => {
+                    cb.access = invalid_value.as_ptr();
+                    cb.access_len = invalid_value.len() as i64;
+                }
+                "FORM" => {
+                    cb.form = invalid_value.as_ptr();
+                    cb.form_len = invalid_value.len() as i64;
+                }
+                "POSITION" => {
+                    cb.position = invalid_value.as_ptr();
+                    cb.position_len = invalid_value.len() as i64;
+                }
+                _ => unreachable!(),
+            }
+
+            afs_open(&cb);
+
+            assert_ne!(iostat, 0, "invalid {specifier}= must fail");
+            let message = String::from_utf8_lossy(&iomsg);
+            assert!(
+                message.contains(specifier),
+                "IOMSG must identify {specifier}=: {message:?}"
+            );
+            assert_eq!(
+                newunit, 12_345,
+                "invalid {specifier}= must fail before NEWUNIT allocation"
+            );
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "invalid {specifier}= must not create or truncate FILE="
+            );
+            let state = io_state().lock().unwrap_or_else(|error| error.into_inner());
+            assert!(
+                !state.units.contains_key(&unit),
+                "invalid {specifier}= must not connect the requested unit"
+            );
+            drop(state);
+        }
     }
 
     #[test]
