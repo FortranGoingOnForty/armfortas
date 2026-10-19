@@ -185,18 +185,40 @@ Closure evidence:
 
 ## Tranche 11: Release and benchmark fail-closed behavior
 
-Status: `[ ]`
+Status: `[x]`
 
-- `[ ]` A13-20: package committed root/submodule blobs or reject tracked dirty
+- `[x]` A13-20: package committed root/submodule blobs or reject tracked dirty
   state before constructing a release archive.
-- `[ ]` Low L07: make benchmark comparison require an existing exact baseline;
+- `[x]` Low L07: make benchmark comparison require an existing exact baseline;
   reserve baseline creation for an explicit update mode.
-- `[ ]` Low L08: make the release smoke compare normalized complete output and
+- `[x]` Low L08: make the release smoke compare normalized complete output and
   require empty stderr.
-- `[ ]` Low L09: content-hash every pinned official OpenMP source.
-- `[ ]` Low L10: quote and guard benchmark temporary cleanup correctly.
-- `[ ]` Low L11: correct native-vs-ELF afs-as routing documentation, or change
+- `[x]` Low L09: content-hash every pinned official OpenMP source.
+- `[x]` Low L10: quote and guard benchmark temporary cleanup correctly.
+- `[x]` Low L11: correct native-vs-ELF afs-as routing documentation, or change
   routing and prove the new default in a subprocess test.
+
+Closure evidence:
+
+- The source packager exports the root `HEAD` and every pinned submodule commit
+  from Git's object store. Its regression dirties and stages different root and
+  submodule bytes, then verifies that only the committed blobs enter the
+  deterministic archive.
+- Benchmark comparison now refuses a missing baseline, validates the complete
+  ordered identity set and row schema, and reserves creation for `--update`.
+  Its guarded, quoted cleanup owns only a `mktemp` directory beneath the
+  selected temporary root; the regression exercises a root containing spaces.
+- Release smoke validation accepts exactly one normalized `42` record and an
+  empty stderr stream. The checker is required in the packaged archive, and
+  focused tests reject substring-only matches, suffixes, extra/blank records,
+  and stderr diagnostics.
+- All 15 pinned OpenMP Examples sources now carry and verify SHA-256 identities,
+  matching the existing content-hash discipline for the pinned OpenMP V&V
+  sources.
+- README assembler claims now match the driver: native Apple-Silicon Mach-O
+  uses Apple `as`, x86_64 ELF uses in-process `afs-as`, and cross-target Mach-O
+  object generation uses embedded `afs-as`; a documentation contract test pins
+  those distinctions.
 
 ## Tranche 12: Convert plausible observations into decisions
 
