@@ -151,17 +151,37 @@ Status: `[x]`
 
 ## Tranche 10: Exact test-debt and platform coverage identities
 
-Status: `[ ]`
+Status: `[x]`
 
-- `[ ]` A13-17: represent harness failures by stage/kind and bind each XFAIL
+- `[x]` A13-17: represent harness failures by stage/kind and bind each XFAIL
   ID to an expected failure signature.
-- `[ ]` A13-18: require successful `-S` for every ordinary x86 differential
+- `[x]` A13-18: require successful `-S` for every ordinary x86 differential
   cell and compare an exact expected identity set.
-- `[ ]` A13-19: give afs-as and afs-ld exact per-platform skip manifests.
-- `[ ]` Coverage G01: add opt-in exact stdout/stderr/diagnostic directives and
+- `[x]` A13-19: give afs-as and afs-ld exact per-platform skip manifests.
+- `[x]` Coverage G01: add opt-in exact stdout/stderr/diagnostic directives and
   migrate tests whose complete stream is the contract.
-- `[ ]` Coverage G02: choose and enforce a CI tier for the 55 bencch suites and
+- `[x]` Coverage G02: choose and enforce a CI tier for the 55 bencch suites and
   inventory the nested future fixtures.
+
+Closure evidence:
+
+- XFAILs now carry structural stage/kind/signature contracts, and the x86
+  differential owns an exact 891-source identity manifest covering 2,298
+  ordinary O0/O2/O3 comparison cells plus 125 diagnostic sources.
+- afs-as exact platform manifests account for 40 macOS-arm64 and 875
+  Linux-x86_64 skip identities; afs-ld accounts for 57 macOS and 132 Linux
+  identities. Both complete standalone suites passed while establishing the
+  baselines.
+- `STDOUT_EXACT`, `STDERR_EXACT`, and `DIAGNOSTIC_EXACT` preserve the legacy
+  substring contract while allowing complete escaped-stream assertions.
+- CI now runs a native bencch O0 tier of 196 cells (31 frontend/stage/graph,
+  162 consistency-runtime, and 3 nested future-I/O cells). Exact manifests
+  account for all 55 authored suites, all 358 cases, and every nested
+  `test_programs` source plus its bencch owners.
+- Opening the bencch tier retired four stale XPASS expectations, aligned
+  check-comment whitespace semantics with the root harness, refreshed stage
+  capture assertions, and fixed the misleading missing-`END SELECT` parser
+  diagnostic it exposed.
 
 ## Tranche 11: Release and benchmark fail-closed behavior
 
