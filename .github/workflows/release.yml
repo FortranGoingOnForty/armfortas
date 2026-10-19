@@ -12,6 +12,7 @@ on:
       - "afs-ld"
       - "bencch"
       - "scripts/package-release-source.sh"
+      - "scripts/check-release-smoke-output.sh"
       - "scripts/validate-release-source.sh"
       - "tests/release_packaging.rs"
       - "tests/release_workflow.rs"

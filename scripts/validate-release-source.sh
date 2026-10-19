@@ -76,10 +76,8 @@ printf '%s\n' \
     'end program release_smoke' > "$smoke_dir/hello.f90"
 AFS_RUNTIME_CACHE="$validation_dir/runtime-cache" \
     "$compiler" "$smoke_dir/hello.f90" -o "$smoke_dir/hello"
-smoke_output=$("$smoke_dir/hello")
-case "$smoke_output" in
-    *42*) ;;
-    *) echo "release compiler produced unexpected output: $smoke_output" >&2; exit 1 ;;
-esac
+"$smoke_dir/hello" > "$smoke_dir/stdout.txt" 2> "$smoke_dir/stderr.txt"
+scripts/check-release-smoke-output.sh \
+    "$smoke_dir/stdout.txt" "$smoke_dir/stderr.txt"
 
 echo "validated $archive_name with $($compiler --print-target)"
