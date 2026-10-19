@@ -1,6 +1,7 @@
-//! x14: whole-corpus assembler differential. Every test_programs
-//! source is compiled to x86_64 assembly at -O0/-O2/-O3, and each .s
-//! is assembled by both GNU as and the in-process afs-as x86 pipeline
+//! x14: whole-corpus assembler differential. Every ordinary test_programs
+//! source in the exact corpus manifest is compiled to x86_64 assembly at
+//! -O0/-O2/-O3, and each .s is assembled by both GNU as and the in-process
+//! afs-as x86 pipeline
 //! (parse -> encode -> relax -> ELF model). The two objects must
 //! agree exactly on section contents and hold policy-equal
 //! relocations and symbols (same normalization as afs-as's own
@@ -10,7 +11,7 @@
 //! x86_64 ELF hosts with a GNU assembler only; skips loudly
 //! elsewhere.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -22,6 +23,7 @@ use afs_as::x86::assemble::assemble_x86;
 use armfortas::target::{Arch, ObjectFormat, TargetSpec};
 
 const OPT_LEVELS: &[&str] = &["-O0", "-O2", "-O3"];
+const CORPUS_MANIFEST: &str = include_str!("fixtures/x86_afs_as_differential_sources.txt");
 
 fn compiler() -> PathBuf {
     armfortas::testing::built_binary("armfortas")
@@ -35,6 +37,98 @@ fn programs_dir() -> PathBuf {
         }
     }
     panic!("cannot find test_programs/");
+}
+
+fn manifest_programs() -> Vec<PathBuf> {
+    let root = programs_dir();
+    let mut manifest_names = BTreeSet::new();
+    let mut compare_programs = Vec::new();
+    let mut previous_name: Option<&str> = None;
+
+    for (line_index, raw) in CORPUS_MANIFEST.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let class = fields
+            .next()
+            .unwrap_or_else(|| panic!("manifest line {} has no class", line_index + 1));
+        let name = fields
+            .next()
+            .unwrap_or_else(|| panic!("manifest line {} has no source", line_index + 1));
+        assert!(
+            fields.next().is_none(),
+            "manifest line {} has extra fields: {line}",
+            line_index + 1
+        );
+        assert!(
+            matches!(class, "compare" | "diagnostic"),
+            "manifest line {} has unknown class {class:?}",
+            line_index + 1
+        );
+        assert!(
+            !name.contains('/') && (name.ends_with(".f90") || name.ends_with(".f")),
+            "manifest line {} has invalid source identity {name:?}",
+            line_index + 1
+        );
+        if let Some(previous) = previous_name {
+            assert!(
+                previous < name,
+                "manifest must be strictly sorted: {previous:?} before {name:?}"
+            );
+        }
+        previous_name = Some(name);
+        assert!(
+            manifest_names.insert(name.to_string()),
+            "duplicate manifest source {name:?}"
+        );
+
+        let path = root.join(name);
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read manifest source {}: {e}", path.display()));
+        let is_diagnostic = source
+            .lines()
+            .any(|line| line.trim_start().starts_with("! ERROR_EXPECTED:"));
+        assert_eq!(
+            class == "diagnostic",
+            is_diagnostic,
+            "manifest classification disagrees with ERROR_EXPECTED for {name}"
+        );
+        if class == "compare" {
+            compare_programs.push(path);
+        }
+    }
+
+    let discovered_names: BTreeSet<String> = std::fs::read_dir(&root)
+        .expect("read test_programs")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "f90" || extension == "f")
+        })
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        manifest_names, discovered_names,
+        "x86 differential corpus manifest does not exactly match top-level test_programs sources"
+    );
+    assert!(
+        compare_programs.len() > 400,
+        "x86 differential comparison corpus shrank to {} sources",
+        compare_programs.len()
+    );
+    compare_programs
+}
+
+#[test]
+fn corpus_manifest_matches_test_programs() {
+    let programs = manifest_programs();
+    assert!(
+        !programs.is_empty(),
+        "x86 differential manifest has no comparison sources"
+    );
 }
 
 fn gas_path() -> Option<PathBuf> {
@@ -219,7 +313,6 @@ fn compare(tag: &str, gas: &ObjectFile, ours: &ObjectFile) -> Option<String> {
 
 struct Totals {
     compared: usize,
-    compile_skips: usize,
     failures: Vec<String>,
 }
 
@@ -240,14 +333,7 @@ fn whole_corpus_matches_gas() {
     };
 
     let compiler = compiler();
-    let mut programs: Vec<PathBuf> = std::fs::read_dir(programs_dir())
-        .expect("read test_programs")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "f90" || x == "f"))
-        .collect();
-    programs.sort();
-    assert!(programs.len() > 400, "corpus shrank? {}", programs.len());
+    let programs = manifest_programs();
 
     let tmp = std::env::temp_dir().join(format!("afs_x86_corpdiff_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("mkdir tmp");
@@ -259,7 +345,6 @@ fn whole_corpus_matches_gas() {
         .collect();
     let totals = Mutex::new(Totals {
         compared: 0,
-        compile_skips: 0,
         failures: Vec::new(),
     });
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -299,10 +384,11 @@ fn whole_corpus_matches_gas() {
                     .output()
                     .expect("run armfortas");
                 if !r.status.success() {
-                    // Compile-error tests are run_programs' business;
-                    // count them so a mass regression still trips the
-                    // floor assert below.
-                    totals.lock().unwrap().compile_skips += 1;
+                    totals.lock().unwrap().failures.push(format!(
+                        "{}: ordinary corpus source failed compiler -S:\n{}",
+                        tag,
+                        String::from_utf8_lossy(&r.stderr)
+                    ));
                     return_clean(&asm_path, &obj_path);
                     continue;
                 }
@@ -361,24 +447,23 @@ fn whole_corpus_matches_gas() {
     std::fs::remove_dir_all(&tmp).ok();
     let t = totals.into_inner().unwrap();
     eprintln!(
-        "x86_afs_as_differential: {} objects compared, {} compile skips, {} divergences",
+        "x86_afs_as_differential: {}/{} exact manifest objects compared, {} failures",
         t.compared,
-        t.compile_skips,
+        work.len(),
         t.failures.len()
-    );
-    assert!(
-        t.compared >= 1550,
-        "only {} objects compared ({} compile skips) — corpus or -S path broke",
-        t.compared,
-        t.compile_skips
     );
     let report = Path::new("target").join("x86_afs_as_differential_report.txt");
     if t.failures.is_empty() {
+        assert_eq!(
+            t.compared,
+            work.len(),
+            "successful differential did not compare every exact manifest cell"
+        );
         std::fs::remove_file(&report).ok(); // don't leave a stale report
     } else {
         std::fs::write(&report, t.failures.join("\n\n")).ok();
         panic!(
-            "{} divergences from gas (full report: {}):\n\n{}",
+            "{} differential failures (full report: {}):\n\n{}",
             t.failures.len(),
             report.display(),
             t.failures
