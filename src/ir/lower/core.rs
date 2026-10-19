@@ -25294,6 +25294,14 @@ fn type_name_is_enumeration(name: &str, st: Option<&SymbolTable>) -> bool {
         .is_some_and(|sym| matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType))
 }
 
+/// True when `TYPE(name)` is a nominal IEEE intrinsic-module type whose
+/// runtime representation is a scalar integer tag.  These remain distinct
+/// derived types in semantic analysis, but must not use the aggregate sret
+/// ABI during lowering.
+fn type_name_uses_scalar_storage(name: &str) -> bool {
+    crate::sema::resolve::type_resolution::is_ieee_opaque_type(name)
+}
+
 /// Extract the derived-type name from a function `return_type`
 /// declaration. Returns `Some("vec")` for `type(vec) function f()` and
 /// `None` for intrinsic-typed returns. Used by the Function lowering
@@ -25309,6 +25317,9 @@ pub(super) fn derived_type_name_for_return(
             return None;
         }
         if type_name_is_enumeration(name, st) {
+            return None;
+        }
+        if type_name_uses_scalar_storage(name) {
             return None;
         }
         Some(name.clone())
@@ -25350,6 +25361,9 @@ pub(super) fn derived_type_name_for_result_var(
                             return None;
                         }
                         if type_name_is_enumeration(name, st) {
+                            return None;
+                        }
+                        if type_name_uses_scalar_storage(name) {
                             return None;
                         }
                         return Some(name.clone());
@@ -26903,7 +26917,9 @@ fn hidden_result_abi_for_symbol(sym: &crate::sema::symtab::Symbol) -> Option<Hid
             }
         }
         _ if sym.attrs.allocatable => Some(HiddenResultAbi::ArrayDescriptor),
-        TypeInfo::Derived(_) if !sym.attrs.pointer => Some(HiddenResultAbi::DerivedAggregate),
+        TypeInfo::Derived(name) if !sym.attrs.pointer && !type_name_uses_scalar_storage(name) => {
+            Some(HiddenResultAbi::DerivedAggregate)
+        }
         // Complex scalar return: hidden output pointer, caller-allocated buffer.
         // Mirrors function_hidden_result_abi (definition side) so calls
         // resolved via SymbolTable see the same ABI as direct lowering.

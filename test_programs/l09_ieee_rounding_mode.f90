@@ -32,7 +32,7 @@ program l09_ieee_rounding_mode
   print *, 'restored', (ieee_get_rounding_mode_tag() == saved)
 contains
   ! Read the mode back after restore through the same get path.
-  integer function ieee_get_rounding_mode_tag() result(t)
+  type(ieee_round_type) function ieee_get_rounding_mode_tag() result(t)
     type(ieee_round_type) :: m
     call ieee_get_rounding_mode(m)
     t = m

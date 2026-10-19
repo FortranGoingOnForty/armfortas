@@ -10243,6 +10243,76 @@ fn ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs() {
 }
 
 #[test]
+fn contained_ieee_nominal_result_uses_scalar_abi_at_optimized_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_ieee_nominal_result_uses_scalar_abi_at_optimized_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("ieee_nominal_result_abi");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use, intrinsic :: ieee_arithmetic, only : ieee_round_type, ieee_nearest
+  implicit none
+  type(ieee_round_type) :: mode
+  mode = current_mode()
+  if (mode /= ieee_nearest) error stop 1
+  print *, 'ok'
+contains
+  type(ieee_round_type) function current_mode() result(result_mode)
+    result_mode = ieee_nearest
+  end function current_mode
+end program p
+"#,
+    );
+
+    for optimization in ["-O0", "-O3"] {
+        let executable = dir.join(format!(
+            "ieee_nominal_result_abi_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .env("AFS_VERIFY_AFTER_EACH", "1")
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("IEEE nominal-result compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: IEEE nominal-result source should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("IEEE nominal-result executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: IEEE nominal-result source should run: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: unexpected IEEE nominal-result output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ieee_nominal_types_reject_cross_assignment_without_output() {
     let src = write_program(
         "program p
