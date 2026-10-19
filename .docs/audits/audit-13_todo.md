@@ -222,15 +222,35 @@ Closure evidence:
 
 ## Tranche 12: Convert plausible observations into decisions
 
-Status: `[ ]`
+Status: `[x]`
 
-- `[ ]` U01: establish or refute source reachability for overlapping-byte
+- `[x]` U01: establish or refute source reachability for overlapping-byte
   alias answers in dead-store elimination; fix and test if reachable.
-- `[ ]` U02: establish or refute loop-interchange reachability and semantic
+- `[x]` U02: establish or refute loop-interchange reachability and semantic
   transformation; fix or remove/disable the pass if its contract is false.
-- `[ ]` U03 is tracked with `.amod` strictness in Tranche 6.
-- `[ ]` Record every refutation with a complete source trace and durable test
+- `[x]` U03 is tracked with `.amod` strictness in Tranche 6.
+- `[x]` Record every refutation with a complete source trace and durable test
   where regression risk remains.
+
+Closure evidence:
+
+- U01 is a real IR-boundary defect. Source lowering deliberately uses
+  byte-addressed GEP cursors with typed scalar accesses, while DSE compared an
+  intervening load only at its starting address. A load of bytes `[4, 8)` was
+  therefore treated as disjoint from a pending 8-byte store at `[0, 8)` and a
+  later exact overwrite could erase the observed store. Alias analysis now
+  compares checked byte ranges at the DSE memory-access boundary; regressions
+  cover both overlapping and adjacent disjoint ranges without weakening exact
+  overwrite elimination.
+- U02's implementation did not rewrite the loop-nest CFG. It exchanged the
+  outer and inner induction-variable initial values and bounds in place, which
+  gives each source index the other index's domain when ranges differ. Although
+  it was registered at `-O2`, `-Os`, `-O3`, and `-Ofast`, the audited source
+  probe did not activate it; retaining the false transform as an optimization
+  was unjustified. It is no longer exported or registered. Pipeline-roster
+  tests pin that decision, and an asymmetric `3 x 5` source regression verifies
+  the source index domains at `-O0`, `-O2`, and `-O3` before any future real CFG
+  interchange may be admitted.
 
 ## Tranche 13: Full closeout and release recertification
 
