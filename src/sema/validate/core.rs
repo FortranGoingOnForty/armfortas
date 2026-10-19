@@ -8473,6 +8473,14 @@ fn field_is_accessible(ctx: &Ctx<'_>, field: &crate::sema::type_layout::FieldLay
         .is_none_or(|owner| scope_has_private_component_access(ctx, owner))
 }
 
+fn bound_proc_is_accessible(ctx: &Ctx<'_>, binding: &crate::sema::type_layout::BoundProc) -> bool {
+    binding.access != Access::Private
+        || binding
+            .owner_module
+            .as_deref()
+            .is_none_or(|owner| scope_has_private_component_access(ctx, owner))
+}
+
 fn report_inaccessible_component(
     ctx: &mut Ctx<'_>,
     span: Span,
@@ -8488,6 +8496,25 @@ fn report_inaccessible_component(
         format!(
             "private component '{}' of derived type '{}' is not accessible in this scope{}",
             component, base_type, owner
+        ),
+    );
+}
+
+fn report_inaccessible_bound_proc(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    binding: &str,
+    base_type: &str,
+    owner_module: Option<&str>,
+) {
+    let owner = owner_module
+        .map(|module| format!(" (declared in module '{}')", module))
+        .unwrap_or_default();
+    ctx.error(
+        span,
+        format!(
+            "private type-bound procedure '{}' of derived type '{}' is not accessible in this scope{}",
+            binding, base_type, owner
         ),
     );
 }
@@ -8537,6 +8564,22 @@ fn validate_component_access(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Spanned
                             component,
                             &base_type,
                             field.owner_module.as_deref(),
+                        );
+                    }
+                } else {
+                    let candidates = layout.bound_proc_candidates(component);
+                    if !candidates.is_empty()
+                        && !candidates
+                            .iter()
+                            .any(|binding| bound_proc_is_accessible(ctx, binding))
+                    {
+                        let binding = candidates[0];
+                        report_inaccessible_bound_proc(
+                            ctx,
+                            expr.span,
+                            component,
+                            &base_type,
+                            binding.owner_module.as_deref(),
                         );
                     }
                 }
@@ -10460,6 +10503,23 @@ fn validate_derived_type(
     }
 
     for tbp in type_bound_procs {
+        let access_specs = tbp
+            .attrs
+            .iter()
+            .filter(|attr| {
+                attr.eq_ignore_ascii_case("public") || attr.eq_ignore_ascii_case("private")
+            })
+            .count();
+        if access_specs > 1 {
+            ctx.error(
+                span,
+                format!(
+                    "type-bound procedure '{}' specifies accessibility more than once",
+                    tbp.name
+                ),
+            );
+        }
+
         // Deferred procedures only allowed in abstract types.
         let is_deferred = tbp.attrs.iter().any(|a| a.eq_ignore_ascii_case("deferred"));
         if is_deferred && !is_abstract {

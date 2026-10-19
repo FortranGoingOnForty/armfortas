@@ -24,11 +24,12 @@ use crate::sema::type_layout::{
     concretize_intrinsic_type_info, BoundProc, TypeLayout, TypeLayoutRegistry,
 };
 
-const AMOD_VERSION: u32 = 19;
+const AMOD_VERSION: u32 = 20;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
 const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
 const AMOD_FINAL_ELEMENTAL_VERSION: u32 = 12;
 const AMOD_DEFAULT_ACCESS_VERSION: u32 = 13;
+const AMOD_BOUND_PROC_ACCESS_VERSION: u32 = 20;
 pub(crate) const SMOD_VERSION: u32 = 2;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
@@ -1408,6 +1409,17 @@ fn emit_type(
             .unwrap();
         }
         for bp in &layout.bound_procs {
+            let access = match bp.access {
+                Access::Private => "private",
+                Access::Public | Access::Default => "public",
+            };
+            let owner = bp.owner_module.as_deref().ok_or_else(|| {
+                format!(
+                    "cannot emit .amod binding '{}': declaring module is unresolved",
+                    bp.method_name
+                )
+            })?;
+            let access_suffix = format!(" @access {access} @owner {owner}");
             let abi_suffix = if bp.abi_name != bp.method_name.to_lowercase() {
                 format!(" @abi {}", bp.abi_name)
             } else {
@@ -1433,15 +1445,15 @@ fn emit_type(
             if bp.method_name == bp.target_name {
                 writeln!(
                     out,
-                    "  @binds {}{}{}",
-                    bp.method_name, pass_suffix, abi_suffix
+                    "  @binds {}{}{}{}",
+                    bp.method_name, pass_suffix, abi_suffix, access_suffix
                 )
                 .unwrap();
             } else {
                 writeln!(
                     out,
-                    "  @binds {} => {}{}{}",
-                    bp.method_name, bp.target_name, pass_suffix, abi_suffix
+                    "  @binds {} => {}{}{}{}",
+                    bp.method_name, bp.target_name, pass_suffix, abi_suffix, access_suffix
                 )
                 .unwrap();
             }
@@ -2441,6 +2453,8 @@ fn validate_bound_proc_metadata(
         left.method_name.eq_ignore_ascii_case(&right.method_name)
             && left.target_name.eq_ignore_ascii_case(&right.target_name)
             && left.abi_name.eq_ignore_ascii_case(&right.abi_name)
+            && left.access == right.access
+            && same_optional_name(left.owner_module.as_deref(), right.owner_module.as_deref())
             && left.nopass == right.nopass
             && same_optional_name(left.pass_name.as_deref(), right.pass_name.as_deref())
             && left.pass_index == right.pass_index
@@ -3703,6 +3717,8 @@ fn parse_type(
                 let mut nopass = false;
                 let mut pass_name = None;
                 let mut pass_index = None;
+                let mut access = None;
+                let mut binding_owner = None;
                 let mut index = 0;
                 while index < tokens.len() {
                     match tokens[index] {
@@ -3746,6 +3762,43 @@ fn parse_type(
                             })?);
                             index += 2;
                         }
+                        "@access" if access.is_none() => {
+                            let value = tokens.get(index + 1).ok_or_else(|| {
+                                format!(
+                                    "{}: corrupt .amod file (missing @binds accessibility); rebuild the provider module",
+                                    path.display()
+                                )
+                            })?;
+                            access = Some(match *value {
+                                "public" => Access::Public,
+                                "private" => Access::Private,
+                                _ => {
+                                    return Err(format!(
+                                        "{}: corrupt .amod file (invalid @binds accessibility '{}'); rebuild the provider module",
+                                        path.display(),
+                                        value
+                                    ));
+                                }
+                            });
+                            index += 2;
+                        }
+                        "@owner" if binding_owner.is_none() => {
+                            let value = tokens.get(index + 1).ok_or_else(|| {
+                                format!(
+                                    "{}: corrupt .amod file (missing @binds owner); rebuild the provider module",
+                                    path.display()
+                                )
+                            })?;
+                            if value.starts_with('@') {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (invalid @binds owner '{}'); rebuild the provider module",
+                                    path.display(),
+                                    value
+                                ));
+                            }
+                            binding_owner = Some((*value).to_string());
+                            index += 2;
+                        }
                         token => {
                             return Err(format!(
                                 "{}: corrupt .amod file (invalid or duplicate @binds metadata '{}'); rebuild the provider module",
@@ -3764,10 +3817,30 @@ fn parse_type(
                         method
                     ));
                 }
+                let access = match access {
+                    Some(access) => access,
+                    None if version < AMOD_BOUND_PROC_ACCESS_VERSION => Access::Public,
+                    None => {
+                        return Err(format!(
+                            "{}: corrupt .amod file (missing @binds accessibility for '{}'); rebuild the provider module",
+                            path.display(),
+                            method
+                        ));
+                    }
+                };
+                if version >= AMOD_BOUND_PROC_ACCESS_VERSION && binding_owner.is_none() {
+                    return Err(format!(
+                        "{}: corrupt .amod file (missing @binds owner for '{}'); rebuild the provider module",
+                        path.display(),
+                        method
+                    ));
+                }
                 bound_procs.push(BoundProc {
                     method_name: method.clone(),
                     target_name: target,
                     abi_name: abi_name.unwrap_or_else(|| method.to_ascii_lowercase()),
+                    access,
+                    owner_module: binding_owner,
                     nopass,
                     pass_name,
                     pass_index,
@@ -3796,6 +3869,8 @@ fn parse_type(
                     method_name: method,
                     target_name: target,
                     abi_name: parsed_abi_name,
+                    access: Access::Public,
+                    owner_module: None,
                     nopass,
                     pass_name: None,
                     pass_index: (!nopass).then_some(0),
@@ -3919,6 +3994,11 @@ fn parse_type(
                     name
                 ));
             }
+        }
+    }
+    for binding in &mut bound_procs {
+        if binding.owner_module.is_none() {
+            binding.owner_module.clone_from(&owner_module);
         }
     }
     Ok(TypeLayout {
@@ -4458,7 +4538,7 @@ mod tests {
         let error = parse_var(
             "@var values : integer(4), asynchronous",
             false,
-            AMOD_VERSION - 1,
+            18,
             Path::new("stale.amod"),
         )
         .expect_err("older schema accepted a new variable attribute");
@@ -4699,7 +4779,7 @@ mod tests {
     #[test]
     fn current_schema_cross_checks_pass_name_and_index() {
         let source = format!(
-            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine apply\n  @arg delta : integer(4), intent(in)\n  @arg self : class(item_t), intent(inout)\n@end subroutine\n\n@type item_t, public\n  @layout size=4 align=4\n  @field value : integer(4) @offset 0 @size 4 @access public @owner pass_schema\n  @binds run => apply @pass-name self @pass-index 0 @abi apply\n  @owner pass_schema\n  @tag 1\n@end type\n"
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine apply\n  @arg delta : integer(4), intent(in)\n  @arg self : class(item_t), intent(inout)\n@end subroutine\n\n@type item_t, public\n  @layout size=4 align=4\n  @field value : integer(4) @offset 0 @size 4 @access public @owner pass_schema\n  @binds run => apply @pass-name self @pass-index 0 @abi apply @access public @owner pass_schema\n  @owner pass_schema\n  @tag 1\n@end type\n"
         );
         let text = add_integrity_headers(source.clone());
         let error = read_amod_content(&text, Path::new("pass_schema.amod"))
@@ -4716,9 +4796,34 @@ mod tests {
     }
 
     #[test]
+    fn current_schema_requires_binding_access_and_owner_metadata() {
+        let valid = format!(
+            "#!amod {AMOD_VERSION}\n# module: schema_test\n# default-access: public\n\n@type item_t, public\n  @layout size=0 align=1\n  @binds run => afs_modproc$v2$m$ancestor$p$run @nopass @abi run @access public @owner ancestor\n  @owner schema_test\n  @tag 1\n@end type\n"
+        );
+        let malformed = [
+            valid.replace(" @access public", ""),
+            valid.replace(" @access public", " @access protected"),
+            valid.replace(" @access public", " @access public @access private"),
+            valid.replace(" @owner ancestor", ""),
+            valid.replace(" @owner ancestor", " @owner @tag"),
+        ];
+        for source in malformed {
+            let text = add_integrity_headers(source.clone());
+            let error = read_amod_content(&text, Path::new("schema_test.amod"))
+                .expect_err("malformed current-version binding metadata was accepted");
+            assert!(
+                error.contains("corrupt .amod file")
+                    && error.contains("@binds")
+                    && error.contains("rebuild the provider module"),
+                "{source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn current_schema_validates_passed_object_characteristics() {
         let source = format!(
-            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine apply\n  @arg self : class(item_t), intent(inout)\n@end subroutine\n\n@type item_t, public\n  @layout size=4 align=4\n  @field value : integer(4) @offset 0 @size 4 @access public @owner pass_schema\n  @binds run => apply @pass-name self @pass-index 0 @abi apply\n  @owner pass_schema\n  @tag 1\n@end type\n"
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine apply\n  @arg self : class(item_t), intent(inout)\n@end subroutine\n\n@type item_t, public\n  @layout size=4 align=4\n  @field value : integer(4) @offset 0 @size 4 @access public @owner pass_schema\n  @binds run => apply @pass-name self @pass-index 0 @abi apply @access public @owner pass_schema\n  @owner pass_schema\n  @tag 1\n@end type\n"
         );
         let malformed = [
             ("class(item_t)", "integer(4)"),
@@ -4764,7 +4869,7 @@ mod tests {
     #[test]
     fn current_schema_validates_passed_object_against_defining_type() {
         let source = format!(
-            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine base_touch\n  @arg self : class(base_t), intent(inout)\n@end subroutine\n\n@subroutine child_touch\n  @arg self : class(override_t), intent(inout)\n@end subroutine\n\n@type inherited_t, public\n  @layout size=0 align=1\n  @extends pass_schema::base_t\n  @binds touch => base_touch @pass-name self @pass-index 0 @abi base_touch\n  @owner pass_schema\n  @tag 2\n@end type\n\n@type override_t, public\n  @layout size=0 align=1\n  @extends pass_schema::base_t\n  @binds touch => child_touch @pass-name self @pass-index 0 @abi child_touch\n  @owner pass_schema\n  @tag 3\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => base_touch @pass-name self @pass-index 0 @abi base_touch\n  @owner pass_schema\n  @tag 1\n@end type\n"
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine base_touch\n  @arg self : class(base_t), intent(inout)\n@end subroutine\n\n@subroutine child_touch\n  @arg self : class(override_t), intent(inout)\n@end subroutine\n\n@type inherited_t, public\n  @layout size=0 align=1\n  @extends pass_schema::base_t\n  @binds touch => base_touch @pass-name self @pass-index 0 @abi base_touch @access public @owner pass_schema\n  @owner pass_schema\n  @tag 2\n@end type\n\n@type override_t, public\n  @layout size=0 align=1\n  @extends pass_schema::base_t\n  @binds touch => child_touch @pass-name self @pass-index 0 @abi child_touch @access public @owner pass_schema\n  @owner pass_schema\n  @tag 3\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => base_touch @pass-name self @pass-index 0 @abi base_touch @access public @owner pass_schema\n  @owner pass_schema\n  @tag 1\n@end type\n"
         );
         let text = add_integrity_headers(source);
         read_amod_content(&text, Path::new("pass_schema.amod"))
@@ -4774,7 +4879,7 @@ mod tests {
     #[test]
     fn current_schema_requires_local_binding_procedure_metadata() {
         let source = format!(
-            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@type item_t, public\n  @layout size=0 align=1\n  @binds run => apply @pass-name self @pass-index 0 @abi apply\n  @owner pass_schema\n  @tag 1\n@end type\n"
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@type item_t, public\n  @layout size=0 align=1\n  @binds run => apply @pass-name self @pass-index 0 @abi apply @access public @owner pass_schema\n  @owner pass_schema\n  @tag 1\n@end type\n"
         );
         let text = add_integrity_headers(source);
         let error = read_amod_content(&text, Path::new("pass_schema.amod"))
@@ -4785,7 +4890,7 @@ mod tests {
     #[test]
     fn current_schema_allows_external_inherited_binding_metadata() {
         let source = format!(
-            "#!amod {AMOD_VERSION}\n# module: child_schema\n# default-access: public\n\n@subroutine touch\n  @arg value : integer(4), intent(inout)\n@end subroutine\n\n@type child_t, public\n  @layout size=0 align=1\n  @extends ancestor_schema::base_t\n  @binds touch => afs_modproc$v2$m$ancestor_schema$p$touch @pass-name self @pass-index 0 @abi touch\n  @owner child_schema\n  @tag 2\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => afs_modproc$v2$m$ancestor_schema$p$touch @pass-name self @pass-index 0 @abi touch\n  @owner ancestor_schema\n  @tag 1\n@end type\n"
+            "#!amod {AMOD_VERSION}\n# module: child_schema\n# default-access: public\n\n@subroutine touch\n  @arg value : integer(4), intent(inout)\n@end subroutine\n\n@type child_t, public\n  @layout size=0 align=1\n  @extends ancestor_schema::base_t\n  @binds touch => afs_modproc$v2$m$ancestor_schema$p$touch @pass-name self @pass-index 0 @abi touch @access public @owner ancestor_schema\n  @owner child_schema\n  @tag 2\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => afs_modproc$v2$m$ancestor_schema$p$touch @pass-name self @pass-index 0 @abi touch @access public @owner ancestor_schema\n  @owner ancestor_schema\n  @tag 1\n@end type\n"
         );
         let text = add_integrity_headers(source);
         read_amod_content(&text, Path::new("child_schema.amod"))
@@ -4795,7 +4900,7 @@ mod tests {
     #[test]
     fn current_schema_rejects_malformed_reserved_module_procedure_targets() {
         let source = format!(
-            "#!amod {AMOD_VERSION}\n# module: malformed_target\n# default-access: public\n\n@type item_t, public\n  @layout size=0 align=1\n  @binds run => afs_modproc$v2$m$$p$decoy_proc @nopass @abi run\n  @owner malformed_target\n  @tag 1\n@end type\n"
+            "#!amod {AMOD_VERSION}\n# module: malformed_target\n# default-access: public\n\n@type item_t, public\n  @layout size=0 align=1\n  @binds run => afs_modproc$v2$m$$p$decoy_proc @nopass @abi run @access public @owner malformed_target\n  @owner malformed_target\n  @tag 1\n@end type\n"
         );
         let text = add_integrity_headers(source);
         let error = read_amod_content(&text, Path::new("malformed_target.amod"))
@@ -5405,7 +5510,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 19
+            r#"#!amod 20
 # module: cache_test
 # default-access: public
 # source: cache_test.f90
@@ -5438,7 +5543,7 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 19
+            r#"#!amod 20
 # module: cached_parent
 # default-access: public
 # source: cached_parent.f90
@@ -5452,7 +5557,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 19
+            r#"#!amod 20
 # module: supplied_parent
 # default-access: private
 # ancestor-module: supplied_root
@@ -5486,7 +5591,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 19
+            r#"#!amod 20
 # module: child
 # default-access: public
 # ancestor-module: root
@@ -5572,7 +5677,7 @@ mod tests {
             std::process::id()
         ));
         let text = add_integrity_headers(
-            r#"#!amod 18
+            r#"#!amod 19
 # module: stale_test
 # source: stale_test.f90
 
@@ -5586,7 +5691,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 18 (compiler requires 19)")
+            err.contains("incompatible .amod version 19 (compiler requires 20)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

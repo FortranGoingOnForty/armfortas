@@ -3964,7 +3964,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 19\n", "#!amod 18\n", 1);
+        .replacen("#!amod 20\n", "#!amod 19\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -3991,7 +3991,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 18 (compiler requires 19)")
+        stderr.contains("incompatible .amod version 19 (compiler requires 20)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -21450,6 +21450,133 @@ fn imported_type_bound_register_ignores_unrelated_optional_register_mask() {
         String::from_utf8_lossy(&run.stdout)
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn default_private_type_bound_binding_survives_amod_boundary() {
+    let dir = unique_dir("default_private_tbp_amod");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        r#"module binding_access_m
+  implicit none
+  type :: item_t
+    integer :: value = 0
+  contains
+    private
+    procedure, public :: invoke
+    procedure :: hidden
+  end type item_t
+contains
+  subroutine invoke(self)
+    class(item_t), intent(inout) :: self
+    call self%hidden()
+  end subroutine invoke
+
+  subroutine hidden(self)
+    class(item_t), intent(inout) :: self
+    self%value = 42
+  end subroutine hidden
+end module binding_access_m
+"#,
+    );
+    let provider_obj = dir.join("provider.o");
+    let provider_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("provider compile failed to spawn");
+    assert!(
+        provider_compile.status.success(),
+        "provider compile failed: {}",
+        String::from_utf8_lossy(&provider_compile.stderr)
+    );
+
+    let amod = fs::read_to_string(dir.join("binding_access_m.amod"))
+        .expect("provider did not publish binding_access_m.amod");
+    assert!(amod.starts_with("#!amod 20\n"), "{amod}");
+    assert!(
+        amod.lines().any(|line| {
+            line.contains("@binds invoke")
+                && line.contains("@access public")
+                && line.contains("@owner binding_access_m")
+        }),
+        "public binding access was not serialized: {amod}"
+    );
+    assert!(
+        amod.lines().any(|line| {
+            line.contains("@binds hidden")
+                && line.contains("@access private")
+                && line.contains("@owner binding_access_m")
+        }),
+        "default-private binding access was not serialized: {amod}"
+    );
+
+    let allowed = write_program_in(
+        &dir,
+        "allowed.f90",
+        "program allowed\n  use binding_access_m, only: item_t\n  type(item_t) :: item\n  call item%invoke()\nend program allowed\n",
+    );
+    let allowed_obj = dir.join("allowed.o");
+    let allowed_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            allowed.to_str().unwrap(),
+            "-o",
+            allowed_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("public-binding consumer compile failed to spawn");
+    assert!(
+        allowed_compile.status.success(),
+        "public-binding consumer compile failed: {}",
+        String::from_utf8_lossy(&allowed_compile.stderr)
+    );
+
+    let rejected = write_program_in(
+        &dir,
+        "rejected.f90",
+        "program rejected\n  use binding_access_m, only: item_t\n  type(item_t) :: item\n  call item%hidden()\nend program rejected\n",
+    );
+    let rejected_obj = dir.join("rejected.o");
+    let rejected_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            rejected.to_str().unwrap(),
+            "-o",
+            rejected_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("private-binding consumer compile failed to spawn");
+    assert!(
+        !rejected_compile.status.success(),
+        "external call to a private binding was accepted"
+    );
+    assert!(
+        !rejected_obj.exists(),
+        "private-binding diagnostic published an object"
+    );
+    let stderr = String::from_utf8_lossy(&rejected_compile.stderr);
+    assert!(
+        stderr.contains("private type-bound procedure 'hidden'")
+            && stderr.contains("declared in module 'binding_access_m'"),
+        "unexpected private-binding diagnostic: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -50534,7 +50661,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 19\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 20\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))

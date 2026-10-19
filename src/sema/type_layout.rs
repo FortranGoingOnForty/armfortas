@@ -129,6 +129,12 @@ pub struct BoundProc {
     pub method_name: String,
     pub target_name: String,
     pub abi_name: String,
+    /// Effective accessibility of this binding. Generic aliases carry their
+    /// own accessibility rather than inheriting it from a specific binding.
+    pub access: Access,
+    /// Module that declared the binding. Inherited bindings retain their
+    /// original owner so PRIVATE access cannot be gained in an extension.
+    pub owner_module: Option<String>,
     pub nopass: bool,
     /// Source dummy selected by PASS(name), or the resolved first dummy for
     /// default PASS once procedure metadata is available.
@@ -1737,6 +1743,22 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
         }
     }
 
+    fn bound_proc_access(tbp: &crate::ast::decl::TypeBoundProc) -> Access {
+        tbp.attrs
+            .iter()
+            .rev()
+            .find_map(|attr| {
+                if attr.eq_ignore_ascii_case("private") {
+                    Some(Access::Private)
+                } else if attr.eq_ignore_ascii_case("public") {
+                    Some(Access::Public)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(Access::Public)
+    }
+
     // Inherit parent's bindings, then let the local type override by method name.
     let mut bound_procs = parent_layout
         .map(|parent| parent.bound_procs.clone())
@@ -1762,6 +1784,8 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
             method_name: tbp.name.clone(),
             target_name,
             abi_name,
+            access: bound_proc_access(tbp),
+            owner_module: host_module.map(str::to_string),
             nopass,
             pass_name: tbp.pass_name.clone(),
             pass_index: (!nopass).then_some(0),
@@ -1805,6 +1829,8 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
                     method_name: tbp.name.clone(),
                     target_name: lowered_bound_proc_target(host_module, specific),
                     abi_name: specific.to_lowercase(),
+                    access: Access::Public,
+                    owner_module: host_module.map(str::to_string),
                     nopass: false,
                     pass_name: None,
                     pass_index: Some(0),
@@ -1815,6 +1841,8 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
                     method_name: tbp.name.clone(),
                     target_name: alias.target_name,
                     abi_name: alias.abi_name,
+                    access: bound_proc_access(tbp),
+                    owner_module: host_module.map(str::to_string),
                     nopass: alias.nopass,
                     pass_name: alias.pass_name,
                     pass_index: alias.pass_index,

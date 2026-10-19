@@ -767,7 +767,7 @@ end subroutine inspect_memory_attrs
     compile_file(&compiler, &provider_source, &provider_object, None);
     let amod = std::fs::read_to_string(dir.join("memory_attrs_provider.amod"))
         .expect("memory-attribute provider did not emit its module interface");
-    assert!(amod.starts_with("#!amod 19\n"), "{amod}");
+    assert!(amod.starts_with("#!amod 20\n"), "{amod}");
     assert!(
         amod.lines()
             .any(|line| line.starts_with("@var watched :") && line.contains("asynchronous")),
