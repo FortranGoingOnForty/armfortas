@@ -124,17 +124,17 @@ Status: `[x]`
 
 ## Tranche 8: ELF group and extended-index correctness
 
-Status: `[ ]`
+Status: `[x]`
 
-- `[ ]` A13-21: parse and validate ELF groups and select COMDAT groups before
+- `[x]` A13-21: parse and validate ELF groups and select COMDAT groups before
   ordinary section/symbol resolution.
-- `[ ]` Carry losing-group removal atomically through archives, relocations,
+- `[x]` Carry losing-group removal atomically through archives, relocations,
   init/fini arrays, GC, static output, and dynamic output.
-- `[ ]` A13-22: decode extended section count/string-table index in afs-ld
+- `[x]` A13-22: decode extended section count/string-table index in afs-ld
   before table validation.
-- `[ ]` A13-23: add `SHT_SYMTAB_SHNDX` production and consumption for
+- `[x]` A13-23: add `SHT_SYMTAB_SHNDX` production and consumption for
   high-index symbol definitions.
-- `[ ]` Add direct afs-as to afs-ld fixtures and reference-linker comparisons.
+- `[x]` Add direct afs-as to afs-ld fixtures and reference-linker comparisons.
 
 ## Tranche 9: Mach-O relocation and publication contracts
 
