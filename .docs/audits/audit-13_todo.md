@@ -254,20 +254,74 @@ Closure evidence:
 
 ## Tranche 13: Full closeout and release recertification
 
-Status: `[ ]`
+Status: `[~]` — local Apple-Silicon recertification is complete; a fresh
+pushed multi-runner CI cycle and its exact run IDs remain outstanding.
 
-- `[ ]` Re-run targeted O0/O3 reproducers for every fixed semantic finding.
-- `[ ]` Run `cargo test --workspace` and `cargo clippy --workspace`.
-- `[ ]` Run the supported OpenMP matrix and standalone afs-as/afs-ld suites on
-  all available CI runners.
-- `[ ]` Run the current stdlib high-rank/shared/ILP64/O3 configuration through
+- `[x]` Re-run targeted O0/O3 reproducers for every fixed semantic finding.
+- `[x]` Run `cargo test --workspace` and `cargo clippy --workspace`.
+- `[~]` Run the supported OpenMP matrix and standalone afs-as/afs-ld suites on
+  all available CI runners. The complete Apple-Silicon workspace, official
+  OpenMP O0/O3 examples/V&V, and exact native toolchain gates are green; fresh
+  pushed Linux/x86 evidence is pending.
+- `[x]` Run the current stdlib high-rank/shared/ILP64/O3 configuration through
   the intended linker path.
-- `[ ]` Re-run the selected fpm/f-toml and other large-project compiler-edge
+- `[x]` Re-run the selected fpm/f-toml and other large-project compiler-edge
   builds used before this audit.
-- `[ ]` Reconcile all Low, policy, coverage, and plausible items in this
+- `[x]` Reconcile all Low, policy, coverage, and plausible items in this
   ledger; no severity tier is implicitly waived.
-- `[ ]` Record release readiness and any externally blocked platform-only
+- `[~]` Record release readiness and any externally blocked platform-only
   evidence with exact CI run IDs.
+
+Local closure evidence at root commit
+`4601667da480337bb7f216cac81702347a278d16`:
+
+- Every semantic fix remains paired with its focused O0/O3 or compile-fail
+  regression. The full `test_programs` matrix passed at O0, O1, O2, O3, Os,
+  and Ofast, including the loop-cleanup, processor-kind, `C_SIZEOF`, parser,
+  OpenMP nesting/reduction/collapse, I/O, `.amod`, and optimizer-audit cases.
+- `cargo test --workspace` passed in full: the principal summaries include
+  1,193 afs-as unit tests, 2,248 compiler library tests, 1,338 CLI/driver
+  tests, 73 multi-file tests, 161 `test_programs` harness tests, 405 runtime
+  tests, and all workspace doc tests. The six full program sweeps exercised
+  more than 34,000 compile/link/run subprocess identities.
+- `cargo clippy --workspace -- -D warnings -A clippy::too_many_arguments`
+  passed. The sole allowance is the repository's existing deliberate API
+  shape exception.
+- The pinned official OpenMP example build/run set and OpenMP V&V set passed
+  at O0 and O3. The standalone afs-as and afs-ld Apple-Silicon exact gates
+  account for all 40 and 57 native skip identities respectively, and their
+  complete available suites passed again within the workspace run.
+- stdlib commit `b1670f03a69872ad2a8a2eed2003470c2fa27651`
+  built rank 15, shared, ILP64, and O3. All 29 dylib links were traced through
+  `afs-ld`. The disposable source carries one upstream-only F2018 C8105 fix
+  (`PRIVATE :: process_callback` before its forward interface); flang agrees
+  the unmodified ordering is nonconforming. Reconfiguration also proved that
+  unsupported `REAL128` is now rejected instead of being advertised as a
+  usable kind.
+- fpm v0.13.0 commit `90bb83a70e9bcf04d941fb43cca014ae1c0fc5ea`
+  built from the official amalgamation, passed 35/35 CLI, 61/61 help, and
+  12/12 new-project tests, then self-hosted through two further O3/afs-ld
+  stages. Stage 2 and stage 3 were byte-identical with SHA-256
+  `9b317389d7ea86d4e377383e4f1094fa30954a27f328c5b59037f31698431d0e`.
+- fgof-toml commit `8cdf25f0` built its unmodified sources through fpm at O3;
+  all six test programs linked through traced afs-ld invocations and passed.
+  Its direct CMake route remains a project toolchain-identification mismatch:
+  CMake classifies ARMFORTAS as GNU and injects unsupported warning flags.
+- fortsh commit `f8310e7b4c8a1dfc9f22b7be127e725674a02d54`
+  built all 64 release sources at O2 into an 11 MiB arm64 Mach-O executable,
+  with the final link traced through afs-ld. Its smoke target passed, followed
+  by 23/23 quick POSIX suites: 3,632 passed, 0 failed, and 7 documented skips.
+- fortsh exposed and drove one additional `.amod` edge during certification:
+  an exported `TYPE(C_FUNPTR), PARAMETER` initialized from `C_NULL_FUNPTR`
+  wrote a scalar-zero payload that the reader rejected. Commit `4601667d`
+  now round-trips only the valid null C-pointer representation and rejects
+  arbitrary non-null pointer bits, with codec and separate-compilation runtime
+  regressions.
+
+Release disposition: no Audit 13 finding remains open on Apple Silicon. A
+release-candidate decision still requires pushing this branch, obtaining green
+fresh CI across the configured runners, and recording those exact run IDs
+here.
 
 ## Closed audit dispositions that must remain documented
 
