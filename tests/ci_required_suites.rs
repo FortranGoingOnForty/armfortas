@@ -17,8 +17,8 @@ const REQUIRED_SUITES: &[RequiredSuite] = &[
     },
     RequiredSuite {
         job: "test-afs-as",
-        name: "complete afs-as suite",
-        command: "ci/run_logged.sh /tmp/afs-as-tests.log cargo test -p afs-as --all-targets -- --nocapture",
+        name: "complete afs-as suite with serialized skip evidence",
+        command: "ci/run_logged.sh /tmp/afs-as-tests.log cargo test -p afs-as --all-targets -- --nocapture --test-threads=1",
     },
     RequiredSuite {
         job: "test-afs-ld",

@@ -159,7 +159,8 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - run: ci/assert_host.sh "${{ matrix.host_os }}" "${{ matrix.host_arch }}"
-      - run: ci/run_logged.sh /tmp/afs-as-tests.log cargo test -p afs-as --all-targets -- --nocapture
+      # Serialize libtest output so exact skip records cannot interleave.
+      - run: ci/run_logged.sh /tmp/afs-as-tests.log cargo test -p afs-as --all-targets -- --nocapture --test-threads=1
       - run: ci/check_afs_as_skips.sh /tmp/afs-as-tests.log "${{ matrix.skip_profile }}"
 
   test-afs-ld:
