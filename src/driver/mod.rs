@@ -2807,7 +2807,7 @@ fn compile_with_bundled_runtime_inner(
         return Ok(());
     }
 
-    // 10. Assemble (using system assembler for now).
+    // 10. Assemble through the target-specific route selected below.
     //
     // The temp .s / .o paths must satisfy two competing needs:
     //   (1) `ld` embeds the .o path in the linked binary's symbol
