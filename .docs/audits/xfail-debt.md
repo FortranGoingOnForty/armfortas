@@ -6,9 +6,16 @@ both `test_programs/` and imported compatibility fixtures. Remove the annotation
 when the underlying condition is fixed; retain resolved entries here with
 `[FIXED]` in the heading when historical context remains useful.
 
+Active IDs are also bound in `tests/run_programs.rs` to one expected failure
+stage, kind, and stable message substring. A failure outside that signature is
+a regression, not an XFAIL.
+
 ## XFAIL-001 - macOS rejects non-UTF-8 filename bytes
 
 **Status:** Active platform limitation.
+
+**Expected failure:** `run/exit-mismatch`, containing
+`execution exit mismatch: expected 0, got 1`.
 
 Darwin rejects a filename containing raw byte `0xe9` before armfortas runtime
 I/O begins. The byte-preservation test remains active on other hosts and is
@@ -37,6 +44,9 @@ without an XFAIL while checking its nondefault pointer lower bounds.
 
 **Status:** Active diagnostic compatibility debt.
 
+**Expected failure:** `compile/diagnostic-mismatch`, containing
+`ERROR_EXPECTED(`.
+
 Conditional-expression syntax and resolution failures are rejected before the
 compiler can emit the diagnostic substrings expected by the imported gfortran
 fixtures. The fixtures remain expected failures until their error oracle can be
@@ -54,6 +64,9 @@ constructs.
 ## XFAIL-006 - ISO_10646 character kind is unsupported
 
 **Status:** Active compiler limitation.
+
+**Expected failure:** `compile/tool-failure`, containing
+`compilation failed:`.
 
 The backend and runtime support only `CHARACTER(kind=1)`, so
 `SELECTED_CHAR_KIND('ISO_10646')` returns `-1`. The imported UCS-4 `SPLIT`
