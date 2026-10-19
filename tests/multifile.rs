@@ -173,6 +173,23 @@ fn output_contains_expected(output: &str, expected: &str) -> bool {
 // ---- Tests ----
 
 #[test]
+fn null_c_funptr_parameter_round_trips_across_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=null_c_funptr_parameter_round_trips_across_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    multifile_test(
+        "module signal_constants\n  use iso_c_binding, only: c_funptr, c_null_funptr\n  implicit none\n  type(c_funptr), parameter :: sig_dfl = c_null_funptr\nend module\n",
+        "program p\n  use iso_c_binding, only: c_funptr, c_associated\n  use signal_constants, only: sig_dfl\n  implicit none\n  type(c_funptr) :: handler\n  handler = sig_dfl\n  if (c_associated(handler)) error stop 1\n  print *, 'ok'\nend program\n",
+        "ok",
+    );
+}
+
+#[test]
 fn integer16_parameters_round_trip_across_amod() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(

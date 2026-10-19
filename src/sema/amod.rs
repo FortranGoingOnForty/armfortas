@@ -2746,6 +2746,32 @@ fn parse_var(line: &str, is_param: bool, version: u32, path: &Path) -> Result<Am
                     )
                 })?);
             }
+            Some(TypeInfo::Derived(type_name))
+                if matches!(
+                    type_name.to_ascii_lowercase().as_str(),
+                    "c_ptr" | "c_funptr"
+                ) =>
+            {
+                let null_value = value.parse::<i128>().map_err(|_| {
+                    format!(
+                        "{}: corrupt .amod file (invalid null C pointer parameter value for '{}'); rebuild the provider module",
+                        path.display(),
+                        name
+                    )
+                })?;
+                if null_value != 0 {
+                    return Err(format!(
+                        "{}: corrupt .amod file (non-null C pointer parameter value for '{}'); rebuild the provider module",
+                        path.display(),
+                        name
+                    ));
+                }
+                // ISO_C_BINDING's C_NULL_PTR and C_NULL_FUNPTR are modeled
+                // as pointer-sized scalar zeroes.  Preserve that value for
+                // downstream constant lowering just as the defining unit
+                // does, while rejecting arbitrary pointer bit patterns.
+                const_value = Some(0);
+            }
             _ => {
                 return Err(format!(
                     "{}: corrupt .amod file (unexpected parameter value for '{}'); rebuild the provider module",
@@ -4567,6 +4593,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("invalid integer parameter value"), "{error}");
+    }
+
+    #[test]
+    fn parse_var_preserves_null_c_funptr_parameter() {
+        let var = parse_var(
+            "@var sig_dfl : type(c_funptr) = 0",
+            true,
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap();
+        assert_eq!(var.type_info, Some(TypeInfo::Derived("c_funptr".into())));
+        assert_eq!(var.const_value, Some(0));
+
+        let error = parse_var(
+            "@var sig_dfl : type(c_funptr) = 1",
+            true,
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("non-null C pointer parameter value"),
+            "{error}"
+        );
     }
 
     #[test]
