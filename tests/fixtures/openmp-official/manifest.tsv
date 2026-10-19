@@ -1,16 +1,16 @@
-id	upstream_path	local_source	source_form	operation	upstream_expect	version	coverage	armfortas_state
-collapse.4	parallel_execution/sources/collapse.4.f90	parallel_execution/collapse.4.f90	free	compile	success	omp_5.0	parallel-do,collapse(2),nonrectangular-direct-bound,private	pass
-fort_do.1	parallel_execution/sources/fort_do.1.f	parallel_execution/fort_do.1.f	fixed	compile	success	pre_omp_3.0	orphaned-do,shared-labeled-termination,implicit-enddo,explicit-enddo	pass
-get_nthrs.2	parallel_execution/sources/get_nthrs.2.f	parallel_execution/get_nthrs.2.f	fixed	compile	success	pre_omp_3.0	parallel,private,omp_get_thread_num	pass
-nowait.1	parallel_execution/sources/nowait.1.f	parallel_execution/nowait.1.f	fixed	compile	success	pre_omp_3.0	parallel,do,nowait	pass
-nowait.2	parallel_execution/sources/nowait.2.f90	parallel_execution/nowait.2.f90	free	compile	success	pre_omp_3.0	parallel,do,schedule(static),nowait	pass
-parallel.1	parallel_execution/sources/parallel.1.f	parallel_execution/parallel.1.f	fixed	link	success	pre_omp_3.0	parallel,default(private),shared,omp_get_thread_num,omp_get_num_threads,assumed-size-forwarding	pass
-private.1	data_environment/sources/private.1.f	data_environment/private.1.f	fixed	run	success	pre_omp_3.0	parallel,private,firstprivate	pass
-copyin.1	data_environment/sources/copyin.1.f	data_environment/copyin.1.f	fixed	compile	success	pre_omp_3.0	parallel,threadprivate,copyin,scalar-integer-real,pointer-threadprivate,cross-procedure	pass
-threadprivate.6	data_environment/sources/threadprivate.6.f	data_environment/threadprivate.6.f	fixed	run	success	pre_omp_3.0	parallel,private,pointer-threadprivate,per-thread-allocation,cross-procedure,implicit-typing	pass
-fort_loopvar.1	data_environment/sources/fort_loopvar.1.f90	data_environment/fort_loopvar.1.f90	free	compile	success	pre_omp_3.0	parallel,private,predetermined-loop-variable	pass
-fort_loopvar.2	data_environment/sources/fort_loopvar.2.f90	data_environment/fort_loopvar.2.f90	free	compile	success	pre_omp_3.0	parallel,shared,sections,section,single,implicit-barrier	pass
-lastprivate.1	data_environment/sources/lastprivate.1.f	data_environment/lastprivate.1.f	fixed	compile	success	pre_omp_3.0	parallel,do,lastprivate	pass
-reduction.1	data_environment/sources/reduction.1.f90	data_environment/reduction.1.f90	free	compile	success	pre_omp_3.0	parallel-do,private,shared,reduction-add-ieor-min-max	pass
-reduction.2	data_environment/sources/reduction.2.f90	data_environment/reduction.2.f90	free	compile	success	pre_omp_3.0	parallel,do,private,shared,critical	pass
-critical.1	synchronization/sources/critical.1.f	synchronization/critical.1.f	fixed	compile	success	pre_omp_3.0	parallel,private,shared,named-critical	pass
+id	upstream_path	local_source	source_form	operation	upstream_expect	version	coverage	armfortas_state	sha256
+collapse.4	parallel_execution/sources/collapse.4.f90	parallel_execution/collapse.4.f90	free	compile	success	omp_5.0	parallel-do,collapse(2),nonrectangular-direct-bound,private	pass	0efdb158ffea57edc7751f2a29f0d24054d22bf5c9ff16fa0e65f2786269a3a8
+fort_do.1	parallel_execution/sources/fort_do.1.f	parallel_execution/fort_do.1.f	fixed	compile	success	pre_omp_3.0	orphaned-do,shared-labeled-termination,implicit-enddo,explicit-enddo	pass	d9ef41a0ca5e1ab944b9adf0b5f2d92f487620256518a46af572af771887c032
+get_nthrs.2	parallel_execution/sources/get_nthrs.2.f	parallel_execution/get_nthrs.2.f	fixed	compile	success	pre_omp_3.0	parallel,private,omp_get_thread_num	pass	f9165575c583d13847bc3358bf6475f906db9c0e1c38b7722b3ee9f9d9dd222d
+nowait.1	parallel_execution/sources/nowait.1.f	parallel_execution/nowait.1.f	fixed	compile	success	pre_omp_3.0	parallel,do,nowait	pass	2860e9ca6286d407adf88c83fb469e3878f0481cac4421724c443879d09af005
+nowait.2	parallel_execution/sources/nowait.2.f90	parallel_execution/nowait.2.f90	free	compile	success	pre_omp_3.0	parallel,do,schedule(static),nowait	pass	81295f9aba1d9f5fcebfc8e170a30de8bfd8a80a5dc23147abba3d00dd3024f8
+parallel.1	parallel_execution/sources/parallel.1.f	parallel_execution/parallel.1.f	fixed	link	success	pre_omp_3.0	parallel,default(private),shared,omp_get_thread_num,omp_get_num_threads,assumed-size-forwarding	pass	392fb54f90851b130d8b05b4488d5a3b412063ec6624c2461f5d8de4af153c41
+private.1	data_environment/sources/private.1.f	data_environment/private.1.f	fixed	run	success	pre_omp_3.0	parallel,private,firstprivate	pass	112905ba8422bbefaeddd27885ddae2cf3a8827b5ccd0f1af3873657d4451fdf
+copyin.1	data_environment/sources/copyin.1.f	data_environment/copyin.1.f	fixed	compile	success	pre_omp_3.0	parallel,threadprivate,copyin,scalar-integer-real,pointer-threadprivate,cross-procedure	pass	34c1ad10a9853ee05f3268315c93150ca73a9e4bfc15fa37418554600f4e31e1
+threadprivate.6	data_environment/sources/threadprivate.6.f	data_environment/threadprivate.6.f	fixed	run	success	pre_omp_3.0	parallel,private,pointer-threadprivate,per-thread-allocation,cross-procedure,implicit-typing	pass	6ffc194159ff90c4098f91aa2ce097abca817bfd6fe5f1e8470edda5f0a223e5
+fort_loopvar.1	data_environment/sources/fort_loopvar.1.f90	data_environment/fort_loopvar.1.f90	free	compile	success	pre_omp_3.0	parallel,private,predetermined-loop-variable	pass	bdb0141c89fe073c01fa973afe4648708c1e471e024a7993707c702feb60e2c7
+fort_loopvar.2	data_environment/sources/fort_loopvar.2.f90	data_environment/fort_loopvar.2.f90	free	compile	success	pre_omp_3.0	parallel,shared,sections,section,single,implicit-barrier	pass	ac1bd6e2a51f3678f4e45ccfe0726c34d77987fe5babf90f1576ac2715662ed8
+lastprivate.1	data_environment/sources/lastprivate.1.f	data_environment/lastprivate.1.f	fixed	compile	success	pre_omp_3.0	parallel,do,lastprivate	pass	6d47f4471eaacb50e03c862e50a0c263cd785dec58161c60918f19933ba8bffc
+reduction.1	data_environment/sources/reduction.1.f90	data_environment/reduction.1.f90	free	compile	success	pre_omp_3.0	parallel-do,private,shared,reduction-add-ieor-min-max	pass	9ec90e3147d3742ffdb0268eb832b268876264f9519c02b629ba139ca4453d5f
+reduction.2	data_environment/sources/reduction.2.f90	data_environment/reduction.2.f90	free	compile	success	pre_omp_3.0	parallel,do,private,shared,critical	pass	aa599048719a0db7003dfe653e2777a5b1de0bec773baa69dcad36a9cead9d7f
+critical.1	synchronization/sources/critical.1.f	synchronization/critical.1.f	fixed	compile	success	pre_omp_3.0	parallel,private,shared,named-critical	pass	e8597c64571cde213677603ca06202ff9b190c33c56c94110bf62147f938aba7
