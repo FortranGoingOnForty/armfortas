@@ -77,30 +77,63 @@ umask 022
 bundle_root="$staging_dir/$prefix"
 mkdir -p "$bundle_root"
 
-while IFS= read -r -d '' path; do
-    case "$path" in
-        /*|../*|*/../*|*/..)
-            echo "refusing unsafe tracked path: $path" >&2
+validate_tree_paths() {
+    local repository=$1
+    local revision=$2
+    local archive_prefix=$3
+    local path combined
+    while IFS= read -r -d '' path; do
+        combined=${archive_prefix:+$archive_prefix/}$path
+        case "$combined" in
+            /*|../*|*/../*|*/..)
+                echo "refusing unsafe tracked path: $combined" >&2
+                exit 1
+                ;;
+        esac
+        if [[ "$combined" == *$'\n'* ]]; then
+            echo "release archives do not support tracked paths containing newlines" >&2
+            exit 1
+        fi
+    done < <(git -C "$repository" ls-tree -r --name-only -z "$revision")
+}
+
+export_committed_tree() {
+    local repository=$1
+    local revision=$2
+    local destination=$3
+    local archive_prefix=$4
+    validate_tree_paths "$repository" "$revision" "$archive_prefix"
+    mkdir -p "$destination"
+    git -C "$repository" archive --format=tar "$revision" \
+        | tar -xf - -C "$destination"
+}
+
+# Never mix a commit-derived version/epoch with live worktree bytes. Export the
+# root commit and each pinned submodule commit directly from Git's object store;
+# tracked worktree/index edits may exist, but they cannot enter the archive.
+export_committed_tree "$repo_root" HEAD "$bundle_root" ""
+while IFS= read -r status; do
+    [ -z "$status" ] && continue
+    record=${status:1}
+    commit=${record%% *}
+    path_and_description=${record#* }
+    submodule_path=${path_and_description%% \(*}
+    case "$submodule_path" in
+        ''|/*|../*|*/../*|*/..)
+            echo "refusing unsafe submodule path: $submodule_path" >&2
             exit 1
             ;;
     esac
-    if [[ "$path" == *$'\n'* ]]; then
-        echo "release archives do not support tracked paths containing newlines" >&2
+    if [[ "$submodule_path" == *$'\n'* ]]; then
+        echo "release archives do not support submodule paths containing newlines" >&2
         exit 1
     fi
-
-    source_path="$repo_root/$path"
-    destination="$bundle_root/$path"
-    mkdir -p "$(dirname "$destination")"
-    if [ -L "$source_path" ]; then
-        ln -s "$(readlink "$source_path")" "$destination"
-    elif [ -f "$source_path" ]; then
-        cp -p "$source_path" "$destination"
-    else
-        echo "tracked path is missing or unsupported: $path" >&2
-        exit 1
-    fi
-done < <(git ls-files --recurse-submodules -z)
+    export_committed_tree \
+        "$repo_root/$submodule_path" \
+        "$commit" \
+        "$bundle_root/$submodule_path" \
+        "$submodule_path"
+done <<< "$submodule_status"
 
 if date -u -r "$source_epoch" +%Y%m%d%H%M.%S >/dev/null 2>&1; then
     touch_stamp=$(date -u -r "$source_epoch" +%Y%m%d%H%M.%S)
