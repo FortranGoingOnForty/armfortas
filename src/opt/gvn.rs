@@ -869,10 +869,9 @@ mod tests {
     use crate::opt::{
         bce::Bce, call_resolve::CallResolve, const_fold::ConstFold, const_prop::ConstProp,
         dead_func::DeadFuncElim, dse::Dse, fission::LoopFission, fusion::LoopFusion,
-        global_lsf::GlobalLsf, inline::Inline, interchange::LoopInterchange, licm::Licm,
-        lsf::LocalLsf, mem2reg::Mem2Reg, peel::LoopPeel, preheader::PreheaderInsert,
-        simplify_cfg::SimplifyCfg, sroa::Sroa, strength_reduce::StrengthReduce, unroll::LoopUnroll,
-        unswitch::LoopUnswitch,
+        global_lsf::GlobalLsf, inline::Inline, licm::Licm, lsf::LocalLsf, mem2reg::Mem2Reg,
+        peel::LoopPeel, preheader::PreheaderInsert, simplify_cfg::SimplifyCfg, sroa::Sroa,
+        strength_reduce::StrengthReduce, unroll::LoopUnroll, unswitch::LoopUnswitch,
     };
     use crate::parser::Parser;
     use crate::preprocess::PreprocConfig;
@@ -964,7 +963,6 @@ mod tests {
         pm.add(Box::new(Licm));
         pm.add(Box::new(ConstProp));
         pm.add(Box::new(Dse));
-        pm.add(Box::new(LoopInterchange));
         pm.add(Box::new(LoopFission));
         pm.add(Box::new(LoopFusion));
         pm.add(Box::new(LoopUnroll));

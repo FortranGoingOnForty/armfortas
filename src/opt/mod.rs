@@ -27,7 +27,6 @@ pub mod fusion;
 pub mod global_lsf;
 pub mod gvn;
 pub mod inline;
-pub mod interchange;
 pub mod jump_thread;
 pub mod licm;
 pub mod loop_tree;

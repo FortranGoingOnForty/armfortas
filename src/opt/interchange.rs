@@ -1,4 +1,11 @@
-//! Loop interchange pass.
+//! Retired loop interchange prototype.
+//!
+//! Audit 13 established that this implementation swaps induction-variable
+//! initial values and bounds without changing the loop-nest CFG. That changes
+//! which source variable owns each iteration range; it is not loop
+//! interchange when the two ranges differ. The module is intentionally not
+//! exported or registered. Keep the prototype only as design history until a
+//! real CFG transformation replaces it with asymmetric-bound regressions.
 //!
 //! Swaps the iteration order of perfectly-nested loop pairs to improve
 //! memory access patterns. Critical for Fortran because arrays are

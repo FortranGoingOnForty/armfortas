@@ -176,7 +176,7 @@ Inquiry: `KIND`, `SELECTED_INT_KIND`, `SELECTED_REAL_KIND`, `HUGE`, `TINY`, `EPS
 | `-O1` | mem2reg, constant folding, DCE, basic CSE, copy propagation, small inlining |
 | `-O2` | `-O1` plus LICM, strength reduction, DSE, GVN, SROA, loop store forwarding, jump threading, IPO (constant args, dead args, return propagation) |
 | `-Os` | Like `-O2`, but no unrolling and less inlining |
-| `-O3` | `-O2` plus aggressive inlining, loop unrolling and interchange, vectorization (NEON on arm64, SSE2 on x86_64) |
+| `-O3` | `-O2` plus aggressive inlining, loop unrolling, and vectorization (NEON on arm64, SSE2 on x86_64) |
 | `-Ofast` | `-O3` plus fast-math: reassociation, multiply-add contraction, reciprocals, and the assumption that no NaN or Inf values occur |
 
 On x86_64 the vectorizer only emits SSE2, which every x86_64 CPU has. CI fails if any SSE3 or later instruction, any AVX instruction, or any x87 instruction shows up in the output.
