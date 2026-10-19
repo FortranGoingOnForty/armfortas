@@ -57,6 +57,10 @@
 //! diagnostic location text, so the compiler can print either
 //! `path:line:col:` or `line:col:` and still satisfy the contract.
 //!
+//! `! DIAGNOSTIC_EXACT: <escaped-stream>` also composes with
+//! `ERROR_EXPECTED` and pins the compiler's complete stderr stream.
+//! It is opt-in: existing diagnostic substring checks remain unchanged.
+//!
 //! ## IR_CHECK / IR_NOT annotations
 //!
 //! For tests that need to assert on the *shape* of the lowered IR
@@ -86,9 +90,15 @@
 //!
 //!   * `! STDERR_CHECK: <substring>` — ordered substring checks
 //!     against the program's stderr stream.
+//!   * `! STDOUT_EXACT: <escaped-stream>` — exact complete stdout.
+//!   * `! STDERR_EXACT: <escaped-stream>` — exact complete stderr.
 //!   * `! EXIT_CODE: <int>` — exact process exit code. Without this
 //!     annotation, the harness preserves the old rule that runtime
 //!     tests must exit successfully.
+//!
+//! Exact streams use `\n`, `\r`, `\t`, `\\`, and ASCII `\xNN` escapes.
+//! Payload whitespace is ignored, so significant leading/trailing whitespace
+//! must be escaped. Exact and substring checks may not target the same stream.
 //!
 //! This makes runtime tests expressive enough for paths like
 //! `ERROR STOP`, warning-like stderr output, and future
@@ -208,6 +218,13 @@ static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 struct Check {
     line_num: usize,
     pattern: String,
+}
+
+/// One opt-in complete-stream assertion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExactStreamCheck {
+    line_num: usize,
+    expected: String,
 }
 
 /// A single file-content assertion against the per-test sandbox.
@@ -533,6 +550,98 @@ fn extract_stderr_checks(source: &str) -> Vec<Check> {
 /// in l01 for conformance warnings; compilation must still succeed.
 fn extract_warn_checks(source: &str) -> Vec<Check> {
     extract_prefixed_checks(source, "! WARN_CHECK:")
+}
+
+fn decode_exact_stream(
+    raw: &str,
+    filename: &str,
+    line_num: usize,
+    directive: &str,
+) -> Result<String, String> {
+    let mut decoded = String::new();
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        let Some(escaped) = chars.next() else {
+            return Err(format!(
+                "{}:{}: {} has a trailing backslash",
+                filename, line_num, directive
+            ));
+        };
+        match escaped {
+            'n' => decoded.push('\n'),
+            'r' => decoded.push('\r'),
+            't' => decoded.push('\t'),
+            '\\' => decoded.push('\\'),
+            'x' => {
+                let Some(high) = chars.next() else {
+                    return Err(format!(
+                        "{}:{}: {} has an incomplete \\xNN escape",
+                        filename, line_num, directive
+                    ));
+                };
+                let Some(low) = chars.next() else {
+                    return Err(format!(
+                        "{}:{}: {} has an incomplete \\xNN escape",
+                        filename, line_num, directive
+                    ));
+                };
+                let digits = [high, low].iter().collect::<String>();
+                let byte = u8::from_str_radix(&digits, 16).map_err(|_| {
+                    format!(
+                        "{}:{}: {} has invalid hex escape \\x{}",
+                        filename, line_num, directive, digits
+                    )
+                })?;
+                if !byte.is_ascii() {
+                    return Err(format!(
+                        "{}:{}: {} only accepts ASCII \\xNN escapes, got \\x{}",
+                        filename, line_num, directive, digits
+                    ));
+                }
+                decoded.push(char::from(byte));
+            }
+            other => {
+                return Err(format!(
+                    "{}:{}: {} has unsupported escape \\{}; use \\n, \\r, \\t, \\\\, or ASCII \\xNN",
+                    filename, line_num, directive, other
+                ));
+            }
+        }
+    }
+    Ok(decoded)
+}
+
+fn extract_exact_stream(
+    source: &str,
+    filename: &str,
+    directive: &str,
+) -> Result<Option<ExactStreamCheck>, String> {
+    let prefix = format!("! {directive}:");
+    let mut found: Option<ExactStreamCheck> = None;
+    for (i, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix(&prefix) else {
+            continue;
+        };
+        if let Some(previous) = &found {
+            return Err(format!(
+                "{}:{}: multiple {} annotations are not allowed (another at line {})",
+                filename,
+                i + 1,
+                directive,
+                previous.line_num
+            ));
+        }
+        found = Some(ExactStreamCheck {
+            line_num: i + 1,
+            expected: decode_exact_stream(rest.trim(), filename, i + 1, directive)?,
+        });
+    }
+    Ok(found)
 }
 
 /// Target selector inside a directive qualifier (sprint x01). Closed
@@ -1819,6 +1928,21 @@ fn match_checks(
     Ok(())
 }
 
+fn match_exact_stream(
+    check: &ExactStreamCheck,
+    output: &str,
+    filename: &str,
+    directive_name: &str,
+) -> Result<(), String> {
+    if output == check.expected {
+        return Ok(());
+    }
+    Err(format!(
+        "{}:{}: {} failed: expected complete stream {:?}, got {:?}",
+        filename, check.line_num, directive_name, check.expected, output
+    ))
+}
+
 fn output_line_matches_check(line: &str, pattern: &str) -> bool {
     let text = line.trim();
     if has_repeated_pattern_whitespace(pattern) {
@@ -2524,6 +2648,18 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     let checks = extract_checks(&source_text);
     let stderr_checks = extract_stderr_checks(&source_text);
     let warn_checks = extract_warn_checks(&source_text);
+    let stdout_exact = match extract_exact_stream(&source_text, filename, "STDOUT_EXACT") {
+        Ok(check) => check,
+        Err(e) => return TestOutcome::Fail(e),
+    };
+    let stderr_exact = match extract_exact_stream(&source_text, filename, "STDERR_EXACT") {
+        Ok(check) => check,
+        Err(e) => return TestOutcome::Fail(e),
+    };
+    let diagnostic_exact = match extract_exact_stream(&source_text, filename, "DIAGNOSTIC_EXACT") {
+        Ok(check) => check,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     let expected_exit_code = match extract_exit_code(&source_text, filename) {
         Ok(code) => code,
         Err(e) => return TestOutcome::Fail(e),
@@ -2568,6 +2704,9 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     };
     if checks.is_empty()
         && stderr_checks.is_empty()
+        && stdout_exact.is_none()
+        && stderr_exact.is_none()
+        && diagnostic_exact.is_none()
         && ir_checks.is_empty()
         && asm_checks.is_empty()
         && file_checks.is_empty()
@@ -2587,7 +2726,37 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         // Programs with no runtime or shape assertions, no XFAIL marker,
         // and no ERROR marker are mis-configured tests, not test failures.
         return TestOutcome::Fail(format!(
-            "{}: no CHECK / STDERR_CHECK / WARN_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / FILE_CHECK / FILE_EXISTS / FILE_MISSING / FILE_LINE_COUNT / FILE_RERUN_MODE / FILE_SET_EXACT / REPRO_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
+            "{}: no CHECK / STDERR_CHECK / STDOUT_EXACT / STDERR_EXACT / DIAGNOSTIC_EXACT / WARN_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / FILE_CHECK / FILE_EXISTS / FILE_MISSING / FILE_LINE_COUNT / FILE_RERUN_MODE / FILE_SET_EXACT / REPRO_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
+            filename,
+        ));
+    }
+    if stdout_exact.is_some() && !checks.is_empty() {
+        return TestOutcome::Fail(format!(
+            "{}: STDOUT_EXACT cannot be combined with substring CHECK annotations",
+            filename,
+        ));
+    }
+    if stderr_exact.is_some() && !stderr_checks.is_empty() {
+        return TestOutcome::Fail(format!(
+            "{}: STDERR_EXACT cannot be combined with substring STDERR_CHECK annotations",
+            filename,
+        ));
+    }
+    if diagnostic_exact.is_some() && error_expected.is_none() {
+        return TestOutcome::Fail(format!(
+            "{}: DIAGNOSTIC_EXACT requires ERROR_EXPECTED so compilation must fail",
+            filename,
+        ));
+    }
+    if error_expected.is_some() && (stdout_exact.is_some() || stderr_exact.is_some()) {
+        return TestOutcome::Fail(format!(
+            "{}: runtime exact-stream annotations cannot be combined with ERROR_EXPECTED",
+            filename,
+        ));
+    }
+    if diagnostic_exact.is_some() && !warn_checks.is_empty() {
+        return TestOutcome::Fail(format!(
+            "{}: DIAGNOSTIC_EXACT cannot be combined with successful-compilation WARN_CHECK annotations",
             filename,
         ));
     }
@@ -2614,6 +2783,12 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     // and kind so an XFAIL cannot absorb a regression in another phase.
     let multifile_segments = split_multifile_segments(&source_text);
     let multifile_link_order = extract_multifile_link(&source_text);
+    if diagnostic_exact.is_some() && multifile_segments.is_some() {
+        return TestOutcome::Fail(format!(
+            "{}: DIAGNOSTIC_EXACT is not supported for MULTIFILE tests because their compile errors include per-segment harness context",
+            filename,
+        ));
+    }
 
     let inner = || -> Result<(), HarnessFailure> {
         // Use a per-(file,level) binary path so concurrent jobs
@@ -2799,6 +2974,17 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                         ),
                     ));
                 }
+                if let Some(check) = &diagnostic_exact {
+                    let label = format!("{} [{}]", filename, opt_flag);
+                    if let Err(e) = match_exact_stream(check, &stderr, &label, "DIAGNOSTIC_EXACT") {
+                        let _ = fs::remove_dir_all(&compile_sandbox);
+                        return Err(HarnessFailure::new(
+                            FailureStage::Compile,
+                            FailureKind::DiagnosticMismatch,
+                            e,
+                        ));
+                    }
+                }
                 if let Some(expected_span) = error_span {
                     if !diagnostic_contains_span(&stderr, expected_span) {
                         let _ = fs::remove_dir_all(&compile_sandbox);
@@ -2898,6 +3084,17 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                 e,
             ));
         }
+        if let Some(check) = &stdout_exact {
+            if let Err(e) = match_exact_stream(check, stdout, &label, "STDOUT_EXACT") {
+                let _ = fs::remove_file(&binary);
+                let _ = fs::remove_dir_all(&sandbox);
+                return Err(HarnessFailure::new(
+                    FailureStage::Check,
+                    FailureKind::ContentMismatch,
+                    e,
+                ));
+            }
+        }
         if let Err(e) = match_checks(&stderr_checks, stderr, &label, "STDERR_CHECK") {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
@@ -2906,6 +3103,17 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                 FailureKind::ContentMismatch,
                 e,
             ));
+        }
+        if let Some(check) = &stderr_exact {
+            if let Err(e) = match_exact_stream(check, stderr, &label, "STDERR_EXACT") {
+                let _ = fs::remove_file(&binary);
+                let _ = fs::remove_dir_all(&sandbox);
+                return Err(HarnessFailure::new(
+                    FailureStage::Check,
+                    FailureKind::ContentMismatch,
+                    e,
+                ));
+            }
         }
         if let Err(e) = match_file_checks(&file_checks, &snapshot.files, &label) {
             let _ = fs::remove_file(&binary);
@@ -3629,6 +3837,36 @@ fn extract_error_span_accepts_line_and_column() {
 }
 
 #[test]
+fn extract_exact_stream_decodes_whitespace_and_backslashes() {
+    let source = "! STDOUT_EXACT: \\x20hello\\npath=one\\\\two\\tend\\r\n";
+    let check = extract_exact_stream(source, "inline.f90", "STDOUT_EXACT")
+        .unwrap()
+        .unwrap();
+    assert_eq!(check.line_num, 1);
+    assert_eq!(check.expected, " hello\npath=one\\two\tend\r");
+
+    let empty = extract_exact_stream("! STDERR_EXACT:\n", "inline.f90", "STDERR_EXACT")
+        .unwrap()
+        .unwrap();
+    assert_eq!(empty.expected, "");
+}
+
+#[test]
+fn extract_exact_stream_rejects_ambiguous_annotations_and_bad_escapes() {
+    let duplicate = extract_exact_stream(
+        "! STDOUT_EXACT: one\n! STDOUT_EXACT: two\n",
+        "inline.f90",
+        "STDOUT_EXACT",
+    )
+    .unwrap_err();
+    assert!(duplicate.contains("multiple STDOUT_EXACT"));
+
+    let bad =
+        extract_exact_stream("! STDERR_EXACT: bad\\q\n", "inline.f90", "STDERR_EXACT").unwrap_err();
+    assert!(bad.contains("unsupported escape"));
+}
+
+#[test]
 fn extract_file_checks_accepts_relative_path_and_pattern() {
     let source = "! FILE_CHECK: out.txt => hello\n! FILE_NOT: out.txt => goodbye\n";
     let checks = extract_file_checks(source, "inline.f90", "! FILE_CHECK:", "! FILE_NOT:").unwrap();
@@ -3792,6 +4030,44 @@ fn match_checks_reports_stderr_check_failures_by_name() {
     )
     .unwrap_err();
     assert!(err.contains("STDERR_CHECK failed"));
+}
+
+#[test]
+fn match_exact_stream_reports_the_complete_contract() {
+    let check = ExactStreamCheck {
+        line_num: 4,
+        expected: " exact\n".into(),
+    };
+    match_exact_stream(&check, " exact\n", "inline.f90 [O0]", "STDOUT_EXACT").unwrap();
+    let err = match_exact_stream(&check, "exact\n", "inline.f90 [O0]", "STDOUT_EXACT").unwrap_err();
+    assert!(err.contains("STDOUT_EXACT failed"));
+    assert!(err.contains("\" exact\\n\""));
+}
+
+#[test]
+fn exact_stream_directives_enforce_complete_contracts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let fixtures = [
+        "hello.f90",
+        "ar11_stop_char_code.f90",
+        "ar10_direct_list_directed_rejected.f90",
+    ];
+    if skip_native_e2e(
+        "exact_stream_directives_enforce_complete_contracts",
+        fixtures.len(),
+    ) {
+        return;
+    }
+    for opt_flag in ["-O0", "-O3"] {
+        for fixture in fixtures {
+            let outcome = run_test(&compiler, &test_dir.join(fixture), opt_flag);
+            assert!(
+                matches!(outcome, TestOutcome::Pass),
+                "{fixture} did not satisfy its exact stream contract at {opt_flag}: {outcome:?}"
+            );
+        }
+    }
 }
 
 #[test]

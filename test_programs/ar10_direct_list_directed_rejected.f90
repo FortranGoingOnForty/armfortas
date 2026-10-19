@@ -6,3 +6,4 @@ program ar10_direct_list_directed_rejected
        form='formatted', recl=16, status='replace')
   write(30, *, rec=1) 42
 end program ar10_direct_list_directed_rejected
+! DIAGNOSTIC_EXACT: armfortas: error: 6:13: list-directed format is not valid with REC=\n
