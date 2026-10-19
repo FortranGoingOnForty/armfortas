@@ -72,8 +72,16 @@ fn find_dead_stores(
             }
 
             InstKind::Load(ptr) => {
-                pending.retain(|_, entry| {
-                    matches!(alias_oracle.query(entry.ptr, *ptr), AliasResult::NoAlias)
+                pending.retain(|key, entry| {
+                    matches!(
+                        alias_oracle.query_memory_access(
+                            entry.ptr,
+                            key.value_type.as_ref(),
+                            *ptr,
+                            Some(&inst.ty),
+                        ),
+                        AliasResult::NoAlias
+                    )
                 });
             }
 
@@ -604,6 +612,114 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn overlapping_offset_load_preserves_pending_wide_store() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let byte_array = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 16);
+        let base = push(
+            &mut f,
+            InstKind::Alloca(byte_array.clone()),
+            IrType::Ptr(Box::new(byte_array)),
+        );
+        let zero = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let four = push(
+            &mut f,
+            InstKind::ConstInt(4, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let wide_ptr = push(
+            &mut f,
+            InstKind::GetElementPtr(base, vec![zero]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        let overlapping_ptr = push(
+            &mut f,
+            InstKind::GetElementPtr(base, vec![four]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        let first = push(
+            &mut f,
+            InstKind::ConstInt(1, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let second = push(
+            &mut f,
+            InstKind::ConstInt(2, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        push(&mut f, InstKind::Store(first, wide_ptr), IrType::Void);
+        push(&mut f, InstKind::Load(overlapping_ptr), i32_ty());
+        push(&mut f, InstKind::Store(second, wide_ptr), IrType::Void);
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(
+            !Dse.run(&mut m),
+            "the overlapping load observes bytes from the first wide store"
+        );
+        assert_eq!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Store(..)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn disjoint_offset_load_does_not_block_exact_overwrite() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let byte_array = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 16);
+        let base = push(
+            &mut f,
+            InstKind::Alloca(byte_array.clone()),
+            IrType::Ptr(Box::new(byte_array)),
+        );
+        let zero = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let four = push(
+            &mut f,
+            InstKind::ConstInt(4, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let first_ptr = push(
+            &mut f,
+            InstKind::GetElementPtr(base, vec![zero]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        let disjoint_ptr = push(
+            &mut f,
+            InstKind::GetElementPtr(base, vec![four]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        let first = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
+        let second = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
+        push(&mut f, InstKind::Store(first, first_ptr), IrType::Void);
+        push(&mut f, InstKind::Load(disjoint_ptr), i32_ty());
+        push(&mut f, InstKind::Store(second, first_ptr), IrType::Void);
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(Dse.run(&mut m));
+        let stores = m.functions[0].blocks[0]
+            .insts
+            .iter()
+            .filter(|inst| matches!(inst.kind, InstKind::Store(..)))
+            .collect::<Vec<_>>();
+        assert_eq!(stores.len(), 1);
+        assert!(matches!(stores[0].kind, InstKind::Store(value, _) if value == second));
     }
 
     #[test]

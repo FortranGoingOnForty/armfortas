@@ -226,6 +226,49 @@ impl<'a> AliasOracle<'a> {
         AliasResult::MayAlias
     }
 
+    /// Query two complete scalar memory accesses rather than only their start
+    /// addresses. Point queries may prove distinct constant offsets disjoint,
+    /// but a wide access beginning at one offset can still overlap an access
+    /// beginning at the other. Unknown sizes and range overflow remain
+    /// conservative.
+    pub(crate) fn query_memory_access(
+        &mut self,
+        a: ValueId,
+        a_ty: Option<&IrType>,
+        b: ValueId,
+        b_ty: Option<&IrType>,
+    ) -> AliasResult {
+        let point_result = self.query(a, b);
+        if !matches!(point_result, AliasResult::NoAlias) {
+            return point_result;
+        }
+
+        let base_a = self.trace_base(a);
+        let base_b = self.trace_base(b);
+        if base_a != base_b {
+            return AliasResult::NoAlias;
+        }
+
+        let Some((start_a, end_a)) = self.memory_range(a, a_ty) else {
+            return AliasResult::MayAlias;
+        };
+        let Some((start_b, end_b)) = self.memory_range(b, b_ty) else {
+            return AliasResult::MayAlias;
+        };
+        if start_a < end_b && start_b < end_a {
+            AliasResult::MayAlias
+        } else {
+            AliasResult::NoAlias
+        }
+    }
+
+    fn memory_range(&mut self, ptr: ValueId, ty: Option<&IrType>) -> Option<(i64, i64)> {
+        let start = self.trace_offset(ptr)?;
+        let size = i64::try_from(ty?.try_size_bytes(&self.layout).ok()?).ok()?;
+        let end = start.checked_add(size)?;
+        Some((start, end))
+    }
+
     /// Return a key suitable for indexing exact-location optimizations.
     pub(crate) fn proven_location(&mut self, ptr: ValueId) -> ProvenLocation {
         let base = self.trace_base(ptr);
