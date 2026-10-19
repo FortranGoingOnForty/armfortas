@@ -156,6 +156,8 @@ exec "$ARMFORTAS_TEST_REAL_TAR" "$@"
         "afs-as/Cargo.toml",
         "afs-ld/Cargo.toml",
         "bencch/bench/Cargo.toml",
+        "scripts/check-release-smoke-output.sh",
+        "scripts/validate-release-source.sh",
     ] {
         let expected = format!("{prefix}{required}");
         assert!(
