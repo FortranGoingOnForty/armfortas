@@ -138,17 +138,16 @@ Status: `[x]`
 
 ## Tranche 9: Mach-O relocation and publication contracts
 
-Status: `[ ]`
+Status: `[x]`
 
-- `[ ]` A13-24: retain and validate complete ARM64 ADDEND/SUBTRACTOR prefix
+- `[x]` A13-24: retain and validate complete ARM64 ADDEND/SUBTRACTOR prefix
   metadata before relocation fusion.
-- `[ ]` Replace the invalid `ADDEND + UNSIGNED` success test with rejection and
+- `[x]` Replace the invalid `ADDEND + UNSIGNED` success test with rejection and
   output-nonpublication coverage.
-- `[ ]` Low L12: preserve valid noncanonical dylib/RPATH load-command bytes or
+- `[x]` Low L12: preserve valid noncanonical dylib/RPATH load-command bytes or
   explicitly narrow the public reader/writer contract.
-- `[ ]` Policy P01: decide whether executable plus requested link map is one
-  transaction; implement staging/rollback or document explicit partial
-  publication and test the decision.
+- `[x]` Policy P01: treat executable plus requested link map as one
+  transaction; stage both, roll back commit failures, and test the decision.
 
 ## Tranche 10: Exact test-debt and platform coverage identities
 
