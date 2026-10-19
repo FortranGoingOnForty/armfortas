@@ -7,8 +7,9 @@
 #
 # Compares against a per-target baseline file
 # (.benchmarks/baseline-<triple>.txt, triple from `armfortas
-# --print-target`). If no baseline exists, creates one. Thresholds
-# are shared across targets; the baselines are not (x10).
+# --print-target`). Comparison requires an exact committed baseline;
+# baseline creation and refresh are reserved for --update. Thresholds
+# are shared across targets; the baselines are not.
 #
 # Usage:
 #   ./scripts/benchmark_gate.sh           # compare against baseline
@@ -24,6 +25,23 @@
 # binary size is, so size gates everywhere.
 
 set -euo pipefail
+
+update_baseline=0
+case "$#" in
+0) ;;
+1)
+    if [ "$1" != "--update" ]; then
+        echo "Usage: $0 [--update]" >&2
+        exit 2
+    fi
+    update_baseline=1
+    ;;
+*)
+    echo "Usage: $0 [--update]" >&2
+    exit 2
+    ;;
+esac
+
 # Repo root via git when available; the FreeBSD CI VM has no git (the
 # tree arrives by rsync) and already runs from the root.
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -56,9 +74,7 @@ TRIPLE=$("$COMPILER" --print-target)
 # Linux baselines are additionally distro-tagged: NixOS and ubuntu
 # link different crt/libgcc/build-id sets, so binary sizes are only
 # comparable within a distro (learned when CI's ubuntu binaries came
-# out 63-81% larger than the NixOS baseline). An environment without
-# a committed baseline bootstraps one and passes — commit it to arm
-# the gate there.
+# out 63-81% larger than the NixOS baseline).
 ENV_TAG=""
 case "$TRIPLE" in
 *linux*)
@@ -70,9 +86,33 @@ esac
 BASELINE=".benchmarks/baseline-${TRIPLE}${ENV_TAG}.txt"
 echo "Target: $TRIPLE (baseline: $BASELINE)"
 
+if [ "$update_baseline" -eq 0 ] && [ ! -f "$BASELINE" ]; then
+    echo "FAIL: no benchmark baseline exists for $TRIPLE${ENV_TAG}" >&2
+    echo "Create it explicitly with: $0 --update" >&2
+    exit 1
+fi
+
 mkdir -p .benchmarks
-TMPDIR=$(mktemp -d)
-trap "rm -rf $TMPDIR" EXIT
+benchmark_tmp_root=${TMPDIR:-/tmp}
+benchmark_tmp=$(mktemp -d "$benchmark_tmp_root/armfortas-benchmark.XXXXXX")
+cleanup_benchmark_tmp() {
+    case "$benchmark_tmp" in
+    "$benchmark_tmp_root"/armfortas-benchmark.*)
+        rm -rf -- "$benchmark_tmp"
+        ;;
+    *)
+        echo "REFUSING to clean unexpected benchmark path: $benchmark_tmp" >&2
+        return 1
+        ;;
+    esac
+}
+trap cleanup_benchmark_tmp EXIT
+
+results_file="$benchmark_tmp/results.txt"
+expected_names_file="$benchmark_tmp/expected-names.txt"
+baseline_names_file="$benchmark_tmp/baseline-names.txt"
+: > "$results_file"
+: > "$expected_names_file"
 
 # Monotonic-ish seconds: python3 where present (the fleet boxes),
 # whole-second date elsewhere (the CI VM, which gates size only).
@@ -88,7 +128,7 @@ compile_and_measure() {
     local src="$1"
     local stem
     stem=$(basename "$src" .f90)
-    local binary="$TMPDIR/$stem"
+    local binary="$benchmark_tmp/$stem"
 
     # Compile and time it
     local start end elapsed
@@ -115,7 +155,7 @@ check_bss_size_guard() {
         exit 1
     fi
 
-    local binary="$TMPDIR/bss-size-guard"
+    local binary="$benchmark_tmp/bss-size-guard"
     "$COMPILER" "$src" $OPT -o "$binary" 2>/dev/null
 
     local size
@@ -130,25 +170,52 @@ check_bss_size_guard() {
 }
 
 echo "Benchmarking ${#PROGRAMS[@]} programs at $OPT..."
-RESULTS=""
 for prog in "${PROGRAMS[@]}"; do
     result=$(compile_and_measure "$prog")
     echo "  $result"
-    RESULTS="$RESULTS$result"$'\n'
+    printf '%s\n' "$result" >> "$results_file"
+    basename "$prog" .f90 >> "$expected_names_file"
 done
 check_bss_size_guard
 
-if [ "${1:-}" = "--update" ]; then
-    echo "$RESULTS" > "$BASELINE"
+if [ "$update_baseline" -eq 1 ]; then
+    cp "$results_file" "$BASELINE"
     echo "Baseline updated: $BASELINE"
     exit 0
 fi
 
-if [ ! -f "$BASELINE" ]; then
-    echo "$RESULTS" > "$BASELINE"
-    echo "No baseline found — created: $BASELINE"
-    echo "Run again to compare."
-    exit 0
+if ! awk -v names_file="$baseline_names_file" '
+    NF == 0 { next }
+    NF != 3 {
+        printf "FAIL: malformed benchmark baseline line %d: expected 3 fields\n", NR > "/dev/stderr"
+        bad = 1
+        next
+    }
+    $1 !~ /^[A-Za-z0-9_.-]+$/ || $2 !~ /^[0-9]+([.][0-9]+)?$/ || $3 !~ /^[0-9]+$/ {
+        printf "FAIL: malformed benchmark baseline line %d\n", NR > "/dev/stderr"
+        bad = 1
+        next
+    }
+    seen[$1]++ {
+        printf "FAIL: duplicate benchmark baseline identity: %s\n", $1 > "/dev/stderr"
+        bad = 1
+        next
+    }
+    { print $1 > names_file }
+    END { exit bad }
+' "$BASELINE"; then
+    exit 1
+fi
+
+if ! cmp -s "$expected_names_file" "$baseline_names_file"; then
+    echo "FAIL: benchmark baseline identities do not exactly match the benchmark suite" >&2
+    diff -u "$expected_names_file" "$baseline_names_file" >&2 || true
+    exit 1
+fi
+
+if [ ! -s "$baseline_names_file" ]; then
+    echo "FAIL: benchmark baseline contains no identities" >&2
+    exit 1
 fi
 
 # Compare against baseline
@@ -157,11 +224,7 @@ echo "Comparing against baseline..."
 FAIL=0
 while IFS=' ' read -r name time size; do
     [ -z "$name" ] && continue
-    baseline_line=$(grep "^$name " "$BASELINE" 2>/dev/null || true)
-    if [ -z "$baseline_line" ]; then
-        echo "  $name: NEW (no baseline)"
-        continue
-    fi
+    baseline_line=$(awk -v wanted="$name" '$1 == wanted { print; exit }' "$BASELINE")
     base_time=$(echo "$baseline_line" | awk '{print $2}')
     base_size=$(echo "$baseline_line" | awk '{print $3}')
 
@@ -185,7 +248,7 @@ while IFS=' ' read -r name time size; do
     fi
 
     echo "  $name: time ${time_pct}% size ${size_pct}% [$status]"
-done <<< "$RESULTS"
+done < "$results_file"
 
 if [ $FAIL -ne 0 ]; then
     echo ""
