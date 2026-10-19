@@ -25,6 +25,21 @@ const REQUIRED_SUITES: &[RequiredSuite] = &[
         name: "complete afs-ld suite with serialized skip evidence",
         command: "ci/run_logged.sh /tmp/afs-ld-tests.log cargo test -p afs-ld --all-targets -- --nocapture --test-threads=1",
     },
+    RequiredSuite {
+        job: "test-end-to-end",
+        name: "bencch frontend O0 tier",
+        command: "cargo run -p afs-tests --release --quiet -- run --suite frontend --opt O0 --fail-fast --armfortas-bin ./target/release/armfortas",
+    },
+    RequiredSuite {
+        job: "test-end-to-end",
+        name: "bencch consistency-runtime O0 tier",
+        command: "cargo run -p afs-tests --release --quiet -- run --suite consistency/runtime --opt O0 --fail-fast --armfortas-bin ./target/release/armfortas",
+    },
+    RequiredSuite {
+        job: "test-end-to-end",
+        name: "bencch nested future O0 tier",
+        command: "cargo run -p afs-tests --release --quiet -- run --suite runtime/future --opt O0 --fail-fast --armfortas-bin ./target/release/armfortas",
+    },
 ];
 
 const AFS_AS_REQUIRED_CONTROLS: &[(&str, &str)] = &[

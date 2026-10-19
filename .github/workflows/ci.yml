@@ -101,6 +101,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace --release
       - run: cargo test --release --test run_programs -- --nocapture
+      # Audit 13 G02: execute the bencch native O0 tier, not merely its Rust
+      # unit tests. These filters cover frontend/stage/graph behavior, the
+      # consistency runtime matrix, and every nested future I/O fixture.
+      - run: cargo run -p afs-tests --release --quiet -- run --suite frontend --opt O0 --fail-fast --armfortas-bin ./target/release/armfortas
+      - run: cargo run -p afs-tests --release --quiet -- run --suite consistency/runtime --opt O0 --fail-fast --armfortas-bin ./target/release/armfortas
+      - run: cargo run -p afs-tests --release --quiet -- run --suite runtime/future --opt O0 --fail-fast --armfortas-bin ./target/release/armfortas
       # x10: per-target benchmark gate. Size-only in CI (time baselines
       # come from the fleet machines and don't compare across hosts).
       - run: BENCH_SKIP_TIME=1 ./scripts/benchmark_gate.sh
