@@ -17,6 +17,7 @@ struct Case<'a> {
     version: &'a str,
     coverage: &'a str,
     armfortas_state: &'a str,
+    sha256: &'a str,
 }
 
 fn compiler() -> PathBuf {
@@ -41,14 +42,14 @@ fn unique_dir(stem: &str) -> PathBuf {
 
 fn cases() -> Vec<Case<'static>> {
     const MANIFEST: &str = include_str!("fixtures/openmp-official/manifest.tsv");
-    const HEADER: &str = "id\tupstream_path\tlocal_source\tsource_form\toperation\tupstream_expect\tversion\tcoverage\tarmfortas_state";
+    const HEADER: &str = "id\tupstream_path\tlocal_source\tsource_form\toperation\tupstream_expect\tversion\tcoverage\tarmfortas_state\tsha256";
     let mut lines = MANIFEST.lines();
     assert_eq!(lines.next(), Some(HEADER), "unexpected manifest schema");
     lines
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             let fields = line.split('\t').collect::<Vec<_>>();
-            assert_eq!(fields.len(), 9, "malformed manifest row: {line}");
+            assert_eq!(fields.len(), 10, "malformed manifest row: {line}");
             let case = Case {
                 id: fields[0],
                 upstream_path: fields[1],
@@ -59,6 +60,7 @@ fn cases() -> Vec<Case<'static>> {
                 version: fields[6],
                 coverage: fields[7],
                 armfortas_state: fields[8],
+                sha256: fields[9],
             };
             assert!(matches!(case.source_form, "fixed" | "free"), "{case:?}");
             assert!(
@@ -71,12 +73,39 @@ fn cases() -> Vec<Case<'static>> {
                 !case.version.is_empty() && !case.coverage.is_empty(),
                 "{case:?}"
             );
+            assert!(
+                case.sha256.len() == 64 && case.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "invalid SHA-256 identity for {case:?}"
+            );
             case
         })
         .collect()
 }
 
+fn sha256(path: &Path) -> String {
+    let output = Command::new("sha256sum").arg(path).output().or_else(|_| {
+        Command::new("shasum")
+            .args(["-a", "256"])
+            .arg(path)
+            .output()
+    });
+    let output = output.expect("neither sha256sum nor shasum is available");
+    assert!(output.status.success(), "failed to hash {}", path.display());
+    String::from_utf8(output.stdout)
+        .expect("checksum output is not UTF-8")
+        .split_whitespace()
+        .next()
+        .expect("checksum output is empty")
+        .to_string()
+}
+
 fn assert_pinned_source(case: &Case<'_>, source: &Path) {
+    assert_eq!(
+        sha256(source),
+        case.sha256,
+        "pinned source drifted from {}",
+        case.upstream_path
+    );
     let text = std::fs::read_to_string(source)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", source.display()));
     assert!(
@@ -96,6 +125,16 @@ fn assert_pinned_source(case: &Case<'_>, source: &Path) {
         "version metadata drifted for {}",
         case.id
     );
+}
+
+#[test]
+fn official_example_sources_match_their_content_hashes() {
+    let root = fixture_root();
+    for case in cases() {
+        let source = root.join(case.local_source);
+        assert!(source.is_file(), "missing pinned source for {case:?}");
+        assert_pinned_source(&case, &source);
+    }
 }
 
 #[test]

@@ -173,6 +173,23 @@ fn output_contains_expected(output: &str, expected: &str) -> bool {
 // ---- Tests ----
 
 #[test]
+fn null_c_funptr_parameter_round_trips_across_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=null_c_funptr_parameter_round_trips_across_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    multifile_test(
+        "module signal_constants\n  use iso_c_binding, only: c_funptr, c_null_funptr\n  implicit none\n  type(c_funptr), parameter :: sig_dfl = c_null_funptr\nend module\n",
+        "program p\n  use iso_c_binding, only: c_funptr, c_associated\n  use signal_constants, only: sig_dfl\n  implicit none\n  type(c_funptr) :: handler\n  handler = sig_dfl\n  if (c_associated(handler)) error stop 1\n  print *, 'ok'\nend program\n",
+        "ok",
+    );
+}
+
+#[test]
 fn integer16_parameters_round_trip_across_amod() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
@@ -699,6 +716,173 @@ fn volatile_module_variable_survives_amod_round_trip() {
             "{optimization}: provider and consumer-local VOLATILE stores must remain observable:\n{ir_text}"
         );
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn module_variable_memory_attributes_survive_amod_round_trip() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let provider_source = dir.join("memory_attrs_provider.f90");
+    let provider_object = dir.join("memory_attrs_provider.o");
+    let consumer_source = dir.join("memory_attrs_consumer.f90");
+    let consumer_object = dir.join("memory_attrs_consumer.o");
+    let combined_source = dir.join("memory_attrs_combined.f90");
+    let combined_object = dir.join("memory_attrs_combined.o");
+    let module = "module memory_attrs_provider
+  implicit none
+  integer, asynchronous :: watched
+  integer, pointer, contiguous :: values(:)
+end module memory_attrs_provider
+";
+    let consumer = "subroutine inspect_memory_attrs()
+  use memory_attrs_provider, only: watched, values
+  implicit none
+!$omp parallel shared(watched)
+  watched = watched + 1
+!$omp end parallel
+  if (associated(values)) values(1) = values(1)
+end subroutine inspect_memory_attrs
+";
+    std::fs::write(&provider_source, module).unwrap();
+    std::fs::write(&consumer_source, consumer).unwrap();
+    std::fs::write(&combined_source, format!("{module}{consumer}")).unwrap();
+
+    let compile_rejected = |source: &Path, output: &Path, search_dir: Option<&Path>| {
+        let mut command = Command::new(&compiler);
+        command.current_dir(&dir).arg("-fopenmp").arg("-c");
+        if let Some(search_dir) = search_dir {
+            command.arg(format!("-I{}", search_dir.display()));
+        }
+        let result = command
+            .arg(source)
+            .arg("-o")
+            .arg(output)
+            .output()
+            .expect("memory-attribute compiler launch failed");
+        assert!(
+            !result.status.success(),
+            "{} unexpectedly passed the OpenMP ASYNCHRONOUS safety gate",
+            source.display()
+        );
+        assert!(
+            !output.exists(),
+            "{} published an object after semantic failure",
+            source.display()
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+        assert!(
+            stderr.contains("shared VOLATILE or ASYNCHRONOUS variable 'watched'"),
+            "unexpected memory-attribute diagnostic for {}:\n{stderr}",
+            source.display()
+        );
+        stderr
+    };
+
+    let combined_stderr = compile_rejected(&combined_source, &combined_object, None);
+    compile_file(&compiler, &provider_source, &provider_object, None);
+    let amod = std::fs::read_to_string(dir.join("memory_attrs_provider.amod"))
+        .expect("memory-attribute provider did not emit its module interface");
+    assert!(amod.starts_with("#!amod 20\n"), "{amod}");
+    assert!(
+        amod.lines()
+            .any(|line| line.starts_with("@var watched :") && line.contains("asynchronous")),
+        "ASYNCHRONOUS module-variable metadata was not serialized:\n{amod}"
+    );
+    assert!(
+        amod.lines().any(|line| {
+            line.starts_with("@var values :")
+                && line.contains("pointer")
+                && line.contains("contiguous")
+        }),
+        "CONTIGUOUS module-variable metadata was not serialized:\n{amod}"
+    );
+    let split_stderr = compile_rejected(&consumer_source, &consumer_object, Some(&dir));
+    let diagnostic = |stderr: &str| {
+        stderr.lines().find_map(|line| {
+            line.split_once("error: ")
+                .map(|(_, message)| message.to_owned())
+        })
+    };
+    assert_eq!(
+        diagnostic(&combined_stderr),
+        diagnostic(&split_stderr),
+        "combined and split compilation disagreed on imported ASYNCHRONOUS metadata"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ieee_nominal_module_variables_remain_distinct_across_amod() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let provider_source = dir.join("ieee_nominal_provider.f90");
+    let provider_object = dir.join("ieee_nominal_provider.o");
+    let consumer_source = dir.join("ieee_nominal_consumer.f90");
+    let consumer_object = dir.join("ieee_nominal_consumer.o");
+    std::fs::write(
+        &provider_source,
+        "module ieee_nominal_provider
+  use, intrinsic :: ieee_arithmetic, only: ieee_class_type, ieee_round_type
+  implicit none
+  type(ieee_class_type) :: class_value
+  type(ieee_round_type) :: round_value
+end module ieee_nominal_provider
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &consumer_source,
+        "subroutine invalid_cross_assignment()
+  use ieee_nominal_provider, only: class_value, round_value
+  implicit none
+  class_value = round_value
+end subroutine invalid_cross_assignment
+",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &provider_source, &provider_object, None);
+    let amod = std::fs::read_to_string(dir.join("ieee_nominal_provider.amod"))
+        .expect("IEEE nominal provider did not emit its module interface");
+    assert!(
+        amod.lines()
+            .any(|line| { line.starts_with("@var class_value : type(ieee_class_type)") }),
+        "IEEE_CLASS_TYPE identity was erased from .amod:\n{amod}"
+    );
+    assert!(
+        amod.lines()
+            .any(|line| { line.starts_with("@var round_value : type(ieee_round_type)") }),
+        "IEEE_ROUND_TYPE identity was erased from .amod:\n{amod}"
+    );
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            consumer_source.to_str().unwrap(),
+            "-o",
+            consumer_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("IEEE nominal consumer compiler launch failed");
+    assert!(
+        !result.status.success(),
+        "cross-unit assignment between distinct IEEE nominal types compiled"
+    );
+    assert!(
+        !consumer_object.exists(),
+        "cross-unit IEEE semantic failure published an object"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("TYPE(ieee_round_type)") && stderr.contains("TYPE(ieee_class_type)"),
+        "unexpected cross-unit IEEE nominal-type diagnostic: {stderr}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

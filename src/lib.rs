@@ -152,14 +152,14 @@ fn emit_cli_warnings(program_name: &str, opts: &driver::Options) -> bool {
 /// this is heuristic on the string content; a future structured
 /// error type would let us be precise.
 fn classify_compile_error(msg: &str, compile: i32, link: i32, io: i32) -> i32 {
-    if msg.contains("cannot read")
+    if msg.contains("linker failed") || msg.contains("cannot run linker") || msg.contains("ld:") {
+        link
+    } else if msg.contains("cannot read")
         || msg.contains("cannot write")
         || msg.contains("No such file")
         || msg.contains("cannot open")
     {
         io
-    } else if msg.contains("linker failed") || msg.contains("ld:") {
-        link
     } else {
         compile
     }

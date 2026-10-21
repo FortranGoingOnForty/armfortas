@@ -1056,6 +1056,9 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.skip_newlines();
                 // Parse type-bound procedures until 'end type'.
+                let mut saw_binding = false;
+                let mut saw_private_bindings_stmt = false;
+                let mut default_bindings_private = false;
                 loop {
                     self.skip_newlines();
                     let proc_text = self.peek_text().to_lowercase();
@@ -1068,12 +1071,32 @@ impl<'a> Parser<'a> {
 
                     if proc_text == "procedure" {
                         self.advance();
-                        let tbps = self.parse_type_bound_proc()?;
+                        let mut tbps = self.parse_type_bound_proc()?;
+                        if default_bindings_private {
+                            for tbp in &mut tbps {
+                                if !tbp.attrs.iter().any(|attr| {
+                                    attr.eq_ignore_ascii_case("public")
+                                        || attr.eq_ignore_ascii_case("private")
+                                }) {
+                                    tbp.attrs.push("private".to_string());
+                                }
+                            }
+                        }
                         type_bound_procs.extend(tbps);
+                        saw_binding = true;
                     } else if proc_text == "generic" {
                         self.advance();
-                        let tbp = self.parse_type_bound_proc_generic()?;
+                        let mut tbp = self.parse_type_bound_proc_generic()?;
+                        if default_bindings_private
+                            && !tbp.attrs.iter().any(|attr| {
+                                attr.eq_ignore_ascii_case("public")
+                                    || attr.eq_ignore_ascii_case("private")
+                            })
+                        {
+                            tbp.attrs.push("private".to_string());
+                        }
                         type_bound_procs.push(tbp);
+                        saw_binding = true;
                     } else if proc_text == "final" {
                         self.advance();
                         self.eat(&TokenKind::ColonColon);
@@ -1089,9 +1112,31 @@ impl<'a> Parser<'a> {
                                 break;
                             }
                         }
+                        saw_binding = true;
                     } else if proc_text == "private" {
+                        if !self.at_stmt_end_after(1) {
+                            return Err(
+                                self.error("binding PRIVATE statement must be bare".to_string())
+                            );
+                        }
+                        if saw_binding {
+                            return Err(self.error(
+                                "binding PRIVATE statement must precede type-bound procedures"
+                                    .to_string(),
+                            ));
+                        }
+                        if saw_private_bindings_stmt {
+                            return Err(self.error(
+                                "duplicate binding PRIVATE statement in derived type definition"
+                                    .to_string(),
+                            ));
+                        }
+                        self.advance();
+                        saw_private_bindings_stmt = true;
+                        default_bindings_private = true;
+                    } else if proc_text == "public" {
                         return Err(self.error(
-                            "binding PRIVATE statement is recognized but not yet implemented"
+                            "binding PUBLIC statement is not permitted in a derived type definition"
                                 .to_string(),
                         ));
                     } else {
@@ -2148,8 +2193,8 @@ end type item",
                 "unrecognized statement 'arbitrary' in derived-type binding part",
             ),
             (
-                "type :: item\ncontains\n  private\nend type item",
-                "binding PRIVATE statement is recognized but not yet implemented",
+                "type :: item\ncontains\n  public\nend type item",
+                "binding PUBLIC statement is not permitted",
             ),
             (
                 "type :: item\n  integer :: value\n  sequence\nend type item",
@@ -2162,6 +2207,69 @@ end type item",
             (
                 "type :: item\n  sequence\ncontains\nend type item",
                 "SEQUENCE derived type must not have a CONTAINS section",
+            ),
+        ] {
+            let error = parse_derived_type_error(source);
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn derived_type_binding_private_sets_default_access_without_overriding_public() {
+        let tokens = Lexer::tokenize(
+            "\
+type :: item
+contains
+  private
+  procedure :: hidden
+  procedure, public :: shown
+  generic :: hidden_group => hidden
+  generic, public :: shown_group => shown
+end type item",
+            0,
+        )
+        .unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.advance();
+        let decl = parser.parse_derived_type_def().unwrap();
+        let Decl::DerivedTypeDef {
+            type_bound_procs, ..
+        } = decl.node
+        else {
+            panic!("not a derived type definition");
+        };
+
+        let access = |name: &str| {
+            type_bound_procs
+                .iter()
+                .find(|binding| binding.name == name)
+                .and_then(|binding| {
+                    binding.attrs.iter().find(|attr| {
+                        attr.eq_ignore_ascii_case("public") || attr.eq_ignore_ascii_case("private")
+                    })
+                })
+                .map(String::as_str)
+        };
+        assert_eq!(access("hidden"), Some("private"));
+        assert_eq!(access("shown"), Some("public"));
+        assert_eq!(access("hidden_group"), Some("private"));
+        assert_eq!(access("shown_group"), Some("public"));
+    }
+
+    #[test]
+    fn derived_type_rejects_malformed_binding_private_statements() {
+        for (source, expected) in [
+            (
+                "type :: item\ncontains\n  private :: hidden\n  procedure :: hidden\nend type item",
+                "binding PRIVATE statement must be bare",
+            ),
+            (
+                "type :: item\ncontains\n  procedure :: shown\n  private\nend type item",
+                "binding PRIVATE statement must precede type-bound procedures",
+            ),
+            (
+                "type :: item\ncontains\n  private\n  private\nend type item",
+                "duplicate binding PRIVATE statement",
             ),
         ] {
             let error = parse_derived_type_error(source);

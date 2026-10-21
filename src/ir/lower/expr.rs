@@ -111,6 +111,84 @@ fn lower_kind_inquiry_ast(
     Some(b.const_i32(i32::from(kind)))
 }
 
+/// Lower C_SIZEOF from the semantic entity before ordinary expression
+/// lowering erases aggregate shape and derived-type layout behind pointers.
+#[allow(clippy::too_many_arguments)]
+fn lower_c_sizeof_intrinsic_ast(
+    b: &mut FuncBuilder,
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    if args.len() != 1 {
+        return None;
+    }
+    let arg = &args[0];
+    if arg
+        .keyword
+        .as_deref()
+        .is_some_and(|keyword| !keyword.eq_ignore_ascii_case("x"))
+    {
+        return None;
+    }
+    let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+        return None;
+    };
+
+    if let Some((descriptor, _)) = lower_array_expr_descriptor(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    ) {
+        let elements = b.call(
+            FuncRef::External("afs_array_size".into()),
+            vec![descriptor],
+            IrType::Int(IntWidth::I64),
+        );
+        let element_bytes = descriptor_elem_size(b, descriptor);
+        return Some(b.imul(elements, element_bytes));
+    }
+
+    let type_info = generic_actual_expr_type_info(expr, locals, st, type_layouts)?;
+    if let crate::sema::symtab::TypeInfo::Derived(type_name) = &type_info {
+        if matches!(
+            type_name.to_ascii_lowercase().as_str(),
+            "c_ptr" | "c_funptr"
+        ) {
+            return Some(b.const_i64(b.layout.ptr_bytes as i64));
+        }
+        let layouts = type_layouts?;
+        let canonical =
+            canonical_layout_type_name_for_scope(st, current_proc_scope(), type_name, layouts);
+        let layout = canonical
+            .as_deref()
+            .and_then(|name| layouts.get(name))
+            .or_else(|| layouts.get(type_name))?;
+        return Some(b.const_i64(layout.size as i64));
+    }
+
+    if matches!(
+        type_info,
+        crate::sema::symtab::TypeInfo::Class(_)
+            | crate::sema::symtab::TypeInfo::ClassStar
+            | crate::sema::symtab::TypeInfo::TypeStar
+    ) {
+        return None;
+    }
+
+    let size = ir_scalar_byte_size(&type_info_to_ir_type(&type_info), b.layout);
+    Some(b.const_i64(size))
+}
+
 pub(crate) fn lower_expr_tl(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -2383,10 +2461,15 @@ pub(crate) fn lower_expr_full(
                     }
                 }
                 if !has_named_interface
-                    && resolved_intrinsic_name.as_deref() == Some("ieee_selected_real_kind")
+                    && resolved_intrinsic_name.as_deref().is_some_and(|name| {
+                        matches!(name, "selected_real_kind" | "ieee_selected_real_kind")
+                    })
                 {
+                    let intrinsic_name = resolved_intrinsic_name
+                        .as_deref()
+                        .expect("selected-real-kind intrinsic name");
                     let arg_slots =
-                        reorder_args_by_keyword_slots(original_args, "ieee_selected_real_kind", st);
+                        reorder_args_by_keyword_slots(original_args, intrinsic_name, st);
                     let mut values = [None, None, None];
                     for (index, arg) in arg_slots.iter().take(values.len()).enumerate() {
                         let Some(arg) = arg else {
@@ -2406,9 +2489,27 @@ pub(crate) fn lower_expr_full(
                             descriptor_params,
                         ));
                     }
-                    return super::intrinsic::lower_ieee_selected_real_kind(
+                    return super::intrinsic::lower_selected_real_kind(
                         b, values[0], values[1], values[2],
                     );
+                }
+                if !has_named_interface
+                    && resolved_intrinsic_name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("c_sizeof"))
+                {
+                    if let Some(result) = lower_c_sizeof_intrinsic_ast(
+                        b,
+                        original_args,
+                        locals,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        return result;
+                    }
                 }
                 if !has_named_interface && key == "same_type_as" {
                     if let Some(result) = lower_same_type_as_intrinsic_ast(

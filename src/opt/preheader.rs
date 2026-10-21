@@ -4,7 +4,7 @@
 //! inserting a new block between the out-of-loop predecessors and the
 //! header. Block arguments are threaded through so SSA form is preserved.
 //!
-//! Run early at O2+ so downstream passes (LICM, unswitching, interchange)
+//! Run early at O2+ so downstream passes (LICM and unswitching)
 //! can assume every loop has a preheader.
 
 use super::loop_utils::find_preheader;

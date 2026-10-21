@@ -1,4 +1,5 @@
-! STDERR_CHECK: STOP char stop code message
+! STDOUT_EXACT:
+! STDERR_EXACT: STOP char stop code message\n
 ! EXIT_CODE: 0
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit
 program ar11_stop_char_code

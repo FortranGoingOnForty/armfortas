@@ -22,10 +22,16 @@ Under active development. The full pipeline, from preprocessor to object file, w
 ```
 Pipeline: Source → Preprocessor → Lexer → Parser → AST →
           Sema → SSA IR → Optimizations → ARM64 / x86_64 Codegen →
-          afs-as → .o (Mach-O / ELF) → ld → Binary
+          target assembler → .o (Mach-O / ELF) → ld → Binary
 ```
 
-`afs-as` assembles both architectures and writes both object formats in-process, so the default build never calls the system `as`. Linking still goes through the system `ld` by default. Our own linker, `afs-ld`, can be used instead by setting `AFS_LD=1` (or `AFS_LD_PATH`), and it links both ELF and Mach-O.
+Assembler routing is target-specific. Native `arm64-macos` builds invoke
+Apple's `as` by default. x86_64 ELF builds use `afs-as` in-process by default,
+and cross-target Mach-O object builds use its embedded ARM64 path. Set
+`AFS_AS_PATH` to select an external assembler explicitly; on ELF hosts,
+`AFS_AS=0` selects the system `as`. Linking still goes through the system `ld`
+by default. Our own linker, `afs-ld`, can be used instead by setting
+`AFS_LD=1` (or `AFS_LD_PATH`), and it links both ELF and Mach-O.
 
 armfortas compiles and runs real programs. The largest test so far is fpm: armfortas builds fpm, and that fpm rebuilds itself to a byte-identical result.
 
@@ -82,7 +88,10 @@ afs --version
 ## Preview limitations
 
 - OpenMP host execution is experimental and limited to the OpenMP 5.2 language baseline. `parallel` regions and the data forms listed in [OPENMP.md](OPENMP.md) run in parallel. Constructs, clauses, and data forms outside that list are rejected at compile time instead of being run serially.
-- `afs-as` is the default assembler, but the system linker is still the default linker. `AFS_LD=1` switches to `afs-ld` while we finish bringing it to parity.
+- `afs-as` is the default assembler for x86_64 ELF and cross-target Mach-O
+  object generation. Native Apple-Silicon Mach-O builds still use Apple `as`
+  by default. The system linker remains the default; `AFS_LD=1` switches to
+  `afs-ld` while we finish bringing it to parity.
 - Linux AArch64 is not supported. The only ARM64 target is Apple Silicon macOS, and the ELF targets (Linux and FreeBSD) are x86_64 only.
 - `.amod` module files are specific to armfortas. They can't be read by gfortran, flang, or other compilers, and armfortas can't read theirs.
 - Language and optimizer coverage is broad but not complete. A 0.1.x release does not claim full Fortran conformance.
@@ -167,7 +176,7 @@ Inquiry: `KIND`, `SELECTED_INT_KIND`, `SELECTED_REAL_KIND`, `HUGE`, `TINY`, `EPS
 | `-O1` | mem2reg, constant folding, DCE, basic CSE, copy propagation, small inlining |
 | `-O2` | `-O1` plus LICM, strength reduction, DSE, GVN, SROA, loop store forwarding, jump threading, IPO (constant args, dead args, return propagation) |
 | `-Os` | Like `-O2`, but no unrolling and less inlining |
-| `-O3` | `-O2` plus aggressive inlining, loop unrolling and interchange, vectorization (NEON on arm64, SSE2 on x86_64) |
+| `-O3` | `-O2` plus aggressive inlining, loop unrolling, and vectorization (NEON on arm64, SSE2 on x86_64) |
 | `-Ofast` | `-O3` plus fast-math: reassociation, multiply-add contraction, reciprocals, and the assumption that no NaN or Inf values occur |
 
 On x86_64 the vectorizer only emits SSE2, which every x86_64 CPU has. CI fails if any SSE3 or later instruction, any AVX instruction, or any x87 instruction shows up in the output.
@@ -261,7 +270,13 @@ Each type with bound procedures gets one constant vtable, `_afs_vtable_<module>_
 
 #### afs-as and afs-ld
 
-afs-as is a standalone assembler for ARM64 and x86_64 (a subset of AT&T syntax) that writes Mach-O and ELF. It has no Fortran-specific code. It runs in-process by default, and its output is checked byte-for-byte against the system assembler across the whole test corpus. afs-ld is a standalone linker built the same way. The driver uses the system `ld` unless `AFS_LD=1` is set.
+afs-as is a standalone assembler for ARM64 and x86_64 (a subset of AT&T
+syntax) that writes Mach-O and ELF. It has no Fortran-specific code. Its
+in-process implementation is the default on x86_64 ELF and for cross-target
+Mach-O object generation; native Apple-Silicon Mach-O compilation invokes
+Apple `as` by default. Its output is checked byte-for-byte against the system
+assembler across the whole test corpus. afs-ld is a standalone linker built
+the same way. The driver uses the system `ld` unless `AFS_LD=1` is set.
 
 ## Testing
 

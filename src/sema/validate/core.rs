@@ -157,10 +157,10 @@ pub(super) struct Ctx<'a> {
     /// worksharing constructs bind dynamically, so this tracks only the data
     /// environment that semantic validation can prove from the source tree.
     pub(super) openmp_parallel_depth: usize,
-    /// Nearest enclosing OpenMP regions, used for close-nesting rules such as
-    /// MASTER being directly bound to a PARALLEL region. Ordinary Fortran
-    /// control constructs do not alter this stack.
-    pub(super) openmp_construct_stack: Vec<&'static str>,
+    /// Enclosing OpenMP regions with the categories, binding boundaries, and
+    /// identities needed by the centralized nesting-relation checks. Ordinary
+    /// Fortran control constructs do not alter this stack.
+    pub(super) openmp_construct_stack: Vec<super::openmp::OpenMpRegionFrame>,
     /// Number of enclosing worksharing loops that carry a bare ORDERED clause.
     /// The construct stack separately enforces close nesting.
     pub(super) openmp_ordered_binding_depth: usize,
@@ -632,38 +632,29 @@ fn is_c_interop_pointer_typespec(ts: &crate::ast::decl::TypeSpec) -> bool {
     )
 }
 
-/// Evaluate a REAL/COMPLEX kind selector to a concrete kind value when
-/// it is an integer literal or a named integer constant in scope (a
-/// PARAMETER such as `dp`, or an ISO_FORTRAN_ENV name like `real64`).
-/// Returns None when the kind can't be determined statically — the
-/// caller must not reject on an unknown kind. `real*16` (the old-style
-/// `Star` selector) is evaluated the same way.
-fn eval_real_complex_kind(ctx: &Ctx<'_>, type_spec: &TypeSpec) -> Option<u8> {
+/// Evaluate a REAL/COMPLEX kind selector to a concrete, signed kind value.
+/// Negative results from kind-selection intrinsics and unavailable
+/// ISO_FORTRAN_ENV constants are still definite values: treating them as an
+/// unresolved selector silently falls back to the default real kind.
+/// Returns None only when the selector cannot be determined statically.
+/// `complex*16` (the old-style `Star` selector) denotes two REAL(8)
+/// components, rather than component kind 16.
+fn eval_real_complex_kind(ctx: &Ctx<'_>, type_spec: &TypeSpec) -> Option<i128> {
     use crate::ast::decl::KindSelector;
-    use crate::ast::expr::Expr;
     let (sel, is_complex) = match type_spec {
         TypeSpec::Real(sel) => (sel, false),
         TypeSpec::Complex(sel) => (sel, true),
         _ => return None,
     };
     let (KindSelector::Expr(e) | KindSelector::Star(e)) = sel.as_ref()?;
-    let value = match &e.node {
-        Expr::IntegerLiteral { text, .. } => text.parse::<u8>().ok(),
-        Expr::Name { name } => {
-            let key = name.to_lowercase();
-            ctx.st
-                .lookup_in(ctx.scope_id, &key)
-                .or_else(|| ctx.st.find_symbol_any_scope(&key))
-                .and_then(|sym| sym.const_value)
-                .and_then(|v| u8::try_from(v).ok())
-        }
-        _ => None,
-    }?;
-    Some(if is_complex {
-        crate::sema::resolve::type_resolution::normalize_complex_kind_selector_value(sel, value)
-    } else {
-        value
-    })
+    let value = eval_const_int_expr_checked(ctx, e).ok().flatten()?.value;
+    Some(
+        if is_complex && matches!(sel, Some(KindSelector::Star(_))) {
+            value / 2
+        } else {
+            value
+        },
+    )
 }
 
 fn validate_supported_character_type_spec(ctx: &mut Ctx<'_>, span: Span, type_spec: &TypeSpec) {
@@ -6209,7 +6200,9 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                     ctx.openmp_parallel_depth += 1;
                     ctx.openmp_parallel_private_frames.push(frame);
                 }
-                ctx.openmp_construct_stack.push(construct.name());
+                let region_frame = super::openmp::region_frame(construct)
+                    .expect("OpenMP structured-block construct must define a region frame");
+                ctx.openmp_construct_stack.push(region_frame);
                 validate_stmts(ctx, body);
                 ctx.openmp_construct_stack.pop();
                 if enters_parallel {
@@ -6230,7 +6223,9 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 if enters_doacross_binding {
                     ctx.openmp_doacross_binding_depth += 1;
                 }
-                ctx.openmp_construct_stack.push(construct.name());
+                let region_frame = super::openmp::region_frame(construct)
+                    .expect("OpenMP loop construct must define a region frame");
+                ctx.openmp_construct_stack.push(region_frame);
                 validate_stmt(ctx, loop_stmt);
                 ctx.openmp_construct_stack.pop();
                 if enters_doacross_binding {
@@ -8469,6 +8464,14 @@ fn field_is_accessible(ctx: &Ctx<'_>, field: &crate::sema::type_layout::FieldLay
         .is_none_or(|owner| scope_has_private_component_access(ctx, owner))
 }
 
+fn bound_proc_is_accessible(ctx: &Ctx<'_>, binding: &crate::sema::type_layout::BoundProc) -> bool {
+    binding.access != Access::Private
+        || binding
+            .owner_module
+            .as_deref()
+            .is_none_or(|owner| scope_has_private_component_access(ctx, owner))
+}
+
 fn report_inaccessible_component(
     ctx: &mut Ctx<'_>,
     span: Span,
@@ -8484,6 +8487,25 @@ fn report_inaccessible_component(
         format!(
             "private component '{}' of derived type '{}' is not accessible in this scope{}",
             component, base_type, owner
+        ),
+    );
+}
+
+fn report_inaccessible_bound_proc(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    binding: &str,
+    base_type: &str,
+    owner_module: Option<&str>,
+) {
+    let owner = owner_module
+        .map(|module| format!(" (declared in module '{}')", module))
+        .unwrap_or_default();
+    ctx.error(
+        span,
+        format!(
+            "private type-bound procedure '{}' of derived type '{}' is not accessible in this scope{}",
+            binding, base_type, owner
         ),
     );
 }
@@ -8533,6 +8555,22 @@ fn validate_component_access(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Spanned
                             component,
                             &base_type,
                             field.owner_module.as_deref(),
+                        );
+                    }
+                } else {
+                    let candidates = layout.bound_proc_candidates(component);
+                    if !candidates.is_empty()
+                        && !candidates
+                            .iter()
+                            .any(|binding| bound_proc_is_accessible(ctx, binding))
+                    {
+                        let binding = candidates[0];
+                        report_inaccessible_bound_proc(
+                            ctx,
+                            expr.span,
+                            component,
+                            &base_type,
+                            binding.owner_module.as_deref(),
                         );
                     }
                 }
@@ -10456,6 +10494,23 @@ fn validate_derived_type(
     }
 
     for tbp in type_bound_procs {
+        let access_specs = tbp
+            .attrs
+            .iter()
+            .filter(|attr| {
+                attr.eq_ignore_ascii_case("public") || attr.eq_ignore_ascii_case("private")
+            })
+            .count();
+        if access_specs > 1 {
+            ctx.error(
+                span,
+                format!(
+                    "type-bound procedure '{}' specifies accessibility more than once",
+                    tbp.name
+                ),
+            );
+        }
+
         // Deferred procedures only allowed in abstract types.
         let is_deferred = tbp.attrs.iter().any(|a| a.eq_ignore_ascii_case("deferred"));
         if is_deferred && !is_abstract {
@@ -12033,7 +12088,7 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
                 );
             }
         }
-        "ieee_selected_real_kind" => {
+        "selected_real_kind" | "ieee_selected_real_kind" => {
             const FORMALS: [&str; 3] = ["p", "r", "radix"];
             validate_intrinsic_argument_associations(ctx, span, &key, args, &FORMALS, 0);
             for (position, formal) in FORMALS.iter().enumerate() {
@@ -14674,6 +14729,38 @@ end program
                 err.contains("ieee_selected_real_kind")
                     && err.contains("R")
                     && err.contains("must be scalar")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn ieee_opaque_types_keep_distinct_assignment_identities() {
+        let errs = errors_from(
+            "\
+program p
+  use, intrinsic :: ieee_arithmetic, only : ieee_class_type, ieee_round_type, &
+       ieee_quiet_nan, ieee_nearest
+  implicit none
+  type(ieee_class_type) :: class_value
+  type(ieee_round_type) :: round_value
+  class_value = ieee_quiet_nan
+  round_value = ieee_nearest
+  class_value = round_value
+  round_value = class_value
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|error| error.contains("intrinsic assignment cannot convert TYPE("))
+                .count(),
+            2,
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|error| {
+                error.contains("TYPE(ieee_round_type)") && error.contains("TYPE(ieee_class_type)")
             }),
             "{errs:?}"
         );
@@ -20793,6 +20880,32 @@ end program
         assert!(errs
             .iter()
             .any(|e| e.contains("MOVE_ALLOC") && e.contains("F2003")));
+    }
+
+    #[test]
+    fn rejects_definite_negative_real_kind_selectors() {
+        let errs = errors_from(
+            "\
+program p
+  use, intrinsic :: iso_fortran_env, only : real128
+  implicit none
+  real(real128) :: unavailable_named_kind
+  real(selected_real_kind(33)) :: unavailable_selected_kind
+  real(2 + 2) :: supported_computed_kind
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|error| error.contains("REAL(kind=-1) is not supported"))
+                .count(),
+            2,
+            "{errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|error| error.contains("REAL(kind=4)")),
+            "{errs:?}"
+        );
     }
 
     // ---- Elemental ----

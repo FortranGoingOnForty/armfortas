@@ -28,8 +28,10 @@ use crate::sema::{resolve, validate};
 
 static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
-/// OpenMP language level advertised through the `_OPENMP` predefined macro.
-/// `202111` denotes OpenMP 5.2.
+/// OpenMP language baseline selected by the `_OPENMP` predefined macro.
+/// `202111` denotes OpenMP 5.2. During the preview this is paired with the
+/// machine-readable `__ARMFORTAS_OPENMP_*__` capability policy below and is
+/// not a claim of complete OpenMP 5.2 conformance.
 pub const OPENMP_VERSION: u32 = 202111;
 
 struct RemoveFileOnDrop(PathBuf);
@@ -37,6 +39,43 @@ struct RemoveFileOnDrop(PathBuf);
 impl Drop for RemoveFileOnDrop {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// A uniquely created temporary directory owned by this driver invocation.
+/// The create-only loop prevents us from claiming or deleting a stale path.
+struct RemoveDirOnDrop(PathBuf);
+
+impl RemoveDirOnDrop {
+    fn create(prefix: &str) -> Result<Self, String> {
+        for _ in 0..32 {
+            let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("{prefix}_{}_{}", std::process::id(), id));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "cannot create temporary directory '{}': {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "cannot create a unique {prefix} temporary directory under '{}'",
+            std::env::temp_dir().display()
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -1240,8 +1279,11 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             }
 
             // ---- Debug / introspection ----
-            "-g" | "-g1" | "-g2" | "-g3" | "-g0" => opts.debug_info = true,
-            arg if arg.starts_with("-g") => opts.debug_info = true,
+            "-g" | "-g1" | "-g2" | "-g3" => opts.debug_info = true,
+            "-g0" => opts.debug_info = false,
+            arg if arg.starts_with("-g") => {
+                return Err(format!("unsupported debug option: {arg}"));
+            }
             "-v" | "--verbose" => opts.verbose = true,
             "--time-report" => opts.time_report = true,
             arg if arg.starts_with("--diagnostics-format=") => {
@@ -2013,6 +2055,24 @@ fn preproc_config_for_input(
         include_paths: opts.module_search_paths.clone(),
         ..crate::preprocess::PreprocConfig::for_target(&opts.target)
     };
+    if opts.openmp || opts.openmp_simd {
+        for (name, value) in [
+            ("__ARMFORTAS_OPENMP_PREVIEW__", "1"),
+            ("__ARMFORTAS_OPENMP_CONFORMING__", "0"),
+            (
+                "__ARMFORTAS_OPENMP_HOST_PARALLEL__",
+                if opts.openmp { "1" } else { "0" },
+            ),
+            ("__ARMFORTAS_OPENMP_SIMD__", "0"),
+            ("__ARMFORTAS_OPENMP_TASKING__", "0"),
+            ("__ARMFORTAS_OPENMP_OFFLOAD__", "0"),
+            ("__ARMFORTAS_OPENMP_TOOLS__", "0"),
+        ] {
+            config
+                .defines
+                .insert(name.into(), crate::preprocess::MacroDef::object(value));
+        }
+    }
     if opts.openmp {
         config.defines.insert(
             "_OPENMP".into(),
@@ -2512,6 +2572,7 @@ fn compile_with_bundled_runtime_inner(
             buf.push_str(&format!("{:?}\n", t));
         }
         write_primary_output_atomic(&out, &buf)?;
+        phases.report();
         return Ok(());
     }
 
@@ -2543,6 +2604,7 @@ fn compile_with_bundled_runtime_inner(
             buf.push_str(&format!("{:#?}\n", u));
         }
         write_primary_output_atomic(&out, &buf)?;
+        phases.report();
         return Ok(());
     }
 
@@ -2697,6 +2759,7 @@ fn compile_with_bundled_runtime_inner(
         let ir_text = ir_printer::print_module(&ir_module);
         let out = opts.output_path();
         write_primary_output_atomic(&out, &ir_text)?;
+        phases.report();
         return Ok(());
     }
 
@@ -2744,7 +2807,7 @@ fn compile_with_bundled_runtime_inner(
         return Ok(());
     }
 
-    // 10. Assemble (using system assembler for now).
+    // 10. Assemble through the target-specific route selected below.
     //
     // The temp .s / .o paths must satisfy two competing needs:
     //   (1) `ld` embeds the .o path in the linked binary's symbol
@@ -3863,9 +3926,7 @@ fn compile_multi_with_bundled_runtime(
     let tmp_dir = if terminal_mode.is_some() {
         None
     } else {
-        let dir = std::env::temp_dir().join(format!("afs_multi_{}", std::process::id()));
-        fs::create_dir_all(&dir).map_err(|e| format!("cannot create temp dir: {}", e))?;
-        Some(dir)
+        Some(RemoveDirOnDrop::create("afs_multi")?)
     };
 
     // Compilation may run in dependency order, but linker operands must remain
@@ -3880,7 +3941,7 @@ fn compile_multi_with_bundled_runtime(
             Some(outputs) => outputs[idx].clone(),
             None => {
                 let tmp_dir = tmp_dir.as_ref().expect("temp dir for multi-file link");
-                Some(tmp_dir.join(format!("source_{}.o", idx)))
+                Some(tmp_dir.path().join(format!("source_{}.o", idx)))
             }
         };
 
@@ -3898,7 +3959,7 @@ fn compile_multi_with_bundled_runtime(
         sub_opts.module_search_paths = {
             let mut paths = opts.module_search_paths.clone();
             if let Some(tmp_dir) = tmp_dir.as_ref() {
-                paths.push(tmp_dir.clone()); // find .amod from earlier compilations
+                paths.push(tmp_dir.path().to_path_buf()); // find .amod from earlier compilations
             }
             paths
         };
@@ -3965,11 +4026,6 @@ fn compile_multi_with_bundled_runtime(
         &included_files,
     )?;
 
-    // Cleanup.
-    if let Some(tmp_dir) = tmp_dir {
-        let _ = fs::remove_dir_all(&tmp_dir);
-    }
-
     Ok(())
 }
 
@@ -3978,16 +4034,26 @@ fn find_runtime_lib(bundled_runtime: Option<&'static [u8]>) -> Result<RuntimeArc
     // 1. $AFS_RUNTIME_PATH — the explicit override.  Accepts either
     //    a directory containing libarmfortas_rt.a or the archive
     //    path directly.
-    if let Ok(env_path) = std::env::var("AFS_RUNTIME_PATH") {
-        let p = PathBuf::from(&env_path);
+    if let Some(env_path) = std::env::var_os("AFS_RUNTIME_PATH") {
+        let p = PathBuf::from(env_path);
+        if p.as_os_str().is_empty() {
+            return Err(
+                "AFS_RUNTIME_PATH is set but empty; set it to libarmfortas_rt.a or its containing directory"
+                    .into(),
+            );
+        }
         if p.is_dir() {
             let candidate = p.join("libarmfortas_rt.a");
-            if candidate.exists() {
+            if candidate.is_file() {
                 return Ok(RuntimeArchive::external(candidate));
             }
-        } else if p.exists() {
+        } else if p.is_file() {
             return Ok(RuntimeArchive::external(p));
         }
+        return Err(format!(
+            "AFS_RUNTIME_PATH '{}' does not provide libarmfortas_rt.a for a static link; set it to the archive or its containing directory",
+            p.display()
+        ));
     }
 
     // 2. A source workspace that owns the compiler executable. Development
@@ -4079,8 +4145,14 @@ fn find_runtime_dylib() -> Result<PathBuf, String> {
         ));
     }
 
-    if let Some(path) = env_override("AFS_RUNTIME_PATH") {
-        let requested = PathBuf::from(&path);
+    if let Some(path) = std::env::var_os("AFS_RUNTIME_PATH") {
+        let requested = PathBuf::from(path);
+        if requested.as_os_str().is_empty() {
+            return Err(
+                "AFS_RUNTIME_PATH is set but empty; set it to libarmfortas_rt.dylib or its containing directory"
+                    .into(),
+            );
+        }
         let dylib = if requested.is_dir() {
             requested.join("libarmfortas_rt.dylib")
         } else {
@@ -4457,6 +4529,39 @@ mod tests {
     }
 
     #[test]
+    fn debug_flags_accept_only_explicit_levels_and_obey_last_option_wins() {
+        let parse_debug = |flags: &[&str]| {
+            let mut args = flags
+                .iter()
+                .map(|flag| (*flag).to_string())
+                .collect::<Vec<_>>();
+            args.push("hello.f90".to_string());
+            let ParsedCli::Compile(opts) = parse_cli(&args).expect("debug flags must parse") else {
+                panic!("debug flags unexpectedly produced an information action");
+            };
+            opts.debug_info
+        };
+
+        for flag in ["-g", "-g1", "-g2", "-g3"] {
+            assert!(
+                parse_debug(&[flag]),
+                "{flag} must request debug information"
+            );
+        }
+        assert!(!parse_debug(&["-g0"]), "-g0 must disable debug information");
+        assert!(!parse_debug(&["-g", "-g0"]));
+        assert!(parse_debug(&["-g0", "-g"]));
+
+        for flag in ["-g4", "-ggdb", "-garbage"] {
+            let error = match parse_cli(&[flag.to_string(), "hello.f90".to_string()]) {
+                Ok(_) => panic!("unsupported debug suffix must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(error, format!("unsupported debug option: {flag}"));
+        }
+    }
+
+    #[test]
     fn floating_point_contraction_is_ofast_only() {
         assert!(OptLevel::Ofast.fp_contract());
         for level in [
@@ -4607,6 +4712,24 @@ mod tests {
                 .map(|definition| definition.body.as_str()),
             Some("202111")
         );
+        for (name, expected) in [
+            ("__ARMFORTAS_OPENMP_PREVIEW__", "1"),
+            ("__ARMFORTAS_OPENMP_CONFORMING__", "0"),
+            ("__ARMFORTAS_OPENMP_HOST_PARALLEL__", "1"),
+            ("__ARMFORTAS_OPENMP_SIMD__", "0"),
+            ("__ARMFORTAS_OPENMP_TASKING__", "0"),
+            ("__ARMFORTAS_OPENMP_OFFLOAD__", "0"),
+            ("__ARMFORTAS_OPENMP_TOOLS__", "0"),
+        ] {
+            assert_eq!(
+                config
+                    .defines
+                    .get(name)
+                    .map(|definition| definition.body.as_str()),
+                Some(expected),
+                "unexpected OpenMP preview capability macro {name}"
+            );
+        }
 
         let simd = Options {
             openmp_simd: true,
@@ -4617,6 +4740,29 @@ mod tests {
             !config.defines.contains_key("_OPENMP"),
             "the SIMD-only mode must not advertise full OpenMP"
         );
+        assert_eq!(
+            config
+                .defines
+                .get("__ARMFORTAS_OPENMP_PREVIEW__")
+                .map(|definition| definition.body.as_str()),
+            Some("1")
+        );
+        assert_eq!(
+            config
+                .defines
+                .get("__ARMFORTAS_OPENMP_HOST_PARALLEL__")
+                .map(|definition| definition.body.as_str()),
+            Some("0")
+        );
+
+        let disabled = preproc_config_for_input(
+            &Options::default(),
+            Path::new("input.F90"),
+            SourceForm::FreeForm,
+        );
+        assert!(!disabled
+            .defines
+            .contains_key("__ARMFORTAS_OPENMP_PREVIEW__"));
     }
 
     #[test]

@@ -39,6 +39,77 @@ fn temporary_codegen_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn multi_input_temp_directories(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .expect("cannot inspect temporary directory")
+        .map(|entry| entry.expect("cannot read temporary entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("afs_multi_"))
+        })
+        .collect()
+}
+
+#[test]
+fn multi_input_temporaries_are_removed_after_compile_and_link_failures() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_temp_paths test=multi_input_temporaries_are_removed_after_compile_and_link_failures count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = compiler();
+    let dir = unique_dir("multi_input_cleanup");
+    let temp_dir = dir.join("tmp");
+    std::fs::create_dir_all(&temp_dir).expect("cannot create temporary directory");
+
+    let good = dir.join("good.f90");
+    let bad = dir.join("bad.f90");
+    std::fs::write(&good, "subroutine good\nend subroutine\n").expect("cannot write source");
+    std::fs::write(&bad, "this is not Fortran\n").expect("cannot write source");
+    let compile_failure = Command::new(&compiler)
+        .env("TMPDIR", &temp_dir)
+        .arg(&good)
+        .arg(&bad)
+        .arg("-o")
+        .arg(dir.join("compile-failure"))
+        .output()
+        .expect("failing multi-input compiler launch failed");
+    assert!(
+        !compile_failure.status.success(),
+        "invalid second source unexpectedly compiled"
+    );
+    assert!(
+        multi_input_temp_directories(&temp_dir).is_empty(),
+        "compile failure retained multi-input temporaries: {:?}",
+        multi_input_temp_directories(&temp_dir)
+    );
+
+    let main = dir.join("main.f90");
+    std::fs::write(&main, "program main\n  call good\nend program main\n")
+        .expect("cannot write source");
+    let link_failure = Command::new(&compiler)
+        .env("TMPDIR", &temp_dir)
+        .env("AFS_LD_PATH", "false")
+        .arg(&good)
+        .arg(&main)
+        .arg("-o")
+        .arg(dir.join("link-failure"))
+        .output()
+        .expect("failing multi-input linker launch failed");
+    assert!(!link_failure.status.success(), "false linker succeeded");
+    assert!(
+        multi_input_temp_directories(&temp_dir).is_empty(),
+        "link failure retained multi-input temporaries: {:?}",
+        multi_input_temp_directories(&temp_dir)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn temporary_assembly_is_removed_after_success_and_failure() {
     let compiler = compiler();

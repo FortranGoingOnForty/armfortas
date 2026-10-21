@@ -3964,7 +3964,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 18\n", "#!amod 17\n", 1);
+        .replacen("#!amod 20\n", "#!amod 19\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -3991,7 +3991,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 17 (compiler requires 18)")
+        stderr.contains("incompatible .amod version 19 (compiler requires 20)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -10031,6 +10031,172 @@ fn logical_intrinsic_kind_argument_compiles_and_runs() {
 }
 
 #[test]
+fn selected_kinds_and_iso_fortran_env_inventory_share_runtime_model() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=selected_kinds_and_iso_fortran_env_inventory_share_runtime_model count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("selected_kind_model");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use, intrinsic :: iso_fortran_env, only : character_kinds, integer_kinds, &
+       logical_kinds, real_kinds, real128
+  implicit none
+  integer(kind=8) :: decimal_range, precision, exponent_range, requested_radix
+
+  decimal_range = 18
+  if (selected_int_kind(decimal_range) /= selected_int_kind(18)) error stop 1
+  decimal_range = 19
+  if (selected_int_kind(decimal_range) /= 16) error stop 2
+  decimal_range = 39
+  if (selected_int_kind(decimal_range) /= -1) error stop 3
+
+  precision = 15
+  exponent_range = 300
+  requested_radix = 2
+  if (selected_real_kind(r=exponent_range, radix=requested_radix, p=precision) /= 8) error stop 4
+  precision = 16
+  if (selected_real_kind(p=precision) /= -1) error stop 5
+  precision = 15
+  exponent_range = 308
+  if (selected_real_kind(r=exponent_range, p=precision) /= -2) error stop 6
+  precision = 16
+  if (selected_real_kind(precision, exponent_range, requested_radix) /= -3) error stop 7
+  requested_radix = 10
+  if (selected_real_kind(radix=requested_radix) /= -5) error stop 8
+
+  if (size(character_kinds) /= 1 .or. any(character_kinds /= [1])) error stop 9
+  if (size(integer_kinds) /= 5 .or. any(integer_kinds /= [1, 2, 4, 8, 16])) error stop 10
+  if (size(logical_kinds) /= 5 .or. any(logical_kinds /= [1, 2, 4, 8, 16])) error stop 11
+  if (size(real_kinds) /= 2 .or. any(real_kinds /= [4, 8])) error stop 12
+  if (real128 >= 0) error stop 13
+  print *, 'ok'
+end program p
+"#,
+    );
+
+    for optimization in ["-O0", "-O3"] {
+        let executable = dir.join(format!(
+            "selected_kind_model_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("selected kind model compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: selected kind model should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("selected kind model executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: selected kind model should run: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn c_sizeof_uses_semantic_aggregate_layout_and_runtime_extents() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=c_sizeof_uses_semantic_aggregate_layout_and_runtime_extents count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("c_sizeof_semantic_layout");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use, intrinsic :: iso_c_binding, only : c_int, c_int8_t, c_int64_t, c_size_t, c_sizeof
+  implicit none
+  type, bind(c) :: padded
+    integer(c_int8_t) :: first
+    integer(c_int64_t) :: middle
+    integer(c_int8_t) :: last
+  end type padded
+  integer(c_int) :: scalar
+  integer(c_int) :: values(3)
+  type(padded) :: item
+  type(padded) :: items(2)
+
+  if (c_sizeof(scalar) /= 4_c_size_t) error stop 1
+  if (c_sizeof(values) /= 12_c_size_t) error stop 2
+  if (c_sizeof(item) /= 24_c_size_t) error stop 3
+  if (c_sizeof(items) /= 48_c_size_t) error stop 4
+  call check_runtime_extent(5)
+  print *, 'ok'
+contains
+  subroutine check_runtime_extent(n)
+    integer, intent(in) :: n
+    integer(c_int) :: automatic(n)
+    if (c_sizeof(automatic) /= 20_c_size_t) error stop 5
+  end subroutine check_runtime_extent
+end program p
+"#,
+    );
+
+    for optimization in ["-O0", "-O3"] {
+        let executable = dir.join(format!(
+            "c_sizeof_semantic_layout_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("C_SIZEOF semantic-layout compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: C_SIZEOF semantic-layout source should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("C_SIZEOF semantic-layout executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: C_SIZEOF semantic-layout source should run: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -10043,7 +10209,7 @@ fn ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs() {
     let src = write_program_in(
         &dir,
         "main.f90",
-        "program p\n  use, intrinsic :: ieee_arithmetic, only : ieee_value, ieee_quiet_nan, ieee_is_nan\n  implicit none\n  real :: x\n  x = ieee_value(0.0, ieee_quiet_nan)\n  if (.not. ieee_is_nan(x)) error stop 1\n  print *, 'ok'\nend program p\n",
+        "program p\n  use, intrinsic :: ieee_arithmetic, only : ieee_class_type, ieee_round_type, &\n       ieee_value, ieee_class, ieee_quiet_nan, ieee_nearest, ieee_is_nan\n  implicit none\n  real :: x\n  type(ieee_class_type) :: class_value\n  type(ieee_round_type) :: round_value\n  x = ieee_value(0.0, ieee_quiet_nan)\n  class_value = ieee_class(x)\n  round_value = ieee_nearest\n  if (.not. ieee_is_nan(x)) error stop 1\n  if (class_value /= ieee_quiet_nan) error stop 2\n  print *, 'ok'\nend program p\n",
     );
 
     let exe = dir.join("ieee_value_quiet_nan.bin");
@@ -10074,6 +10240,115 @@ fn ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contained_ieee_nominal_result_uses_scalar_abi_at_optimized_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_ieee_nominal_result_uses_scalar_abi_at_optimized_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("ieee_nominal_result_abi");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use, intrinsic :: ieee_arithmetic, only : ieee_round_type, ieee_nearest
+  implicit none
+  type(ieee_round_type) :: mode
+  mode = current_mode()
+  if (mode /= ieee_nearest) error stop 1
+  print *, 'ok'
+contains
+  type(ieee_round_type) function current_mode() result(result_mode)
+    result_mode = ieee_nearest
+  end function current_mode
+end program p
+"#,
+    );
+
+    for optimization in ["-O0", "-O3"] {
+        let executable = dir.join(format!(
+            "ieee_nominal_result_abi_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .env("AFS_VERIFY_AFTER_EACH", "1")
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("IEEE nominal-result compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: IEEE nominal-result source should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("IEEE nominal-result executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: IEEE nominal-result source should run: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: unexpected IEEE nominal-result output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ieee_nominal_types_reject_cross_assignment_without_output() {
+    let src = write_program(
+        "program p
+  use, intrinsic :: ieee_arithmetic, only : ieee_class_type, ieee_round_type
+  implicit none
+  type(ieee_class_type) :: class_value
+  type(ieee_round_type) :: round_value
+  class_value = round_value
+end program p
+",
+        "f90",
+    );
+    let output = unique_path("ieee_nominal_cross_assignment", "ir");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("IEEE nominal-type compile failed to spawn");
+    assert!(
+        !compile.status.success(),
+        "cross-assignment between distinct IEEE nominal types compiled"
+    );
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(
+        stderr.contains("TYPE(ieee_round_type)") && stderr.contains("TYPE(ieee_class_type)"),
+        "unexpected IEEE nominal-type diagnostic: {stderr}"
+    );
+    assert!(
+        !output.exists(),
+        "semantic failure published IEEE nominal-type IR output"
+    );
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -21178,6 +21453,133 @@ fn imported_type_bound_register_ignores_unrelated_optional_register_mask() {
 }
 
 #[test]
+fn default_private_type_bound_binding_survives_amod_boundary() {
+    let dir = unique_dir("default_private_tbp_amod");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        r#"module binding_access_m
+  implicit none
+  type :: item_t
+    integer :: value = 0
+  contains
+    private
+    procedure, public :: invoke
+    procedure :: hidden
+  end type item_t
+contains
+  subroutine invoke(self)
+    class(item_t), intent(inout) :: self
+    call self%hidden()
+  end subroutine invoke
+
+  subroutine hidden(self)
+    class(item_t), intent(inout) :: self
+    self%value = 42
+  end subroutine hidden
+end module binding_access_m
+"#,
+    );
+    let provider_obj = dir.join("provider.o");
+    let provider_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("provider compile failed to spawn");
+    assert!(
+        provider_compile.status.success(),
+        "provider compile failed: {}",
+        String::from_utf8_lossy(&provider_compile.stderr)
+    );
+
+    let amod = fs::read_to_string(dir.join("binding_access_m.amod"))
+        .expect("provider did not publish binding_access_m.amod");
+    assert!(amod.starts_with("#!amod 20\n"), "{amod}");
+    assert!(
+        amod.lines().any(|line| {
+            line.contains("@binds invoke")
+                && line.contains("@access public")
+                && line.contains("@owner binding_access_m")
+        }),
+        "public binding access was not serialized: {amod}"
+    );
+    assert!(
+        amod.lines().any(|line| {
+            line.contains("@binds hidden")
+                && line.contains("@access private")
+                && line.contains("@owner binding_access_m")
+        }),
+        "default-private binding access was not serialized: {amod}"
+    );
+
+    let allowed = write_program_in(
+        &dir,
+        "allowed.f90",
+        "program allowed\n  use binding_access_m, only: item_t\n  type(item_t) :: item\n  call item%invoke()\nend program allowed\n",
+    );
+    let allowed_obj = dir.join("allowed.o");
+    let allowed_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            allowed.to_str().unwrap(),
+            "-o",
+            allowed_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("public-binding consumer compile failed to spawn");
+    assert!(
+        allowed_compile.status.success(),
+        "public-binding consumer compile failed: {}",
+        String::from_utf8_lossy(&allowed_compile.stderr)
+    );
+
+    let rejected = write_program_in(
+        &dir,
+        "rejected.f90",
+        "program rejected\n  use binding_access_m, only: item_t\n  type(item_t) :: item\n  call item%hidden()\nend program rejected\n",
+    );
+    let rejected_obj = dir.join("rejected.o");
+    let rejected_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            rejected.to_str().unwrap(),
+            "-o",
+            rejected_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("private-binding consumer compile failed to spawn");
+    assert!(
+        !rejected_compile.status.success(),
+        "external call to a private binding was accepted"
+    );
+    assert!(
+        !rejected_obj.exists(),
+        "private-binding diagnostic published an object"
+    );
+    let stderr = String::from_utf8_lossy(&rejected_compile.stderr);
+    assert!(
+        stderr.contains("private type-bound procedure 'hidden'")
+            && stderr.contains("declared in module 'binding_access_m'"),
+        "unexpected private-binding diagnostic: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn type_bound_call_on_allocatable_component_array_element_mutates_real_receiver() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -22870,6 +23272,89 @@ end program
 }
 
 #[test]
+fn fopenmp_initial_team_reductions_run_without_explicit_parallel_region() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fopenmp_initial_team_reductions_run_without_explicit_parallel_region count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p
+  implicit none
+  integer :: i, isum, empty_sum, nowait_sum
+  integer :: values(3)
+  real(kind=4) :: rsum
+  complex(kind=8) :: csum
+  isum = 10
+  values = [10, 20, 30]
+  rsum = 1.5_4
+  csum = cmplx(1.0_8, 2.0_8, kind=8)
+!$omp do reduction(+:isum,values,rsum,csum)
+  do i = 1, 3
+    isum = isum + i
+    values(i) = values(i) + i
+    rsum = rsum + real(i, kind=4)
+    csum = csum + cmplx(real(i, kind=8), -real(i, kind=8), kind=8)
+  end do
+!$omp end do
+  empty_sum = 7
+!$omp do reduction(+:empty_sum)
+  do i = 1, 0
+    empty_sum = empty_sum + i
+  end do
+!$omp end do
+  nowait_sum = 4
+!$omp do reduction(+:nowait_sum)
+  do i = 1, 2
+    nowait_sum = nowait_sum + i
+  end do
+!$omp end do nowait
+  if (isum /= 16 .or. any(values /= [11, 22, 33])) error stop 1
+  if (abs(rsum - 7.5_4) > 0.001_4) error stop 2
+  if (abs(real(csum, kind=8) - 7.0_8) > 0.000001_8) error stop 3
+  if (abs(aimag(csum) + 4.0_8) > 0.000001_8) error stop 4
+  if (empty_sum /= 7 .or. nowait_sum /= 7) error stop 5
+  print *, 'ok'
+end program
+",
+        "f90",
+    );
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("openmp_initial_team_reductions", "bin");
+        let runtime_cache = unique_dir("openmp_initial_team_reductions_runtime_cache");
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                opt,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .output()
+            .expect("spawn failed");
+        assert!(
+            compile.status.success(),
+            "initial-team OpenMP reductions should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run binary");
+        assert!(
+            run.status.success(),
+            "initial-team OpenMP reductions failed at {opt}:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&runtime_cache);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fopenmp_standalone_do_scalar_reductions_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -24419,6 +24904,118 @@ fn fopenmp_barrier_rejects_illegal_close_nesting() {
     assert!(String::from_utf8_lossy(&result.stderr)
         .contains("OpenMP BARRIER is not allowed in a PURE procedure"));
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fopenmp_region_model_rejects_all_prohibited_audit_nesting() {
+    let cases = [
+        (
+            "barrier_single",
+            "program p\n!$omp parallel\n!$omp single\n!$omp barrier\n!$omp end single nowait\n!$omp end parallel\nend program p\n",
+            "OpenMP BARRIER may not be closely nested inside an OpenMP SINGLE region",
+        ),
+        (
+            "barrier_ordered",
+            "program p\ninteger :: i\n!$omp parallel\n!$omp do ordered\ndo i=1,4\n!$omp ordered\n!$omp barrier\n!$omp end ordered\nend do\n!$omp end do\n!$omp end parallel\nend program p\n",
+            "OpenMP BARRIER may not be closely nested inside an OpenMP ORDERED region",
+        ),
+        (
+            "do_single",
+            "program p\ninteger :: i\n!$omp parallel\n!$omp single\n!$omp do\ndo i=1,4\nend do\n!$omp end do nowait\n!$omp end single\n!$omp end parallel\nend program p\n",
+            "OpenMP DO may not be closely nested inside an OpenMP SINGLE region",
+        ),
+        (
+            "loop_single",
+            "program p\ninteger :: i\n!$omp parallel\n!$omp single\n!$omp loop\ndo i=1,4\nend do\n!$omp end loop\n!$omp end single\n!$omp end parallel\nend program p\n",
+            "OpenMP LOOP may not be closely nested inside an OpenMP SINGLE region",
+        ),
+        (
+            "critical_named",
+            "program p\n!$omp critical(same_name)\n!$omp critical(same_name)\n!$omp end critical(same_name)\n!$omp end critical(same_name)\nend program p\n",
+            "may not be nested inside an OpenMP CRITICAL region with the same name",
+        ),
+        (
+            "critical_case_across_parallel",
+            "program p\n!$omp critical(Mixed_Name)\n!$omp parallel num_threads(1)\n!$omp critical(mIxEd_NaMe)\n!$omp end critical(MIXED_NAME)\n!$omp end parallel\n!$omp end critical(mixed_name)\nend program p\n",
+            "may not be nested inside an OpenMP CRITICAL region with the same name",
+        ),
+        (
+            "critical_unnamed",
+            "program p\n!$omp critical\n!$omp critical\n!$omp end critical\n!$omp end critical\nend program p\n",
+            "OpenMP CRITICAL region without a name may not be nested inside an OpenMP CRITICAL region with the same name",
+        ),
+        (
+            "masked_through_critical",
+            "program p\n!$omp parallel\n!$omp single\n!$omp critical(helper)\n!$omp master\ncontinue\n!$omp end master\n!$omp end critical(helper)\n!$omp end single\n!$omp end parallel\nend program p\n",
+            "OpenMP MASTER may not be closely nested inside an OpenMP SINGLE region",
+        ),
+    ];
+
+    for (stem, source, expected) in cases {
+        let src = write_program(source, "f90");
+        let out = unique_path(stem, "s");
+        let result = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                "-S",
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("prohibited OpenMP nesting compile failed to spawn");
+        assert!(
+            !result.status.success(),
+            "prohibited OpenMP nesting case {stem} compiled"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected),
+            "unexpected diagnostic for {stem}: {stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "prohibited OpenMP nesting case {stem} published assembly"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
+fn fopenmp_region_model_preserves_parallel_boundaries_and_distinct_critical_names() {
+    for (stem, source) in [
+        (
+            "barrier_nested_parallel",
+            "program p\n!$omp parallel num_threads(1)\n!$omp single\n!$omp parallel num_threads(1)\n!$omp barrier\n!$omp end parallel\n!$omp end single\n!$omp end parallel\nend program p\n",
+        ),
+        (
+            "distinct_nested_critical",
+            "program p\n!$omp critical(first)\n!$omp critical(second)\n!$omp end critical(second)\n!$omp end critical(first)\nend program p\n",
+        ),
+    ] {
+        let src = write_program(source, "f90");
+        let out = unique_path(stem, "s");
+        let result = Command::new(compiler("armfortas"))
+            .args([
+                "-fopenmp",
+                "-S",
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("valid OpenMP nesting compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "valid OpenMP nesting case {stem} failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(out.exists(), "valid OpenMP nesting case {stem} emitted no assembly");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&src);
+    }
 }
 
 #[test]
@@ -29665,6 +30262,29 @@ fn accepted_but_unimplemented_flags_emit_warnings() {
     );
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn warning_suppression_cannot_hide_unsupported_debug_flags() {
+    let src = write_program("program p\nend program p\n", "f90");
+    let out = unique_path("unsupported_debug", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-w", "-garbage", "-c"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("compiler launch failed");
+
+    assert_eq!(result.status.code(), Some(1), "unexpected driver status");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("unsupported debug option: -garbage"),
+        "missing unsupported-debug diagnostic:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!out.exists(), "unsupported debug flag produced an object");
+
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -45476,6 +46096,40 @@ fn time_report_prints_phase_table() {
 }
 
 #[test]
+fn time_report_covers_token_ast_and_ir_terminal_modes() {
+    let src = write_program("program p\n  print *, 1\nend program\n", "f90");
+    for (flag, extension, final_phase) in [
+        ("--emit-tokens", "tokens", "lex"),
+        ("--emit-ast", "ast", "parse"),
+        ("--emit-ir", "ir", "opt"),
+    ] {
+        let out = unique_path("terminal_timer", extension);
+        let result = Command::new(compiler("armfortas"))
+            .args([
+                "--time-report",
+                flag,
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("terminal time-report compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "{flag} failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(out.is_file(), "{flag} did not publish its artifact");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains("Phase"), "{flag}: {stderr}");
+        assert!(stderr.contains(final_phase), "{flag}: {stderr}");
+        assert!(stderr.contains("Total"), "{flag}: {stderr}");
+        let _ = std::fs::remove_file(out);
+    }
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
 fn time_report_prints_phase_table_on_error() {
     let src = write_program("program p\n  error stop 'oops'\nend program\n", "f90");
     let out = unique_path("timer_err", "bin");
@@ -46857,6 +47511,84 @@ fn afs_runtime_path_env_overrides_runtime_discovery() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_dir_all(&rt_dir);
+}
+
+#[test]
+fn invalid_explicit_static_runtime_path_fails_without_output() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=invalid_explicit_static_runtime_path_fails_without_output count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let missing_runtime = unique_path("missing_runtime_override", "dir");
+    let src = write_program("program p\n  print *, 11\nend program\n", "f90");
+    let out = unique_path("missing_runtime_override", "bin");
+    assert!(!missing_runtime.exists());
+    assert!(!out.exists());
+
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-static",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .env("AFS_RUNTIME_PATH", &missing_runtime)
+        .output()
+        .expect("invalid runtime override compile failed to spawn");
+
+    assert!(
+        !result.status.success(),
+        "an invalid explicit runtime override must not fall back"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("AFS_RUNTIME_PATH"), "{stderr}");
+    assert!(
+        stderr.contains(&missing_runtime.to_string_lossy().into_owned()),
+        "{stderr}"
+    );
+    assert!(stderr.contains("libarmfortas_rt.a"), "{stderr}");
+    assert!(
+        !out.exists(),
+        "failed runtime discovery published an output"
+    );
+
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
+fn missing_linker_launch_uses_linker_exit_category() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=missing_linker_launch_uses_linker_exit_category count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let missing_linker = unique_path("missing_linker", "tool");
+    let src = write_program("program p\nend program p\n", "f90");
+    let out = unique_path("missing_linker", "bin");
+    assert!(!missing_linker.exists());
+
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("AFS_LD_PATH", &missing_linker)
+        .output()
+        .expect("missing-linker compile failed to spawn");
+
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "linker launch must use the documented linker exit category: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("cannot run linker"), "{stderr}");
+    assert!(!out.exists(), "linker launch failure published an output");
+
+    let _ = std::fs::remove_file(src);
 }
 
 #[test]
@@ -49929,7 +50661,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 18\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 20\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))
@@ -52556,6 +53288,48 @@ fn list_directed_read_unit_real_returns_correct_f32_value() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file("/tmp/afs_real_read.txt");
+}
+
+#[test]
+fn list_directed_repeat_null_and_slash_semantics_run_at_o0_and_o3() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=list_directed_repeat_null_and_slash_semantics_run_at_o0_and_o3 count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=64) :: record\n  integer :: values(7), ios, unit, i\n\n  record = '3*7, 2*, 9, / 99'\n  do i = 1, 7\n    values(i) = -i\n  end do\n  read(record, *, iostat=ios) values\n  if (ios /= 0) error stop 1\n  if (any(values /= [7, 7, 7, -4, -5, 9, -7])) error stop 2\n\n  do i = 1, 7\n    values(i) = -10 - i\n  end do\n  open(newunit=unit, status='scratch', action='readwrite')\n  write(unit, '(a)') trim(record)\n  rewind(unit)\n  read(unit, *, iostat=ios) values\n  close(unit)\n  if (ios /= 0) error stop 3\n  if (any(values /= [7, 7, 7, -14, -15, 9, -17])) error stop 4\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path(&format!("list_repeat_slash_{}", &opt[1..]), "bin");
+        let compile = Command::new(compiler("armfortas"))
+            .args([src.to_str().unwrap(), opt, "-o", out.to_str().unwrap()])
+            .output()
+            .expect("list repeat/slash compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "list repeat/slash compile failed at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&out)
+            .output()
+            .expect("list repeat/slash binary failed to start");
+        assert!(
+            run.status.success(),
+            "list repeat/slash run failed at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(out);
+    }
+    let _ = std::fs::remove_file(src);
 }
 
 #[test]
@@ -58816,6 +59590,47 @@ fn contained_program_char_function_inside_execute_command_line_arg_links_and_run
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn empty_execute_command_line_policy_runs_at_o0_and_o3() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=empty_execute_command_line_policy_runs_at_o0_and_o3 count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: exitstat, cmdstat\n  character(len=16) :: cmdmsg\n\n  exitstat = -9\n  cmdstat = -9\n  cmdmsg = 'unchanged'\n  call execute_command_line('', exitstat=exitstat, cmdstat=cmdstat, cmdmsg=cmdmsg)\n  if (exitstat /= 0 .or. cmdstat /= 0 .or. trim(cmdmsg) /= 'unchanged') error stop 1\n\n  exitstat = -9\n  cmdstat = -9\n  cmdmsg = 'unchanged'\n  call execute_command_line('   ', wait=.false., exitstat=exitstat, cmdstat=cmdstat, cmdmsg=cmdmsg)\n  if (exitstat /= -9 .or. cmdstat /= 0 .or. trim(cmdmsg) /= 'unchanged') error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path(&format!("empty_command_{}", &opt[1..]), "bin");
+        let compile = Command::new(compiler("armfortas"))
+            .args([src.to_str().unwrap(), opt, "-o", out.to_str().unwrap()])
+            .output()
+            .expect("empty command compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "empty command compile failed at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("empty command binary failed to start");
+        assert!(
+            run.status.success(),
+            "empty command run failed at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+        let _ = std::fs::remove_file(out);
+    }
+    let _ = std::fs::remove_file(src);
 }
 
 #[test]

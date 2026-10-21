@@ -1,0 +1,5 @@
+# Exact inventory of nested test_programs sources and their bencch owners.
+# Format: <workspace-relative-source> <comma-separated-suite-paths>.
+test_programs/future/io_backspace.f90 bencch/suites/differential/known_gaps.afs,bencch/suites/runtime/future.afs
+test_programs/future/io_direct_access.f90 bencch/suites/differential/known_gaps.afs,bencch/suites/runtime/future.afs
+test_programs/future/io_internal.f90 bencch/suites/differential/known_gaps.afs,bencch/suites/runtime/future.afs

@@ -30,6 +30,58 @@ fn repeated_inline_source(call_count: usize) -> String {
 }
 
 #[test]
+fn asymmetric_nested_loop_ranges_remain_attached_to_their_source_indices() {
+    let source_path = unique_source_path("asymmetric_nested_ranges");
+    fs::write(
+        &source_path,
+        r#"program p
+  implicit none
+  integer :: a(3, 5)
+  integer :: i, j
+  a = -1
+  do i = 1, 3
+    do j = 1, 5
+      a(i, j) = 100 * i + j
+    end do
+  end do
+  print *, a(1, 1), a(3, 5), sum(a)
+end program p
+"#,
+    )
+    .expect("write asymmetric nested-loop source");
+
+    for opt_level in [OptLevel::O0, OptLevel::O2, OptLevel::O3] {
+        let request = CaptureRequest {
+            input: source_path.clone(),
+            requested: BTreeSet::from([Stage::Run]),
+            opt_level,
+        };
+        let result = capture_from_path(&request)
+            .unwrap_or_else(|error| panic!("{opt_level:?} capture failed: {error}"));
+        let run = match result.get(Stage::Run) {
+            Some(CapturedStage::Run(run)) => run,
+            other => panic!("expected {opt_level:?} run capture, got {other:?}"),
+        };
+        assert_eq!(run.exit_code, 0, "{opt_level:?} execution failed");
+        assert!(
+            run.stderr.is_empty(),
+            "{opt_level:?} emitted stderr: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(
+            run.stdout_text()
+                .expect("nested-loop stdout is UTF-8")
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["101", "305", "3045"],
+            "{opt_level:?} changed the asymmetric iteration domain"
+        );
+    }
+
+    fs::remove_file(source_path).expect("remove asymmetric nested-loop source");
+}
+
+#[test]
 fn o1_inlines_more_than_thirty_two_sites_without_truncation() {
     let source_path = unique_source_path("inline_40");
     fs::write(&source_path, repeated_inline_source(40)).expect("write inline source");

@@ -46,6 +46,31 @@ fn validate_statement_label_expr(expr: &SpannedExpr) -> Result<(), ParseError> {
     Ok(())
 }
 
+fn is_end_boundary_keyword(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "program"
+            | "module"
+            | "submodule"
+            | "subroutine"
+            | "function"
+            | "procedure"
+            | "block"
+            | "blockdata"
+            | "if"
+            | "do"
+            | "select"
+            | "where"
+            | "forall"
+            | "associate"
+            | "critical"
+            | "interface"
+            | "type"
+            | "enum"
+            | "team"
+    )
+}
+
 impl<'a> Parser<'a> {
     /// Parse a single statement.
     pub fn parse_stmt(&mut self) -> Result<SpannedStmt, ParseError> {
@@ -304,6 +329,15 @@ impl<'a> Parser<'a> {
             if terminators.iter().any(|t| text == format!("end{}", t)) {
                 break;
             }
+            if let Some(actual) = text.strip_prefix("end") {
+                if is_end_boundary_keyword(actual) {
+                    return Err(self.error(format!(
+                        "expected 'end {}' before '{}'",
+                        terminators.join("' or 'end "),
+                        text
+                    )));
+                }
+            }
             // Check for "end" followed by a terminator keyword: "end if", "end do", etc.
             if text == "end" {
                 let next = if self.pos + 1 < self.tokens.len() {
@@ -311,8 +345,20 @@ impl<'a> Parser<'a> {
                 } else {
                     String::new()
                 };
-                if terminators.iter().any(|t| next == *t) || next.is_empty() {
+                if terminators.iter().any(|t| next == *t) {
                     break;
+                }
+                if next.is_empty() || is_end_boundary_keyword(&next) {
+                    let actual = if next.is_empty() {
+                        "bare 'end'".to_string()
+                    } else {
+                        format!("'end {next}'")
+                    };
+                    return Err(self.error(format!(
+                        "expected 'end {}' before {}",
+                        terminators.join("' or 'end "),
+                        actual
+                    )));
                 }
             }
             // Check for "else", "elsewhere", "case", "contains" which terminate inner blocks.
@@ -2473,6 +2519,18 @@ mod tests {
         } else {
             panic!("not SelectCase");
         }
+    }
+
+    #[test]
+    fn select_case_reports_missing_end_before_program_boundary() {
+        let error = parse_error("select case (x)\ncase (1)\n  y = 1\nend program broken_select\n");
+        assert!(
+            error
+                .msg
+                .contains("expected 'end select' before 'end program'"),
+            "{}",
+            error.msg
+        );
     }
 
     // ---- Simple statements ----

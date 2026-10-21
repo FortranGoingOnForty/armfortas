@@ -11,6 +11,24 @@ the preview it does not supersede the feature matrix below or constitute a
 claim of full 5.2 conformance. The AST and runtime ABI are designed to grow
 toward [OpenMP 6.0][omp-60] without silently changing existing behavior.
 
+The preview policy is also machine-readable. When either OpenMP mode is
+selected, the preprocessor defines `__ARMFORTAS_OPENMP_PREVIEW__=1` and
+`__ARMFORTAS_OPENMP_CONFORMING__=0`. It additionally publishes these coarse
+capability guards:
+
+| Macro | `-fopenmp` | `-fopenmp-simd` | Meaning |
+|---|---:|---:|---|
+| `__ARMFORTAS_OPENMP_HOST_PARALLEL__` | 1 | 0 | The bounded host-parallel slices in this matrix are enabled. |
+| `__ARMFORTAS_OPENMP_SIMD__` | 0 | 0 | OpenMP SIMD execution semantics are not implemented. |
+| `__ARMFORTAS_OPENMP_TASKING__` | 0 | 0 | Tasking is not implemented. |
+| `__ARMFORTAS_OPENMP_OFFLOAD__` | 0 | 0 | Device offload is not implemented. |
+| `__ARMFORTAS_OPENMP_TOOLS__` | 0 | 0 | OMPT and OMPD are not implemented. |
+
+`_OPENMP` and `omp_lib::openmp_version` remain synchronized at the selected
+5.2 language baseline for compatibility. Portable source must not infer full
+5.2 conformance from that value when `__ARMFORTAS_OPENMP_PREVIEW__` is defined;
+it should use the vendor capability guards and the detailed matrix below.
+
 ## Enabling the preview
 
 - `-fopenmp` enables conditional compilation, directive processing, host
@@ -92,8 +110,10 @@ An explicit `barrier` likewise binds dynamically to the current team, so it can
 reside in a procedure whose source is lexically outside a `parallel` region.
 When such a procedure is called serially, the initial one-thread team makes the
 barrier a no-op. A barrier may not be closely nested inside a worksharing
-`do`, `loop`, combined `parallel do`, `sections`, `critical`, `master`, or
-`atomic update` region.
+`do`, `loop`, combined `parallel do`, `single`, `sections`, `critical`,
+`master`, `ordered`, or `atomic` region. A named or unnamed `critical` region
+may not be nested at any depth inside a `critical` region with the same
+case-insensitive identity, even across a nested parallel region.
 
 The pinned OpenMP V&V corpus starts with three unchanged OpenMP 5.0 `loop`
 host cases: `test_loop_private.F90`, `test_loop_reduction_add.F90`, and

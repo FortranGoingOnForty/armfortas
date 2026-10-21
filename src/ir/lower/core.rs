@@ -9056,6 +9056,45 @@ fn install_parameter_inline_const(
     true
 }
 
+fn install_intrinsic_parameter_array(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    local_key: String,
+    symbol: &crate::sema::symtab::Symbol,
+    st: &SymbolTable,
+) -> bool {
+    if locals.contains_key(&local_key)
+        || !symbol.attrs.parameter
+        || !st.scope(symbol.scope).intrinsic_module
+    {
+        return false;
+    }
+    let Some(values) = crate::sema::types::intrinsic_kind_array_values(&symbol.name) else {
+        return false;
+    };
+    let addr = materialize_i32_rank1_descriptor(b, values);
+    locals.insert(
+        local_key,
+        LocalInfo {
+            addr,
+            ty: IrType::Int(IntWidth::I32),
+            dims: vec![(1, values.len() as i64)],
+            allocatable: false,
+            descriptor_arg: true,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+    true
+}
+
 fn module_scope_name_for_symbol(
     st: &SymbolTable,
     scope_id: crate::sema::symtab::ScopeId,
@@ -9221,6 +9260,9 @@ fn install_resolved_global_import(
     st: &SymbolTable,
 ) {
     if locals.contains_key(&local_key) {
+        return;
+    }
+    if install_intrinsic_parameter_array(b, locals, local_key.clone(), symbol, st) {
         return;
     }
     let Some(global_key) = defining_global_key(st, globals, symbol) else {
@@ -10482,7 +10524,7 @@ pub(super) fn eval_const_scalar_with_decl_scope(
             };
             let key = name.to_ascii_lowercase();
             match key.as_str() {
-                "selected_int_kind" | "selected_real_kind" | "selected_logical_kind" => {
+                "selected_int_kind" | "selected_logical_kind" => {
                     let ConstScalar::Int(arg) =
                         const_call_arg_expr(args.first()?).and_then(|e| {
                             eval_const_scalar_with_decl_scope(e, decls, param_consts, st)
@@ -10491,6 +10533,15 @@ pub(super) fn eval_const_scalar_with_decl_scope(
                         return None;
                     };
                     crate::sema::types::selected_kind_value(&key, arg).map(ConstScalar::Int)
+                }
+                "selected_real_kind" => {
+                    crate::sema::types::eval_selected_real_kind_args(args, |expr| {
+                        match eval_const_scalar_with_decl_scope(expr, decls, param_consts, st)? {
+                            ConstScalar::Int(value) => Some(value),
+                            ConstScalar::Float(_) => None,
+                        }
+                    })
+                    .map(ConstScalar::Int)
                 }
                 "selected_char_kind" => {
                     eval_selected_char_kind_with_decl_scope(args, decls, param_consts)
@@ -20415,7 +20466,7 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "eoshift" => Some(&["array", "shift", "boundary", "dim"]),
         "ieee_fma" => Some(&["a", "b", "c"]),
         "ieee_rem" => Some(&["x", "y"]),
-        "ieee_selected_real_kind" => Some(&["p", "r", "radix"]),
+        "selected_real_kind" | "ieee_selected_real_kind" => Some(&["p", "r", "radix"]),
         _ => None,
     }
 }
@@ -25243,6 +25294,14 @@ fn type_name_is_enumeration(name: &str, st: Option<&SymbolTable>) -> bool {
         .is_some_and(|sym| matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType))
 }
 
+/// True when `TYPE(name)` is a nominal IEEE intrinsic-module type whose
+/// runtime representation is a scalar integer tag.  These remain distinct
+/// derived types in semantic analysis, but must not use the aggregate sret
+/// ABI during lowering.
+fn type_name_uses_scalar_storage(name: &str) -> bool {
+    crate::sema::resolve::type_resolution::is_ieee_opaque_type(name)
+}
+
 /// Extract the derived-type name from a function `return_type`
 /// declaration. Returns `Some("vec")` for `type(vec) function f()` and
 /// `None` for intrinsic-typed returns. Used by the Function lowering
@@ -25258,6 +25317,9 @@ pub(super) fn derived_type_name_for_return(
             return None;
         }
         if type_name_is_enumeration(name, st) {
+            return None;
+        }
+        if type_name_uses_scalar_storage(name) {
             return None;
         }
         Some(name.clone())
@@ -25299,6 +25361,9 @@ pub(super) fn derived_type_name_for_result_var(
                             return None;
                         }
                         if type_name_is_enumeration(name, st) {
+                            return None;
+                        }
+                        if type_name_uses_scalar_storage(name) {
                             return None;
                         }
                         return Some(name.clone());
@@ -26852,7 +26917,9 @@ fn hidden_result_abi_for_symbol(sym: &crate::sema::symtab::Symbol) -> Option<Hid
             }
         }
         _ if sym.attrs.allocatable => Some(HiddenResultAbi::ArrayDescriptor),
-        TypeInfo::Derived(_) if !sym.attrs.pointer => Some(HiddenResultAbi::DerivedAggregate),
+        TypeInfo::Derived(name) if !sym.attrs.pointer && !type_name_uses_scalar_storage(name) => {
+            Some(HiddenResultAbi::DerivedAggregate)
+        }
         // Complex scalar return: hidden output pointer, caller-allocated buffer.
         // Mirrors function_hidden_result_abi (definition side) so calls
         // resolved via SymbolTable see the same ABI as direct lowering.
@@ -37680,9 +37747,12 @@ pub(super) fn lower_internal_read_items(
     buf_len: ValueId,
     iostat: ValueId,
 ) {
-    let zero = b.const_i64(0);
-    let pos = b.alloca(IrType::Int(IntWidth::I64));
-    b.store(zero, pos);
+    let pos = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I64)), 3));
+    b.call(
+        FuncRef::External("afs_internal_list_read_begin".into()),
+        vec![pos],
+        IrType::Void,
+    );
     let done = b.create_block("internal_read_done");
     let mode = ReadMode::Internal {
         buf_ptr,
@@ -61023,6 +61093,9 @@ pub(super) fn type_info_to_ir_type(ti: &crate::sema::symtab::TypeInfo) -> IrType
     use crate::sema::symtab::TypeInfo;
     if let TypeInfo::Derived(name) | TypeInfo::Class(name) = ti {
         let lower = name.to_lowercase();
+        if let Some(kind) = crate::sema::resolve::type_resolution::ieee_opaque_int_kind(&lower) {
+            return IrType::int_from_kind(kind);
+        }
         if lower == "c_ptr" || lower == "c_funptr" {
             return IrType::Int(IntWidth::I64);
         }

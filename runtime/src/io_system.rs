@@ -215,6 +215,13 @@ enum UnitStream {
 enum ListReadToken {
     Null,
     Value(String),
+    Terminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BufferedListReadToken {
+    Token(ListReadToken),
+    Repeat { count: u64, token: ListReadToken },
 }
 
 struct Unit {
@@ -228,7 +235,7 @@ struct Unit {
     /// Record length for direct access (in bytes). None for sequential/stream.
     recl: Option<i64>,
     /// Buffered tokens from the current input record for list-directed READ.
-    read_tokens: VecDeque<ListReadToken>,
+    read_tokens: VecDeque<BufferedListReadToken>,
     /// Cached formatted input record for the current READ statement.
     formatted_read_record: Option<Vec<u8>>,
     /// Cursor within a cached formatted input record for ADVANCE='NO' reads.
@@ -278,20 +285,9 @@ struct Unit {
     list_read_depth: usize,
 }
 
-fn scan_list_directed_token(input: &[u8], start: usize) -> Option<(ListReadToken, usize)> {
-    let mut cursor = start.min(input.len());
-    while cursor < input.len() && input[cursor].is_ascii_whitespace() {
-        cursor += 1;
-    }
-    if cursor == input.len() {
-        return None;
-    }
-
-    if input[cursor] == b',' {
-        return Some((ListReadToken::Null, cursor + 1));
-    }
-
-    let token_start = cursor;
+fn scan_list_directed_value(input: &[u8], start: usize) -> (String, usize) {
+    let token_start = start;
+    let mut cursor = start;
     if matches!(input[cursor], b'\'' | b'"') {
         let delimiter = input[cursor];
         cursor += 1;
@@ -310,15 +306,15 @@ fn scan_list_directed_token(input: &[u8], start: usize) -> Option<(ListReadToken
         // Keep any non-separator suffix in the same raw token. The
         // character decoder will reject it instead of silently treating
         // the suffix as a second list item.
-        while cursor < input.len() && !input[cursor].is_ascii_whitespace() && input[cursor] != b','
+        while cursor < input.len()
+            && !input[cursor].is_ascii_whitespace()
+            && !matches!(input[cursor], b',' | b'/')
         {
             cursor += 1;
         }
     } else if input[cursor] == b'(' {
         // A list-directed complex value is one input item even though its
         // `(real, imaginary)` spelling contains whitespace and a comma.
-        // Preserve the complete parenthesized value for the type-aware
-        // complex reader instead of handing the real reader a bare `(`.
         cursor += 1;
         while cursor < input.len() && input[cursor] != b')' {
             cursor += 1;
@@ -328,12 +324,16 @@ fn scan_list_directed_token(input: &[u8], start: usize) -> Option<(ListReadToken
         }
         // Keep an invalid suffix attached so the complex decoder rejects
         // malformed input rather than silently treating it as another item.
-        while cursor < input.len() && !input[cursor].is_ascii_whitespace() && input[cursor] != b','
+        while cursor < input.len()
+            && !input[cursor].is_ascii_whitespace()
+            && !matches!(input[cursor], b',' | b'/')
         {
             cursor += 1;
         }
     } else {
-        while cursor < input.len() && !input[cursor].is_ascii_whitespace() && input[cursor] != b','
+        while cursor < input.len()
+            && !input[cursor].is_ascii_whitespace()
+            && !matches!(input[cursor], b',' | b'/')
         {
             cursor += 1;
         }
@@ -347,18 +347,88 @@ fn scan_list_directed_token(input: &[u8], start: usize) -> Option<(ListReadToken
         cursor += 1;
     }
 
-    Some((
-        ListReadToken::Value(String::from_utf8_lossy(&input[token_start..token_end]).into_owned()),
+    (
+        String::from_utf8_lossy(&input[token_start..token_end]).into_owned(),
         cursor,
+    )
+}
+
+fn scan_list_directed_token(input: &[u8], start: usize) -> Option<(BufferedListReadToken, usize)> {
+    let mut cursor = start.min(input.len());
+    while cursor < input.len() && input[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if cursor == input.len() {
+        return None;
+    }
+
+    if input[cursor] == b',' {
+        return Some((
+            BufferedListReadToken::Token(ListReadToken::Null),
+            cursor + 1,
+        ));
+    }
+    if input[cursor] == b'/' {
+        return Some((
+            BufferedListReadToken::Token(ListReadToken::Terminate),
+            input.len(),
+        ));
+    }
+
+    let repeat_start = cursor;
+    while cursor < input.len() && input[cursor].is_ascii_digit() {
+        cursor += 1;
+    }
+    if cursor > repeat_start && cursor < input.len() && input[cursor] == b'*' {
+        if let Ok(count) = String::from_utf8_lossy(&input[repeat_start..cursor]).parse::<u64>() {
+            if count > 0 {
+                cursor += 1;
+                let (token, next_cursor) = if cursor == input.len() || input[cursor] == b'/' {
+                    (ListReadToken::Null, cursor)
+                } else if input[cursor].is_ascii_whitespace() {
+                    let mut separator_end = cursor;
+                    while separator_end < input.len() && input[separator_end].is_ascii_whitespace()
+                    {
+                        separator_end += 1;
+                    }
+                    if separator_end < input.len() && input[separator_end] == b',' {
+                        separator_end += 1;
+                    }
+                    (ListReadToken::Null, separator_end)
+                } else if input[cursor] == b',' {
+                    (ListReadToken::Null, cursor + 1)
+                } else {
+                    let (value, next_cursor) = scan_list_directed_value(input, cursor);
+                    (ListReadToken::Value(value), next_cursor)
+                };
+                return Some((BufferedListReadToken::Repeat { count, token }, next_cursor));
+            }
+        }
+        cursor = repeat_start;
+    } else {
+        cursor = repeat_start;
+    }
+
+    let (value, next_cursor) = scan_list_directed_value(input, cursor);
+    Some((
+        BufferedListReadToken::Token(ListReadToken::Value(value)),
+        next_cursor,
     ))
 }
 
-fn tokenize_list_directed_record(line: &str) -> VecDeque<ListReadToken> {
+fn tokenize_list_directed_record(line: &str) -> VecDeque<BufferedListReadToken> {
     let mut tokens = VecDeque::new();
     let mut cursor = 0usize;
     while let Some((token, next_cursor)) = scan_list_directed_token(line.as_bytes(), cursor) {
+        let terminated = matches!(
+            token,
+            BufferedListReadToken::Token(ListReadToken::Terminate)
+        );
         tokens.push_back(token);
         cursor = next_cursor;
+        if terminated {
+            break;
+        }
     }
     tokens
 }
@@ -600,7 +670,7 @@ impl Unit {
     /// Reads a new line if the token buffer is empty.
     fn next_read_token(&mut self) -> io::Result<Option<ListReadToken>> {
         // Consume from buffer first.
-        if let Some(token) = self.read_tokens.pop_front() {
+        if let Some(token) = self.next_buffered_read_token() {
             return Ok(Some(token));
         }
 
@@ -614,7 +684,27 @@ impl Unit {
                 continue;
             }
             self.read_tokens = tokens;
-            return Ok(self.read_tokens.pop_front());
+            return Ok(self.next_buffered_read_token());
+        }
+    }
+
+    fn next_buffered_read_token(&mut self) -> Option<ListReadToken> {
+        match self.read_tokens.pop_front()? {
+            BufferedListReadToken::Token(ListReadToken::Terminate) => {
+                self.read_tokens
+                    .push_front(BufferedListReadToken::Token(ListReadToken::Terminate));
+                Some(ListReadToken::Terminate)
+            }
+            BufferedListReadToken::Token(token) => Some(token),
+            BufferedListReadToken::Repeat { count, token } => {
+                if count > 1 {
+                    self.read_tokens.push_front(BufferedListReadToken::Repeat {
+                        count: count - 1,
+                        token: token.clone(),
+                    });
+                }
+                Some(token)
+            }
         }
     }
 
@@ -966,6 +1056,50 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     let iomsg = cb.iomsg;
     let iomsg_len = cb.iomsg_len;
     let missing_filename = fname.is_empty();
+
+    let invalid_specifier = [
+        (
+            "STATUS",
+            status,
+            &["old", "new", "replace", "scratch", "unknown"] as &[&str],
+        ),
+        (
+            "ACTION",
+            action_str.trim(),
+            &["read", "write", "readwrite"] as &[&str],
+        ),
+        (
+            "ACCESS",
+            access_str.trim(),
+            &["sequential", "direct", "stream"] as &[&str],
+        ),
+        (
+            "FORM",
+            form_str.trim(),
+            &["formatted", "unformatted"] as &[&str],
+        ),
+        (
+            "POSITION",
+            position_str.trim(),
+            &["asis", "rewind", "append"] as &[&str],
+        ),
+    ]
+    .into_iter()
+    .find(|(_, value, allowed)| {
+        !value.is_empty() && !allowed.iter().any(|candidate| candidate == value)
+    });
+    if let Some((name, value, _)) = invalid_specifier {
+        let message = format!("OPEN: invalid {name}= value '{value}'");
+        assign_iomsg(iomsg, iomsg_len, &message);
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+            return;
+        }
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
 
     if is_scratch && !cb.filename.is_null() {
         let message = "OPEN: FILE= must not be specified with STATUS='SCRATCH'";
@@ -1949,7 +2083,7 @@ pub extern "C" fn afs_read_logical_kind(
                     &format!("cannot parse logical from '{}'", token),
                 );
             }
-            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(Some(ListReadToken::Null | ListReadToken::Terminate)) => set_read_success(iostat),
             Ok(None) => {
                 set_read_iostat_or_exit(iostat, IOSTAT_END, "end of file");
             }
@@ -2010,7 +2144,7 @@ pub extern "C" fn afs_read_int8(unit: i32, val: *mut i8, iostat: *mut i32) {
                     }
                 }
             },
-            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(Some(ListReadToken::Null | ListReadToken::Terminate)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -2081,7 +2215,7 @@ pub extern "C" fn afs_read_int16(unit: i32, val: *mut i16, iostat: *mut i32) {
                     }
                 }
             },
-            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(Some(ListReadToken::Null | ListReadToken::Terminate)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -2153,7 +2287,7 @@ pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
                     }
                 }
             },
-            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(Some(ListReadToken::Null | ListReadToken::Terminate)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -2224,7 +2358,7 @@ pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
                     }
                 }
             },
-            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(Some(ListReadToken::Null | ListReadToken::Terminate)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -2289,7 +2423,7 @@ pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
                     }
                 }
             },
-            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(Some(ListReadToken::Null | ListReadToken::Terminate)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -2357,7 +2491,7 @@ pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
                     }
                 }
             }
-            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(Some(ListReadToken::Null | ListReadToken::Terminate)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -2428,7 +2562,7 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
                     }
                 }
             }
-            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(Some(ListReadToken::Null | ListReadToken::Terminate)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -2490,7 +2624,7 @@ pub extern "C" fn afs_read_complex(unit: i32, val: *mut f32, iostat: *mut i32) {
                     );
                 }
             }
-            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(Some(ListReadToken::Null | ListReadToken::Terminate)) => set_read_success(iostat),
             Ok(None) => set_read_iostat_or_exit(iostat, IOSTAT_END, "end of file"),
             Err(error) => set_read_iostat_or_exit(iostat, 1, &error.to_string()),
         }
@@ -2540,7 +2674,7 @@ pub extern "C" fn afs_read_complex64(unit: i32, val: *mut f64, iostat: *mut i32)
                     );
                 }
             }
-            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(Some(ListReadToken::Null | ListReadToken::Terminate)) => set_read_success(iostat),
             Ok(None) => set_read_iostat_or_exit(iostat, IOSTAT_END, "end of file"),
             Err(error) => set_read_iostat_or_exit(iostat, 1, &error.to_string()),
         }
@@ -2895,7 +3029,7 @@ pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iosta
                     }
                 }
             }
-            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(Some(ListReadToken::Null | ListReadToken::Terminate)) => set_read_success(iostat),
             Ok(None) => {
                 crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
                 set_read_status_or_exit(iostat, IOSTAT_END);
@@ -4229,33 +4363,78 @@ pub extern "C" fn afs_write_internal_string(
     write_internal_list_to_buffer(buf, buf_len, start, &data, pos);
 }
 
+#[repr(C)]
+struct InternalListReadCursor {
+    offset: u64,
+    repeat_start: u64,
+    repeat_remaining: u64,
+}
+
+const INTERNAL_LIST_READ_TERMINATED: u64 = u64::MAX;
+
+/// Initialize the fixed-size cursor used by list-directed internal READ.
+/// The compiler reserves three contiguous i64 words for this state.
+#[no_mangle]
+pub extern "C" fn afs_internal_list_read_begin(cursor: *mut i64) {
+    if cursor.is_null() {
+        return;
+    }
+    unsafe {
+        std::ptr::write_bytes(cursor, 0, 3);
+    }
+}
+
+fn materialize_buffered_list_token(token: BufferedListReadToken) -> ListReadToken {
+    match token {
+        BufferedListReadToken::Token(token) => token,
+        BufferedListReadToken::Repeat { token, .. } => token,
+    }
+}
+
 fn next_internal_token(buf: *const u8, buf_len: i64, pos: *mut i64) -> Option<ListReadToken> {
     if buf.is_null() || buf_len <= 0 {
         return None;
     }
 
     let slice = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
-    let cursor = if !pos.is_null() {
-        unsafe { (*pos).clamp(0, buf_len) as usize }
-    } else {
-        0
-    };
+    if pos.is_null() {
+        return scan_list_directed_token(slice, 0)
+            .map(|(token, _)| materialize_buffered_list_token(token));
+    }
+    let cursor = unsafe { &mut *(pos.cast::<InternalListReadCursor>()) };
+    if cursor.repeat_remaining == INTERNAL_LIST_READ_TERMINATED {
+        return Some(ListReadToken::Terminate);
+    }
+    if cursor.repeat_remaining > 0 {
+        let start = usize::try_from(cursor.repeat_start).ok()?.min(slice.len());
+        let (token, _) = scan_list_directed_token(slice, start)?;
+        let BufferedListReadToken::Repeat { token, .. } = token else {
+            cursor.repeat_remaining = 0;
+            return None;
+        };
+        cursor.repeat_remaining -= 1;
+        return Some(token);
+    }
 
-    match scan_list_directed_token(slice, cursor) {
+    let start = usize::try_from(cursor.offset).ok()?.min(slice.len());
+    match scan_list_directed_token(slice, start) {
         Some((token, next_cursor)) => {
-            if !pos.is_null() {
-                unsafe {
-                    *pos = next_cursor as i64;
+            cursor.offset = next_cursor as u64;
+            match token {
+                BufferedListReadToken::Token(ListReadToken::Terminate) => {
+                    cursor.repeat_remaining = INTERNAL_LIST_READ_TERMINATED;
+                    Some(ListReadToken::Terminate)
+                }
+                BufferedListReadToken::Token(token) => Some(token),
+                BufferedListReadToken::Repeat { count, token } => {
+                    cursor.repeat_start = start as u64;
+                    cursor.repeat_remaining = count - 1;
+                    Some(token)
                 }
             }
-            Some(token)
         }
         None => {
-            if !pos.is_null() {
-                unsafe {
-                    *pos = slice.len() as i64;
-                }
-            }
+            cursor.offset = slice.len() as u64;
             None
         }
     }
@@ -4288,7 +4467,7 @@ pub extern "C" fn afs_read_internal_int(
                 }
             }
         },
-        Some(ListReadToken::Null) => set_read_success(iostat),
+        Some(ListReadToken::Null | ListReadToken::Terminate) => set_read_success(iostat),
         None => {
             if !iostat.is_null() {
                 unsafe {
@@ -4313,7 +4492,7 @@ pub extern "C" fn afs_read_internal_logical(
         Some(ListReadToken::Value(token)) => {
             set_read_iostat_or_exit(iostat, 1, &format!("cannot parse logical from '{}'", token));
         }
-        Some(ListReadToken::Null) => set_read_success(iostat),
+        Some(ListReadToken::Null | ListReadToken::Terminate) => set_read_success(iostat),
         None => {
             set_read_iostat_or_exit(iostat, IOSTAT_END, "end of record");
         }
@@ -4357,7 +4536,7 @@ pub extern "C" fn afs_read_internal_string(
                 }
             }
         }
-        Some(ListReadToken::Null) => set_read_success(iostat),
+        Some(ListReadToken::Null | ListReadToken::Terminate) => set_read_success(iostat),
         None => {
             dest_slice.fill(b' ');
             if !iostat.is_null() {
@@ -4396,7 +4575,7 @@ pub extern "C" fn afs_read_internal_int64(
                 }
             }
         },
-        Some(ListReadToken::Null) => set_read_success(iostat),
+        Some(ListReadToken::Null | ListReadToken::Terminate) => set_read_success(iostat),
         None => {
             if !iostat.is_null() {
                 unsafe {
@@ -4434,7 +4613,7 @@ pub extern "C" fn afs_read_internal_int128(
                 }
             }
         },
-        Some(ListReadToken::Null) => set_read_success(iostat),
+        Some(ListReadToken::Null | ListReadToken::Terminate) => set_read_success(iostat),
         None => {
             if !iostat.is_null() {
                 unsafe {
@@ -4475,7 +4654,7 @@ pub extern "C" fn afs_read_internal_real(
                 }
             }
         }
-        Some(ListReadToken::Null) => set_read_success(iostat),
+        Some(ListReadToken::Null | ListReadToken::Terminate) => set_read_success(iostat),
         None => {
             if !iostat.is_null() {
                 unsafe {
@@ -4508,7 +4687,7 @@ pub extern "C" fn afs_read_internal_complex(
                 );
             }
         }
-        Some(ListReadToken::Null) => set_read_success(iostat),
+        Some(ListReadToken::Null | ListReadToken::Terminate) => set_read_success(iostat),
         None => set_read_iostat_or_exit(iostat, IOSTAT_END, "end of record"),
     }
 }
@@ -4535,7 +4714,7 @@ pub extern "C" fn afs_read_internal_complex64(
                 );
             }
         }
-        Some(ListReadToken::Null) => set_read_success(iostat),
+        Some(ListReadToken::Null | ListReadToken::Terminate) => set_read_success(iostat),
         None => set_read_iostat_or_exit(iostat, IOSTAT_END, "end of record"),
     }
 }
@@ -7524,6 +7703,12 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    fn internal_list_read_cursor() -> [i64; 3] {
+        let mut cursor = [0; 3];
+        afs_internal_list_read_begin(cursor.as_mut_ptr());
+        cursor
+    }
+
     struct BlockingReader {
         entered: Option<mpsc::Sender<()>>,
         release: mpsc::Receiver<Vec<u8>>,
@@ -7842,11 +8027,11 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                ListReadToken::Null,
-                ListReadToken::Value("42".into()),
-                ListReadToken::Null,
-                ListReadToken::Value("7".into()),
-                ListReadToken::Value("8".into()),
+                BufferedListReadToken::Token(ListReadToken::Null),
+                BufferedListReadToken::Token(ListReadToken::Value("42".into())),
+                BufferedListReadToken::Token(ListReadToken::Null),
+                BufferedListReadToken::Token(ListReadToken::Value("7".into())),
+                BufferedListReadToken::Token(ListReadToken::Value("8".into())),
             ]
         );
     }
@@ -7904,10 +8089,10 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                ListReadToken::Value("'alpha beta'".into()),
-                ListReadToken::Value("\"gamma,delta\"".into()),
-                ListReadToken::Value("'don''t'".into()),
-                ListReadToken::Value("plain".into()),
+                BufferedListReadToken::Token(ListReadToken::Value("'alpha beta'".into())),
+                BufferedListReadToken::Token(ListReadToken::Value("\"gamma,delta\"".into())),
+                BufferedListReadToken::Token(ListReadToken::Value("'don''t'".into())),
+                BufferedListReadToken::Token(ListReadToken::Value("plain".into())),
             ]
         );
     }
@@ -7921,9 +8106,9 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                ListReadToken::Value("( 1.25, -2.5)".into()),
-                ListReadToken::Value("(-3.0D+00, 4.5D-01)".into()),
-                ListReadToken::Value("17".into()),
+                BufferedListReadToken::Token(ListReadToken::Value("( 1.25, -2.5)".into())),
+                BufferedListReadToken::Token(ListReadToken::Value("(-3.0D+00, 4.5D-01)".into(),)),
+                BufferedListReadToken::Token(ListReadToken::Value("17".into())),
             ]
         );
         assert_eq!(
@@ -7937,9 +8122,39 @@ mod tests {
     }
 
     #[test]
+    fn list_directed_tokenizer_represents_repeats_nulls_and_slash() {
+        let tokens: Vec<_> =
+            tokenize_list_directed_record("3*7, 2* , 2*'alpha,beta', 2*(1.5,-2.5), / ignored")
+                .into_iter()
+                .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                BufferedListReadToken::Repeat {
+                    count: 3,
+                    token: ListReadToken::Value("7".into()),
+                },
+                BufferedListReadToken::Repeat {
+                    count: 2,
+                    token: ListReadToken::Null,
+                },
+                BufferedListReadToken::Repeat {
+                    count: 2,
+                    token: ListReadToken::Value("'alpha,beta'".into()),
+                },
+                BufferedListReadToken::Repeat {
+                    count: 2,
+                    token: ListReadToken::Value("(1.5,-2.5)".into()),
+                },
+                BufferedListReadToken::Token(ListReadToken::Terminate),
+            ]
+        );
+    }
+
+    #[test]
     fn internal_list_directed_complex_read_consumes_one_value_per_destination() {
         let input = b"( 1.25, -2.5), (-3.0D+00, 4.5D-01), 17";
-        let mut position = 0;
+        let mut position = internal_list_read_cursor();
         let mut iostat = -99;
         let mut single = [-9.0f32; 2];
         let mut double = [-9.0f64; 2];
@@ -7948,7 +8163,7 @@ mod tests {
         afs_read_internal_complex(
             input.as_ptr(),
             input.len() as i64,
-            &mut position,
+            position.as_mut_ptr(),
             single.as_mut_ptr(),
             &mut iostat,
         );
@@ -7957,7 +8172,7 @@ mod tests {
         afs_read_internal_complex64(
             input.as_ptr(),
             input.len() as i64,
-            &mut position,
+            position.as_mut_ptr(),
             double.as_mut_ptr(),
             &mut iostat,
         );
@@ -7966,7 +8181,7 @@ mod tests {
         afs_read_internal_int(
             input.as_ptr(),
             input.len() as i64,
-            &mut position,
+            position.as_mut_ptr(),
             &mut trailing,
             &mut iostat,
         );
@@ -8039,7 +8254,7 @@ mod tests {
     #[test]
     fn internal_list_directed_character_read_uses_quote_aware_cursor() {
         let input = b"'left,right', \"two words\", 'say ''hello'''";
-        let mut position = 0;
+        let mut position = internal_list_read_cursor();
         let mut iostat = -99;
 
         for expected in ["left,right", "two words", "say 'hello'"] {
@@ -8047,7 +8262,7 @@ mod tests {
             afs_read_internal_string(
                 input.as_ptr(),
                 input.len() as i64,
-                &mut position,
+                position.as_mut_ptr(),
                 actual.as_mut_ptr(),
                 actual.len() as i64,
                 &mut iostat,
@@ -8063,28 +8278,292 @@ mod tests {
     #[test]
     fn internal_list_cursor_preserves_null_positions() {
         let buf = b",42, ,7";
-        let mut pos = 0i64;
+        let mut pos = internal_list_read_cursor();
 
         assert_eq!(
-            next_internal_token(buf.as_ptr(), buf.len() as i64, &mut pos),
+            next_internal_token(buf.as_ptr(), buf.len() as i64, pos.as_mut_ptr()),
             Some(ListReadToken::Null)
         );
         assert_eq!(
-            next_internal_token(buf.as_ptr(), buf.len() as i64, &mut pos),
+            next_internal_token(buf.as_ptr(), buf.len() as i64, pos.as_mut_ptr()),
             Some(ListReadToken::Value("42".into()))
         );
         assert_eq!(
-            next_internal_token(buf.as_ptr(), buf.len() as i64, &mut pos),
+            next_internal_token(buf.as_ptr(), buf.len() as i64, pos.as_mut_ptr()),
             Some(ListReadToken::Null)
         );
         assert_eq!(
-            next_internal_token(buf.as_ptr(), buf.len() as i64, &mut pos),
+            next_internal_token(buf.as_ptr(), buf.len() as i64, pos.as_mut_ptr()),
             Some(ListReadToken::Value("7".into()))
         );
         assert_eq!(
-            next_internal_token(buf.as_ptr(), buf.len() as i64, &mut pos),
+            next_internal_token(buf.as_ptr(), buf.len() as i64, pos.as_mut_ptr()),
             None
         );
+    }
+
+    #[test]
+    fn internal_list_cursor_expands_repeats_and_keeps_slash_successful() {
+        let buf = b"1*T,1*1,2*2,2*3.5,2*(4.5,-5.5),2*word,3*,/ ignored";
+        let mut cursor = internal_list_read_cursor();
+        let mut iostat = -99;
+        let mut logical = 0;
+        let mut int = 0;
+        let mut int64 = 0i64;
+        let mut int128 = 0i128;
+        let mut real = 0.0f64;
+        let mut other_real = 0.0f64;
+        let mut complex = [0.0f32; 2];
+        let mut complex64 = [0.0f64; 2];
+        let mut first_string = [b'?'; 8];
+        let mut second_string = [b'?'; 8];
+
+        afs_read_internal_logical(
+            buf.as_ptr(),
+            buf.len() as i64,
+            cursor.as_mut_ptr(),
+            &mut logical,
+            &mut iostat,
+        );
+        afs_read_internal_int(
+            buf.as_ptr(),
+            buf.len() as i64,
+            cursor.as_mut_ptr(),
+            &mut int,
+            &mut iostat,
+        );
+        afs_read_internal_int64(
+            buf.as_ptr(),
+            buf.len() as i64,
+            cursor.as_mut_ptr(),
+            &mut int64,
+            &mut iostat,
+        );
+        afs_read_internal_int128(
+            buf.as_ptr(),
+            buf.len() as i64,
+            cursor.as_mut_ptr(),
+            &mut int128,
+            &mut iostat,
+        );
+        afs_read_internal_real(
+            buf.as_ptr(),
+            buf.len() as i64,
+            cursor.as_mut_ptr(),
+            &mut real,
+            &mut iostat,
+        );
+        afs_read_internal_real(
+            buf.as_ptr(),
+            buf.len() as i64,
+            cursor.as_mut_ptr(),
+            &mut other_real,
+            &mut iostat,
+        );
+        afs_read_internal_complex(
+            buf.as_ptr(),
+            buf.len() as i64,
+            cursor.as_mut_ptr(),
+            complex.as_mut_ptr(),
+            &mut iostat,
+        );
+        afs_read_internal_complex64(
+            buf.as_ptr(),
+            buf.len() as i64,
+            cursor.as_mut_ptr(),
+            complex64.as_mut_ptr(),
+            &mut iostat,
+        );
+        for string in [&mut first_string, &mut second_string] {
+            afs_read_internal_string(
+                buf.as_ptr(),
+                buf.len() as i64,
+                cursor.as_mut_ptr(),
+                string.as_mut_ptr(),
+                string.len() as i64,
+                &mut iostat,
+            );
+        }
+
+        assert_eq!(iostat, 0);
+        assert_eq!((logical, int, int64, int128), (1, 1, 2, 2));
+        assert_eq!((real, other_real), (3.5, 3.5));
+        assert_eq!(complex, [4.5, -5.5]);
+        assert_eq!(complex64, [4.5, -5.5]);
+        assert_eq!(&first_string[..4], b"word");
+        assert_eq!(&second_string[..4], b"word");
+
+        let mut null_int = 41;
+        let mut null_real = 42.0;
+        let mut null_string = *b"keep    ";
+        afs_read_internal_int(
+            buf.as_ptr(),
+            buf.len() as i64,
+            cursor.as_mut_ptr(),
+            &mut null_int,
+            &mut iostat,
+        );
+        afs_read_internal_real(
+            buf.as_ptr(),
+            buf.len() as i64,
+            cursor.as_mut_ptr(),
+            &mut null_real,
+            &mut iostat,
+        );
+        afs_read_internal_string(
+            buf.as_ptr(),
+            buf.len() as i64,
+            cursor.as_mut_ptr(),
+            null_string.as_mut_ptr(),
+            null_string.len() as i64,
+            &mut iostat,
+        );
+        assert_eq!((null_int, null_real, null_string), (41, 42.0, *b"keep    "));
+
+        let mut after_slash_int = 91;
+        let mut after_slash_complex = [92.0f64, 93.0];
+        afs_read_internal_int(
+            buf.as_ptr(),
+            buf.len() as i64,
+            cursor.as_mut_ptr(),
+            &mut after_slash_int,
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0);
+        afs_read_internal_complex64(
+            buf.as_ptr(),
+            buf.len() as i64,
+            cursor.as_mut_ptr(),
+            after_slash_complex.as_mut_ptr(),
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0);
+        assert_eq!(after_slash_int, 91);
+        assert_eq!(after_slash_complex, [92.0, 93.0]);
+    }
+
+    #[test]
+    fn external_typed_list_readers_share_repeat_null_and_slash_state() {
+        let path = format!(
+            "/tmp/afs_list_repeat_slash_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        std::fs::write(
+            &path,
+            b"1*T,1*1,2*2,2*3,2*4.5,2*(5.5,-6.5),2*word,3*,/ ignored\n",
+        )
+        .expect("create repeated list-directed input");
+        let unit = 47_220;
+        afs_open_simple(
+            unit,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
+        );
+
+        let mut iostat = -99;
+        afs_list_read_begin(unit, &mut iostat, std::ptr::null_mut(), 0);
+        let mut logical = 0;
+        let mut int8 = 0i8;
+        let mut int16 = 0i16;
+        let mut int = 0i32;
+        let mut int64 = 0i64;
+        let mut int128 = 0i128;
+        let mut real = 0.0f32;
+        let mut real64 = 0.0f64;
+        let mut complex = [0.0f32; 2];
+        let mut complex64 = [0.0f64; 2];
+        let mut first_string = [b'?'; 8];
+        let mut second_string = [b'?'; 8];
+
+        afs_read_logical(unit, &mut logical, &mut iostat);
+        afs_read_int8(unit, &mut int8, &mut iostat);
+        afs_read_int16(unit, &mut int16, &mut iostat);
+        afs_read_int(unit, &mut int, &mut iostat);
+        afs_read_int64(unit, &mut int64, &mut iostat);
+        afs_read_int128(unit, &mut int128, &mut iostat);
+        afs_read_real(unit, &mut real, &mut iostat);
+        afs_read_real64(unit, &mut real64, &mut iostat);
+        afs_read_complex(unit, complex.as_mut_ptr(), &mut iostat);
+        afs_read_complex64(unit, complex64.as_mut_ptr(), &mut iostat);
+        afs_read_string(
+            unit,
+            first_string.as_mut_ptr(),
+            first_string.len() as i64,
+            &mut iostat,
+        );
+        afs_read_string(
+            unit,
+            second_string.as_mut_ptr(),
+            second_string.len() as i64,
+            &mut iostat,
+        );
+
+        assert_eq!(iostat, 0);
+        assert_eq!((logical, int8, int16, int), (1, 1, 2, 2));
+        assert_eq!((int64, int128), (3, 3));
+        assert_eq!((real, real64), (4.5, 4.5));
+        assert_eq!(complex, [5.5, -6.5]);
+        assert_eq!(complex64, [5.5, -6.5]);
+        assert_eq!(&first_string[..4], b"word");
+        assert_eq!(&second_string[..4], b"word");
+
+        let mut null_int = 41;
+        let mut null_real = 42.0;
+        let mut null_string = *b"keep    ";
+        afs_read_int(unit, &mut null_int, &mut iostat);
+        afs_read_real64(unit, &mut null_real, &mut iostat);
+        afs_read_string(
+            unit,
+            null_string.as_mut_ptr(),
+            null_string.len() as i64,
+            &mut iostat,
+        );
+        assert_eq!((null_int, null_real, null_string), (41, 42.0, *b"keep    "));
+
+        logical = 11;
+        int8 = 12;
+        int16 = 13;
+        int = 14;
+        int64 = 15;
+        int128 = 16;
+        real = 17.0;
+        real64 = 18.0;
+        complex = [19.0, 20.0];
+        complex64 = [21.0, 22.0];
+        let mut slash_string = *b"remain  ";
+        afs_read_logical(unit, &mut logical, &mut iostat);
+        afs_read_int8(unit, &mut int8, &mut iostat);
+        afs_read_int16(unit, &mut int16, &mut iostat);
+        afs_read_int(unit, &mut int, &mut iostat);
+        afs_read_int64(unit, &mut int64, &mut iostat);
+        afs_read_int128(unit, &mut int128, &mut iostat);
+        afs_read_real(unit, &mut real, &mut iostat);
+        afs_read_real64(unit, &mut real64, &mut iostat);
+        afs_read_complex(unit, complex.as_mut_ptr(), &mut iostat);
+        afs_read_complex64(unit, complex64.as_mut_ptr(), &mut iostat);
+        afs_read_string(
+            unit,
+            slash_string.as_mut_ptr(),
+            slash_string.len() as i64,
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0, "slash termination is successful");
+        assert_eq!((logical, int8, int16, int), (11, 12, 13, 14));
+        assert_eq!((int64, int128), (15, 16));
+        assert_eq!((real, real64), (17.0, 18.0));
+        assert_eq!(complex, [19.0, 20.0]);
+        assert_eq!(complex64, [21.0, 22.0]);
+        assert_eq!(slash_string, *b"remain  ");
+
+        afs_list_read_end(unit, &mut iostat, std::ptr::null_mut(), 0);
+        afs_close_ex(unit, "delete".as_ptr(), 6, &mut iostat);
+        assert_eq!(iostat, 0);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -8103,7 +8582,7 @@ mod tests {
     #[test]
     fn internal_logical_read_consumes_each_token() {
         let buf = b"T, .FALSE.";
-        let mut pos = 0i64;
+        let mut pos = internal_list_read_cursor();
         let mut first = 0i32;
         let mut second = 1i32;
         let mut iostat = -99i32;
@@ -8111,7 +8590,7 @@ mod tests {
         afs_read_internal_logical(
             buf.as_ptr(),
             buf.len() as i64,
-            &mut pos,
+            pos.as_mut_ptr(),
             &mut first,
             &mut iostat,
         );
@@ -8119,7 +8598,7 @@ mod tests {
         afs_read_internal_logical(
             buf.as_ptr(),
             buf.len() as i64,
-            &mut pos,
+            pos.as_mut_ptr(),
             &mut second,
             &mut iostat,
         );
@@ -8215,7 +8694,7 @@ mod tests {
     #[test]
     fn internal_real_read_accepts_implicit_signed_exponents() {
         let buf = b"1.-3 1.+3 1234567890-9";
-        let mut pos = 0i64;
+        let mut pos = internal_list_read_cursor();
         let mut first = 0.0f64;
         let mut second = 0.0f64;
         let mut third = 0.0f64;
@@ -8224,7 +8703,7 @@ mod tests {
         afs_read_internal_real(
             buf.as_ptr(),
             buf.len() as i64,
-            &mut pos,
+            pos.as_mut_ptr(),
             &mut first,
             &mut iostat,
         );
@@ -8232,7 +8711,7 @@ mod tests {
         afs_read_internal_real(
             buf.as_ptr(),
             buf.len() as i64,
-            &mut pos,
+            pos.as_mut_ptr(),
             &mut second,
             &mut iostat,
         );
@@ -8240,7 +8719,7 @@ mod tests {
         afs_read_internal_real(
             buf.as_ptr(),
             buf.len() as i64,
-            &mut pos,
+            pos.as_mut_ptr(),
             &mut third,
             &mut iostat,
         );
@@ -8386,6 +8865,98 @@ mod tests {
         drop(state);
 
         std::fs::remove_file(path).expect("remove scratch FILE sentinel");
+    }
+
+    #[test]
+    fn invalid_open_enum_values_fail_before_file_or_unit_state_changes() {
+        let path = format!(
+            "/tmp/afs_open_invalid_enum_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        let _ = std::fs::remove_file(&path);
+        let cases = [
+            ("STATUS", "invalid-status"),
+            ("ACTION", "invalid-action"),
+            ("ACCESS", "invalid-access"),
+            ("FORM", "invalid-form"),
+            ("POSITION", "invalid-position"),
+        ];
+
+        for (index, (specifier, invalid_value)) in cases.into_iter().enumerate() {
+            let unit = 47_100 + index as i32;
+            let mut iostat = -99i32;
+            let mut iomsg = [b'?'; 128];
+            let mut newunit = 12_345i32;
+            let mut cb = OpenControlBlock {
+                unit,
+                filename: path.as_ptr(),
+                filename_len: path.len() as i64,
+                status: "replace".as_ptr(),
+                status_len: 7,
+                action: "readwrite".as_ptr(),
+                action_len: 9,
+                access: "sequential".as_ptr(),
+                access_len: 10,
+                form: "formatted".as_ptr(),
+                form_len: 9,
+                recl: 0,
+                iostat: &mut iostat,
+                newunit: &mut newunit,
+                position: "rewind".as_ptr(),
+                position_len: 6,
+                leading_zero: std::ptr::null(),
+                leading_zero_len: 0,
+                iomsg: iomsg.as_mut_ptr(),
+                iomsg_len: iomsg.len() as i64,
+            };
+            match specifier {
+                "STATUS" => {
+                    cb.status = invalid_value.as_ptr();
+                    cb.status_len = invalid_value.len() as i64;
+                }
+                "ACTION" => {
+                    cb.action = invalid_value.as_ptr();
+                    cb.action_len = invalid_value.len() as i64;
+                }
+                "ACCESS" => {
+                    cb.access = invalid_value.as_ptr();
+                    cb.access_len = invalid_value.len() as i64;
+                }
+                "FORM" => {
+                    cb.form = invalid_value.as_ptr();
+                    cb.form_len = invalid_value.len() as i64;
+                }
+                "POSITION" => {
+                    cb.position = invalid_value.as_ptr();
+                    cb.position_len = invalid_value.len() as i64;
+                }
+                _ => unreachable!(),
+            }
+
+            afs_open(&cb);
+
+            assert_ne!(iostat, 0, "invalid {specifier}= must fail");
+            let message = String::from_utf8_lossy(&iomsg);
+            assert!(
+                message.contains(specifier),
+                "IOMSG must identify {specifier}=: {message:?}"
+            );
+            assert_eq!(
+                newunit, 12_345,
+                "invalid {specifier}= must fail before NEWUNIT allocation"
+            );
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "invalid {specifier}= must not create or truncate FILE="
+            );
+            let state = io_state().lock().unwrap_or_else(|error| error.into_inner());
+            assert!(
+                !state.units.contains_key(&unit),
+                "invalid {specifier}= must not connect the requested unit"
+            );
+            drop(state);
+        }
     }
 
     #[test]
@@ -9921,7 +10492,7 @@ mod tests {
             &mut write_pos,
         );
 
-        let mut read_pos = 0i64;
+        let mut read_pos = internal_list_read_cursor();
         let mut first = 0i128;
         let mut second = 0i128;
         let mut iostat = -99i32;
@@ -9929,7 +10500,7 @@ mod tests {
         afs_read_internal_int128(
             buf.as_ptr(),
             buf.len() as i64,
-            &mut read_pos,
+            read_pos.as_mut_ptr(),
             &mut first,
             &mut iostat,
         );
@@ -9938,7 +10509,7 @@ mod tests {
         afs_read_internal_int128(
             buf.as_ptr(),
             buf.len() as i64,
-            &mut read_pos,
+            read_pos.as_mut_ptr(),
             &mut second,
             &mut iostat,
         );
@@ -9950,12 +10521,18 @@ mod tests {
     #[test]
     fn internal_i128_read_accepts_unaligned_destination() {
         let buf = b"170141183460469231731687303715884105727";
-        let mut pos = 0i64;
+        let mut pos = internal_list_read_cursor();
         let mut raw = [0u8; 32];
         let ptr = unsafe { raw.as_mut_ptr().add(1) as *mut i128 };
         let mut iostat = -99i32;
 
-        afs_read_internal_int128(buf.as_ptr(), buf.len() as i64, &mut pos, ptr, &mut iostat);
+        afs_read_internal_int128(
+            buf.as_ptr(),
+            buf.len() as i64,
+            pos.as_mut_ptr(),
+            ptr,
+            &mut iostat,
+        );
 
         assert_eq!(iostat, 0, "expected internal i128 read to succeed");
         let value = unsafe { std::ptr::read_unaligned(ptr) };

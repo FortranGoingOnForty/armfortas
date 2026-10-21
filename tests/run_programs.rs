@@ -13,8 +13,9 @@
 //!
 //! A program may carry one or more `! XFAIL: XFAIL-NNN <reason>` lines
 //! anywhere in the source. `X64-O0-NNN` sweep findings are also accepted.
-//! An XFAIL'd program is *expected* to fail at compile or runtime (or to
-//! mismatch its CHECKs) — it's tracking a known bug. The harness reports:
+//! An XFAIL'd program is expected to fail at the registered stage and kind,
+//! with a stable diagnostic signature. An unrelated failure is a hard test
+//! failure rather than an XFAIL. The harness reports:
 //!
 //!   * `XFAIL`  — the program failed as expected. Counted as a pass.
 //!   * `XPASS`  — the program unexpectedly succeeded. Counted as a
@@ -56,6 +57,10 @@
 //! diagnostic location text, so the compiler can print either
 //! `path:line:col:` or `line:col:` and still satisfy the contract.
 //!
+//! `! DIAGNOSTIC_EXACT: <escaped-stream>` also composes with
+//! `ERROR_EXPECTED` and pins the compiler's complete stderr stream.
+//! It is opt-in: existing diagnostic substring checks remain unchanged.
+//!
 //! ## IR_CHECK / IR_NOT annotations
 //!
 //! For tests that need to assert on the *shape* of the lowered IR
@@ -85,9 +90,15 @@
 //!
 //!   * `! STDERR_CHECK: <substring>` — ordered substring checks
 //!     against the program's stderr stream.
+//!   * `! STDOUT_EXACT: <escaped-stream>` — exact complete stdout.
+//!   * `! STDERR_EXACT: <escaped-stream>` — exact complete stderr.
 //!   * `! EXIT_CODE: <int>` — exact process exit code. Without this
 //!     annotation, the harness preserves the old rule that runtime
 //!     tests must exit successfully.
+//!
+//! Exact streams use `\n`, `\r`, `\t`, `\\`, and ASCII `\xNN` escapes.
+//! Payload whitespace is ignored, so significant leading/trailing whitespace
+//! must be escaped. Exact and substring checks may not target the same stream.
 //!
 //! This makes runtime tests expressive enough for paths like
 //! `ERROR STOP`, warning-like stderr output, and future
@@ -207,6 +218,13 @@ static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 struct Check {
     line_num: usize,
     pattern: String,
+}
+
+/// One opt-in complete-stream assertion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExactStreamCheck {
+    line_num: usize,
+    expected: String,
 }
 
 /// A single file-content assertion against the per-test sandbox.
@@ -534,6 +552,98 @@ fn extract_warn_checks(source: &str) -> Vec<Check> {
     extract_prefixed_checks(source, "! WARN_CHECK:")
 }
 
+fn decode_exact_stream(
+    raw: &str,
+    filename: &str,
+    line_num: usize,
+    directive: &str,
+) -> Result<String, String> {
+    let mut decoded = String::new();
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        let Some(escaped) = chars.next() else {
+            return Err(format!(
+                "{}:{}: {} has a trailing backslash",
+                filename, line_num, directive
+            ));
+        };
+        match escaped {
+            'n' => decoded.push('\n'),
+            'r' => decoded.push('\r'),
+            't' => decoded.push('\t'),
+            '\\' => decoded.push('\\'),
+            'x' => {
+                let Some(high) = chars.next() else {
+                    return Err(format!(
+                        "{}:{}: {} has an incomplete \\xNN escape",
+                        filename, line_num, directive
+                    ));
+                };
+                let Some(low) = chars.next() else {
+                    return Err(format!(
+                        "{}:{}: {} has an incomplete \\xNN escape",
+                        filename, line_num, directive
+                    ));
+                };
+                let digits = [high, low].iter().collect::<String>();
+                let byte = u8::from_str_radix(&digits, 16).map_err(|_| {
+                    format!(
+                        "{}:{}: {} has invalid hex escape \\x{}",
+                        filename, line_num, directive, digits
+                    )
+                })?;
+                if !byte.is_ascii() {
+                    return Err(format!(
+                        "{}:{}: {} only accepts ASCII \\xNN escapes, got \\x{}",
+                        filename, line_num, directive, digits
+                    ));
+                }
+                decoded.push(char::from(byte));
+            }
+            other => {
+                return Err(format!(
+                    "{}:{}: {} has unsupported escape \\{}; use \\n, \\r, \\t, \\\\, or ASCII \\xNN",
+                    filename, line_num, directive, other
+                ));
+            }
+        }
+    }
+    Ok(decoded)
+}
+
+fn extract_exact_stream(
+    source: &str,
+    filename: &str,
+    directive: &str,
+) -> Result<Option<ExactStreamCheck>, String> {
+    let prefix = format!("! {directive}:");
+    let mut found: Option<ExactStreamCheck> = None;
+    for (i, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix(&prefix) else {
+            continue;
+        };
+        if let Some(previous) = &found {
+            return Err(format!(
+                "{}:{}: multiple {} annotations are not allowed (another at line {})",
+                filename,
+                i + 1,
+                directive,
+                previous.line_num
+            ));
+        }
+        found = Some(ExactStreamCheck {
+            line_num: i + 1,
+            expected: decode_exact_stream(rest.trim(), filename, i + 1, directive)?,
+        });
+    }
+    Ok(found)
+}
+
 /// Target selector inside a directive qualifier (sprint x01). Closed
 /// set reusing x00's triple grammar plus arch/OS shorthands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -722,9 +832,17 @@ fn extract_xfail(
         if let Some((is_active, rest)) =
             match_qualified_directive(line, "XFAIL", active, Some(opt_flag), filename, i + 1)?
         {
-            if xfail_reference_ids(rest).is_empty() {
+            let ids = xfail_reference_ids(rest);
+            if ids.is_empty() {
                 return Err(format!(
                     "{}:{}: XFAIL reason must cite a durable XFAIL-NNN or X64-O0-NNN reference",
+                    filename,
+                    i + 1,
+                ));
+            }
+            if ids.len() != 1 {
+                return Err(format!(
+                    "{}:{}: XFAIL reason must cite exactly one durable debt reference",
                     filename,
                     i + 1,
                 ));
@@ -1810,6 +1928,21 @@ fn match_checks(
     Ok(())
 }
 
+fn match_exact_stream(
+    check: &ExactStreamCheck,
+    output: &str,
+    filename: &str,
+    directive_name: &str,
+) -> Result<(), String> {
+    if output == check.expected {
+        return Ok(());
+    }
+    Err(format!(
+        "{}:{}: {} failed: expected complete stream {:?}, got {:?}",
+        filename, check.line_num, directive_name, check.expected, output
+    ))
+}
+
 fn output_line_matches_check(line: &str, pattern: &str) -> bool {
     let text = line.trim();
     if has_repeated_pattern_whitespace(pattern) {
@@ -2334,6 +2467,159 @@ enum TestOutcome {
     Fail(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureStage {
+    Setup,
+    Compile,
+    Link,
+    Run,
+    Check,
+    Repro,
+    Ir,
+    Asm,
+    CrossOpt,
+    Triangulation,
+}
+
+impl FailureStage {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Compile => "compile",
+            Self::Link => "link",
+            Self::Run => "run",
+            Self::Check => "check",
+            Self::Repro => "repro",
+            Self::Ir => "ir",
+            Self::Asm => "asm",
+            Self::CrossOpt => "cross-opt",
+            Self::Triangulation => "triangulation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    Io,
+    ToolLaunch,
+    ToolFailure,
+    DiagnosticMismatch,
+    UnexpectedSuccess,
+    ExitMismatch,
+    ContentMismatch,
+    Nondeterminism,
+}
+
+impl FailureKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Io => "io",
+            Self::ToolLaunch => "tool-launch",
+            Self::ToolFailure => "tool-failure",
+            Self::DiagnosticMismatch => "diagnostic-mismatch",
+            Self::UnexpectedSuccess => "unexpected-success",
+            Self::ExitMismatch => "exit-mismatch",
+            Self::ContentMismatch => "content-mismatch",
+            Self::Nondeterminism => "nondeterminism",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HarnessFailure {
+    stage: FailureStage,
+    kind: FailureKind,
+    detail: String,
+}
+
+impl HarnessFailure {
+    fn new(stage: FailureStage, kind: FailureKind, detail: impl Into<String>) -> Self {
+        Self {
+            stage,
+            kind,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for HarnessFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{}/{}] {}",
+            self.stage.name(),
+            self.kind.name(),
+            self.detail
+        )
+    }
+}
+
+trait ClassifyHarnessFailure<T> {
+    fn classify(self, stage: FailureStage, kind: FailureKind) -> Result<T, HarnessFailure>;
+}
+
+impl<T> ClassifyHarnessFailure<T> for Result<T, String> {
+    fn classify(self, stage: FailureStage, kind: FailureKind) -> Result<T, HarnessFailure> {
+        self.map_err(|detail| HarnessFailure::new(stage, kind, detail))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct XfailSignature {
+    id: &'static str,
+    stage: FailureStage,
+    kind: FailureKind,
+    contains: &'static str,
+}
+
+const XFAIL_SIGNATURES: &[XfailSignature] = &[
+    XfailSignature {
+        id: "XFAIL-001",
+        stage: FailureStage::Run,
+        kind: FailureKind::ExitMismatch,
+        contains: "execution exit mismatch: expected 0, got 1",
+    },
+    XfailSignature {
+        id: "XFAIL-004",
+        stage: FailureStage::Compile,
+        kind: FailureKind::DiagnosticMismatch,
+        contains: "ERROR_EXPECTED(",
+    },
+    XfailSignature {
+        id: "XFAIL-006",
+        stage: FailureStage::Compile,
+        kind: FailureKind::ToolFailure,
+        contains: "compilation failed:",
+    },
+];
+
+fn match_xfail_signature(reason: &str, failure: &HarnessFailure) -> Result<(), String> {
+    let ids = xfail_reference_ids(reason);
+    if ids.len() != 1 {
+        return Err(format!(
+            "active XFAIL must cite exactly one debt ID, found {:?}",
+            ids
+        ));
+    }
+    let id = ids.into_iter().next().unwrap();
+    let Some(expected) = XFAIL_SIGNATURES.iter().find(|expected| expected.id == id) else {
+        return Err(format!("{id} has no registered failure signature"));
+    };
+    if failure.stage != expected.stage
+        || failure.kind != expected.kind
+        || !failure.detail.contains(expected.contains)
+    {
+        return Err(format!(
+            "{id} failure signature changed: expected [{}/{}] containing {:?}, got {}",
+            expected.stage.name(),
+            expected.kind.name(),
+            expected.contains,
+            failure
+        ));
+    }
+    Ok(())
+}
+
 /// Run a single test program: compile at the given optimization level,
 /// execute, check output. Honors `! XFAIL:` annotations.
 fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
@@ -2362,6 +2648,18 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     let checks = extract_checks(&source_text);
     let stderr_checks = extract_stderr_checks(&source_text);
     let warn_checks = extract_warn_checks(&source_text);
+    let stdout_exact = match extract_exact_stream(&source_text, filename, "STDOUT_EXACT") {
+        Ok(check) => check,
+        Err(e) => return TestOutcome::Fail(e),
+    };
+    let stderr_exact = match extract_exact_stream(&source_text, filename, "STDERR_EXACT") {
+        Ok(check) => check,
+        Err(e) => return TestOutcome::Fail(e),
+    };
+    let diagnostic_exact = match extract_exact_stream(&source_text, filename, "DIAGNOSTIC_EXACT") {
+        Ok(check) => check,
+        Err(e) => return TestOutcome::Fail(e),
+    };
     let expected_exit_code = match extract_exit_code(&source_text, filename) {
         Ok(code) => code,
         Err(e) => return TestOutcome::Fail(e),
@@ -2406,6 +2704,9 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     };
     if checks.is_empty()
         && stderr_checks.is_empty()
+        && stdout_exact.is_none()
+        && stderr_exact.is_none()
+        && diagnostic_exact.is_none()
         && ir_checks.is_empty()
         && asm_checks.is_empty()
         && file_checks.is_empty()
@@ -2425,7 +2726,37 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         // Programs with no runtime or shape assertions, no XFAIL marker,
         // and no ERROR marker are mis-configured tests, not test failures.
         return TestOutcome::Fail(format!(
-            "{}: no CHECK / STDERR_CHECK / WARN_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / FILE_CHECK / FILE_EXISTS / FILE_MISSING / FILE_LINE_COUNT / FILE_RERUN_MODE / FILE_SET_EXACT / REPRO_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
+            "{}: no CHECK / STDERR_CHECK / STDOUT_EXACT / STDERR_EXACT / DIAGNOSTIC_EXACT / WARN_CHECK / EXIT_CODE / IR_CHECK / ASM_CHECK / FILE_CHECK / FILE_EXISTS / FILE_MISSING / FILE_LINE_COUNT / FILE_RERUN_MODE / FILE_SET_EXACT / REPRO_CHECK / XFAIL / ERROR_EXPECTED / ERROR_SPAN annotations",
+            filename,
+        ));
+    }
+    if stdout_exact.is_some() && !checks.is_empty() {
+        return TestOutcome::Fail(format!(
+            "{}: STDOUT_EXACT cannot be combined with substring CHECK annotations",
+            filename,
+        ));
+    }
+    if stderr_exact.is_some() && !stderr_checks.is_empty() {
+        return TestOutcome::Fail(format!(
+            "{}: STDERR_EXACT cannot be combined with substring STDERR_CHECK annotations",
+            filename,
+        ));
+    }
+    if diagnostic_exact.is_some() && error_expected.is_none() {
+        return TestOutcome::Fail(format!(
+            "{}: DIAGNOSTIC_EXACT requires ERROR_EXPECTED so compilation must fail",
+            filename,
+        ));
+    }
+    if error_expected.is_some() && (stdout_exact.is_some() || stderr_exact.is_some()) {
+        return TestOutcome::Fail(format!(
+            "{}: runtime exact-stream annotations cannot be combined with ERROR_EXPECTED",
+            filename,
+        ));
+    }
+    if diagnostic_exact.is_some() && !warn_checks.is_empty() {
+        return TestOutcome::Fail(format!(
+            "{}: DIAGNOSTIC_EXACT cannot be combined with successful-compilation WARN_CHECK annotations",
             filename,
         ));
     }
@@ -2448,12 +2779,18 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         ));
     }
 
-    // Try the compile/run/check pipeline. Any failure path returns
-    // an Err with a message; success returns Ok.
+    // Try the compile/run/check pipeline. Failures retain a structural stage
+    // and kind so an XFAIL cannot absorb a regression in another phase.
     let multifile_segments = split_multifile_segments(&source_text);
     let multifile_link_order = extract_multifile_link(&source_text);
+    if diagnostic_exact.is_some() && multifile_segments.is_some() {
+        return TestOutcome::Fail(format!(
+            "{}: DIAGNOSTIC_EXACT is not supported for MULTIFILE tests because their compile errors include per-segment harness context",
+            filename,
+        ));
+    }
 
-    let inner = || -> Result<(), String> {
+    let inner = || -> Result<(), HarnessFailure> {
         // Use a per-(file,level) binary path so concurrent jobs
         // and successive runs at different levels don't stomp each other.
         let stem = source.file_stem().unwrap().to_str().unwrap();
@@ -2463,14 +2800,23 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         // ---- Multi-file path: split, compile each to .o, link ----
         if let Some(segments) = &multifile_segments {
             let build_dir = unique_temp_path("multifile_build", stem, level, "");
-            fs::create_dir_all(&build_dir)
-                .map_err(|e| format!("{}: cannot create multifile build dir: {}", filename, e))?;
+            fs::create_dir_all(&build_dir).map_err(|e| {
+                HarnessFailure::new(
+                    FailureStage::Setup,
+                    FailureKind::Io,
+                    format!("{}: cannot create multifile build dir: {}", filename, e),
+                )
+            })?;
 
             // Write each segment to its own .f90.
             for seg in segments {
                 let seg_path = build_dir.join(&seg.name);
                 fs::write(&seg_path, &seg.source).map_err(|e| {
-                    format!("{}: cannot write segment {}: {}", filename, seg.name, e)
+                    HarnessFailure::new(
+                        FailureStage::Setup,
+                        FailureKind::Io,
+                        format!("{}: cannot write segment {}: {}", filename, seg.name, e),
+                    )
                 })?;
             }
 
@@ -2519,46 +2865,67 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                     if err_msg.contains(expected.as_str()) {
                         return Ok(());
                     }
-                    return Err(format!(
-                        "{} [{}]: ERROR_EXPECTED({}) but compile error did not contain it.\n\
-                         Actual error:\n{}",
-                        filename, opt_flag, expected, err_msg,
+                    return Err(HarnessFailure::new(
+                        FailureStage::Compile,
+                        FailureKind::DiagnosticMismatch,
+                        format!(
+                            "{} [{}]: ERROR_EXPECTED({}) but compile error did not contain it.\n\
+                             Actual error:\n{}",
+                            filename, opt_flag, expected, err_msg,
+                        ),
                     ));
                 }
-                return Err(err_msg);
+                return Err(HarnessFailure::new(
+                    FailureStage::Compile,
+                    FailureKind::ToolFailure,
+                    err_msg,
+                ));
             }
 
             // ERROR_EXPECTED but compilation succeeded — that's a failure.
             if error_expected.is_some() {
                 let _ = fs::remove_dir_all(&build_dir);
-                return Err(format!(
-                    "{} [{}]: ERROR_EXPECTED but all segments compiled successfully",
-                    filename, opt_flag,
+                return Err(HarnessFailure::new(
+                    FailureStage::Compile,
+                    FailureKind::UnexpectedSuccess,
+                    format!(
+                        "{} [{}]: ERROR_EXPECTED but all segments compiled successfully",
+                        filename, opt_flag,
+                    ),
                 ));
             }
 
             // Link all .o files into a binary.
             link_objects(compiler, &objects, &binary)
-                .map_err(|e| format!("{} [{}]: {}", filename, opt_flag, e))?;
+                .map_err(|e| format!("{} [{}]: {}", filename, opt_flag, e))
+                .classify(FailureStage::Link, FailureKind::ToolFailure)?;
 
             let _ = fs::remove_dir_all(&build_dir);
         } else {
             // ---- Single-file path ----
             let source_path = fs::canonicalize(source).map_err(|e| {
-                format!(
-                    "{}: cannot canonicalize source {}: {}",
-                    filename,
-                    source.display(),
-                    e
+                HarnessFailure::new(
+                    FailureStage::Setup,
+                    FailureKind::Io,
+                    format!(
+                        "{}: cannot canonicalize source {}: {}",
+                        filename,
+                        source.display(),
+                        e
+                    ),
                 )
             })?;
             let compile_sandbox = unique_temp_path("compile_sandbox", stem, level, "");
             fs::create_dir_all(&compile_sandbox).map_err(|e| {
-                format!(
-                    "{}: cannot create compile sandbox dir {}: {}",
-                    filename,
-                    compile_sandbox.display(),
-                    e
+                HarnessFailure::new(
+                    FailureStage::Setup,
+                    FailureKind::Io,
+                    format!(
+                        "{}: cannot create compile sandbox dir {}: {}",
+                        filename,
+                        compile_sandbox.display(),
+                        e
+                    ),
                 )
             })?;
             let compile = Command::new(compiler)
@@ -2571,7 +2938,13 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                 ])
                 .args(&extra_flags)
                 .output()
-                .map_err(|e| format!("{}: cannot run compiler: {}", filename, e))?;
+                .map_err(|e| {
+                    HarnessFailure::new(
+                        FailureStage::Compile,
+                        FailureKind::ToolLaunch,
+                        format!("{}: cannot run compiler: {}", filename, e),
+                    )
+                })?;
 
             // ERROR_EXPECTED branch: compilation MUST fail with the
             // expected stderr substring. CHECKs are ignored.
@@ -2579,27 +2952,54 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                 if compile.status.success() {
                     let _ = fs::remove_dir_all(&compile_sandbox);
                     let _ = fs::remove_file(&binary);
-                    return Err(format!(
-                        "{} [{}]: ERROR_EXPECTED({}) but compilation succeeded",
-                        filename, opt_flag, expected,
+                    return Err(HarnessFailure::new(
+                        FailureStage::Compile,
+                        FailureKind::UnexpectedSuccess,
+                        format!(
+                            "{} [{}]: ERROR_EXPECTED({}) but compilation succeeded",
+                            filename, opt_flag, expected,
+                        ),
                     ));
                 }
                 let stderr = String::from_utf8_lossy(&compile.stderr);
                 if !stderr.contains(expected.as_str()) {
                     let _ = fs::remove_dir_all(&compile_sandbox);
-                    return Err(format!(
-                        "{} [{}]: ERROR_EXPECTED({}) but stderr did not contain it.\n\
-                         Full stderr:\n{}",
-                        filename, opt_flag, expected, stderr,
+                    return Err(HarnessFailure::new(
+                        FailureStage::Compile,
+                        FailureKind::DiagnosticMismatch,
+                        format!(
+                            "{} [{}]: ERROR_EXPECTED({}) but stderr did not contain it.\n\
+                             Full stderr:\n{}",
+                            filename, opt_flag, expected, stderr,
+                        ),
                     ));
+                }
+                if let Some(check) = &diagnostic_exact {
+                    let label = format!("{} [{}]", filename, opt_flag);
+                    if let Err(e) = match_exact_stream(check, &stderr, &label, "DIAGNOSTIC_EXACT") {
+                        let _ = fs::remove_dir_all(&compile_sandbox);
+                        return Err(HarnessFailure::new(
+                            FailureStage::Compile,
+                            FailureKind::DiagnosticMismatch,
+                            e,
+                        ));
+                    }
                 }
                 if let Some(expected_span) = error_span {
                     if !diagnostic_contains_span(&stderr, expected_span) {
                         let _ = fs::remove_dir_all(&compile_sandbox);
-                        return Err(format!(
-                            "{} [{}]: ERROR_SPAN({}:{}) but stderr did not contain that location.\n\
-                             Full stderr:\n{}",
-                            filename, opt_flag, expected_span.line, expected_span.col, stderr,
+                        return Err(HarnessFailure::new(
+                            FailureStage::Compile,
+                            FailureKind::DiagnosticMismatch,
+                            format!(
+                                "{} [{}]: ERROR_SPAN({}:{}) but stderr did not contain that location.\n\
+                                 Full stderr:\n{}",
+                                filename,
+                                opt_flag,
+                                expected_span.line,
+                                expected_span.col,
+                                stderr,
+                            ),
                         ));
                     }
                 }
@@ -2610,9 +3010,13 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             if !compile.status.success() {
                 let stderr = String::from_utf8_lossy(&compile.stderr);
                 let _ = fs::remove_dir_all(&compile_sandbox);
-                return Err(format!(
-                    "{} [{}]: compilation failed:\n{}",
-                    filename, opt_flag, stderr,
+                return Err(HarnessFailure::new(
+                    FailureStage::Compile,
+                    FailureKind::ToolFailure,
+                    format!(
+                        "{} [{}]: compilation failed:\n{}",
+                        filename, opt_flag, stderr,
+                    ),
                 ));
             }
             if !warn_checks.is_empty() {
@@ -2621,7 +3025,11 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                 if let Err(e) = match_checks(&warn_checks, &stderr, &label, "WARN_CHECK") {
                     let _ = fs::remove_dir_all(&compile_sandbox);
                     let _ = fs::remove_file(&binary);
-                    return Err(e);
+                    return Err(HarnessFailure::new(
+                        FailureStage::Compile,
+                        FailureKind::DiagnosticMismatch,
+                        e,
+                    ));
                 }
             }
             let _ = fs::remove_dir_all(&compile_sandbox);
@@ -2633,15 +3041,20 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         // threads from racing on shared paths.
         let sandbox = unique_temp_path("test_sandbox", stem, level, "");
         fs::create_dir_all(&sandbox).map_err(|e| {
-            format!(
-                "{}: cannot create sandbox dir {}: {}",
-                filename,
-                sandbox.display(),
-                e
+            HarnessFailure::new(
+                FailureStage::Setup,
+                FailureKind::Io,
+                format!(
+                    "{}: cannot create sandbox dir {}: {}",
+                    filename,
+                    sandbox.display(),
+                    e
+                ),
             )
         })?;
 
-        let snapshot = run_binary_in_sandbox(&binary, &sandbox, filename)?;
+        let snapshot = run_binary_in_sandbox(&binary, &sandbox, filename)
+            .classify(FailureStage::Run, FailureKind::ToolLaunch)?;
 
         let actual_exit_code = snapshot.exit_code;
         let stderr = &snapshot.stderr;
@@ -2649,10 +3062,14 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         if actual_exit_code != expected_exit_code {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
-            return Err(format!(
-                "{} [{}]: execution exit mismatch: expected {}, got {}\n\
-                 stderr:\n{}",
-                filename, opt_flag, expected_exit_code, actual_exit_code, stderr,
+            return Err(HarnessFailure::new(
+                FailureStage::Run,
+                FailureKind::ExitMismatch,
+                format!(
+                    "{} [{}]: execution exit mismatch: expected {}, got {}\n\
+                     stderr:\n{}",
+                    filename, opt_flag, expected_exit_code, actual_exit_code, stderr,
+                ),
             ));
         }
 
@@ -2661,61 +3078,120 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
         if let Err(e) = match_checks(&checks, stdout, &label, "CHECK") {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
-            return Err(e);
+            return Err(HarnessFailure::new(
+                FailureStage::Check,
+                FailureKind::ContentMismatch,
+                e,
+            ));
+        }
+        if let Some(check) = &stdout_exact {
+            if let Err(e) = match_exact_stream(check, stdout, &label, "STDOUT_EXACT") {
+                let _ = fs::remove_file(&binary);
+                let _ = fs::remove_dir_all(&sandbox);
+                return Err(HarnessFailure::new(
+                    FailureStage::Check,
+                    FailureKind::ContentMismatch,
+                    e,
+                ));
+            }
         }
         if let Err(e) = match_checks(&stderr_checks, stderr, &label, "STDERR_CHECK") {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
-            return Err(e);
+            return Err(HarnessFailure::new(
+                FailureStage::Check,
+                FailureKind::ContentMismatch,
+                e,
+            ));
+        }
+        if let Some(check) = &stderr_exact {
+            if let Err(e) = match_exact_stream(check, stderr, &label, "STDERR_EXACT") {
+                let _ = fs::remove_file(&binary);
+                let _ = fs::remove_dir_all(&sandbox);
+                return Err(HarnessFailure::new(
+                    FailureStage::Check,
+                    FailureKind::ContentMismatch,
+                    e,
+                ));
+            }
         }
         if let Err(e) = match_file_checks(&file_checks, &snapshot.files, &label) {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
-            return Err(e);
+            return Err(HarnessFailure::new(
+                FailureStage::Check,
+                FailureKind::ContentMismatch,
+                e,
+            ));
         }
         if let Err(e) = match_file_presence_checks(&file_presence_checks, &snapshot.files, &label) {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
-            return Err(e);
+            return Err(HarnessFailure::new(
+                FailureStage::Check,
+                FailureKind::ContentMismatch,
+                e,
+            ));
         }
         if let Err(e) =
             match_file_line_count_checks(&file_line_count_checks, &snapshot.files, &label)
         {
             let _ = fs::remove_file(&binary);
             let _ = fs::remove_dir_all(&sandbox);
-            return Err(e);
+            return Err(HarnessFailure::new(
+                FailureStage::Check,
+                FailureKind::ContentMismatch,
+                e,
+            ));
         }
         if let Some(check) = &file_set_exact {
             if let Err(e) = match_file_set_exact(check, &snapshot.files, &label) {
                 let _ = fs::remove_file(&binary);
                 let _ = fs::remove_dir_all(&sandbox);
-                return Err(e);
+                return Err(HarnessFailure::new(
+                    FailureStage::Check,
+                    FailureKind::ContentMismatch,
+                    e,
+                ));
             }
         }
         if !file_rerun_mode_checks.is_empty() {
-            let second = run_binary_in_sandbox(&binary, &sandbox, filename)?;
+            let second = run_binary_in_sandbox(&binary, &sandbox, filename)
+                .classify(FailureStage::Run, FailureKind::ToolLaunch)?;
             if snapshot.exit_code != second.exit_code {
                 let _ = fs::remove_file(&binary);
                 let _ = fs::remove_dir_all(&sandbox);
-                return Err(format!(
-                    "{} [{}]: FILE_RERUN_MODE rerun exit mismatch: first {}, second {}",
-                    filename, opt_flag, snapshot.exit_code, second.exit_code
+                return Err(HarnessFailure::new(
+                    FailureStage::Repro,
+                    FailureKind::Nondeterminism,
+                    format!(
+                        "{} [{}]: FILE_RERUN_MODE rerun exit mismatch: first {}, second {}",
+                        filename, opt_flag, snapshot.exit_code, second.exit_code
+                    ),
                 ));
             }
             if snapshot.stdout != second.stdout {
                 let _ = fs::remove_file(&binary);
                 let _ = fs::remove_dir_all(&sandbox);
-                return Err(format!(
-                    "{} [{}]: FILE_RERUN_MODE rerun stdout mismatch:\nfirst:\n{}\nsecond:\n{}",
-                    filename, opt_flag, snapshot.stdout, second.stdout
+                return Err(HarnessFailure::new(
+                    FailureStage::Repro,
+                    FailureKind::Nondeterminism,
+                    format!(
+                        "{} [{}]: FILE_RERUN_MODE rerun stdout mismatch:\nfirst:\n{}\nsecond:\n{}",
+                        filename, opt_flag, snapshot.stdout, second.stdout
+                    ),
                 ));
             }
             if snapshot.stderr != second.stderr {
                 let _ = fs::remove_file(&binary);
                 let _ = fs::remove_dir_all(&sandbox);
-                return Err(format!(
-                    "{} [{}]: FILE_RERUN_MODE rerun stderr mismatch:\nfirst:\n{}\nsecond:\n{}",
-                    filename, opt_flag, snapshot.stderr, second.stderr
+                return Err(HarnessFailure::new(
+                    FailureStage::Repro,
+                    FailureKind::Nondeterminism,
+                    format!(
+                        "{} [{}]: FILE_RERUN_MODE rerun stderr mismatch:\nfirst:\n{}\nsecond:\n{}",
+                        filename, opt_flag, snapshot.stderr, second.stderr
+                    ),
                 ));
             }
             if let Err(e) =
@@ -2723,16 +3199,22 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             {
                 let _ = fs::remove_file(&binary);
                 let _ = fs::remove_dir_all(&sandbox);
-                return Err(e);
+                return Err(HarnessFailure::new(
+                    FailureStage::Repro,
+                    FailureKind::Nondeterminism,
+                    e,
+                ));
             }
         }
         for stage in &repro_checks {
             match stage {
                 ReproStage::Asm | ReproStage::Obj => {
                     let first =
-                        compile_stage_bytes(compiler, source, opt_flag, *stage, &extra_flags)?;
+                        compile_stage_bytes(compiler, source, opt_flag, *stage, &extra_flags)
+                            .classify(FailureStage::Repro, FailureKind::ToolFailure)?;
                     let second =
-                        compile_stage_bytes(compiler, source, opt_flag, *stage, &extra_flags)?;
+                        compile_stage_bytes(compiler, source, opt_flag, *stage, &extra_flags)
+                            .classify(FailureStage::Repro, FailureKind::ToolFailure)?;
                     if first != second {
                         let stage_name = match stage {
                             ReproStage::Asm => "asm",
@@ -2742,9 +3224,13 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                         };
                         let _ = fs::remove_file(&binary);
                         let _ = fs::remove_dir_all(&sandbox);
-                        return Err(format!(
-                            "{} [{}]: REPRO_CHECK({}) failed: two compilations produced different {} bytes",
-                            filename, opt_flag, stage_name, stage_name
+                        return Err(HarnessFailure::new(
+                            FailureStage::Repro,
+                            FailureKind::Nondeterminism,
+                            format!(
+                                "{} [{}]: REPRO_CHECK({}) failed: two compilations produced different {} bytes",
+                                filename, opt_flag, stage_name, stage_name
+                            ),
                         ));
                     }
                 }
@@ -2752,34 +3238,48 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                     let repro_sandbox =
                         unique_temp_path("test_sandbox", stem, &format!("{}_repro", level), "");
                     fs::create_dir_all(&repro_sandbox).map_err(|e| {
-                        format!(
-                            "{}: cannot create repro sandbox dir {}: {}",
-                            filename,
-                            repro_sandbox.display(),
-                            e
+                        HarnessFailure::new(
+                            FailureStage::Repro,
+                            FailureKind::Io,
+                            format!(
+                                "{}: cannot create repro sandbox dir {}: {}",
+                                filename,
+                                repro_sandbox.display(),
+                                e
+                            ),
                         )
                     })?;
-                    let second = run_binary_in_sandbox(&binary, &repro_sandbox, filename)?;
+                    let second = run_binary_in_sandbox(&binary, &repro_sandbox, filename)
+                        .classify(FailureStage::Repro, FailureKind::ToolLaunch)?;
                     let _ = fs::remove_dir_all(&repro_sandbox);
                     if snapshot != second {
                         let detail = describe_run_difference(&snapshot, &second);
                         let _ = fs::remove_file(&binary);
                         let _ = fs::remove_dir_all(&sandbox);
-                        return Err(format!(
-                            "{} [{}]: REPRO_CHECK(run) failed: {}",
-                            filename, opt_flag, detail
+                        return Err(HarnessFailure::new(
+                            FailureStage::Repro,
+                            FailureKind::Nondeterminism,
+                            format!(
+                                "{} [{}]: REPRO_CHECK(run) failed: {}",
+                                filename, opt_flag, detail
+                            ),
                         ));
                     }
                 }
                 ReproStage::RunSameSandbox => {
-                    let second = run_binary_in_sandbox(&binary, &sandbox, filename)?;
+                    let second = run_binary_in_sandbox(&binary, &sandbox, filename)
+                        .classify(FailureStage::Repro, FailureKind::ToolLaunch)?;
                     if snapshot != second {
                         let detail = describe_run_difference(&snapshot, &second);
                         let _ = fs::remove_file(&binary);
                         let _ = fs::remove_dir_all(&sandbox);
-                        return Err(format!(
-                            "{} [{}]: REPRO_CHECK(run_same_sandbox) failed: {}",
-                            filename, opt_flag, detail
+                        return Err(HarnessFailure::new(
+                            FailureStage::Repro,
+                            FailureKind::Nondeterminism,
+                            format!(
+                                "{} [{}]: REPRO_CHECK(run_same_sandbox) failed: {}",
+                                filename, opt_flag, detail
+                            ),
                         ));
                     }
                 }
@@ -2805,18 +3305,34 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                 ])
                 .args(&extra_flags)
                 .output()
-                .map_err(|e| format!("{}: cannot run --emit-ir: {}", filename, e))?;
+                .map_err(|e| {
+                    HarnessFailure::new(
+                        FailureStage::Ir,
+                        FailureKind::ToolLaunch,
+                        format!("{}: cannot run --emit-ir: {}", filename, e),
+                    )
+                })?;
             if !ir_compile.status.success() {
                 let stderr = String::from_utf8_lossy(&ir_compile.stderr);
-                return Err(format!(
-                    "{} [{}]: --emit-ir compilation failed:\n{}",
-                    filename, opt_flag, stderr,
+                return Err(HarnessFailure::new(
+                    FailureStage::Ir,
+                    FailureKind::ToolFailure,
+                    format!(
+                        "{} [{}]: --emit-ir compilation failed:\n{}",
+                        filename, opt_flag, stderr,
+                    ),
                 ));
             }
-            let ir_text = fs::read_to_string(&ir_dest)
-                .map_err(|e| format!("{}: cannot read IR: {}", filename, e))?;
+            let ir_text = fs::read_to_string(&ir_dest).map_err(|e| {
+                HarnessFailure::new(
+                    FailureStage::Ir,
+                    FailureKind::Io,
+                    format!("{}: cannot read IR: {}", filename, e),
+                )
+            })?;
             let _ = fs::remove_file(&ir_dest);
-            match_ir_checks(&ir_checks, &ir_text, &label)?;
+            match_ir_checks(&ir_checks, &ir_text, &label)
+                .classify(FailureStage::Ir, FailureKind::ContentMismatch)?;
         }
 
         if !asm_checks.is_empty() {
@@ -2831,18 +3347,34 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                 ])
                 .args(&extra_flags)
                 .output()
-                .map_err(|e| format!("{}: cannot run -S: {}", filename, e))?;
+                .map_err(|e| {
+                    HarnessFailure::new(
+                        FailureStage::Asm,
+                        FailureKind::ToolLaunch,
+                        format!("{}: cannot run -S: {}", filename, e),
+                    )
+                })?;
             if !asm_compile.status.success() {
                 let stderr = String::from_utf8_lossy(&asm_compile.stderr);
-                return Err(format!(
-                    "{} [{}]: -S compilation failed:\n{}",
-                    filename, opt_flag, stderr,
+                return Err(HarnessFailure::new(
+                    FailureStage::Asm,
+                    FailureKind::ToolFailure,
+                    format!(
+                        "{} [{}]: -S compilation failed:\n{}",
+                        filename, opt_flag, stderr,
+                    ),
                 ));
             }
-            let asm_text = fs::read_to_string(&asm_dest)
-                .map_err(|e| format!("{}: cannot read assembly: {}", filename, e))?;
+            let asm_text = fs::read_to_string(&asm_dest).map_err(|e| {
+                HarnessFailure::new(
+                    FailureStage::Asm,
+                    FailureKind::Io,
+                    format!("{}: cannot read assembly: {}", filename, e),
+                )
+            })?;
             let _ = fs::remove_file(&asm_dest);
-            match_asm_checks(&asm_checks, &asm_text, &label)?;
+            match_asm_checks(&asm_checks, &asm_text, &label)
+                .classify(FailureStage::Asm, FailureKind::ContentMismatch)?;
         }
 
         run_opt_eq_rules(
@@ -2853,7 +3385,8 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
             &snapshot,
             &opt_eq_rules,
             &extra_flags,
-        )?;
+        )
+        .classify(FailureStage::CrossOpt, FailureKind::ContentMismatch)?;
 
         if let Some(triangulation) = &phase_triangulation {
             let declared_runtime_paths = collect_declared_runtime_paths(
@@ -2870,7 +3403,8 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
                 filename,
                 triangulation,
                 &declared_runtime_paths,
-            )?;
+            )
+            .classify(FailureStage::Triangulation, FailureKind::ContentMismatch)?;
         }
 
         Ok(())
@@ -2879,8 +3413,14 @@ fn run_test(compiler: &Path, source: &Path, opt_flag: &str) -> TestOutcome {
     let result = inner();
     match (xfail_reason, result) {
         (None, Ok(())) => TestOutcome::Pass,
-        (None, Err(e)) => TestOutcome::Fail(e),
-        (Some(reason), Err(e)) => TestOutcome::Xfail(format!("{}: {}", reason, e)),
+        (None, Err(e)) => TestOutcome::Fail(e.to_string()),
+        (Some(reason), Err(e)) => match match_xfail_signature(&reason, &e) {
+            Ok(()) => TestOutcome::Xfail(format!("{}: {}", reason, e)),
+            Err(signature_error) => TestOutcome::Fail(format!(
+                "{} [{}]: marked XFAIL ({}) but {}",
+                filename, opt_flag, reason, signature_error
+            )),
+        },
         (Some(reason), Ok(())) => TestOutcome::Xpass(format!(
             "{} [{}]: marked XFAIL ({}) but unexpectedly passed — \
              remove the XFAIL annotation",
@@ -3033,6 +3573,7 @@ fn xfail_annotations_reference_tracked_debt() {
     let tracked_ids: BTreeSet<_> = registry_ids.union(&sweep_ids).cloned().collect();
 
     let mut referenced_registry_ids = BTreeSet::new();
+    let mut annotated_ids = BTreeSet::new();
     for source_dir in [find_test_programs(), find_gfortran_dg_fixtures()] {
         for entry in fs::read_dir(&source_dir)
             .unwrap()
@@ -3055,6 +3596,13 @@ fn xfail_annotations_reference_tracked_debt() {
                     path.display(),
                     line_index + 1,
                 );
+                assert_eq!(
+                    ids.len(),
+                    1,
+                    "{}:{}: each XFAIL must cite exactly one debt ID",
+                    path.display(),
+                    line_index + 1,
+                );
                 for id in ids {
                     assert!(
                         tracked_ids.contains(&id),
@@ -3064,8 +3612,9 @@ fn xfail_annotations_reference_tracked_debt() {
                         id,
                     );
                     if registry_ids.contains(&id) {
-                        referenced_registry_ids.insert(id);
+                        referenced_registry_ids.insert(id.clone());
                     }
+                    annotated_ids.insert(id);
                 }
             }
         }
@@ -3084,6 +3633,15 @@ fn xfail_annotations_reference_tracked_debt() {
         orphan_registry_ids.is_empty(),
         "active XFAIL debt IDs have no annotation: {:?}",
         orphan_registry_ids,
+    );
+
+    let signature_ids: BTreeSet<_> = XFAIL_SIGNATURES
+        .iter()
+        .map(|signature| signature.id.to_string())
+        .collect();
+    assert_eq!(
+        signature_ids, annotated_ids,
+        "active XFAIL IDs and registered failure signatures must match exactly"
     );
 }
 
@@ -3279,6 +3837,36 @@ fn extract_error_span_accepts_line_and_column() {
 }
 
 #[test]
+fn extract_exact_stream_decodes_whitespace_and_backslashes() {
+    let source = "! STDOUT_EXACT: \\x20hello\\npath=one\\\\two\\tend\\r\n";
+    let check = extract_exact_stream(source, "inline.f90", "STDOUT_EXACT")
+        .unwrap()
+        .unwrap();
+    assert_eq!(check.line_num, 1);
+    assert_eq!(check.expected, " hello\npath=one\\two\tend\r");
+
+    let empty = extract_exact_stream("! STDERR_EXACT:\n", "inline.f90", "STDERR_EXACT")
+        .unwrap()
+        .unwrap();
+    assert_eq!(empty.expected, "");
+}
+
+#[test]
+fn extract_exact_stream_rejects_ambiguous_annotations_and_bad_escapes() {
+    let duplicate = extract_exact_stream(
+        "! STDOUT_EXACT: one\n! STDOUT_EXACT: two\n",
+        "inline.f90",
+        "STDOUT_EXACT",
+    )
+    .unwrap_err();
+    assert!(duplicate.contains("multiple STDOUT_EXACT"));
+
+    let bad =
+        extract_exact_stream("! STDERR_EXACT: bad\\q\n", "inline.f90", "STDERR_EXACT").unwrap_err();
+    assert!(bad.contains("unsupported escape"));
+}
+
+#[test]
 fn extract_file_checks_accepts_relative_path_and_pattern() {
     let source = "! FILE_CHECK: out.txt => hello\n! FILE_NOT: out.txt => goodbye\n";
     let checks = extract_file_checks(source, "inline.f90", "! FILE_CHECK:", "! FILE_NOT:").unwrap();
@@ -3442,6 +4030,44 @@ fn match_checks_reports_stderr_check_failures_by_name() {
     )
     .unwrap_err();
     assert!(err.contains("STDERR_CHECK failed"));
+}
+
+#[test]
+fn match_exact_stream_reports_the_complete_contract() {
+    let check = ExactStreamCheck {
+        line_num: 4,
+        expected: " exact\n".into(),
+    };
+    match_exact_stream(&check, " exact\n", "inline.f90 [O0]", "STDOUT_EXACT").unwrap();
+    let err = match_exact_stream(&check, "exact\n", "inline.f90 [O0]", "STDOUT_EXACT").unwrap_err();
+    assert!(err.contains("STDOUT_EXACT failed"));
+    assert!(err.contains("\" exact\\n\""));
+}
+
+#[test]
+fn exact_stream_directives_enforce_complete_contracts() {
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let fixtures = [
+        "hello.f90",
+        "ar11_stop_char_code.f90",
+        "ar10_direct_list_directed_rejected.f90",
+    ];
+    if skip_native_e2e(
+        "exact_stream_directives_enforce_complete_contracts",
+        fixtures.len(),
+    ) {
+        return;
+    }
+    for opt_flag in ["-O0", "-O3"] {
+        for fixture in fixtures {
+            let outcome = run_test(&compiler, &test_dir.join(fixture), opt_flag);
+            assert!(
+                matches!(outcome, TestOutcome::Pass),
+                "{fixture} did not satisfy its exact stream contract at {opt_flag}: {outcome:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -6262,6 +6888,27 @@ fn qualifier_bare_directive_is_active_everywhere() {
             .expect("directive should match");
     assert!(active);
     assert_eq!(rest.trim(), "some reason");
+}
+
+#[test]
+fn xfail_signature_requires_registered_stage_kind_and_detail() {
+    let expected = HarnessFailure::new(
+        FailureStage::Run,
+        FailureKind::ExitMismatch,
+        "probe: execution exit mismatch: expected 0, got 1",
+    );
+    assert!(match_xfail_signature("XFAIL-001 platform limitation", &expected).is_ok());
+
+    let wrong_stage = HarnessFailure::new(
+        FailureStage::Compile,
+        FailureKind::ToolFailure,
+        "probe: execution exit mismatch: expected 0, got 1",
+    );
+    let error = match_xfail_signature("XFAIL-001 platform limitation", &wrong_stage)
+        .expect_err("an unrelated compile failure must not satisfy a runtime XFAIL");
+    assert!(error.contains("failure signature changed"));
+    assert!(error.contains("expected [run/exit-mismatch]"));
+    assert!(error.contains("got [compile/tool-failure]"));
 }
 
 #[test]

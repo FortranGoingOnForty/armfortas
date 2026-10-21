@@ -860,6 +860,8 @@ fn install_external_interface(
             save: var.save,
             pointer: var.pointer,
             target: var.target,
+            asynchronous: var.asynchronous,
+            contiguous: var.contiguous,
             volatile: var.volatile,
             protected: var.protected,
             openmp_threadprivate: var.openmp_threadprivate,

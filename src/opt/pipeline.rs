@@ -20,7 +20,6 @@ use super::fusion::LoopFusion;
 use super::global_lsf::GlobalLsf;
 use super::gvn::Gvn;
 use super::inline::Inline;
-use super::interchange::LoopInterchange;
 use super::jump_thread::JumpThread;
 use super::licm::Licm;
 use super::lsf::LocalLsf;
@@ -52,7 +51,7 @@ pub enum OptLevel {
     /// unrolling.
     O2,
     /// `-O3` — `-O2` plus aggressive inlining, NEON vectorization,
-    /// loop interchange/fusion/fission, IPO, devirtualization,
+    /// loop fusion/fission, IPO, devirtualization,
     /// whole-program analysis, speculative optimizations.
     O3,
     /// `-Os` — like `-O2` but prefer code size (no unrolling, less inlining).
@@ -187,7 +186,6 @@ pub fn build_pipeline(level: OptLevel, arch: crate::target::Arch) -> PassManager
             pm.add(Box::new(JumpThread));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
-            pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
             pm.add(Box::new(LoopUnroll));
@@ -220,12 +218,11 @@ pub fn build_pipeline(level: OptLevel, arch: crate::target::Arch) -> PassManager
             pm.add(Box::new(JumpThread));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
-            pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(Gvn));
             pm.add(Box::new(Dce));
         }
         OptLevel::O3 => {
-            // O2 passes + loop unrolling + interchange.
+            // O2 passes + loop unrolling and vectorization.
             pm.add(Box::new(CallResolve));
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(ConstFold));
@@ -250,7 +247,6 @@ pub fn build_pipeline(level: OptLevel, arch: crate::target::Arch) -> PassManager
             pm.add(Box::new(JumpThread));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
-            pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
             match arch {
@@ -293,7 +289,6 @@ pub fn build_pipeline(level: OptLevel, arch: crate::target::Arch) -> PassManager
             pm.add(Box::new(JumpThread));
             pm.add(Box::new(ConstProp));
             pm.add(Box::new(Dse));
-            pm.add(Box::new(LoopInterchange));
             pm.add(Box::new(LoopFission));
             pm.add(Box::new(LoopFusion));
             match arch {
@@ -386,6 +381,17 @@ mod tests {
                 "pipeline {:?} should include gvn, got {:?}",
                 lvl,
                 names
+            );
+        }
+    }
+
+    #[test]
+    fn loop_interchange_stays_disabled_until_it_rewrites_the_cfg() {
+        for lvl in [OptLevel::O2, OptLevel::O3, OptLevel::Os, OptLevel::Ofast] {
+            let names = build_pipeline(lvl, Arch::Arm64).pass_names();
+            assert!(
+                !names.contains(&"loop-interchange"),
+                "pipeline {lvl:?} enabled the retired range-swapping pass: {names:?}"
             );
         }
     }

@@ -24,11 +24,12 @@ use crate::sema::type_layout::{
     concretize_intrinsic_type_info, BoundProc, TypeLayout, TypeLayoutRegistry,
 };
 
-const AMOD_VERSION: u32 = 18;
+const AMOD_VERSION: u32 = 20;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
 const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
 const AMOD_FINAL_ELEMENTAL_VERSION: u32 = 12;
 const AMOD_DEFAULT_ACCESS_VERSION: u32 = 13;
+const AMOD_BOUND_PROC_ACCESS_VERSION: u32 = 20;
 pub(crate) const SMOD_VERSION: u32 = 2;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
@@ -858,6 +859,12 @@ fn emit_variable(
     if sym.attrs.target {
         attrs.push("target");
     }
+    if sym.attrs.asynchronous {
+        attrs.push("asynchronous");
+    }
+    if sym.attrs.contiguous {
+        attrs.push("contiguous");
+    }
     if sym.attrs.volatile {
         attrs.push("volatile");
     }
@@ -1402,6 +1409,17 @@ fn emit_type(
             .unwrap();
         }
         for bp in &layout.bound_procs {
+            let access = match bp.access {
+                Access::Private => "private",
+                Access::Public | Access::Default => "public",
+            };
+            let owner = bp.owner_module.as_deref().ok_or_else(|| {
+                format!(
+                    "cannot emit .amod binding '{}': declaring module is unresolved",
+                    bp.method_name
+                )
+            })?;
+            let access_suffix = format!(" @access {access} @owner {owner}");
             let abi_suffix = if bp.abi_name != bp.method_name.to_lowercase() {
                 format!(" @abi {}", bp.abi_name)
             } else {
@@ -1427,15 +1445,15 @@ fn emit_type(
             if bp.method_name == bp.target_name {
                 writeln!(
                     out,
-                    "  @binds {}{}{}",
-                    bp.method_name, pass_suffix, abi_suffix
+                    "  @binds {}{}{}{}",
+                    bp.method_name, pass_suffix, abi_suffix, access_suffix
                 )
                 .unwrap();
             } else {
                 writeln!(
                     out,
-                    "  @binds {} => {}{}{}",
-                    bp.method_name, bp.target_name, pass_suffix, abi_suffix
+                    "  @binds {} => {}{}{}{}",
+                    bp.method_name, bp.target_name, pass_suffix, abi_suffix, access_suffix
                 )
                 .unwrap();
             }
@@ -1735,6 +1753,8 @@ pub struct AmodVar {
     pub pointer: bool,
     pub proc_pointer: bool,
     pub target: bool,
+    pub asynchronous: bool,
+    pub contiguous: bool,
     pub volatile: bool,
     pub protected: bool,
     pub openmp_threadprivate: bool,
@@ -2186,14 +2206,48 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             // `@enumtype <public|private> <name> <e1> <e2> ...`
             let mut it = rest.split_whitespace();
             let access = match it.next() {
+                Some("public") => Access::Public,
                 Some("private") => Access::Private,
+                Some(_) | None if version >= 19 => {
+                    return Err(format!(
+                        "{}: corrupt .amod file (malformed @enumtype access); rebuild the provider module",
+                        path.display()
+                    ));
+                }
                 _ => Access::Public,
             };
-            if let Some(name) = it.next() {
-                let enums: Vec<String> = it.map(|e| e.to_string()).collect();
-                if !enums.is_empty() {
-                    enum_types.push((name.to_string(), enums, access));
+            let name = it.next();
+            let enums: Vec<String> = it.map(str::to_string).collect();
+            if version >= 19 {
+                let Some(name) = name else {
+                    return Err(format!(
+                        "{}: corrupt .amod file (missing @enumtype name); rebuild the provider module",
+                        path.display()
+                    ));
+                };
+                if enums.is_empty() {
+                    return Err(format!(
+                        "{}: corrupt .amod file (@enumtype '{}' has no enumerators); rebuild the provider module",
+                        path.display(),
+                        name
+                    ));
                 }
+                let mut unique = HashSet::new();
+                if let Some(duplicate) = enums
+                    .iter()
+                    .map(|enumerator| enumerator.to_ascii_lowercase())
+                    .find(|enumerator| !unique.insert(enumerator.clone()))
+                {
+                    return Err(format!(
+                        "{}: corrupt .amod file (@enumtype '{}' repeats enumerator '{}'); rebuild the provider module",
+                        path.display(),
+                        name,
+                        duplicate
+                    ));
+                }
+                enum_types.push((name.to_string(), enums, access));
+            } else if let Some(name) = name.filter(|_| !enums.is_empty()) {
+                enum_types.push((name.to_string(), enums, access));
             }
         } else if trimmed.starts_with("@type ") {
             types.push(parse_amod_type(trimmed, &mut lines, version, path)?);
@@ -2201,24 +2255,78 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             // Generic interface block: header is `@interface <name>[, private]`,
             // body lists `@specific <proc>` until `@end interface`.
             let header = name.trim();
-            let (iface_name, access) = match header.split_once(", ") {
-                Some((n, attr)) if attr.split(", ").any(|a| a == "private") => (
-                    crate::ast::canonical_generic_spec_name(n.trim()),
-                    Access::Private,
-                ),
-                _ => (
-                    crate::ast::canonical_generic_spec_name(header),
-                    Access::Public,
-                ),
+            let header_parts = split_attrs_top_level(header);
+            let malformed_header = header_parts.is_empty()
+                || header_parts[0].trim().is_empty()
+                || header_parts.len() > 2
+                || (header_parts.len() == 2 && header_parts[1] != "private");
+            if version >= 19 && malformed_header {
+                return Err(format!(
+                    "{}: corrupt .amod file (malformed @interface header); rebuild the provider module",
+                    path.display()
+                ));
+            }
+            let raw_name = header_parts.first().map_or(header, String::as_str).trim();
+            let iface_name = crate::ast::canonical_generic_spec_name(raw_name);
+            let access = if header_parts.get(1).is_some_and(|attr| attr == "private") {
+                Access::Private
+            } else {
+                Access::Public
             };
             let mut specifics = Vec::new();
+            let mut saw_end = false;
             for iline in lines.by_ref() {
                 let t = iline.trim();
-                if t.starts_with("@end interface") {
+                if t == "@end interface" {
+                    saw_end = true;
                     break;
                 }
                 if let Some(spec) = t.strip_prefix("@specific ") {
-                    specifics.push(spec.trim().to_string());
+                    let spec = spec.trim();
+                    if version >= 19 && (spec.is_empty() || spec.split_whitespace().count() != 1) {
+                        return Err(format!(
+                            "{}: corrupt .amod file (malformed @specific in interface '{}'); rebuild the provider module",
+                            path.display(),
+                            iface_name
+                        ));
+                    }
+                    specifics.push(spec.to_string());
+                } else if version >= 19 {
+                    return Err(format!(
+                        "{}: corrupt .amod file (unknown interface record '{}' in '{}'); rebuild the provider module",
+                        path.display(),
+                        t,
+                        iface_name
+                    ));
+                }
+            }
+            if version >= 19 && !saw_end {
+                return Err(format!(
+                    "{}: corrupt .amod file (unterminated @interface '{}'); rebuild the provider module",
+                    path.display(),
+                    iface_name
+                ));
+            }
+            if version >= 19 && specifics.is_empty() {
+                return Err(format!(
+                    "{}: corrupt .amod file (@interface '{}' has no specifics); rebuild the provider module",
+                    path.display(),
+                    iface_name
+                ));
+            }
+            if version >= 19 {
+                let mut unique = HashSet::new();
+                if let Some(duplicate) = specifics
+                    .iter()
+                    .map(|specific| specific.to_ascii_lowercase())
+                    .find(|specific| !unique.insert(specific.clone()))
+                {
+                    return Err(format!(
+                        "{}: corrupt .amod file (@interface '{}' repeats specific '{}'); rebuild the provider module",
+                        path.display(),
+                        iface_name,
+                        duplicate
+                    ));
                 }
             }
             interfaces.push(AmodInterface {
@@ -2345,6 +2453,8 @@ fn validate_bound_proc_metadata(
         left.method_name.eq_ignore_ascii_case(&right.method_name)
             && left.target_name.eq_ignore_ascii_case(&right.target_name)
             && left.abi_name.eq_ignore_ascii_case(&right.abi_name)
+            && left.access == right.access
+            && same_optional_name(left.owner_module.as_deref(), right.owner_module.as_deref())
             && left.nopass == right.nopass
             && same_optional_name(left.pass_name.as_deref(), right.pass_name.as_deref())
             && left.pass_index == right.pass_index
@@ -2636,6 +2746,32 @@ fn parse_var(line: &str, is_param: bool, version: u32, path: &Path) -> Result<Am
                     )
                 })?);
             }
+            Some(TypeInfo::Derived(type_name))
+                if matches!(
+                    type_name.to_ascii_lowercase().as_str(),
+                    "c_ptr" | "c_funptr"
+                ) =>
+            {
+                let null_value = value.parse::<i128>().map_err(|_| {
+                    format!(
+                        "{}: corrupt .amod file (invalid null C pointer parameter value for '{}'); rebuild the provider module",
+                        path.display(),
+                        name
+                    )
+                })?;
+                if null_value != 0 {
+                    return Err(format!(
+                        "{}: corrupt .amod file (non-null C pointer parameter value for '{}'); rebuild the provider module",
+                        path.display(),
+                        name
+                    ));
+                }
+                // ISO_C_BINDING's C_NULL_PTR and C_NULL_FUNPTR are modeled
+                // as pointer-sized scalar zeroes.  Preserve that value for
+                // downstream constant lowering just as the defining unit
+                // does, while rejecting arbitrary pointer bit patterns.
+                const_value = Some(0);
+            }
             _ => {
                 return Err(format!(
                     "{}: corrupt .amod file (unexpected parameter value for '{}'); rebuild the provider module",
@@ -2647,20 +2783,19 @@ fn parse_var(line: &str, is_param: bool, version: u32, path: &Path) -> Result<Am
     }
     let mut attrs = HashSet::new();
     for attr in attr_str.split(", ").filter(|attr| !attr.is_empty()) {
-        if version >= 17
-            && !matches!(
-                attr,
-                "allocatable"
-                    | "save"
-                    | "pointer"
-                    | "procptr"
-                    | "target"
-                    | "volatile"
-                    | "protected"
-                    | "threadprivate"
-                    | "private"
-            )
-        {
+        let known_attribute = matches!(
+            attr,
+            "allocatable"
+                | "save"
+                | "pointer"
+                | "procptr"
+                | "target"
+                | "volatile"
+                | "protected"
+                | "threadprivate"
+                | "private"
+        ) || (version >= 19 && matches!(attr, "asynchronous" | "contiguous"));
+        if version >= 17 && !known_attribute {
             return Err(format!(
                 "{}: corrupt .amod file (unknown variable attribute '{}' for '{}'); rebuild the provider module",
                 path.display(),
@@ -2683,6 +2818,8 @@ fn parse_var(line: &str, is_param: bool, version: u32, path: &Path) -> Result<Am
     let pointer = attrs.contains("pointer");
     let proc_pointer = attrs.contains("procptr");
     let target = attrs.contains("target");
+    let asynchronous = attrs.contains("asynchronous");
+    let contiguous = attrs.contains("contiguous");
     let volatile = attrs.contains("volatile");
     let protected = attrs.contains("protected");
     let openmp_threadprivate = attrs.contains("threadprivate");
@@ -2801,6 +2938,8 @@ fn parse_var(line: &str, is_param: bool, version: u32, path: &Path) -> Result<Am
         pointer,
         proc_pointer,
         target,
+        asynchronous,
+        contiguous,
         volatile,
         protected,
         openmp_threadprivate,
@@ -3604,6 +3743,8 @@ fn parse_type(
                 let mut nopass = false;
                 let mut pass_name = None;
                 let mut pass_index = None;
+                let mut access = None;
+                let mut binding_owner = None;
                 let mut index = 0;
                 while index < tokens.len() {
                     match tokens[index] {
@@ -3647,6 +3788,43 @@ fn parse_type(
                             })?);
                             index += 2;
                         }
+                        "@access" if access.is_none() => {
+                            let value = tokens.get(index + 1).ok_or_else(|| {
+                                format!(
+                                    "{}: corrupt .amod file (missing @binds accessibility); rebuild the provider module",
+                                    path.display()
+                                )
+                            })?;
+                            access = Some(match *value {
+                                "public" => Access::Public,
+                                "private" => Access::Private,
+                                _ => {
+                                    return Err(format!(
+                                        "{}: corrupt .amod file (invalid @binds accessibility '{}'); rebuild the provider module",
+                                        path.display(),
+                                        value
+                                    ));
+                                }
+                            });
+                            index += 2;
+                        }
+                        "@owner" if binding_owner.is_none() => {
+                            let value = tokens.get(index + 1).ok_or_else(|| {
+                                format!(
+                                    "{}: corrupt .amod file (missing @binds owner); rebuild the provider module",
+                                    path.display()
+                                )
+                            })?;
+                            if value.starts_with('@') {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (invalid @binds owner '{}'); rebuild the provider module",
+                                    path.display(),
+                                    value
+                                ));
+                            }
+                            binding_owner = Some((*value).to_string());
+                            index += 2;
+                        }
                         token => {
                             return Err(format!(
                                 "{}: corrupt .amod file (invalid or duplicate @binds metadata '{}'); rebuild the provider module",
@@ -3665,10 +3843,30 @@ fn parse_type(
                         method
                     ));
                 }
+                let access = match access {
+                    Some(access) => access,
+                    None if version < AMOD_BOUND_PROC_ACCESS_VERSION => Access::Public,
+                    None => {
+                        return Err(format!(
+                            "{}: corrupt .amod file (missing @binds accessibility for '{}'); rebuild the provider module",
+                            path.display(),
+                            method
+                        ));
+                    }
+                };
+                if version >= AMOD_BOUND_PROC_ACCESS_VERSION && binding_owner.is_none() {
+                    return Err(format!(
+                        "{}: corrupt .amod file (missing @binds owner for '{}'); rebuild the provider module",
+                        path.display(),
+                        method
+                    ));
+                }
                 bound_procs.push(BoundProc {
                     method_name: method.clone(),
                     target_name: target,
                     abi_name: abi_name.unwrap_or_else(|| method.to_ascii_lowercase()),
+                    access,
+                    owner_module: binding_owner,
                     nopass,
                     pass_name,
                     pass_index,
@@ -3697,6 +3895,8 @@ fn parse_type(
                     method_name: method,
                     target_name: target,
                     abi_name: parsed_abi_name,
+                    access: Access::Public,
+                    owner_module: None,
                     nopass,
                     pass_name: None,
                     pass_index: (!nopass).then_some(0),
@@ -3820,6 +4020,11 @@ fn parse_type(
                     name
                 ));
             }
+        }
+    }
+    for binding in &mut bound_procs {
+        if binding.owner_module.is_none() {
+            binding.owner_module.clone_from(&owner_module);
         }
     }
     Ok(TypeLayout {
@@ -4272,7 +4477,10 @@ fn type_info_to_ir_type(info: Option<&TypeInfo>) -> crate::ir::types::IrType {
     match info {
         Some(TypeInfo::Derived(name)) => {
             let lower = name.to_lowercase();
-            if lower == "c_ptr" || lower == "c_funptr" {
+            if let Some(kind) = crate::sema::resolve::type_resolution::ieee_opaque_int_kind(&lower)
+            {
+                IrType::int_from_kind(kind)
+            } else if lower == "c_ptr" || lower == "c_funptr" {
                 IrType::Int(IntWidth::I64)
             } else {
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
@@ -4342,6 +4550,28 @@ mod tests {
     }
 
     #[test]
+    fn module_variable_memory_attributes_require_current_schema() {
+        let var = parse_var(
+            "@var values : integer(4), target, asynchronous, contiguous",
+            false,
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap();
+        assert!(var.asynchronous);
+        assert!(var.contiguous);
+
+        let error = parse_var(
+            "@var values : integer(4), asynchronous",
+            false,
+            18,
+            Path::new("stale.amod"),
+        )
+        .expect_err("older schema accepted a new variable attribute");
+        assert!(error.contains("unknown variable attribute"), "{error}");
+    }
+
+    #[test]
     fn parse_var_preserves_full_width_integer_parameter() {
         let var = parse_var(
             "@var big : integer(16) = 170141183460469231731687303715884105727",
@@ -4363,6 +4593,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("invalid integer parameter value"), "{error}");
+    }
+
+    #[test]
+    fn parse_var_preserves_null_c_funptr_parameter() {
+        let var = parse_var(
+            "@var sig_dfl : type(c_funptr) = 0",
+            true,
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap();
+        assert_eq!(var.type_info, Some(TypeInfo::Derived("c_funptr".into())));
+        assert_eq!(var.const_value, Some(0));
+
+        let error = parse_var(
+            "@var sig_dfl : type(c_funptr) = 1",
+            true,
+            AMOD_VERSION,
+            Path::new("test.amod"),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("non-null C pointer parameter value"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -4498,6 +4753,32 @@ mod tests {
     }
 
     #[test]
+    fn current_schema_rejects_malformed_enum_and_interface_records() {
+        let bodies = [
+            "@enumtype friend color red green\n",
+            "@enumtype public color\n",
+            "@enumtype public color red RED\n",
+            "@interface pick, public\n  @specific pick_i\n@end interface\n",
+            "@interface pick\n@end interface\n",
+            "@interface pick\n  @specific pick_i\n  @specific PICK_I\n@end interface\n",
+            "@interface pick\n  @specific pick_i\n",
+            "@interface pick\n  @unknown pick_i\n@end interface\n",
+        ];
+        for body in bodies {
+            let text = add_integrity_headers(format!(
+                "#!amod {AMOD_VERSION}\n# module: schema_test\n# default-access: public\n\n{body}"
+            ));
+            let error = read_amod_content(&text, Path::new("schema_test.amod"))
+                .expect_err("malformed current-version enum/interface record was accepted");
+            assert!(
+                error.contains("corrupt .amod file")
+                    && error.contains("rebuild the provider module"),
+                "{body:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn current_schema_rejects_malformed_abi_layout_metadata() {
         let valid_type = "@type item_t, public\n  @layout size=8 align=4\n  @field value : integer(4) @offset 4 @size 4 @dims 1:1 @access public @owner schema_test\n  @owner schema_test\n  @tag 1\n@end type\n";
         let malformed = [
@@ -4549,7 +4830,7 @@ mod tests {
     #[test]
     fn current_schema_cross_checks_pass_name_and_index() {
         let source = format!(
-            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine apply\n  @arg delta : integer(4), intent(in)\n  @arg self : class(item_t), intent(inout)\n@end subroutine\n\n@type item_t, public\n  @layout size=4 align=4\n  @field value : integer(4) @offset 0 @size 4 @access public @owner pass_schema\n  @binds run => apply @pass-name self @pass-index 0 @abi apply\n  @owner pass_schema\n  @tag 1\n@end type\n"
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine apply\n  @arg delta : integer(4), intent(in)\n  @arg self : class(item_t), intent(inout)\n@end subroutine\n\n@type item_t, public\n  @layout size=4 align=4\n  @field value : integer(4) @offset 0 @size 4 @access public @owner pass_schema\n  @binds run => apply @pass-name self @pass-index 0 @abi apply @access public @owner pass_schema\n  @owner pass_schema\n  @tag 1\n@end type\n"
         );
         let text = add_integrity_headers(source.clone());
         let error = read_amod_content(&text, Path::new("pass_schema.amod"))
@@ -4566,9 +4847,34 @@ mod tests {
     }
 
     #[test]
+    fn current_schema_requires_binding_access_and_owner_metadata() {
+        let valid = format!(
+            "#!amod {AMOD_VERSION}\n# module: schema_test\n# default-access: public\n\n@type item_t, public\n  @layout size=0 align=1\n  @binds run => afs_modproc$v2$m$ancestor$p$run @nopass @abi run @access public @owner ancestor\n  @owner schema_test\n  @tag 1\n@end type\n"
+        );
+        let malformed = [
+            valid.replace(" @access public", ""),
+            valid.replace(" @access public", " @access protected"),
+            valid.replace(" @access public", " @access public @access private"),
+            valid.replace(" @owner ancestor", ""),
+            valid.replace(" @owner ancestor", " @owner @tag"),
+        ];
+        for source in malformed {
+            let text = add_integrity_headers(source.clone());
+            let error = read_amod_content(&text, Path::new("schema_test.amod"))
+                .expect_err("malformed current-version binding metadata was accepted");
+            assert!(
+                error.contains("corrupt .amod file")
+                    && error.contains("@binds")
+                    && error.contains("rebuild the provider module"),
+                "{source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn current_schema_validates_passed_object_characteristics() {
         let source = format!(
-            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine apply\n  @arg self : class(item_t), intent(inout)\n@end subroutine\n\n@type item_t, public\n  @layout size=4 align=4\n  @field value : integer(4) @offset 0 @size 4 @access public @owner pass_schema\n  @binds run => apply @pass-name self @pass-index 0 @abi apply\n  @owner pass_schema\n  @tag 1\n@end type\n"
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine apply\n  @arg self : class(item_t), intent(inout)\n@end subroutine\n\n@type item_t, public\n  @layout size=4 align=4\n  @field value : integer(4) @offset 0 @size 4 @access public @owner pass_schema\n  @binds run => apply @pass-name self @pass-index 0 @abi apply @access public @owner pass_schema\n  @owner pass_schema\n  @tag 1\n@end type\n"
         );
         let malformed = [
             ("class(item_t)", "integer(4)"),
@@ -4614,7 +4920,7 @@ mod tests {
     #[test]
     fn current_schema_validates_passed_object_against_defining_type() {
         let source = format!(
-            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine base_touch\n  @arg self : class(base_t), intent(inout)\n@end subroutine\n\n@subroutine child_touch\n  @arg self : class(override_t), intent(inout)\n@end subroutine\n\n@type inherited_t, public\n  @layout size=0 align=1\n  @extends pass_schema::base_t\n  @binds touch => base_touch @pass-name self @pass-index 0 @abi base_touch\n  @owner pass_schema\n  @tag 2\n@end type\n\n@type override_t, public\n  @layout size=0 align=1\n  @extends pass_schema::base_t\n  @binds touch => child_touch @pass-name self @pass-index 0 @abi child_touch\n  @owner pass_schema\n  @tag 3\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => base_touch @pass-name self @pass-index 0 @abi base_touch\n  @owner pass_schema\n  @tag 1\n@end type\n"
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@subroutine base_touch\n  @arg self : class(base_t), intent(inout)\n@end subroutine\n\n@subroutine child_touch\n  @arg self : class(override_t), intent(inout)\n@end subroutine\n\n@type inherited_t, public\n  @layout size=0 align=1\n  @extends pass_schema::base_t\n  @binds touch => base_touch @pass-name self @pass-index 0 @abi base_touch @access public @owner pass_schema\n  @owner pass_schema\n  @tag 2\n@end type\n\n@type override_t, public\n  @layout size=0 align=1\n  @extends pass_schema::base_t\n  @binds touch => child_touch @pass-name self @pass-index 0 @abi child_touch @access public @owner pass_schema\n  @owner pass_schema\n  @tag 3\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => base_touch @pass-name self @pass-index 0 @abi base_touch @access public @owner pass_schema\n  @owner pass_schema\n  @tag 1\n@end type\n"
         );
         let text = add_integrity_headers(source);
         read_amod_content(&text, Path::new("pass_schema.amod"))
@@ -4624,7 +4930,7 @@ mod tests {
     #[test]
     fn current_schema_requires_local_binding_procedure_metadata() {
         let source = format!(
-            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@type item_t, public\n  @layout size=0 align=1\n  @binds run => apply @pass-name self @pass-index 0 @abi apply\n  @owner pass_schema\n  @tag 1\n@end type\n"
+            "#!amod {AMOD_VERSION}\n# module: pass_schema\n# default-access: public\n\n@type item_t, public\n  @layout size=0 align=1\n  @binds run => apply @pass-name self @pass-index 0 @abi apply @access public @owner pass_schema\n  @owner pass_schema\n  @tag 1\n@end type\n"
         );
         let text = add_integrity_headers(source);
         let error = read_amod_content(&text, Path::new("pass_schema.amod"))
@@ -4635,7 +4941,7 @@ mod tests {
     #[test]
     fn current_schema_allows_external_inherited_binding_metadata() {
         let source = format!(
-            "#!amod {AMOD_VERSION}\n# module: child_schema\n# default-access: public\n\n@subroutine touch\n  @arg value : integer(4), intent(inout)\n@end subroutine\n\n@type child_t, public\n  @layout size=0 align=1\n  @extends ancestor_schema::base_t\n  @binds touch => afs_modproc$v2$m$ancestor_schema$p$touch @pass-name self @pass-index 0 @abi touch\n  @owner child_schema\n  @tag 2\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => afs_modproc$v2$m$ancestor_schema$p$touch @pass-name self @pass-index 0 @abi touch\n  @owner ancestor_schema\n  @tag 1\n@end type\n"
+            "#!amod {AMOD_VERSION}\n# module: child_schema\n# default-access: public\n\n@subroutine touch\n  @arg value : integer(4), intent(inout)\n@end subroutine\n\n@type child_t, public\n  @layout size=0 align=1\n  @extends ancestor_schema::base_t\n  @binds touch => afs_modproc$v2$m$ancestor_schema$p$touch @pass-name self @pass-index 0 @abi touch @access public @owner ancestor_schema\n  @owner child_schema\n  @tag 2\n@end type\n\n@type base_t, public\n  @layout size=0 align=1\n  @binds touch => afs_modproc$v2$m$ancestor_schema$p$touch @pass-name self @pass-index 0 @abi touch @access public @owner ancestor_schema\n  @owner ancestor_schema\n  @tag 1\n@end type\n"
         );
         let text = add_integrity_headers(source);
         read_amod_content(&text, Path::new("child_schema.amod"))
@@ -4645,7 +4951,7 @@ mod tests {
     #[test]
     fn current_schema_rejects_malformed_reserved_module_procedure_targets() {
         let source = format!(
-            "#!amod {AMOD_VERSION}\n# module: malformed_target\n# default-access: public\n\n@type item_t, public\n  @layout size=0 align=1\n  @binds run => afs_modproc$v2$m$$p$decoy_proc @nopass @abi run\n  @owner malformed_target\n  @tag 1\n@end type\n"
+            "#!amod {AMOD_VERSION}\n# module: malformed_target\n# default-access: public\n\n@type item_t, public\n  @layout size=0 align=1\n  @binds run => afs_modproc$v2$m$$p$decoy_proc @nopass @abi run @access public @owner malformed_target\n  @owner malformed_target\n  @tag 1\n@end type\n"
         );
         let text = add_integrity_headers(source);
         let error = read_amod_content(&text, Path::new("malformed_target.amod"))
@@ -4755,7 +5061,7 @@ mod tests {
 
     #[test]
     fn current_default_access_header_is_required_and_preserved() {
-        let private = r#"#!amod 18
+        let private = r#"#!amod 19
 # module: private_facade
 # default-access: private
 
@@ -4773,7 +5079,7 @@ mod tests {
             ]
         );
 
-        let missing = r#"#!amod 18
+        let missing = r#"#!amod 19
 # module: missing_default_access
 
 @uses provider
@@ -4798,7 +5104,7 @@ mod tests {
 
     #[test]
     fn dotted_relational_operator_interface_loads_with_canonical_name() {
-        let text = r#"#!amod 18
+        let text = r#"#!amod 19
 # module: operators
 # default-access: public
 
@@ -5255,7 +5561,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 18
+            r#"#!amod 20
 # module: cache_test
 # default-access: public
 # source: cache_test.f90
@@ -5288,7 +5594,7 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 18
+            r#"#!amod 20
 # module: cached_parent
 # default-access: public
 # source: cached_parent.f90
@@ -5302,7 +5608,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 18
+            r#"#!amod 20
 # module: supplied_parent
 # default-access: private
 # ancestor-module: supplied_root
@@ -5336,7 +5642,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 18
+            r#"#!amod 20
 # module: child
 # default-access: public
 # ancestor-module: root
@@ -5422,7 +5728,7 @@ mod tests {
             std::process::id()
         ));
         let text = add_integrity_headers(
-            r#"#!amod 17
+            r#"#!amod 19
 # module: stale_test
 # source: stale_test.f90
 
@@ -5436,7 +5742,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 17 (compiler requires 18)")
+            err.contains("incompatible .amod version 19 (compiler requires 20)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );
